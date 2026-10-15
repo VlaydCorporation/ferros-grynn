@@ -155,38 +155,6 @@ impl FileRegistry {
 		})
 	}
 
-	/// Adds a fully created layout after its files are durable but before the
-	/// transaction can stage frames for them.
-	pub(super) fn insert(
-		&mut self,
-		registrations: Vec<DataFileRegistration>,
-		io_mode: DirectFileOpenMode,
-	) -> FerrosGrynnResult<()> {
-		let mut opened = Vec::with_capacity(registrations.len());
-		let mut keys = RapidHashMap::with_capacity(registrations.len());
-		for registration in registrations {
-			let key = (registration.space_id, registration.file_id);
-			if self.files.contains_key(&key) || keys.insert(key, ()).is_some() {
-				return Err(FerrosGrynnError::invalid_storage_file(
-					"duplicate data-file identity in registry extension",
-				));
-			}
-			opened.push((key, Arc::new(open_registration(registration, io_mode)?)));
-		}
-		for (key, file) in opened {
-			self.files.insert(key, file);
-		}
-		Ok(())
-	}
-
-	/// Removes registrations that never became reachable from a durable
-	/// catalog root.
-	pub(super) fn remove(&mut self, keys: &[(DataSpaceId, DataFileId)]) {
-		for key in keys {
-			self.files.remove(key);
-		}
-	}
-
 	/// Reports whether one complete physical identity remains available.
 	pub(super) fn contains(&self, space_id: DataSpaceId, file_id: DataFileId) -> bool {
 		self.files.contains_key(&(space_id, file_id))
@@ -256,12 +224,12 @@ fn open_registration(
 		})?
 		.len();
 	validate_file_length(length)?;
-	if registration.role == DataFileRole::Superblock {
-		if length != crate::storage::page::PAGE_SIZE as u64 {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"registered checkpoint-owned superblock must contain exactly one page",
-			));
-		}
+	if registration.role == DataFileRole::Superblock
+		&& length != crate::storage::page::PAGE_SIZE as u64
+	{
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"registered checkpoint-owned superblock must contain exactly one page",
+		));
 	}
 	let file = OnceLock::new();
 	let page_count = length / crate::storage::page::PAGE_SIZE as u64;
@@ -316,9 +284,12 @@ fn validate_role(file_id: DataFileId, role: DataFileRole) -> FerrosGrynnResult<(
 }
 
 #[cfg(test)]
+/// Regression tests for file registry behavior.
 mod tests {
 	use super::*;
 	use crate::graph::GraphId;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 
 	/// Registry role validation rejects transactional graph metadata.
 	#[test]
@@ -330,19 +301,22 @@ mod tests {
 		assert!(validate_role(data, DataFileRole::Superblock).is_err());
 		assert!(validate_role(graph, DataFileRole::Superblock).is_ok());
 		assert!(validate_role(atoms, DataFileRole::Superblock).is_ok());
-		let graph_space = DataSpaceId::Graph(GraphId::new(1).unwrap());
+		let graph_space = DataSpaceId::Graph(GraphId::new(1).assert_some());
 		assert!(
 			validate_registration(DataSpaceId::Database, graph, DataFileRole::Superblock).is_err()
 		);
 		assert!(validate_registration(graph_space, atoms, DataFileRole::Superblock).is_err());
 	}
 
+	/// Verifies ordinary handle opens only on first use.
 	#[test]
-	fn ordinary_handle_opens_only_on_first_use() -> FerrosGrynnResult<()> {
+	fn ordinary_handle_opens_only_on_first_use() {
+		use crate::test_assertions::AssertResult as _;
+
 		let path =
 			std::env::temp_dir().join(format!("fg-registry-{}.fgb", crate::values::Uuid::now_v7()));
-		let created = DirectFile::create_new(&path)?;
-		created.resize_pages(1)?;
+		let created = DirectFile::create_new(&path).assert_ok();
+		created.resize_pages(1).assert_ok();
 		drop(created);
 		let file_id = DataFileId::for_kind(DataFileKind::NodesHot);
 		let registry = FileRegistry::open(
@@ -354,12 +328,12 @@ mod tests {
 			}],
 			DirectFileOpenMode::Synchronous,
 			&RapidHashSet::default(),
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(registry.handle_counts(), (1, 0));
-		drop(registry.resolve_file(DataSpaceId::Database, file_id)?.file()?);
+		drop(registry.resolve_file(DataSpaceId::Database, file_id).assert_ok().file().assert_ok());
 		assert_eq!(registry.handle_counts(), (1, 1));
 		drop(registry);
 		drop(std::fs::remove_file(path));
-		Ok(())
 	}
 }

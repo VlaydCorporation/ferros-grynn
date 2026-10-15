@@ -34,7 +34,10 @@ use crate::{
 };
 
 /// Event retained until every overlapped scatter read completes.
-struct ScatterEvent(HANDLE);
+struct ScatterEvent(
+	/// Event retained until every overlapped scatter read completes.
+	HANDLE,
+);
 
 impl ScatterEvent {
 	/// Creates one reusable manual-reset event.
@@ -56,6 +59,7 @@ impl ScatterEvent {
 }
 
 impl Drop for ScatterEvent {
+	/// Runs cleanup for this `ScatterEvent` before its fields are released.
 	fn drop(&mut self) {
 		// SAFETY: this wrapper owns the valid handle and closes it once.
 		drop(unsafe { CloseHandle(self.0) });
@@ -64,9 +68,13 @@ impl Drop for ScatterEvent {
 
 /// Per-worker state reused for every extent in one scan.
 struct ScatterReader {
+	/// System page size associated with this scatter reader.
 	system_page_size: usize,
+	/// Segments associated with this scatter reader.
 	segments: Vec<FILE_SEGMENT_ELEMENT>,
+	/// Event associated with this scatter reader.
 	event: ScatterEvent,
+	/// Overlapped associated with this scatter reader.
 	overlapped: Box<OVERLAPPED>,
 }
 
@@ -191,20 +199,27 @@ impl ScatterReader {
 
 /// Owned raw extent passed from the worker to the validating pull cursor.
 struct LoadedExtent {
+	/// First page associated with this loaded extent.
 	first_page: PageNo,
+	/// Page count associated with this loaded extent.
 	page_count: usize,
+	/// Pages associated with this loaded extent.
 	pages: Vec<AlignedPage>,
 }
 
 /// Ordered worker result.
 struct ScatterMessage {
+	/// Ordinal associated with this scatter message.
 	ordinal: usize,
+	/// Result associated with this scatter message.
 	result: FerrosGrynnResult<LoadedExtent>,
 }
 
 /// Borrowed view of one fully validated extent.
 pub struct ValidatedScatterExtent<'cursor> {
+	/// First page associated with this validated scatter extent.
 	first_page: PageNo,
+	/// Pages associated with this validated scatter extent.
 	pages: &'cursor [AlignedPage],
 }
 
@@ -222,12 +237,19 @@ impl ValidatedScatterExtent<'_> {
 
 /// Synchronous ordered cursor with one background extent of read-ahead.
 pub struct ScatterPrefetchCursor<'engine> {
+	/// Receiver associated with this scatter prefetch cursor.
 	_receiver: Option<Receiver<ScatterMessage>>,
+	/// Empty sender associated with this scatter prefetch cursor.
 	empty_sender: Option<SyncSender<Vec<AlignedPage>>>,
+	/// Cancelled associated with this scatter prefetch cursor.
 	cancelled: Arc<AtomicBool>,
+	/// Worker associated with this scatter prefetch cursor.
 	worker: Option<JoinHandle<()>>,
+	/// Current associated with this scatter prefetch cursor.
 	current: Option<LoadedExtent>,
+	/// Next ordinal associated with this scatter prefetch cursor.
 	next_ordinal: usize,
+	/// Lane associated with this scatter prefetch cursor.
 	_lane: MutexGuard<'engine, ()>,
 }
 
@@ -276,9 +298,8 @@ impl<'engine> ScatterPrefetchCursor<'engine> {
 				if worker_cancelled.load(Ordering::Acquire) {
 					break;
 				}
-				let mut pages = match empty_receiver.recv() {
-					Ok(pages) => pages,
-					Err(_) => break,
+				let Ok(mut pages) = empty_receiver.recv() else {
+					break;
 				};
 				let offset = ordinal * extent_pages;
 				let count = extent_pages.min(page_count - offset);
@@ -370,6 +391,10 @@ impl<'engine> ScatterPrefetchCursor<'engine> {
 	}
 
 	/// Joins the worker and releases the single scatter lane.
+	///
+	/// # Errors
+	///
+	/// Propagates scatter-worker shutdown and join failures.
 	pub fn finish(mut self) -> FerrosGrynnResult<()> {
 		self.shutdown()
 	}
@@ -400,6 +425,8 @@ impl<'engine> ScatterPrefetchCursor<'engine> {
 }
 
 impl Drop for ScatterPrefetchCursor<'_> {
+	/// Runs cleanup for this `ScatterPrefetchCursor<'_>` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		let _ignored = self.shutdown();
 	}

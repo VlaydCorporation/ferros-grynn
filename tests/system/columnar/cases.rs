@@ -67,6 +67,8 @@ fn rows(store: &Datastore) -> Vec<PropertyMap> {
 		.collect()
 }
 
+/// Verifies sdk arrow round trip preserves presence validity metadata and
+/// recovered rows.
 #[test]
 fn sdk_arrow_round_trip_preserves_presence_validity_metadata_and_recovered_rows() {
 	let db = database();
@@ -106,6 +108,7 @@ fn sdk_arrow_round_trip_preserves_presence_validity_metadata_and_recovered_rows(
 	});
 }
 
+/// Verifies sdk dense union keeps scalar variants without coercion.
 #[test]
 fn sdk_dense_union_keeps_scalar_variants_without_coercion() {
 	let db = database();
@@ -139,6 +142,7 @@ fn sdk_dense_union_keeps_scalar_variants_without_coercion() {
 	});
 }
 
+/// Verifies columnar batch owns its data after the datastore is dropped.
 #[test]
 fn columnar_batch_owns_its_data_after_the_datastore_is_dropped() {
 	let db = database();
@@ -148,6 +152,8 @@ fn columnar_batch_owns_its_data_after_the_datastore_is_dropped() {
 	assert_eq!(batch.to_rows().unwrap(), expected);
 }
 
+/// Verifies arrow import rejects missing metadata bad presence and duplicate
+/// field mappings.
 #[test]
 fn arrow_import_rejects_missing_metadata_bad_presence_and_duplicate_field_mappings() {
 	let db = database();
@@ -188,6 +194,8 @@ fn arrow_import_rejects_missing_metadata_bad_presence_and_duplicate_field_mappin
 	assert_eq!(error.status().code().to_string(), "FG-22F18");
 }
 
+/// Verifies none only rows preserve row count and unsupported values return
+/// domain status.
 #[test]
 fn none_only_rows_preserve_row_count_and_unsupported_values_return_domain_status() {
 	let db = database();
@@ -211,6 +219,8 @@ fn none_only_rows_preserve_row_count_and_unsupported_values_return_domain_status
 	}
 }
 
+/// Verifies datafusion sdk filters none separately from null and aggregates
+/// numeric rows.
 #[cfg(feature = "datafusion")]
 #[test]
 fn datafusion_sdk_filters_none_separately_from_null_and_aggregates_numeric_rows() {

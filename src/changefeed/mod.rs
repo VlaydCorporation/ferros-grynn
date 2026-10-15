@@ -41,7 +41,10 @@ use crate::{
 
 /// The database-wide durable commit clock, including commits without events.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Versionstamp(u64);
+pub struct Versionstamp(
+	/// Durable database commit position; zero denotes the database origin.
+	u64,
+);
 
 impl Versionstamp {
 	/// Creates an exact commit position. Zero denotes the database origin.
@@ -56,18 +59,21 @@ impl Versionstamp {
 }
 
 impl From<u64> for Versionstamp {
+	/// Converts `u64` into `Versionstamp`.
 	fn from(value: u64) -> Self {
 		Self::new(value)
 	}
 }
 
 impl From<Versionstamp> for Number {
+	/// Converts `Versionstamp` into `Number`.
 	fn from(value: Versionstamp) -> Self {
 		Self::from(value.get())
 	}
 }
 
 impl Display for Versionstamp {
+	/// Formats `Versionstamp` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		Display::fmt(&self.get(), f)
 	}
@@ -75,7 +81,10 @@ impl Display for Versionstamp {
 
 /// Stable identity of one retained changefeed incarnation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChangefeedId(Uuid);
+pub struct ChangefeedId(
+	/// UUID distinguishing this changefeed incarnation from later definitions.
+	Uuid,
+);
 
 impl ChangefeedId {
 	/// Creates an identity from a non-nil UUID.
@@ -104,6 +113,7 @@ impl ChangefeedId {
 impl TryFrom<Uuid> for ChangefeedId {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Uuid` into `ChangefeedId` after validating the conversion.
 	fn try_from(value: Uuid) -> FerrosGrynnResult<Self> {
 		Self::from_uuid(value)
 	}
@@ -112,6 +122,7 @@ impl TryFrom<Uuid> for ChangefeedId {
 impl FromStr for ChangefeedId {
 	type Err = FerrosGrynnError;
 
+	/// Constructs from str for `ChangefeedId`.
 	fn from_str(value: &str) -> FerrosGrynnResult<Self> {
 		let value = value
 			.parse::<Uuid>()
@@ -121,6 +132,7 @@ impl FromStr for ChangefeedId {
 }
 
 impl Display for ChangefeedId {
+	/// Formats `ChangefeedId` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		Display::fmt(&self.0, f)
 	}
@@ -131,9 +143,15 @@ impl Display for ChangefeedId {
 #[non_exhaustive]
 pub enum ChangefeedSource {
 	/// Database-global records of one immutable class identity.
-	Class(ClassId),
+	Class(
+		/// Database-global records of one immutable class identity.
+		ClassId,
+	),
 	/// Qualified occurrences belonging to one graph identity.
-	Graph(GraphId),
+	Graph(
+		/// Qualified occurrences belonging to one graph identity.
+		GraphId,
+	),
 }
 
 /// Resolves active or retained historical sources in the selected snapshot.
@@ -141,22 +159,37 @@ pub enum ChangefeedSource {
 #[non_exhaustive]
 pub enum ChangefeedSelector {
 	/// Selects an exact source incarnation even after its owner is removed.
-	Id(ChangefeedId),
+	Id(
+		/// Selects an exact source incarnation even after its owner is removed.
+		ChangefeedId,
+	),
 	/// Selects the current or retained definition of a stable catalog identity.
-	Source(ChangefeedSource),
+	Source(
+		/// Selects the current or retained definition of a stable catalog
+		/// identity.
+		ChangefeedSource,
+	),
 	/// Active class names win; retired names must be unambiguous.
-	ClassName(Text),
+	ClassName(
+		/// Active class names win; retired names must be unambiguous.
+		Text,
+	),
 	/// Active graph names win; retired names must be unambiguous.
-	GraphName(Text),
+	GraphName(
+		/// Active graph names win; retired names must be unambiguous.
+		Text,
+	),
 }
 
 impl From<ChangefeedId> for ChangefeedSelector {
+	/// Converts `ChangefeedId` into `ChangefeedSelector`.
 	fn from(value: ChangefeedId) -> Self {
 		Self::Id(value)
 	}
 }
 
 impl From<ChangefeedSource> for ChangefeedSelector {
+	/// Converts `ChangefeedSource` into `ChangefeedSelector`.
 	fn from(value: ChangefeedSource) -> Self {
 		Self::Source(value)
 	}

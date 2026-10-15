@@ -1,6 +1,7 @@
+/// Derive parsers and code generation for heap measurement.
 mod derive;
+/// Validation and code generation for the declarative status catalog.
 mod status_codes;
-pub(crate) mod utils;
 
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
@@ -18,6 +19,8 @@ pub fn measurable(input: TokenStream) -> TokenStream {
 		.into()
 }
 
+/// Expands the declarative status catalog into typed codes, constructors and
+/// metadata.
 #[proc_macro]
 pub fn define_status_codes(item: TokenStream) -> TokenStream {
 	status_codes::define_status_codes(item)

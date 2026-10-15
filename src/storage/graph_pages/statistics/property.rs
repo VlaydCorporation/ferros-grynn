@@ -2,7 +2,19 @@
 
 use std::collections::BTreeMap;
 
-use super::{checked_page_no, codec::*};
+use super::{
+	checked_page_no,
+	codec::{
+		invalid_page,
+		read_u16,
+		read_u32,
+		read_u64,
+		validate_zero,
+		write_u16,
+		write_u32,
+		write_u64,
+	},
+};
 use crate::{
 	datastore::{ClassId, SchemaId},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -18,24 +30,42 @@ use crate::{
 	storage::page::{AlignedPage, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
 };
 
+/// Configured class id value.
 const CLASS_ID: usize = 32;
+/// Configured field id value.
 const FIELD_ID: usize = 36;
+/// Configured scope kind value.
 const SCOPE_KIND: usize = 40;
+/// Configured value type value.
 const VALUE_TYPE: usize = 41;
+/// Configured method value.
 const METHOD: usize = 42;
+/// Configured hll precision value.
 const HLL_PRECISION: usize = 43;
+/// Configured sample count value.
 const SAMPLE_COUNT: usize = 44;
+/// Configured scope graph value.
 const SCOPE_GRAPH: usize = 48;
+/// Configured distinct count value.
 const DISTINCT_COUNT: usize = 56;
+/// Configured null fraction value.
 const NULL_FRACTION: usize = 64;
+/// Configured bucket count value.
 const BUCKET_COUNT: usize = 68;
+/// Configured reserved value.
 const RESERVED: usize = 70;
+/// Configured offsets value.
 const OFFSETS: usize = 72;
+/// Configured geometry population value.
 const GEOMETRY_POPULATION: usize = 72;
+/// Configured geometry offsets value.
 const GEOMETRY_OFFSETS: usize = 80;
+/// Configured exact precision value.
 const EXACT_PRECISION: u8 = 0;
+/// Configured approximate precision value.
 const APPROXIMATE_PRECISION: u8 = 12;
 
+/// Encodes property statistics.
 pub(in crate::storage) fn encode_property_statistics(
 	histograms: &BTreeMap<PropertyHistogramKey, PropertyHistogram>,
 	page_lsn: PageLsn,
@@ -64,6 +94,7 @@ pub(in crate::storage) fn encode_property_statistics(
 	Ok(pages)
 }
 
+/// Decodes property statistics.
 pub(in crate::storage) fn decode_property_statistics<ReadPage>(
 	read_page: ReadPage,
 	layout: super::StatisticsLayout,
@@ -74,6 +105,7 @@ where
 	decode_property_statistics_range(read_page, layout.property_pages)
 }
 
+/// Decodes property statistics range.
 pub(in crate::storage) fn decode_property_statistics_range<ReadPage>(
 	mut read_page: ReadPage,
 	page_count: u32,
@@ -93,7 +125,7 @@ where
 		if histogram.type_tag == 0x27 {
 			let ordinal = usize::from(read_u16(page.as_bytes(), RESERVED));
 			let expected = usize::try_from(read_u64(page.as_bytes(), DISTINCT_COUNT))
-				.map_err(|_| invalid("geometry sample count exceeds usize"))?;
+				.map_err(|_conversion_error| invalid("geometry sample count exceeds usize"))?;
 			if expected > 1024
 				|| ordinal >= expected.div_ceil(509).max(1)
 				|| histogram.mbr_sample.len() != expected.saturating_sub(ordinal * 509).min(509)
@@ -108,7 +140,8 @@ where
 					|| ordinal * 509 != previous.mbr_sample.len()
 					|| previous.sample_count != histogram.sample_count
 					|| previous.mbr_population != histogram.mbr_population
-					|| previous.null_fraction != histogram.null_fraction
+					|| previous.null_fraction.partial_cmp(&histogram.null_fraction)
+						!= Some(std::cmp::Ordering::Equal)
 					|| geometry_counts.get(&key) != Some(&expected)
 					|| previous
 						.mbr_sample
@@ -188,6 +221,7 @@ fn encode_geometry_sample(
 	Ok(())
 }
 
+/// Encodes page.
 fn encode_page(
 	page_no: PageNo,
 	page_lsn: PageLsn,
@@ -264,6 +298,7 @@ fn encode_page(
 	Ok(Some(page))
 }
 
+/// Decodes page.
 fn decode_page(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -407,6 +442,7 @@ fn decode_page(
 	))
 }
 
+/// Validates histogram.
 fn validate_histogram(histogram: &PropertyHistogram) -> FerrosGrynnResult<()> {
 	if histogram.mbr_sample.len() > 1024
 		|| (histogram.type_tag != 0x27
@@ -451,10 +487,12 @@ fn validate_histogram(histogram: &PropertyHistogram) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Returns whether the valid type tag condition holds.
 fn valid_type_tag(value: u8) -> bool {
 	matches!(value, 0x00..=0x0c | 0x10..=0x13 | 0x15 | 0x21..=0x27 | 0x31..=0x38)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

@@ -3,6 +3,8 @@
 use std::path::Path;
 
 use super::{GraphCheckpointAuthority, GraphFileSet};
+#[cfg(test)]
+use crate::storage::{image_io::stage_pages, wal::TxHandle};
 use crate::{
 	datastore::{DatabaseRoot, GraphRoot},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -18,11 +20,11 @@ use crate::{
 			open_graph_image,
 		},
 		graph_superblock::GraphSuperblock,
-		image_io::{read_pages, read_pages_cached, stage_pages},
+		image_io::{read_pages, read_pages_cached},
 		metadata_cow::select_checkpoint_page,
 		page::{AlignedPage, PageLsn, PageNo},
 		types::{PageKey, StorageSnapshot},
-		wal::{FrameWal, TxHandle},
+		wal::FrameWal,
 	},
 	values::storage::{DecodeContext, EncodeContext},
 };
@@ -47,6 +49,7 @@ pub(in crate::storage) fn build_import_durable_graph_image(
 }
 
 /// Stages all graph files and publishes the logical superblock last.
+#[cfg(test)]
 pub(in crate::storage) fn stage_durable_graph_image(
 	tx: &mut TxHandle,
 	files: GraphFileSet,
@@ -66,20 +69,6 @@ pub(in crate::storage) fn stage_durable_graph_image(
 		PageKey::new(space, files.superblock, PageNo::new(0)),
 		&image.superblock.encode()?,
 	)
-}
-
-/// Stages graph metadata only when its logical contents changed.
-pub(in crate::storage) fn stage_graph_superblock_if_changed(
-	tx: &mut TxHandle,
-	files: GraphFileSet,
-	previous: GraphSuperblock,
-	next: GraphSuperblock,
-) -> FerrosGrynnResult<bool> {
-	if previous.same_logical_metadata(next) {
-		return Ok(false);
-	}
-	tx.stage_page(PageKey::new(files.space(), files.superblock, PageNo::new(0)), &next.encode()?)?;
-	Ok(true)
 }
 
 /// Reopens one graph through WAL-first snapshot resolution.
@@ -215,6 +204,7 @@ fn read_graph_superblock(
 }
 
 /// Checks every count and rooted index before WAL publication.
+#[cfg(test)]
 fn validate_image(files: GraphFileSet, image: &BuiltGraphImage) -> FerrosGrynnResult<()> {
 	if files.graph_id != image.reference.id() || files.graph_id != image.superblock.graph_id {
 		return Err(invalid("graph image and physical file set identities disagree"));
@@ -248,6 +238,7 @@ fn validate_image(files: GraphFileSet, image: &BuiltGraphImage) -> FerrosGrynnRe
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

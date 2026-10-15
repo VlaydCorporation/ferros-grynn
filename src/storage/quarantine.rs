@@ -28,35 +28,58 @@ use crate::{
 	},
 };
 
+/// Configured magic value.
 const MAGIC: [u8; 4] = *b"FGQR";
+/// Format signature for footer.
 const FOOTER_MAGIC: [u8; 4] = *b"FGQF";
+/// Configured version value.
 const VERSION: u16 = 1;
+/// Configured header bytes value.
 const HEADER_BYTES: usize = 72;
+/// Configured footer bytes value.
 const FOOTER_BYTES: usize = 32;
+/// Byte offset of header checksum in its encoded layout.
 const HEADER_CHECKSUM_OFFSET: usize = 64;
+/// Byte offset of footer checksum in its encoded layout.
 const FOOTER_CHECKSUM_OFFSET: usize = 24;
+/// Configured max context entries value.
 const MAX_CONTEXT_ENTRIES: usize = 1_000_000;
+/// Configured max name bytes value.
 const MAX_NAME_BYTES: usize = 16 * 1024 * 1024;
+/// Configured max payload bytes value.
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+/// Configured max diagnostic bytes value.
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// One decoded rejected import item.
-pub(crate) struct QuarantineRecord {
+pub struct QuarantineRecord {
+	/// Ordinal associated with this quarantine record.
 	pub(crate) ordinal: u64,
+	/// Payload associated with this quarantine record.
 	pub(crate) payload: Value,
+	/// Code associated with this quarantine record.
 	pub(crate) code: StatusCode,
+	/// Diagnostic associated with this quarantine record.
 	pub(crate) diagnostic: String,
 }
 
 /// Streaming writer whose incomplete file is removed on every unwind path.
-pub(crate) struct QuarantineWriter {
+pub struct QuarantineWriter {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: Uuid,
+	/// Path associated with this quarantine writer.
 	path: PathBuf,
+	/// Writer associated with this quarantine writer.
 	writer: BufWriter<File>,
+	/// Context associated with this quarantine writer.
 	context: EncodeContext,
+	/// Record count associated with this quarantine writer.
 	record_count: u32,
+	/// Record bytes associated with this quarantine writer.
 	record_bytes: u64,
+	/// Last ordinal associated with this quarantine writer.
 	last_ordinal: u64,
+	/// Armed associated with this quarantine writer.
 	armed: bool,
 }
 
@@ -167,7 +190,7 @@ impl QuarantineWriter {
 			context_counts,
 			self.record_bytes,
 			context_bytes,
-		)?;
+		);
 		self.writer
 			.seek(SeekFrom::Start(0))
 			.and_then(|_| self.writer.write_all(&header))
@@ -194,6 +217,7 @@ impl QuarantineWriter {
 }
 
 impl Drop for QuarantineWriter {
+	/// Runs cleanup for this `QuarantineWriter` before its fields are released.
 	fn drop(&mut self) {
 		if self.armed {
 			drop(fs::remove_file(&self.path));
@@ -202,13 +226,17 @@ impl Drop for QuarantineWriter {
 }
 
 /// Sealed file that remains unreachable until its catalog publication wins.
-pub(crate) struct QuarantineArtifact {
+pub struct QuarantineArtifact {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: Uuid,
+	/// Path associated with this quarantine artifact.
 	path: PathBuf,
+	/// Armed associated with this quarantine artifact.
 	armed: bool,
 }
 
 impl QuarantineArtifact {
+	/// Returns the id result.
 	pub(crate) const fn id(&self) -> Uuid {
 		self.id
 	}
@@ -239,6 +267,8 @@ impl QuarantineArtifact {
 }
 
 impl Drop for QuarantineArtifact {
+	/// Runs cleanup for this `QuarantineArtifact` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		if self.armed {
 			drop(fs::remove_file(&self.path));
@@ -248,16 +278,23 @@ impl Drop for QuarantineArtifact {
 
 /// Exact reader that validates the complete immutable file before yielding its
 /// first record, then decodes records one at a time.
-pub(crate) struct QuarantineArchiveReader {
+pub struct QuarantineArchiveReader {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: Uuid,
+	/// Reader associated with this quarantine archive reader.
 	reader: BufReader<File>,
+	/// Context associated with this quarantine archive reader.
 	context: EncodeContext,
+	/// Number of elements that have not yet been consumed.
 	remaining: u32,
+	/// Records end associated with this quarantine archive reader.
 	records_end: u64,
+	/// Last ordinal associated with this quarantine archive reader.
 	last_ordinal: u64,
 }
 
 impl QuarantineArchiveReader {
+	/// Opens quarantine archive reader.
 	pub(crate) fn open(path: &Path) -> FerrosGrynnResult<Self> {
 		let file =
 			File::open(path).map_err(|source| io_failure("open import quarantine", source))?;
@@ -321,10 +358,12 @@ impl QuarantineArchiveReader {
 		})
 	}
 
+	/// Returns the id result.
 	pub(crate) const fn id(&self) -> Uuid {
 		self.id
 	}
 
+	/// Returns the next record.
 	pub(crate) fn next_record(&mut self) -> FerrosGrynnResult<Option<QuarantineRecord>> {
 		if self.remaining == 0 {
 			return Ok(None);
@@ -386,28 +425,40 @@ impl QuarantineArchiveReader {
 }
 
 #[derive(Clone, Copy)]
+/// Context counts state.
 struct ContextCounts {
+	/// Properties associated with this context counts.
 	properties: u32,
+	/// Classes associated with this context counts.
 	classes: u32,
+	/// Graphs associated with this context counts.
 	graphs: u32,
+	/// Time zones associated with this context counts.
 	time_zones: u32,
 }
 
+/// Header state.
 struct Header {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: Uuid,
+	/// Record count associated with this header.
 	record_count: u32,
+	/// Context counts associated with this header.
 	context_counts: ContextCounts,
+	/// Record bytes associated with this header.
 	record_bytes: u64,
+	/// Context bytes associated with this header.
 	context_bytes: u64,
 }
 
+/// Encodes header.
 fn encode_header(
 	id: Uuid,
 	record_count: u32,
 	counts: ContextCounts,
 	record_bytes: u64,
 	context_bytes: u64,
-) -> FerrosGrynnResult<[u8; HEADER_BYTES]> {
+) -> [u8; HEADER_BYTES] {
 	let mut bytes = [0; HEADER_BYTES];
 	bytes[..4].copy_from_slice(&MAGIC);
 	bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
@@ -421,9 +472,10 @@ fn encode_header(
 	bytes[56..64].copy_from_slice(&context_bytes.to_le_bytes());
 	let checksum = rapidhash_v3(&bytes[..HEADER_CHECKSUM_OFFSET]);
 	bytes[HEADER_CHECKSUM_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
-	Ok(bytes)
+	bytes
 }
 
+/// Decodes header.
 fn decode_header(bytes: &[u8; HEADER_BYTES]) -> FerrosGrynnResult<Header> {
 	if bytes[..4] != MAGIC {
 		return Err(invalid("quarantine magic does not match FGQR"));
@@ -459,6 +511,7 @@ fn decode_header(bytes: &[u8; HEADER_BYTES]) -> FerrosGrynnResult<Header> {
 	})
 }
 
+/// Encodes footer.
 fn encode_footer(record_count: u64, checksum: u64) -> [u8; FOOTER_BYTES] {
 	let mut bytes = [0; FOOTER_BYTES];
 	bytes[..4].copy_from_slice(&FOOTER_MAGIC);
@@ -470,6 +523,7 @@ fn encode_footer(record_count: u64, checksum: u64) -> [u8; FOOTER_BYTES] {
 	bytes
 }
 
+/// Decodes footer.
 fn decode_footer(bytes: &[u8; FOOTER_BYTES], record_count: u64) -> FerrosGrynnResult<u64> {
 	if bytes[..4] != FOOTER_MAGIC
 		|| slice_u16(bytes, 4) != VERSION
@@ -486,6 +540,7 @@ fn decode_footer(bytes: &[u8; FOOTER_BYTES], record_count: u64) -> FerrosGrynnRe
 	Ok(slice_u64(bytes, 16))
 }
 
+/// Writes context.
 fn write_context(
 	writer: &mut BufWriter<File>,
 	context: &EncodeContext,
@@ -524,6 +579,7 @@ fn write_context(
 	Ok(counts)
 }
 
+/// Reads context.
 fn read_context(
 	reader: &mut BufReader<File>,
 	counts: ContextCounts,
@@ -571,6 +627,7 @@ fn read_context(
 	Ok(context)
 }
 
+/// Registers references.
 fn register_references(
 	value: &Value,
 	schema: &SchemaCatalog,
@@ -612,6 +669,7 @@ fn register_references(
 	}
 }
 
+/// Registers class.
 fn register_class(
 	name: &str,
 	schema: &SchemaCatalog,
@@ -625,6 +683,7 @@ fn register_class(
 	context.register_class_name(id.get(), class.name().clone())
 }
 
+/// Writes string.
 fn write_string(writer: &mut BufWriter<File>, value: &str, field: &str) -> FerrosGrynnResult<()> {
 	if value.len() > MAX_NAME_BYTES || value.contains('\0') {
 		return Err(invalid(format!("{field} is outside its format domain")));
@@ -637,6 +696,7 @@ fn write_string(writer: &mut BufWriter<File>, value: &str, field: &str) -> Ferro
 		.map_err(|source| io_failure(format!("write {field}"), source))
 }
 
+/// Reads string.
 fn read_string(reader: &mut BufReader<File>, field: &str) -> FerrosGrynnResult<String> {
 	let length = read_bounded_u32(reader, MAX_NAME_BYTES, field)?;
 	let mut bytes = vec![0; length];
@@ -649,12 +709,13 @@ fn read_string(reader: &mut BufReader<File>, field: &str) -> FerrosGrynnResult<S
 	Ok(value)
 }
 
+/// Returns the hash prefix result.
 fn hash_prefix(path: &Path, length: u64) -> FerrosGrynnResult<u64> {
 	let mut file =
 		File::open(path).map_err(|source| io_failure("open quarantine checksum", source))?;
 	let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
 	let mut remaining = length;
-	let mut buffer = [0; 64 * 1024];
+	let mut buffer = vec![0; 64 * 1024];
 	while remaining != 0 {
 		let wanted = usize::try_from(remaining.min(buffer.len() as u64))
 			.map_err(|_error| invalid("quarantine checksum window exceeds usize"))?;
@@ -666,10 +727,12 @@ fn hash_prefix(path: &Path, length: u64) -> FerrosGrynnResult<u64> {
 	Ok(hasher.finish())
 }
 
-pub(crate) fn quarantine_path(root: &Path, id: Uuid) -> PathBuf {
+/// Returns the quarantine path result.
+pub fn quarantine_path(root: &Path, id: Uuid) -> PathBuf {
 	root.join("admin").join("quarantine").join(format!("{id}.fgq"))
 }
 
+/// Returns the graph kind result.
 fn graph_kind(value: GraphKind) -> u8 {
 	match value {
 		GraphKind::Graph => 0,
@@ -683,6 +746,7 @@ fn graph_kind(value: GraphKind) -> u8 {
 	}
 }
 
+/// Decodes graph kind.
 fn decode_graph_kind(value: u8) -> FerrosGrynnResult<GraphKind> {
 	match value {
 		0 => Ok(GraphKind::Graph),
@@ -697,6 +761,7 @@ fn decode_graph_kind(value: u8) -> FerrosGrynnResult<GraphKind> {
 	}
 }
 
+/// Returns the storage mode result.
 fn storage_mode(value: GraphStorageMode) -> u8 {
 	match value {
 		GraphStorageMode::InMemory => 0,
@@ -705,6 +770,7 @@ fn storage_mode(value: GraphStorageMode) -> u8 {
 	}
 }
 
+/// Decodes storage mode.
 fn decode_storage_mode(value: u8) -> FerrosGrynnResult<GraphStorageMode> {
 	match value {
 		0 => Ok(GraphStorageMode::InMemory),
@@ -714,6 +780,7 @@ fn decode_storage_mode(value: u8) -> FerrosGrynnResult<GraphStorageMode> {
 	}
 }
 
+/// Reads exact.
 fn read_exact(
 	reader: &mut BufReader<File>,
 	output: &mut [u8],
@@ -722,30 +789,35 @@ fn read_exact(
 	reader.read_exact(output).map_err(|source| io_failure(format!("read {field}"), source))
 }
 
+/// Reads u8.
 fn read_u8(reader: &mut BufReader<File>, field: &str) -> FerrosGrynnResult<u8> {
 	let mut bytes = [0; 1];
 	read_exact(reader, &mut bytes, field)?;
 	Ok(bytes[0])
 }
 
+/// Reads u16.
 fn read_u16(reader: &mut BufReader<File>, field: &str) -> FerrosGrynnResult<u16> {
 	let mut bytes = [0; 2];
 	read_exact(reader, &mut bytes, field)?;
 	Ok(u16::from_le_bytes(bytes))
 }
 
+/// Reads u32.
 fn read_u32(reader: &mut BufReader<File>, field: &str) -> FerrosGrynnResult<u32> {
 	let mut bytes = [0; 4];
 	read_exact(reader, &mut bytes, field)?;
 	Ok(u32::from_le_bytes(bytes))
 }
 
+/// Reads u64.
 fn read_u64(reader: &mut BufReader<File>, field: &str) -> FerrosGrynnResult<u64> {
 	let mut bytes = [0; 8];
 	read_exact(reader, &mut bytes, field)?;
 	Ok(u64::from_le_bytes(bytes))
 }
 
+/// Reads bounded u32.
 fn read_bounded_u32(
 	reader: &mut BufReader<File>,
 	maximum: usize,
@@ -759,33 +831,39 @@ fn read_bounded_u32(
 	Ok(value)
 }
 
+/// Returns the slice u16 result.
 fn slice_u16(bytes: &[u8], offset: usize) -> u16 {
 	let mut value = [0; 2];
 	value.copy_from_slice(&bytes[offset..offset + 2]);
 	u16::from_le_bytes(value)
 }
 
+/// Returns the slice u32 result.
 fn slice_u32(bytes: &[u8], offset: usize) -> u32 {
 	let mut value = [0; 4];
 	value.copy_from_slice(&bytes[offset..offset + 4]);
 	u32::from_le_bytes(value)
 }
 
+/// Returns the slice u64 result.
 fn slice_u64(bytes: &[u8], offset: usize) -> u64 {
 	let mut value = [0; 8];
 	value.copy_from_slice(&bytes[offset..offset + 8]);
 	u64::from_le_bytes(value)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
+/// Returns the io failure result.
 fn io_failure(operation: impl Into<String>, source: std::io::Error) -> FerrosGrynnError {
 	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
 }
 
 #[cfg(test)]
+/// Regression tests for quarantine behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -794,11 +872,15 @@ mod tests {
 		values::{Object, RecordId, RecordIdPart},
 	};
 
+	/// Verifies fg qr v1 streams values and rejects corruption.
 	#[test]
-	fn fg_qr_v1_streams_values_and_rejects_corruption() -> FerrosGrynnResult<()> {
+	fn fg_qr_v1_streams_values_and_rejects_corruption() {
+		use crate::test_assertions::AssertResult as _;
+
 		let directory = std::env::temp_dir().join(format!("fgqr-test-{}", Uuid::now_v7()));
 		fs::create_dir(&directory)
-			.map_err(|source| io_failure("create quarantine test directory", source))?;
+			.map_err(|source| io_failure("create quarantine test directory", source))
+			.assert_ok();
 		let result = (|| {
 			let store = crate::datastore::Datastore::in_memory();
 			let mut transaction = store.begin();
@@ -842,6 +924,7 @@ mod tests {
 			Ok(())
 		})();
 		drop(fs::remove_dir_all(&directory));
-		result
+		let test_result: FerrosGrynnResult<()> = result;
+		test_result.assert_ok();
 	}
 }

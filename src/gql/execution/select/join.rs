@@ -7,6 +7,7 @@ use rapidhash::RapidHashMap;
 use super::*;
 use crate::gql::spill::RecordStream;
 
+/// Configured join partitions value.
 const JOIN_PARTITIONS: u64 = 64;
 
 /// Admits each product before cloning, including predicate-free CROSS joins.
@@ -83,6 +84,7 @@ pub(super) fn combine_rows<Read: QueryRead>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "join evaluation uses the complete statement context")]
+/// Joins rows.
 pub(super) fn join_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -150,8 +152,13 @@ pub(super) fn join_rows<Read: QueryRead>(
 				control,
 			);
 		}
-		(crate::gql::optimizer::JoinOperator::BlockNestedLoop, left, right, _)
-		| (crate::gql::optimizer::JoinOperator::IndexNestedLoop, left, right, _) => (left, right),
+		(
+			crate::gql::optimizer::JoinOperator::BlockNestedLoop
+			| crate::gql::optimizer::JoinOperator::IndexNestedLoop,
+			left,
+			right,
+			_,
+		) => (left, right),
 		(
 			crate::gql::optimizer::JoinOperator::Hash
 			| crate::gql::optimizer::JoinOperator::PartitionedHash,
@@ -178,6 +185,7 @@ pub(super) fn join_rows<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "an index nested-loop retains the exact source and statement context"
 )]
+/// Returns the index nested join rows result.
 pub(super) fn index_nested_join_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -258,6 +266,7 @@ pub(super) fn index_nested_join_rows<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "block nested-loop keeps statement evaluation and resource controls explicit"
 )]
+/// Returns the block nested join rows result.
 fn block_nested_join_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -334,6 +343,7 @@ fn block_nested_join_rows<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "one nested-loop block retains the complete join execution context"
 )]
+/// Joins block.
 fn join_block<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -375,6 +385,7 @@ fn join_block<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "hash join keeps expression evaluation and statement controls explicit"
 )]
+/// Returns the hash join rows result.
 fn hash_join_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -499,6 +510,7 @@ fn hash_join_rows<Read: QueryRead>(
 	joined.finish()
 }
 
+/// Returns the estimated hash entry bytes result.
 fn estimated_hash_entry_bytes(key: &[Value]) -> usize {
 	key.len()
 		.saturating_mul(size_of::<Value>())
@@ -513,6 +525,7 @@ fn estimated_hash_entry_bytes(key: &[Value]) -> usize {
 	clippy::too_many_arguments,
 	reason = "partitioned join keeps statement evaluation and resource controls explicit"
 )]
+/// Returns the partitioned hash join rows result.
 fn partitioned_hash_join_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -580,6 +593,7 @@ fn partitioned_hash_join_rows<Read: QueryRead>(
 	joined.finish()
 }
 
+/// Sorts join partitions.
 fn sort_join_partitions<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -601,7 +615,7 @@ fn sort_join_partitions<Read: QueryRead>(
 		}],
 		control.barrier_account(),
 		true,
-	)?;
+	);
 	let mut ordinal = 0_usize;
 	rows.consume(|row| {
 		let key = join_key(&row, columns.iter().copied());
@@ -617,6 +631,7 @@ fn sort_join_partitions<Read: QueryRead>(
 	sorter.finish()
 }
 
+/// Joins partition number.
 fn join_partition_number(key: &[Value]) -> u64 {
 	use std::hash::{Hash, Hasher};
 
@@ -628,12 +643,16 @@ fn join_partition_number(key: &[Value]) -> u64 {
 	hasher.finish() % JOIN_PARTITIONS
 }
 
+/// Partition reader state.
 struct PartitionReader {
+	/// Stream associated with this partition reader.
 	stream: RecordStream,
+	/// Pending associated with this partition reader.
 	pending: Option<CursorRecord>,
 }
 
 impl PartitionReader {
+	/// Creates a new `PartitionReader` value.
 	fn new(records: SortedRecords) -> FerrosGrynnResult<Self> {
 		Ok(Self {
 			stream: records.into_stream()?,
@@ -641,6 +660,7 @@ impl PartitionReader {
 		})
 	}
 
+	/// Returns the next partition.
 	fn next_partition<Read: QueryRead>(
 		&mut self,
 		read: &Read,
@@ -671,6 +691,7 @@ impl PartitionReader {
 	}
 }
 
+/// Records partition.
 fn record_partition(record: &CursorRecord) -> FerrosGrynnResult<u64> {
 	let Some(Value::Number(number)) = record.anchor.order_keys.first() else {
 		return Err(FerrosGrynnError::invalid_storage_file("join partition key is absent"));
@@ -684,6 +705,7 @@ fn record_partition(record: &CursorRecord) -> FerrosGrynnResult<u64> {
 	clippy::too_many_arguments,
 	reason = "one partition retains the complete join execution context"
 )]
+/// Joins partition.
 fn join_partition<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -854,6 +876,7 @@ fn join_partition<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "skew fallback keeps the partition join context explicit"
 )]
+/// Returns the nested join partition result.
 fn nested_join_partition<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -867,7 +890,7 @@ fn nested_join_partition<Read: QueryRead>(
 	control: &ExecutionControl,
 	joined: &mut RowCollector,
 ) -> FerrosGrynnResult<()> {
-	// ponytail: an over-budget single hash partition uses bounded nested-loop;
+	// shortcut: an over-budget single hash partition uses bounded nested-loop;
 	// recursively repartition only if measured skew makes this path material.
 	left.consume(|left| {
 		let mut matched = false;
@@ -886,11 +909,13 @@ fn nested_join_partition<Read: QueryRead>(
 	})
 }
 
+/// Joins key.
 fn join_key(row: &Row, columns: impl Iterator<Item = usize>) -> Vec<Value> {
 	columns.map(|column| row.values.get(column).cloned().unwrap_or(Value::None)).collect()
 }
 
 #[allow(clippy::too_many_arguments, reason = "join predicate uses the statement evaluator")]
+/// Joins predicate matches.
 fn join_predicate_matches<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -940,6 +965,7 @@ fn join_predicate_matches<Read: QueryRead>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "physical joins may activate several predicates")]
+/// Joins predicates match.
 fn join_predicates_match<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,

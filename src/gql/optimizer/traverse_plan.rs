@@ -46,7 +46,7 @@ pub(in crate::gql) fn plan_traverse(
 			LogicalTraverseSource::Expression(expression) => {
 				let cardinality = expression_cardinality(expression);
 				(
-					TraversalSourceOperator::ValueSource,
+					TraversalSourceOperator::Value,
 					cardinality,
 					scan_cost(cardinality, 1, CostWeights::default()),
 					Vec::new(),
@@ -57,7 +57,7 @@ pub(in crate::gql) fn plan_traverse(
 				let plan = super::plan_match(child, snapshot, deterministic)?;
 				let hash = super::PhysicalPlan::Match(plan.clone()).hash();
 				(
-					TraversalSourceOperator::MatchSource,
+					TraversalSourceOperator::Match,
 					plan.cardinality,
 					plan.cost,
 					plan.warnings,
@@ -68,7 +68,7 @@ pub(in crate::gql) fn plan_traverse(
 				let (_logical, plan) = super::prepare_select(child, snapshot, barrier_bytes)?;
 				let hash = super::PhysicalPlan::Select(plan.clone()).hash();
 				(
-					TraversalSourceOperator::SelectSource,
+					TraversalSourceOperator::Select,
 					plan.cardinality,
 					plan.cost,
 					plan.warnings,
@@ -309,25 +309,42 @@ fn tensor_projection(
 	}
 }
 
-/// Returns a literal option without evaluating query expressions while
-/// planning.
-fn static_option_value<'a>(options: Option<&'a TypedExpr>, key: &str) -> Option<Option<&'a Value>> {
+/// Planning-time knowledge of one traversal option without expression
+/// evaluation.
+enum StaticOption<'a> {
+	/// The options object or selected field requires runtime evaluation.
+	Dynamic,
+	/// The option is known to be omitted, so its documented default applies.
+	Absent,
+	/// The selected option is an existing literal, including an explicit NONE.
+	Literal(
+		/// The selected option is an existing literal, including an explicit
+		/// NONE.
+		&'a Value,
+	),
+}
+
+/// Classifies one option while borrowing literal values from the typed
+/// expression.
+fn static_option_value<'a>(options: Option<&'a TypedExpr>, key: &str) -> StaticOption<'a> {
 	match options.map(|value| &value.kind) {
-		None => Some(None),
-		Some(TypedExprKind::Constant(Value::Object(object))) => Some(object.get(key)),
+		None => StaticOption::Absent,
+		Some(TypedExprKind::Constant(Value::Object(object))) => {
+			object.get(key).map_or(StaticOption::Absent, StaticOption::Literal)
+		}
 		Some(TypedExprKind::Object(fields)) => {
 			match fields.iter().find(|(name, _value)| name.as_ref() == key) {
-				None => Some(None),
+				None => StaticOption::Absent,
 				Some((_name, value)) => {
 					if let TypedExprKind::Constant(value) = &value.kind {
-						Some(Some(value))
+						StaticOption::Literal(value)
 					} else {
-						None
+						StaticOption::Dynamic
 					}
 				}
 			}
 		}
-		_ => None,
+		_ => StaticOption::Dynamic,
 	}
 }
 
@@ -337,7 +354,11 @@ fn static_option_text<'a>(
 	key: &str,
 	default: &'a str,
 ) -> Option<&'a str> {
-	static_option_value(options, key)?.map_or(Some(default), Value::as_str)
+	match static_option_value(options, key) {
+		StaticOption::Dynamic => None,
+		StaticOption::Absent => Some(default),
+		StaticOption::Literal(value) => value.as_str(),
+	}
 }
 
 /// Copies only known canonical label filters into physical metadata.
@@ -355,12 +376,12 @@ fn static_labels(options: Option<&TypedExpr>) -> Option<Vec<Box<str>>> {
 			})
 			.collect::<Option<Vec<_>>>()?
 	} else {
-		match static_option_value(options, "labels")? {
-			None => Some(Vec::new()),
-			Some(Value::Array(values)) => {
+		match static_option_value(options, "labels") {
+			StaticOption::Absent => Some(Vec::new()),
+			StaticOption::Literal(Value::Array(values)) => {
 				values.iter().map(|value| value.as_str().map(Into::into)).collect()
 			}
-			_ => None,
+			StaticOption::Dynamic | StaticOption::Literal(_) => None,
 		}?
 	};
 	labels.sort_unstable();
@@ -368,6 +389,7 @@ fn static_labels(options: Option<&TypedExpr>) -> Option<Vec<Box<str>>> {
 	Some(labels)
 }
 
+/// Returns correlated cardinality for this module.
 fn correlated_cardinality(input: Cardinality, child: Cardinality) -> Cardinality {
 	Cardinality::new(
 		input.lower.saturating_mul(child.lower),
@@ -376,6 +398,7 @@ fn correlated_cardinality(input: Cardinality, child: Cardinality) -> Cardinality
 	)
 }
 
+/// Returns repeated cost for this module.
 fn repeated_cost(cost: PlanCost, repetitions: u64) -> PlanCost {
 	PlanCost {
 		startup: cost.startup.saturating_mul(repetitions),
@@ -388,6 +411,7 @@ fn repeated_cost(cost: PlanCost, repetitions: u64) -> PlanCost {
 	}
 }
 
+/// Returns expression cardinality for this module.
 fn expression_cardinality(expression: &TypedExpr) -> Cardinality {
 	match &expression.kind {
 		TypedExprKind::Constant(Value::Array(values)) => exact_len(values.len()),
@@ -398,10 +422,12 @@ fn expression_cardinality(expression: &TypedExpr) -> Cardinality {
 	}
 }
 
+/// Returns exact len for this module.
 fn exact_len(length: usize) -> Cardinality {
 	Cardinality::exact(u64::try_from(length).unwrap_or(u64::MAX))
 }
 
+/// Returns static graph for this module.
 fn static_graph(statement: &LogicalTraverse) -> Option<GraphId> {
 	statement.graph.as_ref().and_then(static_graph_reference).or_else(|| match &statement.source {
 		LogicalTraverseSource::Match(statement) => static_graph_reference(&statement.graph),
@@ -413,6 +439,7 @@ fn static_graph(statement: &LogicalTraverse) -> Option<GraphId> {
 	})
 }
 
+/// Returns static graph reference for this module.
 fn static_graph_reference(reference: &LogicalGraphReference) -> Option<GraphId> {
 	match reference {
 		LogicalGraphReference::Static(graph) => Some(graph.id()),
@@ -420,6 +447,7 @@ fn static_graph_reference(reference: &LogicalGraphReference) -> Option<GraphId> 
 	}
 }
 
+/// Estimates step for this module.
 fn estimate_step(
 	kind: TraverseStepKind,
 	arguments: &[TypedExpr],
@@ -519,6 +547,7 @@ fn estimate_step(
 	}
 }
 
+/// Returns expand cardinality for this module.
 fn expand_cardinality(
 	kind: TraverseStepKind,
 	input: Cardinality,
@@ -544,20 +573,24 @@ fn expand_cardinality(
 	multiply(input, average, maximum)
 }
 
+/// Returns multiply for this module.
 fn multiply(input: Cardinality, expected: u64, upper: u64) -> Cardinality {
 	Cardinality::new(0, input.expected.saturating_mul(expected), input.upper.saturating_mul(upper))
 }
 
+/// Returns fraction for this module.
 fn fraction(input: Cardinality, numerator: u64, denominator: u64) -> Cardinality {
 	Cardinality::new(0, input.expected.saturating_mul(numerator).div_ceil(denominator), input.upper)
 }
 
+/// Returns cap for this module.
 fn cap(input: Cardinality, limit: Option<u64>) -> Cardinality {
 	limit.map_or(input, |limit| {
 		Cardinality::new(input.lower.min(limit), input.expected.min(limit), input.upper.min(limit))
 	})
 }
 
+/// Returns skip for this module.
 fn skip(input: Cardinality, count: Option<u64>) -> Cardinality {
 	count.map_or(input, |count| {
 		Cardinality::new(
@@ -568,6 +601,7 @@ fn skip(input: Cardinality, count: Option<u64>) -> Cardinality {
 	})
 }
 
+/// Returns constant u64 for this module.
 fn constant_u64(expression: Option<&TypedExpr>) -> Option<u64> {
 	let TypedExprKind::Constant(Value::Number(number)) = &expression?.kind else {
 		return None;
@@ -575,6 +609,7 @@ fn constant_u64(expression: Option<&TypedExpr>) -> Option<u64> {
 	i64::try_from(*number).ok().and_then(|value| u64::try_from(value).ok())
 }
 
+/// Returns step cost for this module.
 fn step_cost(
 	kind: TraverseStepKind,
 	input: Cardinality,

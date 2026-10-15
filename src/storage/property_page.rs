@@ -63,6 +63,7 @@ impl PropertyPageBuilder {
 		Self::new_typed(page, PageType::GraphOverlay, page_no, page_lsn)
 	}
 
+	/// Returns the new typed result.
 	fn new_typed(
 		page: &mut AlignedPage,
 		page_type: PageType,
@@ -157,6 +158,7 @@ pub(super) fn read_overlay_record(
 	read_slotted_record(page, page_no, slot, Some(expected_len), PageType::GraphOverlay)
 }
 
+/// Reads slotted record.
 fn read_slotted_record(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -297,6 +299,7 @@ pub(super) fn append_large_overlay(
 	append_large_record(pages, first_page, page_lsn, record, PageType::GraphOverlay)
 }
 
+/// Appends large record.
 fn append_large_record(
 	pages: &mut Vec<AlignedPage>,
 	first_page: PageNo,
@@ -370,6 +373,7 @@ pub(super) fn decode_large_overlay(
 	decode_large_record(first_page, pages, expected_len, limit, PageType::GraphOverlay)
 }
 
+/// Decodes large record.
 fn decode_large_record(
 	first_page: PageNo,
 	pages: &[AlignedPage],
@@ -487,41 +491,56 @@ fn invalid(page_no: u64, reason: impl Into<String>) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for property page behavior.
 mod tests {
 	use super::*;
 	use crate::values::{PropertyDictionary, PropertyKeyId, Value};
 
+	/// Verifies property map round trips through a slotted page.
 	#[test]
-	fn property_map_round_trips_through_a_slotted_page() -> FerrosGrynnResult<()> {
+	fn property_map_round_trips_through_a_slotted_page() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut properties = PropertyMap::new();
 		properties.insert(PropertyKeyId::new(3), Value::from("value"));
 		let mut context = EncodeContext::new(PropertyDictionary::new());
-		let record = encode_property_map(&properties, &mut context)?;
+		let record = encode_property_map(&properties, &mut context).assert_ok();
 		let mut page = AlignedPage::zeroed();
 		let mut builder = PropertyPageBuilder::new(&mut page, PageNo::new(7), PageLsn::new(11));
 		let slot = builder
-			.try_insert(&mut page, &record)?
-			.ok_or_else(|| invalid(7, "test record unexpectedly requires a large page"))?;
-		builder.finish(&mut page)?;
+			.try_insert(&mut page, &record)
+			.assert_ok()
+			.ok_or_else(|| invalid(7, "test record unexpectedly requires a large page"))
+			.assert_ok();
+		builder.finish(&mut page).assert_ok();
 		let stored = read_property_record(
 			&page,
 			PageNo::new(7),
 			slot,
-			u32::try_from(record.len()).map_err(|_error| invalid(7, "test record exceeds u32"))?,
-		)?;
-		let decoded = decode_property_map(stored, &context.decoder(), DecodeLimits::default())?;
+			u32::try_from(record.len())
+				.map_err(|_error| invalid(7, "test record exceeds u32"))
+				.assert_ok(),
+		)
+		.assert_ok();
+		let decoded =
+			decode_property_map(stored, &context.decoder(), DecodeLimits::default()).assert_ok();
 		assert_eq!(decoded, properties);
-		Ok(())
 	}
 
+	/// Verifies large property chain round trips and validates links.
 	#[test]
-	fn large_property_chain_round_trips_and_validates_links() -> FerrosGrynnResult<()> {
+	fn large_property_chain_round_trips_and_validates_links() {
+		use crate::test_assertions::AssertResult as _;
+
 		let record = vec![0xa5; MAX_INLINE_BYTES + LARGE_CHUNK_BYTES];
 		let mut pages = Vec::new();
-		append_large_property(&mut pages, PageNo::new(9), PageLsn::new(13), &record)?;
-		let length =
-			u32::try_from(record.len()).map_err(|_error| invalid(9, "test record exceeds u32"))?;
-		assert_eq!(decode_large_property(PageNo::new(9), &pages, length, record.len())?, record);
-		Ok(())
+		append_large_property(&mut pages, PageNo::new(9), PageLsn::new(13), &record).assert_ok();
+		let length = u32::try_from(record.len())
+			.map_err(|_error| invalid(9, "test record exceeds u32"))
+			.assert_ok();
+		assert_eq!(
+			decode_large_property(PageNo::new(9), &pages, length, record.len()).assert_ok(),
+			record
+		);
 	}
 }

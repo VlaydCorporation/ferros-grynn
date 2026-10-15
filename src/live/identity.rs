@@ -9,7 +9,10 @@ use crate::{
 
 /// Stable subscription incarnation, independent of session and source names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LiveId(Uuid);
+pub struct LiveId(
+	/// Non-nil UUID identifying one subscription incarnation.
+	Uuid,
+);
 
 impl LiveId {
 	/// Accepts a non-nil UUID without allocating a registry entry.
@@ -33,6 +36,7 @@ impl LiveId {
 impl TryFrom<Uuid> for LiveId {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Uuid` into `LiveId` after validating the conversion.
 	fn try_from(value: Uuid) -> FerrosGrynnResult<Self> {
 		Self::from_uuid(value)
 	}
@@ -41,6 +45,7 @@ impl TryFrom<Uuid> for LiveId {
 impl FromStr for LiveId {
 	type Err = FerrosGrynnError;
 
+	/// Constructs from str for `LiveId`.
 	fn from_str(value: &str) -> FerrosGrynnResult<Self> {
 		Self::from_uuid(
 			value
@@ -51,6 +56,7 @@ impl FromStr for LiveId {
 }
 
 impl fmt::Display for LiveId {
+	/// Formats `LiveId` using the requested formatter.
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(&self.0, f)
 	}
@@ -58,7 +64,11 @@ impl fmt::Display for LiveId {
 
 /// Stable reactive binding identity; lexical shadowing does not rebind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LiveBindingId(Uuid);
+pub struct LiveBindingId(
+	/// Non-nil UUID identifying one reactive binding independently of its
+	/// lexical name.
+	Uuid,
+);
 
 impl LiveBindingId {
 	/// Accepts a non-nil binding UUID, independently of any lexical name.
@@ -84,6 +94,7 @@ impl LiveBindingId {
 impl TryFrom<Uuid> for LiveBindingId {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Uuid` into `LiveBindingId` after validating the conversion.
 	fn try_from(value: Uuid) -> FerrosGrynnResult<Self> {
 		Self::from_uuid(value)
 	}
@@ -92,6 +103,7 @@ impl TryFrom<Uuid> for LiveBindingId {
 impl FromStr for LiveBindingId {
 	type Err = FerrosGrynnError;
 
+	/// Constructs from str for `LiveBindingId`.
 	fn from_str(value: &str) -> FerrosGrynnResult<Self> {
 		Self::from_uuid(
 			value
@@ -102,6 +114,7 @@ impl FromStr for LiveBindingId {
 }
 
 impl fmt::Display for LiveBindingId {
+	/// Formats `LiveBindingId` using the requested formatter.
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(&self.0, f)
 	}
@@ -109,7 +122,10 @@ impl fmt::Display for LiveBindingId {
 
 /// Nonzero version of a query or binding definition, separate from commit time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LiveVersion(NonZeroU64);
+pub struct LiveVersion(
+	/// Positive version distinguishing successive query or binding definitions.
+	NonZeroU64,
+);
 
 impl LiveVersion {
 	/// Checks a definition version read from a catalog or cursor.
@@ -130,6 +146,7 @@ impl LiveVersion {
 }
 
 impl Default for LiveVersion {
+	/// Constructs the default initial state of `LiveVersion`.
 	fn default() -> Self {
 		Self(NonZeroU64::MIN)
 	}

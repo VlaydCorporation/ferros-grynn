@@ -10,6 +10,7 @@ use crate::{
 	values::{Array, Duration, Matcher, Number, Regex, Set, Type, Ulid, Uuid, Value},
 };
 
+/// Executes the current state.
 pub(super) fn execute(
 	function: &Builtin,
 	arguments: Vec<Value>,
@@ -369,6 +370,7 @@ pub(super) fn execute_with_fields(
 	}
 }
 
+/// Returns the random id result.
 fn random_id(arguments: Vec<Value>) -> FerrosGrynnResult<Value> {
 	let length = match arguments.into_iter().next() {
 		Some(value) => non_negative_usize(value, "rand::id")?,
@@ -377,6 +379,9 @@ fn random_id(arguments: Vec<Value>) -> FerrosGrynnResult<Value> {
 	if !(1..=1024).contains(&length) {
 		return Err(domain("rand::id"));
 	}
+	/// ASCII alphabet used after accepting UUID byte values below 252.
+	/// Fixed UUID version and variant bits mean these inputs are not uniformly
+	/// random bytes.
 	const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 	let mut output = String::with_capacity(length);
 	while output.len() < length {
@@ -393,13 +398,15 @@ fn random_id(arguments: Vec<Value>) -> FerrosGrynnResult<Value> {
 	Ok(Value::from(output))
 }
 
+/// Returns the non negative usize result.
 fn non_negative_usize(value: Value, function: &str) -> FerrosGrynnResult<usize> {
 	let Value::Number(Number::Int(value)) = value else {
 		return Err(type_error(function, "non-negative integer"));
 	};
-	usize::try_from(value).map_err(|_| domain(function))
+	usize::try_from(value).map_err(|_conversion_error| domain(function))
 }
 
+/// Returns the scalar byte offset result.
 fn scalar_byte_offset(value: &str, offset: usize) -> FerrosGrynnResult<usize> {
 	if offset == 0 {
 		return Ok(0);
@@ -412,10 +419,12 @@ fn scalar_byte_offset(value: &str, offset: usize) -> FerrosGrynnResult<usize> {
 		.ok_or_else(|| domain("string::slice"))
 }
 
+/// Returns the missing argument result.
 fn missing_argument() -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument("Built-in argument is missing.")
 }
 
+/// Checks the current state.
 fn check(control: Option<&ExecutionControl>, index: usize) -> FerrosGrynnResult<()> {
 	if index.is_multiple_of(1024)
 		&& let Some(control) = control
@@ -425,6 +434,7 @@ fn check(control: Option<&ExecutionControl>, index: usize) -> FerrosGrynnResult<
 	Ok(())
 }
 
+/// Returns the math abs result.
 fn math_abs(value: Value) -> FerrosGrynnResult<Value> {
 	match value {
 		Value::Number(Number::Int(value)) => value
@@ -437,6 +447,7 @@ fn math_abs(value: Value) -> FerrosGrynnResult<Value> {
 	}
 }
 
+/// Returns the meta id result.
 fn meta_id(value: Value) -> FerrosGrynnResult<Value> {
 	match value {
 		Value::Record(record) => Ok(record.id().clone().into_value()),
@@ -446,6 +457,7 @@ fn meta_id(value: Value) -> FerrosGrynnResult<Value> {
 	}
 }
 
+/// Returns the meta class result.
 fn meta_class(value: Value) -> FerrosGrynnResult<Value> {
 	match value {
 		Value::Record(record) => Ok(Value::from(record.class())),
@@ -455,10 +467,12 @@ fn meta_class(value: Value) -> FerrosGrynnResult<Value> {
 	}
 }
 
+/// Returns whether the type matches condition holds.
 fn type_matches(target: &Type, value: &Value) -> bool {
 	crate::gql::analysis::compatible(target, &value.value_type())
 }
 
+/// Returns the number f64 result.
 fn number_f64(
 	value: Value,
 	function: &str,
@@ -483,6 +497,7 @@ fn number_f64(
 	}
 }
 
+/// Returns the string result.
 fn string(value: Value, function: &str) -> FerrosGrynnResult<String> {
 	match value {
 		Value::String(value) => Ok(value.to_string()),
@@ -490,6 +505,7 @@ fn string(value: Value, function: &str) -> FerrosGrynnResult<String> {
 	}
 }
 
+/// Returns the regex result.
 fn regex(value: Value, function: &str) -> FerrosGrynnResult<Regex> {
 	match value {
 		Value::Regex(value) => Ok(value),
@@ -500,6 +516,7 @@ fn regex(value: Value, function: &str) -> FerrosGrynnResult<Regex> {
 	}
 }
 
+/// Returns the array result.
 fn array(value: Value, function: &str) -> FerrosGrynnResult<Array> {
 	match value {
 		Value::Array(value) => Ok(value),
@@ -507,6 +524,7 @@ fn array(value: Value, function: &str) -> FerrosGrynnResult<Array> {
 	}
 }
 
+/// Sets the current state.
 fn set(value: Value, function: &str) -> FerrosGrynnResult<Set> {
 	match value {
 		Value::Set(value) => Ok(value),
@@ -514,6 +532,7 @@ fn set(value: Value, function: &str) -> FerrosGrynnResult<Set> {
 	}
 }
 
+/// Returns the path result.
 fn path(value: Value, function: &str) -> FerrosGrynnResult<Box<crate::graph::Path>> {
 	match value {
 		Value::Path(value) => Ok(value),
@@ -521,12 +540,14 @@ fn path(value: Value, function: &str) -> FerrosGrynnResult<Box<crate::graph::Pat
 	}
 }
 
+/// Returns the one result.
 fn one(mut arguments: Vec<Value>) -> FerrosGrynnResult<Value> {
 	arguments
 		.pop()
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("Built-in argument is missing."))
 }
 
+/// Returns the two result.
 fn two(arguments: Vec<Value>) -> FerrosGrynnResult<(Value, Value)> {
 	let mut arguments = arguments.into_iter();
 	let left = arguments
@@ -538,15 +559,17 @@ fn two(arguments: Vec<Value>) -> FerrosGrynnResult<(Value, Value)> {
 	Ok((left, right))
 }
 
+/// Returns the two sets result.
 fn two_sets(arguments: Vec<Value>, function: &str) -> FerrosGrynnResult<(Set, Set)> {
 	let (left, right) = two(arguments)?;
 	Ok((set(left, function)?, set(right, function)?))
 }
 
+/// Returns the length result.
 fn length(value: usize) -> FerrosGrynnResult<Value> {
 	i64::try_from(value)
 		.map(Value::from)
-		.map_err(|_| FerrosGrynnError::operation_overflow("collection length"))
+		.map_err(|_conversion_error| FerrosGrynnError::operation_overflow("collection length"))
 }
 
 /// Counts a deterministic formatting stream before allocating its exact output.
@@ -627,6 +650,7 @@ struct TimeFormatWriter<'a> {
 }
 
 impl std::fmt::Write for TimeFormatWriter<'_> {
+	/// Writes str for `TimeFormatWriter<'_>`.
 	fn write_str(&mut self, s: &str) -> std::fmt::Result {
 		if self.failure.is_some() {
 			return Err(std::fmt::Error);
@@ -660,10 +684,12 @@ impl std::fmt::Write for TimeFormatWriter<'_> {
 	}
 }
 
+/// Returns the type error result.
 fn type_error(function: &str, expected: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("{function} expects {expected}."))
 }
 
+/// Returns the domain result.
 fn domain(function: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("{function} received a value outside its domain."))
 }

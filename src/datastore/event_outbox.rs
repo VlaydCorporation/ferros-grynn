@@ -408,31 +408,44 @@ impl EventOutbox {
 }
 
 #[cfg(test)]
+/// Regression tests for event outbox behavior.
 mod tests {
 	use super::*;
 	use crate::datastore::EventAsyncOptions;
 
+	/// Verifies event cause preserves zero and ancestor bounds across sync
+	/// calls.
 	#[test]
-	fn event_cause_preserves_zero_and_ancestor_bounds_across_sync_calls() -> FerrosGrynnResult<()> {
-		let zero = EventCause::next(None, EventExecution::Async(EventAsyncOptions::new(0, 0)?))?;
+	fn event_cause_preserves_zero_and_ancestor_bounds_across_sync_calls() {
+		use crate::test_assertions::AssertResult as _;
+
+		let zero =
+			EventCause::next(None, EventExecution::Async(EventAsyncOptions::new(0, 0).assert_ok()))
+				.assert_ok();
 		assert_eq!(zero.depth, 0);
 		assert!(EventCause::next(Some(zero), EventExecution::Sync).is_err());
 		let mut cause =
-			EventCause::next(None, EventExecution::Async(EventAsyncOptions::new(0, 3)?))?;
+			EventCause::next(None, EventExecution::Async(EventAsyncOptions::new(0, 3).assert_ok()))
+				.assert_ok();
 		for depth in 1..=3 {
-			cause = EventCause::next(Some(cause), EventExecution::Sync)?;
+			cause = EventCause::next(Some(cause), EventExecution::Sync).assert_ok();
 			assert_eq!(cause.depth, depth);
 		}
 		assert!(
-			EventCause::next(Some(cause), EventExecution::Async(EventAsyncOptions::new(0, 16)?))
-				.is_err()
+			EventCause::next(
+				Some(cause),
+				EventExecution::Async(EventAsyncOptions::new(0, 16).assert_ok())
+			)
+			.is_err()
 		);
-		let mut cause =
-			EventCause::next(None, EventExecution::Async(EventAsyncOptions::new(0, 16)?))?;
+		let mut cause = EventCause::next(
+			None,
+			EventExecution::Async(EventAsyncOptions::new(0, 16).assert_ok()),
+		)
+		.assert_ok();
 		for _ in 0..16 {
-			cause = EventCause::next(Some(cause), EventExecution::Sync)?;
+			cause = EventCause::next(Some(cause), EventExecution::Sync).assert_ok();
 		}
 		assert!(EventCause::next(Some(cause), EventExecution::Sync).is_err());
-		Ok(())
 	}
 }

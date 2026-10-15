@@ -20,6 +20,7 @@ impl FrameWal {
 		self.capture_checkpoint_target_with_cancellation(true)
 	}
 
+	/// Captures checkpoint target with cancellation.
 	pub(in crate::storage::wal) fn capture_checkpoint_target_with_cancellation(
 		&self,
 		restart: bool,
@@ -207,6 +208,7 @@ impl FrameWal {
 
 	/// Returns committed frames that recovery must replay, ordered by frame
 	/// LSN.
+	#[cfg(test)]
 	pub(in crate::storage) fn recovery_frames(&self) -> Vec<ResolvedFrame> {
 		let _prune_gate = self.inner.prune_gate.read();
 		let published = self.inner.published.read();
@@ -246,6 +248,7 @@ impl FrameWal {
 	}
 
 	/// Returns the oldest active reader boundary for checkpoint planning.
+	#[cfg(test)]
 	pub(in crate::storage::wal) fn oldest_reader_lsn(&self) -> Option<Lsn> {
 		self.inner
 			.active_snapshots

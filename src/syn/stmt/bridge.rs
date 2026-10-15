@@ -5,6 +5,7 @@ use crate::gql_status::{FerrosGrynnResult, TextSpan};
 
 /// Owned alias and its diagnostic location, without a client or storage DTO.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BridgeClause {
 	/// Runtime adapter alias; connection state is not syntax data.
 	pub alias: Identifier,

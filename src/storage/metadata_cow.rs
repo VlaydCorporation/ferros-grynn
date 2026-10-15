@@ -34,10 +34,15 @@ enum Candidate<T> {
 
 /// Decode and authority state of one variable-length metadata candidate.
 enum BytesCandidate<T> {
+	/// Missing case of bytes candidate.
 	Missing,
+	/// Invalid case of bytes candidate.
 	Invalid,
+	/// Valid case of bytes candidate.
 	Valid {
+		/// Value associated with this bytes candidate.
 		value: T,
+		/// Bytes associated with this bytes candidate.
 		bytes: Vec<u8>,
 	},
 }
@@ -53,6 +58,8 @@ pub(super) fn write_checkpoint_page(target: &Path, page: &AlignedPage) -> Ferros
 	remove_if_present(&temporary, "remove stale metadata temporary file")?;
 	let file = DirectFile::create_new(&temporary)?;
 	file.write_page(PageNo::new(0), page)?;
+	// Make the temporary payload durable before either authoritative candidate
+	// name changes.
 	file.sync_all()?;
 	drop(file);
 

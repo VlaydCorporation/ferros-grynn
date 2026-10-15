@@ -2,20 +2,33 @@
 use super::*;
 use crate::graph::GraphId;
 
+/// Byte offset of class id in its encoded layout.
 const CLASS_ID_OFFSET: usize = PAGE_HEADER_SIZE;
+/// Byte offset of scope kind in its encoded layout.
 const SCOPE_KIND_OFFSET: usize = CLASS_ID_OFFSET + size_of::<u32>();
+/// Byte offset of reserved in its encoded layout.
 const RESERVED_OFFSET: usize = SCOPE_KIND_OFFSET + size_of::<u8>();
+/// Byte offset of scope graph in its encoded layout.
 const SCOPE_GRAPH_OFFSET: usize = RESERVED_OFFSET + 3;
+/// Byte offset of atom count in its encoded layout.
 const ATOM_COUNT_OFFSET: usize = SCOPE_GRAPH_OFFSET + size_of::<u64>();
+/// Byte offset of last updated lsn in its encoded layout.
 const LAST_UPDATED_LSN_OFFSET: usize = ATOM_COUNT_OFFSET + size_of::<u64>();
+/// Byte offset of created at lsn in its encoded layout.
 const CREATED_AT_LSN_OFFSET: usize = LAST_UPDATED_LSN_OFFSET + size_of::<u64>();
+/// Configured payload end value.
 const PAYLOAD_END: usize = CREATED_AT_LSN_OFFSET + size_of::<u64>();
 
 /// Exact logical population selected by one Count side-file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) enum CountIndexScope {
+	/// Base case of count index scope.
 	Base,
-	Effective(GraphId),
+	/// Effective case of count index scope.
+	Effective(
+		/// Effective case of count index scope.
+		GraphId,
+	),
 }
 
 /// Complete logical value stored in one count-index page.

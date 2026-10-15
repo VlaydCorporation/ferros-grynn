@@ -100,6 +100,7 @@ pub(super) fn decode(
 }
 
 #[cfg(test)]
+/// Regression tests for graph result behavior.
 mod tests {
 	use super::{super::*, *};
 	use crate::{
@@ -108,9 +109,13 @@ mod tests {
 		live::{LiveBindingId, LiveSource},
 	};
 
+	/// Verifies graph recipe roundtrips all families and bounded selectors.
 	#[test]
-	fn graph_recipe_roundtrips_all_families_and_bounded_selectors() -> FerrosGrynnResult<()> {
-		let class = ClassId::new(1).ok_or_else(|| invalid("fixture class identity is invalid"))?;
+	fn graph_recipe_roundtrips_all_families_and_bounded_selectors() {
+		use crate::test_assertions::AssertResult as _;
+
+		let class =
+			ClassId::new(1).ok_or_else(|| invalid("fixture class identity is invalid")).assert_ok();
 		for family in [
 			GraphKind::Graph,
 			GraphKind::Tree,
@@ -121,54 +126,55 @@ mod tests {
 			GraphKind::Metagraph,
 			GraphKind::Subgraph,
 		] {
-			let mut graph =
-				LiveGraphResult::new(LiveExpr::field("picked")?, LiveExpr::Array(Vec::new()))
-					.with_family(family)
-					.with_validators([
-						GraphTopologyConstraint::Simple,
-						GraphTopologyConstraint::Bipartite,
-					]);
+			let mut graph = LiveGraphResult::new(
+				LiveExpr::field("picked").assert_ok(),
+				LiveExpr::Array(Vec::new()),
+			)
+			.with_family(family)
+			.with_validators([GraphTopologyConstraint::Simple, GraphTopologyConstraint::Bipartite]);
 			if family == GraphKind::RootedTree {
 				graph = graph.with_root(LiveExpr::Parameter("root".into()));
 			}
 			let query = LiveQuery::new(LiveSource::Class(class)).with_graph_result(graph);
 			let descriptor = LiveDescriptor::Query(query);
-			let bytes = super::super::encode(&descriptor, 1 << 20)?;
+			let bytes = super::super::encode(&descriptor, 1 << 20).assert_ok();
 			assert_eq!(&bytes[4..6], &[2, 0]);
-			assert_eq!(super::super::decode(&bytes, 1 << 20)?, descriptor);
+			assert_eq!(super::super::decode(&bytes, 1 << 20).assert_ok(), descriptor);
 			let mut old = bytes.clone();
 			old[4] = 1;
 			assert!(super::super::decode(&old, 1 << 20).is_err());
 		}
-		let binding = LiveBindingId::from_uuid(crate::values::runtime::Uuid::now_v7())?;
+		let binding = LiveBindingId::from_uuid(crate::values::runtime::Uuid::now_v7()).assert_ok();
 		let descriptor =
 			LiveDescriptor::Query(LiveQuery::new(LiveSource::Class(class)).with_graph_result(
 				LiveGraphResult::new(LiveExpr::Binding(binding), LiveExpr::Array(Vec::new())),
 			));
-		let bytes = super::super::encode(&descriptor, 1 << 20)?;
+		let bytes = super::super::encode(&descriptor, 1 << 20).assert_ok();
 		assert!(super::super::decode(&bytes, 128).is_err());
 		for length in 0..bytes.len() {
 			assert!(super::super::decode(&bytes[..length], 1 << 20).is_err());
 		}
-		Ok(())
 	}
 
+	/// Verifies graph recipe rejects unknown family validators and root flags.
 	#[test]
-	fn graph_recipe_rejects_unknown_family_validators_and_root_flags() -> FerrosGrynnResult<()> {
+	fn graph_recipe_rejects_unknown_family_validators_and_root_flags() {
+		use crate::test_assertions::AssertResult as _;
+
 		let graph = LiveGraphResult::new(LiveExpr::Array(Vec::new()), LiveExpr::Array(Vec::new()));
-		let mut budget = CodecBudget::new(1 << 20, 0)?;
+		let mut budget = CodecBudget::new(1 << 20, 0).assert_ok();
 		let mut context = EncodeContext::default();
 		let mut work = Work {
 			observe: None,
 			remaining: MAX_NODES,
 		};
 		let mut body = Vec::new();
-		super::encode(&mut body, &graph, &mut context, &mut budget, &mut work, 0)?;
+		super::encode(&mut body, &graph, &mut context, &mut budget, &mut work, 0).assert_ok();
 		for (offset, byte) in [(0, 8), (1, 8), (2, 128), (3, 2), (3, 1)] {
 			let mut bad = body.clone();
 			bad[offset] = byte;
 			let mut decoder = Decoder::new(&bad);
-			let mut budget = CodecBudget::new(1 << 20, 0)?;
+			let mut budget = CodecBudget::new(1 << 20, 0).assert_ok();
 			let mut work = Work {
 				observe: None,
 				remaining: MAX_NODES,
@@ -180,7 +186,8 @@ mod tests {
 				&LiveDescriptor::Query(
 					LiveQuery::new(LiveSource::Class(
 						ClassId::new(1)
-							.ok_or_else(|| invalid("fixture class identity is invalid"))?
+							.ok_or_else(|| invalid("fixture class identity is invalid"))
+							.assert_ok()
 					))
 					.with_graph_result(graph.with_root(LiveExpr::Literal(Value::None)))
 				),
@@ -188,6 +195,5 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 }

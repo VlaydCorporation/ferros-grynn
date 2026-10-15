@@ -23,6 +23,7 @@ use crate::{
 	values::storage::DiskAtomRef,
 };
 
+/// Decodes topology.
 pub(super) fn decode_topology(
 	slot: &EdgeHotSlot,
 	adjacency: &[AlignedPage],
@@ -89,6 +90,7 @@ pub(super) fn decode_topology(
 	})
 }
 
+/// Returns the local side result.
 fn local_side<const N: usize>(
 	count: u32,
 	inline: &[Option<DiskAtomRef>; N],
@@ -115,6 +117,7 @@ fn local_side<const N: usize>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "the exact hot-side fields form one decode contract")]
+/// Returns the cross side result.
 fn cross_side<const N: usize>(
 	count: u32,
 	inline: &[Option<DiskAtomRef>; N],
@@ -152,6 +155,7 @@ fn cross_side<const N: usize>(
 	encoded.into_iter().map(|entry| resolve_qualified(entry, locals, arena, database)).collect()
 }
 
+/// Resolves qualified.
 fn resolve_qualified(
 	entry: QualifiedDiskAtomRef,
 	locals: &BTreeMap<DiskAtomRef, AtomId>,
@@ -191,6 +195,7 @@ fn resolve_qualified(
 	QualifiedAtomId::new(scope.to_vec(), atom).map(EdgeEndpoint::Nested)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

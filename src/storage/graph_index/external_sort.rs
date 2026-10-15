@@ -35,27 +35,36 @@ const INDEX_SORT_METADATA_BYTES: usize = 256 * 1024;
 const RUN_RECORD_PREFIX_BYTES: usize = size_of::<u32>() + size_of::<u64>();
 
 #[derive(Clone, Copy)]
+/// Sort options state.
 struct SortOptions {
+	/// Run budget associated with this sort options.
 	run_budget: usize,
+	/// Parallelism associated with this sort options.
 	parallelism: usize,
 }
 
 /// Aggregate counters for the external sorters used by one builder call.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ExternalSortMetrics {
+pub struct ExternalSortMetrics {
+	/// Processed items associated with this external sort metrics.
 	pub(crate) processed_items: u64,
+	/// Written bytes associated with this external sort metrics.
 	pub(crate) written_bytes: u64,
+	/// Runs associated with this external sort metrics.
 	pub(crate) runs: u64,
 }
 
 thread_local! {
+	/// Scoped run-memory budget and worker count for sorters created on this thread.
 	static SORT_OPTIONS: Cell<SortOptions> = const { Cell::new(SortOptions {
 		run_budget: INDEX_SORT_RUN_BYTES,
 		parallelism: 1,
 	}) };
+	/// Scoped cancellation token consulted by sorters on this thread; guards restore the previous token.
 	static SORT_CANCELLATION: std::cell::RefCell<Option<Arc<AtomicBool>>> = const {
 		std::cell::RefCell::new(None)
 	};
+	/// Per-thread counters used to collect processed items, spilled bytes and run counts.
 	static SORT_METRICS: Cell<ExternalSortMetrics> = const {
 		Cell::new(ExternalSortMetrics {
 			processed_items: 0,
@@ -65,17 +74,28 @@ thread_local! {
 	};
 }
 
-struct SortOptionsGuard(SortOptions);
+/// Sort options guard state.
+struct SortOptionsGuard(
+	/// Sort options guard state.
+	SortOptions,
+);
 
 impl Drop for SortOptionsGuard {
+	/// Runs cleanup for this `SortOptionsGuard` before its fields are released.
 	fn drop(&mut self) {
 		SORT_OPTIONS.set(self.0);
 	}
 }
 
-struct SortCancellationGuard(Option<Arc<AtomicBool>>);
+/// Sort cancellation guard state.
+struct SortCancellationGuard(
+	/// Previous thread-local cancellation token restored when the scope ends.
+	Option<Arc<AtomicBool>>,
+);
 
 impl Drop for SortCancellationGuard {
+	/// Runs cleanup for this `SortCancellationGuard` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		SORT_CANCELLATION.with(|slot| {
 			slot.replace(self.0.take());
@@ -85,10 +105,10 @@ impl Drop for SortCancellationGuard {
 
 /// Applies one caller-owned aggregate sort budget and worker limit to every
 /// external sorter created by the closure on this thread.
-pub(crate) fn with_external_sort_options<T>(
+pub fn with_external_sort_options<T, RunArg: FnOnce() -> FerrosGrynnResult<T>>(
 	max_memory_bytes: NonZeroUsize,
 	max_parallelism: NonZeroUsize,
-	run: impl FnOnce() -> FerrosGrynnResult<T>,
+	run: RunArg,
 ) -> FerrosGrynnResult<T> {
 	let previous = SORT_OPTIONS.replace(SortOptions {
 		run_budget: max_memory_bytes.get(),
@@ -100,11 +120,11 @@ pub(crate) fn with_external_sort_options<T>(
 
 /// Applies builder limits and one cooperative cancellation token while
 /// resetting aggregate sorter counters for the call.
-pub(crate) fn with_external_sort_control<T>(
+pub fn with_external_sort_control<T, RunArg: FnOnce() -> FerrosGrynnResult<T>>(
 	max_memory_bytes: NonZeroUsize,
 	max_parallelism: NonZeroUsize,
 	cancellation: Arc<AtomicBool>,
-	run: impl FnOnce() -> FerrosGrynnResult<T>,
+	run: RunArg,
 ) -> FerrosGrynnResult<T> {
 	let previous = SORT_CANCELLATION.with(|slot| slot.replace(Some(cancellation)));
 	let _guard = SortCancellationGuard(previous);
@@ -113,17 +133,17 @@ pub(crate) fn with_external_sort_control<T>(
 }
 
 /// Returns aggregate counters recorded by the current builder call.
-pub(crate) fn external_sort_metrics() -> ExternalSortMetrics {
+pub fn external_sort_metrics() -> ExternalSortMetrics {
 	SORT_METRICS.get()
 }
 
 /// Returns the aggregate run-memory budget installed for the current builder.
-pub(crate) fn external_sort_run_budget() -> usize {
+pub fn external_sort_run_budget() -> usize {
 	SORT_OPTIONS.get().run_budget
 }
 
 /// Checks the current maintenance cancellation token, when one is installed.
-pub(crate) fn check_external_sort_cancelled() -> FerrosGrynnResult<()> {
+pub fn check_external_sort_cancelled() -> FerrosGrynnResult<()> {
 	let cancelled = SORT_CANCELLATION
 		.with(|slot| slot.borrow().as_ref().is_some_and(|token| token.load(Ordering::Acquire)));
 	if cancelled {
@@ -133,6 +153,7 @@ pub(crate) fn check_external_sort_cancelled() -> FerrosGrynnResult<()> {
 	}
 }
 
+/// Records sort item.
 fn record_sort_item() -> FerrosGrynnResult<()> {
 	SORT_METRICS.with(|metrics| {
 		let mut current = metrics.get();
@@ -145,6 +166,7 @@ fn record_sort_item() -> FerrosGrynnResult<()> {
 	})
 }
 
+/// Records sort bytes.
 fn record_sort_bytes(bytes: usize) -> FerrosGrynnResult<()> {
 	SORT_METRICS.with(|metrics| {
 		let mut current = metrics.get();
@@ -157,6 +179,7 @@ fn record_sort_bytes(bytes: usize) -> FerrosGrynnResult<()> {
 	})
 }
 
+/// Records sort run.
 fn record_sort_run() -> FerrosGrynnResult<()> {
 	SORT_METRICS.with(|metrics| {
 		let mut current = metrics.get();
@@ -170,7 +193,7 @@ fn record_sort_run() -> FerrosGrynnResult<()> {
 }
 
 /// One total-order item consumed by index packers and bounded statistics.
-pub(crate) struct IndexSortRecord {
+pub struct IndexSortRecord {
 	/// Order-preserving or primary lookup bytes.
 	pub(super) key: Vec<u8>,
 	/// Opaque payload interpreted by the sorted stream consumer.
@@ -178,14 +201,22 @@ pub(crate) struct IndexSortRecord {
 }
 
 /// Bounded accumulator that spills sorted runs only when its budget is full.
-pub(crate) struct ExternalIndexSorter {
+pub struct ExternalIndexSorter {
+	/// Temporary root associated with this external index sorter.
 	temporary_root: PathBuf,
+	/// Run budget associated with this external index sorter.
 	run_budget: usize,
+	/// Buffered bytes associated with this external index sorter.
 	buffered_bytes: usize,
+	/// Buffered associated with this external index sorter.
 	buffered: Vec<IndexSortRecord>,
+	/// Session associated with this external index sorter.
 	session: Option<SortSession>,
+	/// Runs associated with this external index sorter.
 	runs: Vec<SortRun>,
+	/// Next run associated with this external index sorter.
 	next_run: u64,
+	/// Parallelism associated with this external index sorter.
 	parallelism: usize,
 }
 
@@ -201,6 +232,7 @@ impl ExternalIndexSorter {
 		Self::with_budget_and_parallelism(database_root, run_budget, SORT_OPTIONS.get().parallelism)
 	}
 
+	/// Configures budget and parallelism.
 	fn with_budget_and_parallelism(
 		database_root: &Path,
 		run_budget: usize,
@@ -380,9 +412,12 @@ impl ExternalIndexSorter {
 }
 
 /// Replayable output used directly by bottom-up B+tree packers.
-pub(crate) enum SortedIndexRecords {
+pub enum SortedIndexRecords {
 	/// Inputs below one run budget need no temporary I/O.
-	Memory(Vec<IndexSortRecord>),
+	Memory(
+		/// Inputs below one run budget need no temporary I/O.
+		Vec<IndexSortRecord>,
+	),
 	/// Larger inputs retain only the final bounded merge inputs.
 	Runs {
 		/// Owns best-effort cleanup for all final runs.
@@ -437,7 +472,8 @@ impl SortedIndexRecords {
 }
 
 /// One owned temporary session removed on success, error, or unwind.
-pub(crate) struct SortSession {
+pub struct SortSession {
+	/// Path associated with this sort session.
 	path: PathBuf,
 }
 
@@ -463,9 +499,12 @@ impl Drop for SortSession {
 }
 
 /// One immutable run and its meaningful byte length before final zero padding.
-pub(crate) struct SortRun {
+pub struct SortRun {
+	/// Path associated with this sort run.
 	path: PathBuf,
+	/// Logical bytes associated with this sort run.
 	logical_bytes: u64,
+	/// Record count associated with this sort run.
 	record_count: usize,
 	/// Number of online equal-fan-in merge generations.
 	level: u8,
@@ -473,12 +512,19 @@ pub(crate) struct SortRun {
 
 /// Sequential page-aligned writer for the private run format.
 struct RunWriter {
+	/// Path associated with this run writer.
 	path: PathBuf,
+	/// File associated with this run writer.
 	file: DirectFile,
+	/// Page associated with this run writer.
 	page: Box<AlignedPage>,
+	/// Page no associated with this run writer.
 	page_no: u64,
+	/// Position relative to the beginning of the associated buffer.
 	offset: usize,
+	/// Logical bytes associated with this run writer.
 	logical_bytes: u64,
+	/// Record count associated with this run writer.
 	record_count: usize,
 }
 
@@ -560,10 +606,15 @@ impl RunWriter {
 
 /// Sequential bounded decoder for one private run.
 struct RunReader {
+	/// File associated with this run reader.
 	file: DirectFile,
+	/// Logical bytes associated with this run reader.
 	logical_bytes: u64,
+	/// Position associated with this run reader.
 	position: u64,
+	/// Loaded page associated with this run reader.
 	loaded_page: Option<u64>,
+	/// Page associated with this run reader.
 	page: Box<AlignedPage>,
 }
 
@@ -649,7 +700,7 @@ fn merge_runs(
 	}
 	let mut processed = 0_usize;
 	while let Some(Reverse((key, address, index))) = heap.pop() {
-		if processed % 1024 == 0 {
+		if processed.is_multiple_of(1024) {
 			check_external_sort_cancelled()?;
 		}
 		processed = processed.saturating_add(1);
@@ -678,6 +729,7 @@ fn sort_records(records: &mut [IndexSortRecord], parallelism: usize) -> FerrosGr
 	Ok(())
 }
 
+/// Compares records.
 fn compare_records(left: &IndexSortRecord, right: &IndexSortRecord) -> std::cmp::Ordering {
 	left.key.cmp(&right.key).then_with(|| left.address.cmp(&right.address))
 }
@@ -705,6 +757,7 @@ fn sort_io(operation: &str, source: std::io::Error) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for external sort behavior.
 mod tests {
 	use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -716,15 +769,20 @@ mod tests {
 
 	/// Forced tiny runs merge into one replayable total order.
 	#[test]
-	fn tiny_runs_merge_and_cleanup() -> FerrosGrynnResult<()> {
+	fn tiny_runs_merge_and_cleanup() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::current_dir()
-			.map_err(|source| sort_io("resolve sorter test root", source))?
+			.map_err(|source| sort_io("resolve sorter test root", source))
+			.assert_ok()
 			.join(format!(
 				".ferros-grynn-sort-{}-{}",
 				std::process::id(),
 				NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
 			));
-		fs::create_dir(&root).map_err(|source| sort_io("create sorter test root", source))?;
+		fs::create_dir(&root)
+			.map_err(|source| sort_io("create sorter test root", source))
+			.assert_ok();
 		let scratch = root.join("tmp").join("index-sort");
 		let result = (|| {
 			let mut sorter = ExternalIndexSorter::with_budget(&root, 40);
@@ -746,20 +804,26 @@ mod tests {
 			Ok(())
 		})();
 		drop(fs::remove_dir_all(&root));
-		result
+		let test_result: FerrosGrynnResult<()> = result;
+		test_result.assert_ok();
 	}
 
+	/// Verifies scoped budget and parallelism preserve canonical order.
 	#[test]
-	fn scoped_budget_and_parallelism_preserve_canonical_order() -> FerrosGrynnResult<()> {
+	fn scoped_budget_and_parallelism_preserve_canonical_order() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::current_dir()
-			.map_err(|source| sort_io("resolve parallel sorter test root", source))?
+			.map_err(|source| sort_io("resolve parallel sorter test root", source))
+			.assert_ok()
 			.join(format!(
 				".ferros-grynn-sort-options-{}-{}",
 				std::process::id(),
 				NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
 			));
 		fs::create_dir(&root)
-			.map_err(|source| sort_io("create parallel sorter test root", source))?;
+			.map_err(|source| sort_io("create parallel sorter test root", source))
+			.assert_ok();
 		let result = with_external_sort_options(
 			NonZeroUsize::new(40).unwrap_or(NonZeroUsize::MIN),
 			NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
@@ -782,20 +846,26 @@ mod tests {
 			},
 		);
 		drop(fs::remove_dir_all(root));
-		result
+		let test_result: FerrosGrynnResult<()> = result;
+		test_result.assert_ok();
 	}
 
+	/// Verifies maintenance control reports runs and stops before more input.
 	#[test]
-	fn maintenance_control_reports_runs_and_stops_before_more_input() -> FerrosGrynnResult<()> {
+	fn maintenance_control_reports_runs_and_stops_before_more_input() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::current_dir()
-			.map_err(|source| sort_io("resolve controlled sorter test root", source))?
+			.map_err(|source| sort_io("resolve controlled sorter test root", source))
+			.assert_ok()
 			.join(format!(
 				".ferros-grynn-sort-control-{}-{}",
 				std::process::id(),
 				NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
 			));
 		fs::create_dir(&root)
-			.map_err(|source| sort_io("create controlled sorter test root", source))?;
+			.map_err(|source| sort_io("create controlled sorter test root", source))
+			.assert_ok();
 		let cancellation = Arc::new(AtomicBool::new(false));
 		let result = with_external_sort_control(
 			NonZeroUsize::MIN,
@@ -818,6 +888,7 @@ mod tests {
 			},
 		);
 		drop(fs::remove_dir_all(root));
-		result
+		let test_result: FerrosGrynnResult<()> = result;
+		test_result.assert_ok();
 	}
 }

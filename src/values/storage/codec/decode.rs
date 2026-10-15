@@ -45,14 +45,21 @@ use crate::{
 	},
 };
 
+/// Bounded value decoder tracking its input position and admitted allocation
+/// bytes.
 pub(super) struct Decoder<'a> {
+	/// Borrowed input bytes read by the bounded decoder.
 	bytes: &'a [u8],
+	/// Current byte offset into the decoder input.
 	pub(super) position: usize,
+	/// Depth, length and allocation bounds enforced while decoding.
 	limits: DecodeLimits,
+	/// Total allocation bytes admitted by the decoder so far.
 	pub(super) allocated: usize,
 }
 
 impl<'a> Decoder<'a> {
+	/// Constructs `Decoder<'a>` from the supplied initial state.
 	pub(super) const fn new(bytes: &'a [u8], limits: DecodeLimits) -> Self {
 		Self {
 			bytes,
@@ -62,6 +69,7 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
+	/// Decodes value for `Decoder<'a>`.
 	pub(super) fn decode_value(&mut self, depth: usize) -> FerrosGrynnResult<StorageValue> {
 		self.check_depth(depth)?;
 		let offset = self.position;
@@ -133,6 +141,7 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
+	/// Decodes datetime for `Decoder<'a>`.
 	fn decode_datetime(&mut self, offset: usize) -> FerrosGrynnResult<StorageDateTime> {
 		let seconds = self.read_i64()?;
 		let nanos = self.read_u32()?;
@@ -150,6 +159,7 @@ impl<'a> Decoder<'a> {
 		})
 	}
 
+	/// Decodes duration for `Decoder<'a>`.
 	fn decode_duration(&mut self, offset: usize) -> FerrosGrynnResult<StorageDuration> {
 		let header = self.read_u16()?;
 		if header & 0x1F != 0 {
@@ -177,6 +187,7 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Decodes record id for `Decoder<'a>`.
 	fn decode_record_id(&mut self, depth: usize) -> FerrosGrynnResult<StorageRecordId> {
 		self.check_depth(depth)?;
 		let class_id = self.read_u32()?;
@@ -196,6 +207,7 @@ impl<'a> Decoder<'a> {
 		})
 	}
 
+	/// Decodes record values for `Decoder<'a>`.
 	fn decode_record_values(&mut self, depth: usize) -> FerrosGrynnResult<Vec<StorageRecordValue>> {
 		let count = self.read_collection_len()?;
 		let mut values = self.allocate_vec(count)?;
@@ -205,6 +217,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes record value for `Decoder<'a>`.
 	fn decode_record_value(&mut self, depth: usize) -> FerrosGrynnResult<StorageRecordValue> {
 		self.check_depth(depth)?;
 		let offset = self.position;
@@ -219,6 +232,7 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
+	/// Decodes record object for `Decoder<'a>`.
 	fn decode_record_object(
 		&mut self,
 		depth: usize,
@@ -242,6 +256,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes values for `Decoder<'a>`.
 	fn decode_values(&mut self, depth: usize) -> FerrosGrynnResult<Vec<StorageValue>> {
 		let count = self.read_collection_len()?;
 		let mut values = self.allocate_vec(count)?;
@@ -251,6 +266,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes set for `Decoder<'a>`.
 	fn decode_set(&mut self, depth: usize) -> FerrosGrynnResult<Vec<StorageValue>> {
 		let count = self.read_collection_len()?;
 		let mut values = self.allocate_vec(count)?;
@@ -271,6 +287,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes object for `Decoder<'a>`.
 	fn decode_object(
 		&mut self,
 		depth: usize,
@@ -294,6 +311,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes range for `Decoder<'a>`.
 	fn decode_range(&mut self, depth: usize, offset: usize) -> FerrosGrynnResult<StorageRange> {
 		let flags = self.read_u8()?;
 		if flags & !RANGE_ALLOWED_FLAGS != 0 {
@@ -330,6 +348,7 @@ impl<'a> Decoder<'a> {
 		})
 	}
 
+	/// Decodes geometry for `Decoder<'a>`.
 	fn decode_geometry(&mut self, tag: u8, depth: usize) -> FerrosGrynnResult<Geometry> {
 		let mut elements = 0;
 		let geometry = self.decode_geometry_inner(tag, depth, &mut elements)?;
@@ -412,6 +431,7 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
+	/// Decodes polygon for `Decoder<'a>`.
 	fn decode_polygon(
 		&mut self,
 		depth: usize,
@@ -426,6 +446,7 @@ impl<'a> Decoder<'a> {
 		Ok(rings)
 	}
 
+	/// Decodes positions for `Decoder<'a>`.
 	fn decode_positions(&mut self, elements: &mut usize) -> FerrosGrynnResult<Vec<Position>> {
 		let count = self.geometry_len(elements)?;
 		let mut positions = self.allocate_vec(count)?;
@@ -435,6 +456,7 @@ impl<'a> Decoder<'a> {
 		Ok(positions)
 	}
 
+	/// Decodes position for `Decoder<'a>`.
 	fn decode_position(&mut self) -> FerrosGrynnResult<Position> {
 		let offset = self.position;
 		let longitude = self.read_canonical_f64()?;
@@ -444,11 +466,13 @@ impl<'a> Decoder<'a> {
 			.map_err(|cause| invalid(offset, "geometry coordinate is invalid").with_cause(cause))
 	}
 
+	/// Decodes boxed value for `Decoder<'a>`.
 	fn decode_boxed_value(&mut self, depth: usize) -> FerrosGrynnResult<Box<StorageValue>> {
 		self.charge(size_of::<StorageValue>())?;
 		self.decode_value(depth).map(Box::new)
 	}
 
+	/// Decodes vector for `Decoder<'a>`.
 	fn decode_vector(&mut self, tag: u8) -> FerrosGrynnResult<Vector> {
 		let dimension = usize::from(self.read_u16()?);
 		self.check_collection_len(dimension)?;
@@ -507,6 +531,7 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
+	/// Decodes i64 vector for `Decoder<'a>`.
 	fn decode_i64_vector(&mut self, dimension: usize) -> FerrosGrynnResult<Vec<i64>> {
 		let mut values = self.allocate_vec(dimension)?;
 		for _ in 0..dimension {
@@ -515,6 +540,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes i32 vector for `Decoder<'a>`.
 	fn decode_i32_vector(&mut self, dimension: usize) -> FerrosGrynnResult<Vec<i32>> {
 		let mut values = self.allocate_vec(dimension)?;
 		for _ in 0..dimension {
@@ -523,6 +549,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Decodes i16 vector for `Decoder<'a>`.
 	fn decode_i16_vector(&mut self, dimension: usize) -> FerrosGrynnResult<Vec<i16>> {
 		let mut values = self.allocate_vec(dimension)?;
 		for _ in 0..dimension {
@@ -531,6 +558,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Reads text for `Decoder<'a>`.
 	fn read_text(&mut self) -> FerrosGrynnResult<Text> {
 		let length = self.read_limited_len("string bytes", self.limits.max_string_bytes)?;
 		self.charge(length)?;
@@ -541,6 +569,7 @@ impl<'a> Decoder<'a> {
 		})
 	}
 
+	/// Reads blob for `Decoder<'a>`.
 	fn read_blob(&mut self) -> FerrosGrynnResult<Vec<u8>> {
 		let length = self.read_limited_len("blob bytes", self.limits.max_blob_bytes)?;
 		self.charge(length)?;
@@ -553,14 +582,17 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Reads uuid for `Decoder<'a>`.
 	fn read_uuid(&mut self) -> FerrosGrynnResult<Uuid> {
 		self.read_array::<16>().map(uuid::Uuid::from_bytes).map(Uuid::from)
 	}
 
+	/// Reads ulid for `Decoder<'a>`.
 	fn read_ulid(&mut self) -> FerrosGrynnResult<Ulid> {
 		self.read_array::<16>().map(u128::from_be_bytes).map(ulid::Ulid::from).map(Ulid::from)
 	}
 
+	/// Reads collection len for `Decoder<'a>`.
 	fn read_collection_len(&mut self) -> FerrosGrynnResult<usize> {
 		let count = self.read_uleb()?;
 		let count = usize::try_from(count).map_err(|_err| {
@@ -570,12 +602,14 @@ impl<'a> Decoder<'a> {
 		Ok(count)
 	}
 
+	/// Reads fixed collection len for `Decoder<'a>`.
 	fn read_fixed_collection_len(&mut self) -> FerrosGrynnResult<usize> {
 		let count = self.read_u32()? as usize;
 		self.check_collection_len(count)?;
 		Ok(count)
 	}
 
+	/// Checks collection len for `Decoder<'a>`.
 	fn check_collection_len(&self, count: usize) -> FerrosGrynnResult<()> {
 		if count > self.limits.max_collection_len {
 			return Err(limit_error("collection length", self.limits.max_collection_len, count));
@@ -583,6 +617,7 @@ impl<'a> Decoder<'a> {
 		Ok(())
 	}
 
+	/// Reads limited len for `Decoder<'a>`.
 	fn read_limited_len(&mut self, name: &str, maximum: usize) -> FerrosGrynnResult<usize> {
 		let length = self.read_uleb()?;
 		let length =
@@ -593,6 +628,7 @@ impl<'a> Decoder<'a> {
 		Ok(length)
 	}
 
+	/// Checks depth for `Decoder<'a>`.
 	fn check_depth(&self, depth: usize) -> FerrosGrynnResult<()> {
 		if depth > self.limits.max_depth {
 			return Err(limit_error("nesting depth", self.limits.max_depth, depth));
@@ -600,6 +636,7 @@ impl<'a> Decoder<'a> {
 		Ok(())
 	}
 
+	/// Allocates vec for `Decoder<'a>`.
 	fn allocate_vec<T>(&mut self, count: usize) -> FerrosGrynnResult<Vec<T>> {
 		let bytes = count.checked_mul(size_of::<T>()).ok_or_else(|| {
 			limit_error("allocation bytes", self.limits.max_total_allocation, usize::MAX)
@@ -612,6 +649,7 @@ impl<'a> Decoder<'a> {
 		Ok(values)
 	}
 
+	/// Returns charge for `Decoder<'a>`.
 	fn charge(&mut self, bytes: usize) -> FerrosGrynnResult<()> {
 		let total = self.allocated.checked_add(bytes).ok_or_else(|| {
 			limit_error("allocation bytes", self.limits.max_total_allocation, usize::MAX)
@@ -623,6 +661,7 @@ impl<'a> Decoder<'a> {
 		Ok(())
 	}
 
+	/// Reads uleb for `Decoder<'a>`.
 	fn read_uleb(&mut self) -> FerrosGrynnResult<u64> {
 		let offset = self.position;
 		let mut value = 0_u64;
@@ -643,6 +682,7 @@ impl<'a> Decoder<'a> {
 		Err(invalid(offset, "uLEB128 exceeds ten bytes"))
 	}
 
+	/// Reads canonical f64 for `Decoder<'a>`.
 	fn read_canonical_f64(&mut self) -> FerrosGrynnResult<f64> {
 		let offset = self.position;
 		let bits = self.read_u64()?;
@@ -653,6 +693,7 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Reads canonical f32 for `Decoder<'a>`.
 	fn read_canonical_f32(&mut self) -> FerrosGrynnResult<f32> {
 		let offset = self.position;
 		let bits = self.read_u32()?;
@@ -663,6 +704,7 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Reads u8 for `Decoder<'a>`.
 	fn read_u8(&mut self) -> FerrosGrynnResult<u8> {
 		let offset = self.position;
 		let byte = self.bytes.get(self.position).copied().ok_or_else(|| truncated(offset))?;
@@ -670,34 +712,42 @@ impl<'a> Decoder<'a> {
 		Ok(byte)
 	}
 
+	/// Reads u16 for `Decoder<'a>`.
 	fn read_u16(&mut self) -> FerrosGrynnResult<u16> {
 		self.read_array().map(u16::from_le_bytes)
 	}
 
+	/// Reads i16 for `Decoder<'a>`.
 	fn read_i16(&mut self) -> FerrosGrynnResult<i16> {
 		self.read_array().map(i16::from_le_bytes)
 	}
 
+	/// Reads u32 for `Decoder<'a>`.
 	fn read_u32(&mut self) -> FerrosGrynnResult<u32> {
 		self.read_array().map(u32::from_le_bytes)
 	}
 
+	/// Reads i32 for `Decoder<'a>`.
 	fn read_i32(&mut self) -> FerrosGrynnResult<i32> {
 		self.read_array().map(i32::from_le_bytes)
 	}
 
+	/// Reads u64 for `Decoder<'a>`.
 	fn read_u64(&mut self) -> FerrosGrynnResult<u64> {
 		self.read_array().map(u64::from_le_bytes)
 	}
 
+	/// Reads i64 for `Decoder<'a>`.
 	fn read_i64(&mut self) -> FerrosGrynnResult<i64> {
 		self.read_array().map(i64::from_le_bytes)
 	}
 
+	/// Reads i128 for `Decoder<'a>`.
 	fn read_i128(&mut self) -> FerrosGrynnResult<i128> {
 		self.read_array().map(i128::from_le_bytes)
 	}
 
+	/// Reads array for `Decoder<'a>`.
 	fn read_array<const LENGTH: usize>(&mut self) -> FerrosGrynnResult<[u8; LENGTH]> {
 		let bytes = self.take(LENGTH)?;
 		let mut result = [0_u8; LENGTH];
@@ -705,6 +755,7 @@ impl<'a> Decoder<'a> {
 		Ok(result)
 	}
 
+	/// Performs the take operation for `Decoder<'a>`.
 	fn take(&mut self, length: usize) -> FerrosGrynnResult<&'a [u8]> {
 		let offset = self.position;
 		let end = offset.checked_add(length).ok_or_else(|| truncated(offset))?;

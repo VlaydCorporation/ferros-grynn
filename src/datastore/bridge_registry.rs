@@ -21,11 +21,14 @@ use crate::{
 	values::{RecordId, Text},
 };
 
+/// Shared COW bucket handles retained by one registry snapshot.
+type RegistryBuckets<K, V> = Arc<[Arc<RegistryBucket<K, V>>]>;
+
 /// COW buckets bound mutation copies without duplicating authoritative rows.
 #[derive(Clone)]
 struct RegistryMap<K, V> {
 	/// Shared COW shard table; an empty registry allocates none.
-	buckets: Option<Arc<[Arc<RegistryBucket<K, V>>]>>,
+	buckets: Option<RegistryBuckets<K, V>>,
 }
 
 /// Owned-key accounting avoids scanning a growing bucket during admission.
@@ -38,6 +41,7 @@ struct RegistryBucket<K, V> {
 }
 
 impl<K, V> Default for RegistryMap<K, V> {
+	/// Constructs the default initial state of `RegistryMap<K, V>`.
 	fn default() -> Self {
 		Self {
 			buckets: None,

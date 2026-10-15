@@ -23,25 +23,20 @@ use direct_unix::{configure_direct_io, read_at, write_at};
 use direct_windows::{configure_direct_io, read_at, write_at};
 
 /// Binary kibibyte used by named Direct-I/O extent sizes.
+#[cfg(all(test, windows, feature = "native-async-io"))]
 const KIBIBYTE: usize = 1024;
 
 /// Windows extent selected by the native 16/64/256/1024/2048 KiB profile.
-#[cfg(windows)]
+#[cfg(all(test, windows, feature = "native-async-io"))]
 pub(super) const SYNC_BATCH_BYTES: usize = 2048 * KIBIBYTE;
 
-/// Provisional Linux extent; the Linux/NVMe native gate must calibrate it.
-#[cfg(target_os = "linux")]
-pub(super) const SYNC_BATCH_BYTES: usize = 256 * KIBIBYTE;
-
-/// Compile-time placeholder for targets on which Direct I/O is rejected.
-#[cfg(not(any(target_os = "linux", windows)))]
-pub(super) const SYNC_BATCH_BYTES: usize = 256 * KIBIBYTE;
-
 /// Number of complete pages in the calibrated synchronous extent.
+#[cfg(all(test, windows, feature = "native-async-io"))]
 pub(super) const SYNC_BATCH_PAGES: usize = SYNC_BATCH_BYTES / PAGE_SIZE;
 
 /// Windows handle behavior selected by the page transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DirectFileOpenMode {
 	/// Synchronous positional operations on a non-overlapped handle.
 	Synchronous,
@@ -74,7 +69,7 @@ impl DirectFile {
 	///
 	/// Returns a structured I/O error if creation fails, or Direct I/O is not
 	/// available on the target platform or filesystem.
-	pub fn create_new(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
+	pub fn create_new<PathArg: AsRef<Path>>(path: PathArg) -> FerrosGrynnResult<Self> {
 		Self::open(path.as_ref(), OpenMode::CreateNew, DirectFileOpenMode::Synchronous)
 	}
 
@@ -84,7 +79,7 @@ impl DirectFile {
 	///
 	/// Returns an error if opening fails, Direct I/O is unavailable, or the
 	/// existing file length is not a multiple of [`PAGE_SIZE`].
-	pub fn open_read_only(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
+	pub fn open_read_only<PathArg: AsRef<Path>>(path: PathArg) -> FerrosGrynnResult<Self> {
 		Self::open(path.as_ref(), OpenMode::ReadOnly, DirectFileOpenMode::Synchronous)
 	}
 
@@ -105,8 +100,8 @@ impl DirectFile {
 	///
 	/// Returns an error if opening fails, Direct I/O is unavailable, or the
 	/// existing file length is not a multiple of [`PAGE_SIZE`].
-	pub fn open_read_write_with_mode(
-		path: impl AsRef<Path>,
+	pub fn open_read_write_with_mode<PathArg: AsRef<Path>>(
+		path: PathArg,
 		io_mode: DirectFileOpenMode,
 	) -> FerrosGrynnResult<Self> {
 		Self::open(path.as_ref(), OpenMode::ReadWrite, io_mode)
@@ -171,6 +166,7 @@ impl DirectFile {
 	///
 	/// Returns an error for a range outside the file, arithmetic overflow,
 	/// short I/O, native I/O failure, or any invalid page in the extent.
+	#[cfg(test)]
 	pub(super) fn read_pages(
 		&self,
 		first_page: PageNo,
@@ -205,6 +201,7 @@ impl DirectFile {
 	///
 	/// Returns an error for a range outside the file, arithmetic overflow,
 	/// short I/O, or an operating-system failure.
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	pub fn read_pages_raw(
 		&self,
 		first_page: PageNo,
@@ -296,6 +293,11 @@ impl DirectFile {
 	///
 	/// Returns an error for an empty or out-of-range extent, conversion
 	/// failure, or arithmetic overflow.
+	#[cfg(any(
+		test,
+		feature = "storage-engine-prototype-api",
+		all(windows, feature = "native-async-io")
+	))]
 	pub fn prepare_read_extent(
 		&self,
 		first_page: PageNo,
@@ -373,7 +375,10 @@ impl DirectFile {
 	///
 	/// Returns an error when this file was not opened with its overlapped
 	/// companion handle.
-	#[cfg(windows)]
+	#[cfg(all(
+		windows,
+		any(feature = "native-async-io", feature = "storage-engine-prototype-api")
+	))]
 	pub fn raw_handle(&self) -> FerrosGrynnResult<windows::Win32::Foundation::HANDLE> {
 		use std::os::windows::io::AsRawHandle;
 
@@ -533,6 +538,7 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> FerrosG
 }
 
 /// Reads one complete extent with a single successful positional operation.
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 fn read_extent_at(file: &File, buffer: &mut [u8], offset: u64) -> FerrosGrynnResult<()> {
 	loop {
 		match read_at(file, buffer, offset) {
@@ -718,4 +724,5 @@ fn io_failure(operation: impl Into<String>, source: io::Error) -> FerrosGrynnErr
 	clippy::panic_in_result_fn,
 	reason = "fallible test setup returns Result while assertions report contract failures"
 )]
+/// Regression tests for direct io behavior.
 mod tests;

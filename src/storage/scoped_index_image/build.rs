@@ -26,7 +26,7 @@ pub(in crate::storage) fn build_scoped_index_images(
 	database: &DatabaseRoot,
 ) -> FerrosGrynnResult<ScopedIndexImages> {
 	let mut images = ScopedIndexImages::default();
-	build_explicit(&database.indexes.base, IndexScope::Base, &mut images.base, |atom| Ok(atom))?;
+	build_explicit(&database.indexes.base, IndexScope::Base, &mut images.base, Ok)?;
 	for (graph_id, indexes) in &database.indexes.graphs {
 		let graph = database
 			.graph(*graph_id)
@@ -85,6 +85,7 @@ pub(in crate::storage) fn build_scoped_index_images(
 	Ok(images)
 }
 
+/// Builds explicit.
 fn build_explicit<Source, Target>(
 	bindings: &BTreeMap<crate::datastore::IndexId, IndexBinding<Source>>,
 	scope: IndexScope,
@@ -165,6 +166,7 @@ where
 	Ok(())
 }
 
+/// Returns the scalar entries result.
 fn scalar_entries<Source, Target>(
 	entries: &BTreeMap<Vec<u8>, BTreeSet<Source>>,
 	mut address: impl FnMut(Source) -> FerrosGrynnResult<Target>,
@@ -187,6 +189,7 @@ where
 		.collect()
 }
 
+/// Returns the local addresses result.
 fn local_addresses(atoms: &BTreeSet<AtomId>) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
 	let mut result =
 		atoms.iter().copied().map(local_address).collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -194,6 +197,7 @@ fn local_addresses(atoms: &BTreeSet<AtomId>) -> FerrosGrynnResult<Vec<DiskAtomRe
 	Ok(result)
 }
 
+/// Returns the local address result.
 pub(in crate::storage) fn local_address(atom: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	DiskAtomRef::from_parts(
 		atom.kind().ok_or_else(|| invalid("graph index contains a null atom"))?,
@@ -201,6 +205,7 @@ pub(in crate::storage) fn local_address(atom: AtomId) -> FerrosGrynnResult<DiskA
 	)
 }
 
+/// Returns the label ids result.
 pub(super) fn label_ids<'a>(
 	labels: impl Iterator<Item = (AtomKind, &'a Text)>,
 ) -> FerrosGrynnResult<BTreeMap<(AtomKind, Text), u32>> {
@@ -216,6 +221,7 @@ pub(super) fn label_ids<'a>(
 	Ok(result)
 }
 
+/// Returns the scalar filename result.
 pub(super) fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 	let prefix = match kind {
 		ClassIndexKind::Standard => "std",
@@ -229,6 +235,7 @@ pub(super) fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 	format!("idx/{prefix}_{ordinal:04}.fgidx")
 }
 
+/// Returns the label filename result.
 pub(super) fn label_filename(kind: AtomKind, label_id: u32) -> String {
 	let kind = match kind {
 		AtomKind::Node => "node",
@@ -237,6 +244,7 @@ pub(super) fn label_filename(kind: AtomKind, label_id: u32) -> String {
 	format!("idx/lbl_{kind}_{label_id}.fgidx")
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

@@ -4,19 +4,26 @@ use super::*;
 /// One canonical primary-index item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct PrimaryIndexEntry<Address = DiskAtomRef> {
+	/// Key associated with this primary index entry.
 	pub(in crate::storage) key: Vec<u8>,
+	/// Atom associated with this primary index entry.
 	pub(in crate::storage) atom: Address,
 }
 
 /// One primary-index insertion or removal applied by point DML.
+#[cfg(test)]
 pub(in crate::storage) struct PrimaryIndexMutation<Address = DiskAtomRef> {
+	/// Key associated with this primary index mutation.
 	pub(in crate::storage) key: Vec<u8>,
+	/// Atom associated with this primary index mutation.
 	pub(in crate::storage) atom: Option<Address>,
 }
 
 /// Complete immutable B+tree generation and its root page.
 pub(in crate::storage) struct BuiltPrimaryIndex {
+	/// Root associated with this built primary index.
 	pub(in crate::storage) root: PageNo,
+	/// Pages associated with this built primary index.
 	pub(in crate::storage) pages: Vec<AlignedPage>,
 }
 
@@ -28,6 +35,7 @@ pub(in crate::storage) fn build_primary_index<Address: PrimaryAddress>(
 	build_primary_index_with_leaf_limit(entries, page_lsn, MUTABLE_PRIMARY_LEAF_BYTES)
 }
 
+/// Builds primary index with leaf limit.
 fn build_primary_index_with_leaf_limit<Address: PrimaryAddress>(
 	entries: &[PrimaryIndexEntry<Address>],
 	page_lsn: PageLsn,
@@ -57,6 +65,7 @@ fn build_primary_index_with_leaf_limit<Address: PrimaryAddress>(
 	})
 }
 
+/// Builds primary index with fill for this module.
 #[cfg(test)]
 pub(super) fn build_primary_index_with_fill<Address: PrimaryAddress>(
 	entries: &[PrimaryIndexEntry<Address>],
@@ -139,6 +148,7 @@ pub(in crate::storage) fn visit_primary_index<Address: PrimaryAddress>(
 ///
 /// `None` requests the existing bulk builder because a split, an empty
 /// non-root leaf, or a changed internal separator is required.
+#[cfg(test)]
 pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -203,6 +213,7 @@ pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 
 /// Applies removals before insertions so one stable `RecordId` can be reused
 /// atomically with a new generation.
+#[cfg(test)]
 pub(in crate::storage) fn apply_primary_mutations<
 	'mutation,
 	Address: PrimaryAddress + 'mutation,

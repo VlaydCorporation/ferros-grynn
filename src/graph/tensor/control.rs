@@ -19,6 +19,7 @@ pub struct GraphAlgorithmLimits {
 }
 
 impl Default for GraphAlgorithmLimits {
+	/// Constructs the default initial state of `GraphAlgorithmLimits`.
 	fn default() -> Self {
 		Self {
 			memory_bytes: 256 * 1024 * 1024,

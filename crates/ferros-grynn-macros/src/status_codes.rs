@@ -11,6 +11,7 @@ use syn::{
 	parse::{Parse, ParseStream},
 };
 
+/// Reserved keywords in the status-catalog declaration syntax.
 mod kw {
 	syn::custom_keyword!(category);
 	syn::custom_keyword!(classification);
@@ -25,11 +26,14 @@ mod kw {
 	syn::custom_keyword!(subcondition);
 }
 
+/// Parsed list of declarations supplied to the status-code generator.
 struct StatusInput {
+	/// Status declarations expanded by the procedural macro.
 	definitions: Vec<StatusDefinition>,
 }
 
 impl Parse for StatusInput {
+	/// Parses and validates the input syntax for this type.
 	fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
 		let definitions =
 			syn::punctuated::Punctuated::<StatusDefinition, Token![,]>::parse_terminated(input)?
@@ -43,6 +47,7 @@ impl Parse for StatusInput {
 }
 
 impl ToTokens for StatusInput {
+	/// Appends the generated Rust representation to the output token stream.
 	fn to_tokens(&self, tokens: &mut TokenStream) {
 		let variants = self.definitions.iter().map(StatusDefinition::variant_tokens);
 		let definition_statics = self.definitions.iter().map(StatusDefinition::definition_static);
@@ -63,6 +68,7 @@ impl ToTokens for StatusInput {
 
 			#[derive(Debug, Clone, PartialEq)]
 			#[non_exhaustive]
+			/// Typed states from the GQL declarative code catalog.
 			pub enum Status {
 				#(#variants,)*
 			}
@@ -89,12 +95,14 @@ impl ToTokens for StatusInput {
 					match self { #(#allocation_arms,)* }
 				}
 
+				/// Returns the static definition associated with this status.
 				pub const fn definition(&self) -> &'static StatusDefinition {
 					match self {
 						#(#definitions,)*
 					}
 				}
 
+				/// Writes the status message with its typed diagnostic parameters.
 				pub(crate) fn fmt_message(
 					&self,
 					formatter: &mut ::std::fmt::Formatter<'_>,
@@ -104,6 +112,7 @@ impl ToTokens for StatusInput {
 					}
 				}
 
+				/// Returns the formatted message when this status declares one.
 				pub fn message(&self) -> Option<String> {
 					if self.definition().has_message {
 						Some(self.to_string())
@@ -112,6 +121,7 @@ impl ToTokens for StatusInput {
 					}
 				}
 
+				/// Copies named parameters into the structured diagnostic representation.
 				pub fn parameters(
 					&self,
 				) -> ::std::collections::BTreeMap<
@@ -133,13 +143,18 @@ impl ToTokens for StatusInput {
 	}
 }
 
+/// Parsed name, code and semantic body of one generated status.
 struct StatusDefinition {
+	/// Declared name used when resolving or displaying this element.
 	name: Ident,
+	/// Literal status code validated before generating the catalog.
 	code: LitStr,
+	/// Parsed semantic and formatting settings of the generated status.
 	body: StatusBody,
 }
 
 impl Parse for StatusDefinition {
+	/// Parses and validates the input syntax for this type.
 	fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
 		let name = input.parse()?;
 		input.parse::<Token![,]>()?;
@@ -155,20 +170,28 @@ impl Parse for StatusDefinition {
 }
 
 impl StatusDefinition {
+	/// Returns variant tokens for `StatusDefinition`.
 	fn variant_tokens(&self) -> TokenStream {
 		let name = &self.name;
 		if self.body.params.is_empty() {
-			quote!(#name)
+			quote!(
+				/// A typed diagnostic condition from the status catalog without parameters.
+				#name)
 		} else {
 			let fields = self.body.params.iter().map(|parameter| {
 				let name = &parameter.name;
 				let ty = &parameter.ty;
-				quote!(#name: #ty)
+				quote!(
+					/// The typed value of the diagnostic message parameter and the representation being passed.
+					#name: #ty)
 			});
-			quote!(#name { #(#fields),* })
+			quote!(
+				/// A typed diagnostic condition with its associated message parameters.
+				#name { #(#fields),* })
 		}
 	}
 
+	/// Matches pattern for `StatusDefinition`.
 	fn match_pattern(&self, bind: bool) -> TokenStream {
 		let name = &self.name;
 		if self.body.params.is_empty() {
@@ -181,10 +204,12 @@ impl StatusDefinition {
 		}
 	}
 
+	/// Returns definition ident for `StatusDefinition`.
 	fn definition_ident(&self) -> Ident {
 		format_ident!("__FG_STATUS_DEFINITION_{}", self.name.to_string().to_uppercase())
 	}
 
+	/// Returns definition static for `StatusDefinition`.
 	fn definition_static(&self) -> TokenStream {
 		let definition = self.definition_ident();
 		let name = self.name.to_string();
@@ -199,6 +224,7 @@ impl StatusDefinition {
 		let has_message = self.body.message.is_some();
 
 		quote! {
+			/// Shared immutable metadata for this generated status, independent of its runtime parameters.
 			static #definition: StatusDefinition = StatusDefinition {
 				name: #name,
 				code: StatusCode::new(*#code),
@@ -212,12 +238,14 @@ impl StatusDefinition {
 		}
 	}
 
+	/// Returns definition arm for `StatusDefinition`.
 	fn definition_arm(&self) -> TokenStream {
 		let pattern = self.match_pattern(false);
 		let definition = self.definition_ident();
 		quote!(#pattern => &#definition)
 	}
 
+	/// Returns message arm for `StatusDefinition`.
 	fn message_arm(&self) -> TokenStream {
 		let pattern = self.match_pattern(true);
 		let Some(message) = &self.body.message else {
@@ -235,6 +263,7 @@ impl StatusDefinition {
 		}
 	}
 
+	/// Returns parameters arm for `StatusDefinition`.
 	fn parameters_arm(&self) -> TokenStream {
 		let pattern = self.match_pattern(true);
 		let inserts = self.body.params.iter().map(|parameter| {
@@ -313,6 +342,7 @@ impl StatusDefinition {
 		}
 	}
 
+	/// Returns constructor name for `StatusDefinition`.
 	fn constructor_name(&self) -> Ident {
 		self.body
 			.constructor
@@ -320,16 +350,21 @@ impl StatusDefinition {
 			.unwrap_or_else(|| format_ident!("{}", to_snake_case(&self.name.to_string())))
 	}
 
+	/// Returns constructor parts for `StatusDefinition`.
 	fn constructor_parts(&self) -> (Vec<TokenStream>, Vec<TokenStream>) {
 		self.body.params.iter().map(StatusParameterDefinition::constructor_part).unzip()
 	}
 
+	/// Returns status constructor for `StatusDefinition`.
 	fn status_constructor(&self) -> TokenStream {
 		let method = self.constructor_name();
 		let variant = &self.name;
+		let documentation =
+			format!("Создаёт статус `{variant}` с его типизированными параметрами.");
 		let (arguments, values) = self.constructor_parts();
 		if values.is_empty() {
 			quote! {
+				#[doc = #documentation]
 				pub fn #method() -> Self {
 					Self::#variant
 				}
@@ -337,6 +372,7 @@ impl StatusDefinition {
 		} else {
 			let fields = self.body.params.iter().map(|parameter| &parameter.name);
 			quote! {
+				#[doc = #documentation]
 				pub fn #method(#(#arguments),*) -> Self {
 					Self::#variant {
 						#(#fields: #values),*
@@ -346,10 +382,15 @@ impl StatusDefinition {
 		}
 	}
 
+	/// Returns error constructor for `StatusDefinition`.
 	fn error_constructor(&self) -> TokenStream {
 		let method = self.constructor_name();
+		let status = &self.name;
+		let documentation =
+			format!("Creates an error with status `{status}` and diagnostic parameters passed.");
 		let (arguments, values) = self.constructor_parts();
 		quote! {
+			#[doc = #documentation]
 			pub fn #method(#(#arguments),*) -> Self {
 				Self::from_error_status(Status::#method(#(#values),*))
 			}
@@ -357,18 +398,29 @@ impl StatusDefinition {
 	}
 }
 
+/// Parsed classification, formatting and constructor settings for one status.
 struct StatusBody {
+	/// Selected operation or representation discriminator.
 	kind: StatusKindInput,
+	/// Rust path naming the GQL condition associated with this status.
 	condition: Path,
+	/// Declared subsystem responsible for the generated status.
 	domain: Path,
+	/// Optional text refining the status completion condition.
 	subcondition: Option<LitStr>,
+	/// Optional message template expanded with typed status parameters.
 	message: Option<LitStr>,
+	/// Declared names, types and formatters of status parameters.
 	params: Vec<StatusParameterDefinition>,
+	/// Optional catalog hint explaining how to handle the status.
 	hint: Option<LitStr>,
+	/// Optional explicit method name overriding the generated status
+	/// constructor name.
 	constructor: Option<Ident>,
 }
 
 impl Parse for StatusBody {
+	/// Parses and validates the input syntax for this type.
 	fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
 		let content;
 		syn::braced!(content in input);
@@ -453,20 +505,30 @@ impl Parse for StatusBody {
 	}
 }
 
+/// Parsed completion, notification or error classification in the status DSL.
 enum StatusKindInput {
+	/// Completion status without an error or notification classification.
 	Completion,
+	/// Notification classification and severity parsed from the status DSL.
 	Notification {
+		/// Declared client-handling classification of the generated status.
 		classification: Path,
+		/// Declared severity of the generated notification or error.
 		severity: Path,
 	},
+	/// Error classification, category and severity parsed from the status DSL.
 	Error {
+		/// Declared client-handling classification of the generated status.
 		classification: Path,
+		/// Declared semantic category of the generated error.
 		category: Path,
+		/// Declared severity of the generated notification or error.
 		severity: Path,
 	},
 }
 
 impl StatusKindInput {
+	/// Returns tokens for `StatusKindInput`.
 	fn tokens(&self) -> TokenStream {
 		match self {
 			Self::Completion => quote!(StatusKind::Completion),
@@ -495,6 +557,7 @@ impl StatusKindInput {
 }
 
 impl Parse for StatusKindInput {
+	/// Parses and validates the input syntax for this type.
 	fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
 		let name: Ident = input.parse()?;
 		match name.to_string().as_str() {
@@ -560,13 +623,18 @@ impl Parse for StatusKindInput {
 	}
 }
 
+/// Name, Rust type and formatter used to generate one status parameter.
 struct StatusParameterDefinition {
+	/// Declared name used when resolving or displaying this element.
 	name: Ident,
+	/// Rust parameter type emitted by the procedural macro.
 	ty: Type,
+	/// Formatter type selected when rendering the generated parameter.
 	formatter: Type,
 }
 
 impl Parse for StatusParameterDefinition {
+	/// Parses and validates the input syntax for this type.
 	fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
 		let name = input.parse()?;
 		input.parse::<Token![:]>()?;
@@ -582,6 +650,7 @@ impl Parse for StatusParameterDefinition {
 }
 
 impl StatusParameterDefinition {
+	/// Returns constructor part for `StatusParameterDefinition`.
 	fn constructor_part(&self) -> (TokenStream, TokenStream) {
 		let name = &self.name;
 		if is_string(&self.ty) {
@@ -598,6 +667,7 @@ impl StatusParameterDefinition {
 	}
 }
 
+/// Validates definitions for this module.
 fn validate_definitions(definitions: &[StatusDefinition]) -> syn::Result<()> {
 	let mut names = HashSet::new();
 	let mut codes = HashSet::new();
@@ -623,6 +693,7 @@ fn validate_definitions(definitions: &[StatusDefinition]) -> syn::Result<()> {
 	Ok(())
 }
 
+/// Validates code for this module.
 fn validate_code(code_literal: &LitStr, code: &str) -> syn::Result<()> {
 	let Some(body) = code.strip_prefix("FG-") else {
 		return Err(syn::Error::new_spanned(code_literal, "status code must start with FG-"));
@@ -638,6 +709,7 @@ fn validate_code(code_literal: &LitStr, code: &str) -> syn::Result<()> {
 	Ok(())
 }
 
+/// Validates condition for this module.
 fn validate_condition(definition: &StatusDefinition, code: &str) -> syn::Result<()> {
 	let body = &code[3..];
 	let class = &body[..2];
@@ -671,6 +743,7 @@ fn validate_condition(definition: &StatusDefinition, code: &str) -> syn::Result<
 	Ok(())
 }
 
+/// Validates kind for this module.
 fn validate_kind(definition: &StatusDefinition) -> syn::Result<()> {
 	let condition = last_path_ident(&definition.body.condition);
 	match &definition.body.kind {
@@ -723,6 +796,7 @@ fn validate_kind(definition: &StatusDefinition) -> syn::Result<()> {
 	Ok(())
 }
 
+/// Validates message for this module.
 fn validate_message(definition: &StatusDefinition) -> syn::Result<()> {
 	let Some(message) = &definition.body.message else {
 		return Ok(());
@@ -738,6 +812,8 @@ fn validate_message(definition: &StatusDefinition) -> syn::Result<()> {
 	let mut used = HashSet::new();
 	let mut index = 0;
 
+	// Braces are ASCII boundaries, so slicing just after one remains valid in
+	// UTF-8 messages.
 	while index < bytes.len() {
 		match bytes[index] {
 			b'{' if bytes.get(index + 1) == Some(&b'{') => index += 2,
@@ -779,14 +855,17 @@ fn validate_message(definition: &StatusDefinition) -> syn::Result<()> {
 	}
 	Ok(())
 }
+/// Returns option lit for this module.
 fn option_lit(value: &Option<LitStr>) -> TokenStream {
 	value.as_ref().map(|literal| quote!(Some(#literal))).unwrap_or_else(|| quote!(None))
 }
 
+/// Returns last path ident for this module.
 fn last_path_ident(path: &Path) -> String {
 	path.segments.last().expect("syn paths are non-empty").ident.to_string()
 }
 
+/// Reports whether the value is string for this module.
 fn is_string(ty: &Type) -> bool {
 	let Type::Path(path) = ty else {
 		return false;
@@ -794,6 +873,7 @@ fn is_string(ty: &Type) -> bool {
 	path.path.segments.last().is_some_and(|segment| segment.ident == "String")
 }
 
+/// Reports whether the value is vec string for this module.
 fn is_vec_string(ty: &Type) -> bool {
 	let Type::Path(path) = ty else {
 		return false;
@@ -813,6 +893,7 @@ fn is_vec_string(ty: &Type) -> bool {
 		)
 }
 
+/// Converts to snake case for this module.
 fn to_snake_case(value: &str) -> String {
 	let characters = value.chars().collect::<Vec<_>>();
 	let mut output = String::new();
@@ -834,17 +915,20 @@ fn to_snake_case(value: &str) -> String {
 	output
 }
 
+/// Returns define status codes for this module.
 pub fn define_status_codes(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
 	let parsed = syn::parse_macro_input!(item as StatusInput);
 	quote!(#parsed).into()
 }
 
 #[cfg(test)]
+/// Regression tests for status codes behavior.
 mod tests {
 	use quote::quote;
 
 	use super::*;
 
+	/// Verifies accepts named parameter used more than once.
 	#[test]
 	fn accepts_named_parameter_used_more_than_once() {
 		let input = quote! {
@@ -865,6 +949,7 @@ mod tests {
 		assert!(syn::parse2::<StatusInput>(input).is_ok());
 	}
 
+	/// Verifies rejects duplicate codes.
 	#[test]
 	fn rejects_duplicate_codes() {
 		let input = quote! {
@@ -890,6 +975,7 @@ mod tests {
 		assert!(syn::parse2::<StatusInput>(input).is_err());
 	}
 
+	/// Verifies rejects condition mismatched with code class.
 	#[test]
 	fn rejects_condition_mismatched_with_code_class() {
 		let input = quote! {
@@ -906,6 +992,7 @@ mod tests {
 		assert!(syn::parse2::<StatusInput>(input).is_err());
 	}
 
+	/// Verifies rejects unknown message parameter.
 	#[test]
 	fn rejects_unknown_message_parameter() {
 		let input = quote! {
@@ -926,6 +1013,7 @@ mod tests {
 		assert!(syn::parse2::<StatusInput>(input).is_err());
 	}
 
+	/// Verifies rejects unused message parameter.
 	#[test]
 	fn rejects_unused_message_parameter() {
 		let input = quote! {

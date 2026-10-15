@@ -65,6 +65,7 @@ impl ClockPro {
 	pub(super) fn new(capacity: NonZeroUsize) -> Self {
 		let capacity = capacity.get();
 		let stats = BufferPoolStats {
+			#[cfg(test)]
 			page_buffer_allocations: capacity,
 			..BufferPoolStats::default()
 		};

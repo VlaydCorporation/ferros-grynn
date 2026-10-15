@@ -13,12 +13,12 @@ mod buffer_pool;
 mod catalog;
 /// Checked changefeed group framing; publication is owned by the local store.
 mod changefeed;
-pub(crate) use changefeed::{ChangefeedGroupInfo, ChangefeedSegments};
+pub use changefeed::{ChangefeedGroupInfo, ChangefeedSegments};
 pub use history_codec::pages::{HistoryOwner, HistorySegment};
 mod consts;
 mod database_superblock;
 mod derived_index;
-pub(crate) use derived_index::{GraphArtifactIdentity, SectionKind as DerivedSectionKind};
+pub use derived_index::{GraphArtifactIdentity, SectionKind as DerivedSectionKind};
 mod direct_io;
 mod edge_endpoint_index;
 /// Durable accepted EVENT contexts and immutable function source versions.
@@ -27,7 +27,7 @@ mod file_registry;
 mod fulltext_index;
 mod fulltext_index_delta;
 mod geometry_index;
-pub(crate) use geometry_index::{
+pub use geometry_index::{
 	GeometryCandidates,
 	ResidentGeometryIndex,
 	build_resident_geometry_indexes,
@@ -42,7 +42,7 @@ mod image_io;
 mod immutable_stream;
 mod job_catalog;
 mod neighbourhood_index;
-pub(crate) use neighbourhood_index::{NeighbourhoodHeader, NeighbourhoodLayout, NeighbourhoodTag};
+pub use neighbourhood_index::{NeighbourhoodHeader, NeighbourhoodLayout, NeighbourhoodTag};
 mod tensor_index;
 pub use tensor_index::{TensorCacheHeader, TensorCacheLayout, TensorCacheTag};
 pub(crate) mod live_descriptor;
@@ -61,7 +61,7 @@ mod page;
 	clippy::redundant_pub_crate,
 	reason = "The internal artifact binding reports page-aligned encoded bytes"
 )]
-pub(super) use page::PAGE_SIZE;
+pub use page::PAGE_SIZE;
 mod page_cache;
 mod page_io;
 mod path_index;
@@ -70,15 +70,15 @@ mod property_dictionary;
 mod property_page;
 mod quarantine;
 mod reachability_index;
-pub(crate) use reachability_index::{ReachabilityHeader, ReachabilityLayout, ReachabilityTag};
+pub use reachability_index::{ReachabilityHeader, ReachabilityLayout, ReachabilityTag};
 mod scoped_index_image;
 mod types;
 mod vector_index;
 mod wal;
 
 use direct_io as direct;
-pub(crate) use fulltext_index_delta::FulltextDeltaRecord;
-pub(crate) use local_store::{
+pub use fulltext_index_delta::FulltextDeltaRecord;
+pub use local_store::{
 	LocalChangefeedSnapshot,
 	LocalQuerySnapshot,
 	LocalStore,
@@ -92,11 +92,12 @@ pub(crate) use local_store::{
 	PhysicalTraversalRead,
 };
 pub use page_io::PageIoMode;
-pub(crate) use quarantine::{QuarantineArchiveReader, QuarantineArtifact, QuarantineWriter};
-pub(crate) use vector_index::VectorSearchHit;
+pub use quarantine::{QuarantineArchiveReader, QuarantineArtifact, QuarantineWriter};
+pub use vector_index::VectorSearchHit;
 #[cfg(test)]
-pub(crate) use wal::{CommitFailureGuard, CommitFailurePoint};
+pub use wal::{CommitFailureGuard, CommitFailurePoint};
 
+/// Feature-gated access used by isolated storage-engine measurements.
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
 pub mod prototype_api {
@@ -115,8 +116,8 @@ pub mod prototype_api {
 	}
 
 	/// Builds a prototype storage error while retaining its native source.
-	pub fn storage_io_failure_with_source<E>(
-		operation: impl Into<String>,
+	pub fn storage_io_failure_with_source<E, OperationArg: Into<String>>(
+		operation: OperationArg,
 		source: E,
 	) -> crate::gql_status::FerrosGrynnError
 	where
@@ -126,6 +127,7 @@ pub mod prototype_api {
 			.with_technical_source(source)
 	}
 
+	/// Page-buffer experiments used by the storage prototype feature.
 	pub mod buffer_pool {
 		pub use super::super::{
 			buffer_pool::{BufferPool, PageGuard},
@@ -133,10 +135,14 @@ pub mod prototype_api {
 		};
 	}
 
+	/// Platform Direct I/O access with explicit alignment and file-operation
+	/// contracts.
 	pub mod direct {
 		pub use super::super::direct_io::{DirectFile, DirectFileOpenMode};
 	}
 
+	/// Hybrid graph reads combining resident data and the local storage
+	/// backend.
 	pub mod hybrid {
 		#[cfg(all(windows, feature = "native-async-io"))]
 		pub use super::super::hybrid_engine::SparseReadBatch;
@@ -168,6 +174,7 @@ pub mod prototype_api {
 		pub use super::super::hybrid_engine::{ScatterPrefetchCursor, ValidatedScatterExtent};
 	}
 
+	/// Aligned pages, format headers, checksums and page-level validation.
 	pub mod page {
 		pub use super::super::page::{
 			AlignedPage,
@@ -182,12 +189,16 @@ pub mod prototype_api {
 		};
 	}
 
+	/// Page-oriented I/O operations over aligned storage buffers.
 	pub mod page_io {
-		pub use super::super::page_io::{FilePageExtent, PageIoMode};
+		#[cfg(all(windows, feature = "native-async-io"))]
+		pub use super::super::page_io::FilePageExtent;
+		pub use super::super::page_io::PageIoMode;
 		#[cfg(all(windows, feature = "native-async-io"))]
 		pub use super::super::page_io::{FrameRead, IoRingSubmissionStats, WindowsIoRing};
 	}
 
+	/// Identifiers, locations and metadata shared by storage components.
 	pub mod types {
 		pub use super::super::types::{
 			CheckpointGeneration,
@@ -199,7 +210,7 @@ pub mod prototype_api {
 		pub use crate::graph::GraphId;
 	}
 }
-pub(crate) use graph_index::{
+pub use graph_index::{
 	ExternalIndexSorter,
 	SortedIndexRecords,
 	check_external_sort_cancelled,
@@ -210,12 +221,12 @@ pub(crate) use graph_index::{
 };
 
 /// Returns the canonical number of global atom hot pages for one slot ceiling.
-pub(crate) const fn atom_hot_page_count(slot_capacity: usize) -> usize {
+pub const fn atom_hot_page_count(slot_capacity: usize) -> usize {
 	slot_capacity.div_ceil(atom_page::ATOM_SLOTS_PER_PAGE as usize)
 }
 
 /// Returns the canonical number of graph-local node and edge hot pages.
-pub(crate) const fn graph_hot_page_count(node_capacity: usize, edge_capacity: usize) -> usize {
+pub const fn graph_hot_page_count(node_capacity: usize, edge_capacity: usize) -> usize {
 	node_capacity
 		.div_ceil(graph_pages::HOT_SLOTS_PER_PAGE)
 		.saturating_add(edge_capacity.div_ceil(graph_pages::HOT_SLOTS_PER_PAGE))

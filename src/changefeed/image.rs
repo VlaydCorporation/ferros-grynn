@@ -12,9 +12,15 @@ use crate::{
 #[non_exhaustive]
 pub enum ChangeIdentity {
 	/// A database-global class record.
-	Record(AtomRef),
+	Record(
+		/// A database-global class record.
+		AtomRef,
+	),
 	/// A qualified occurrence in a catalog graph.
-	Occurrence(AtomOccurrenceRef),
+	Occurrence(
+		/// A qualified occurrence in a catalog graph.
+		AtomOccurrenceRef,
+	),
 }
 
 /// Explicit property decision; absent keys inherit their base value.
@@ -22,7 +28,10 @@ pub enum ChangeIdentity {
 #[non_exhaustive]
 pub enum ChangeOverlay {
 	/// An explicit graph-local replacement.
-	Value(crate::values::Value),
+	Value(
+		/// An explicit graph-local replacement.
+		crate::values::Value,
+	),
 	/// An explicit suppression of the base value.
 	Hidden,
 }

@@ -183,6 +183,7 @@ impl AtomStoreSuperblock {
 
 	/// Compares transaction-visible metadata while ignoring the WAL-assigned
 	/// page-frame LSN.
+	#[cfg(test)]
 	pub(super) fn same_logical_metadata(self, other: Self) -> bool {
 		Self {
 			page_lsn: PageLsn::ZERO,
@@ -251,9 +252,11 @@ fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for atom store superblock behavior.
 mod tests {
 	use super::*;
 
+	/// Builds the fixture fixture used by nearby scenarios.
 	fn fixture() -> AtomStoreSuperblock {
 		AtomStoreSuperblock {
 			page_lsn: PageLsn::new(11),
@@ -269,10 +272,13 @@ mod tests {
 		}
 	}
 
+	/// Verifies exact offsets round trip and preserve logical lsn.
 	#[test]
-	fn exact_offsets_round_trip_and_preserve_logical_lsn() -> FerrosGrynnResult<()> {
+	fn exact_offsets_round_trip_and_preserve_logical_lsn() {
+		use crate::test_assertions::AssertResult as _;
+
 		let value = fixture();
-		let page = value.encode()?;
+		let page = value.encode().assert_ok();
 		let bytes = page.as_bytes();
 		assert_eq!(read_u64(bytes, DATA_SPACE_OFFSET), 0);
 		assert_eq!(read_u32(bytes, FORMAT_VERSION_OFFSET), 1);
@@ -286,18 +292,21 @@ mod tests {
 		assert_eq!(read_u64(bytes, ATOMS_HOT_PAGES_OFFSET), 2);
 		assert_eq!(read_u64(bytes, PROPERTIES_PAGES_OFFSET), 4);
 		assert_eq!(read_u64(bytes, PROPERTY_DICTIONARY_PAGES_OFFSET), 3);
-		assert_eq!(AtomStoreSuperblock::decode(&page)?, value);
-		let checkpointed =
-			value.at_checkpoint(CheckpointGeneration::new(4), Lsn::new(23), Lsn::new(25))?;
+		assert_eq!(AtomStoreSuperblock::decode(&page).assert_ok(), value);
+		let checkpointed = value
+			.at_checkpoint(CheckpointGeneration::new(4), Lsn::new(23), Lsn::new(25))
+			.assert_ok();
 		assert_eq!(checkpointed.page_lsn, value.page_lsn);
-		Ok(())
 	}
 
+	/// Verifies rejects wrong header version reserved checksum and legacy graph
+	/// page.
 	#[test]
-	fn rejects_wrong_header_version_reserved_checksum_and_legacy_graph_page()
-	-> FerrosGrynnResult<()> {
+	fn rejects_wrong_header_version_reserved_checksum_and_legacy_graph_page() {
+		use crate::test_assertions::AssertResult as _;
+
 		let value = fixture();
-		let mut wrong_flags = value.encode()?;
+		let mut wrong_flags = value.encode().assert_ok();
 		wrong_flags.reset(
 			PageType::AtomStoreSuperblock,
 			PageFlags::DIRTY,
@@ -306,17 +315,17 @@ mod tests {
 		);
 		assert!(AtomStoreSuperblock::decode(&wrong_flags).is_err());
 
-		let mut wrong_version = value.encode()?;
+		let mut wrong_version = value.encode().assert_ok();
 		write_u32(wrong_version.as_bytes_mut(), FORMAT_VERSION_OFFSET, 2);
-		wrong_version.seal()?;
+		wrong_version.seal().assert_ok();
 		assert!(AtomStoreSuperblock::decode(&wrong_version).is_err());
 
-		let mut reserved = value.encode()?;
+		let mut reserved = value.encode().assert_ok();
 		reserved.as_bytes_mut()[RESERVED_OFFSET] = 1;
-		reserved.seal()?;
+		reserved.seal().assert_ok();
 		assert!(AtomStoreSuperblock::decode(&reserved).is_err());
 
-		let mut checksum = value.encode()?;
+		let mut checksum = value.encode().assert_ok();
 		checksum.as_bytes_mut()[NODE_COUNT_OFFSET] ^= 1;
 		assert!(AtomStoreSuperblock::decode(&checksum).is_err());
 
@@ -327,9 +336,9 @@ mod tests {
 			SUPERBLOCK_PAGE_NO,
 		);
 		assert!(AtomStoreSuperblock::decode(&graph).is_err());
-		Ok(())
 	}
 
+	/// Verifies rejects invalid counts ceilings and checkpoint tuple.
 	#[test]
 	fn rejects_invalid_counts_ceilings_and_checkpoint_tuple() {
 		let mut value = fixture();

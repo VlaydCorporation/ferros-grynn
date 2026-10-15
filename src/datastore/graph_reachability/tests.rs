@@ -1,6 +1,8 @@
 //! All-pairs soundness, exact refinement and byte-budget algorithm selection.
 
 use super::*;
+#[cfg(test)]
+use crate::test_assertions::{AssertOption as _, AssertResult as _};
 use crate::{
 	datastore::{ClassIndexState, ClassSchema, Datastore, GraphIndex, GraphIndexDefinition},
 	graph::{
@@ -14,20 +16,22 @@ use crate::{
 	values::{Object, PropertyMap, RecordId},
 };
 
+/// Verifies reachability publication private invalidation abort and old
+/// snapshots.
 #[test]
 fn reachability_publication_private_invalidation_abort_and_old_snapshots() {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = tx.define_graph("network", GraphKind::Graph).unwrap();
+	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = tx.define_graph("network", GraphKind::Graph).assert_ok();
 	let records =
-		["person:a", "person:b", "link:ab"].map(|record| record.parse::<RecordId>().unwrap());
+		["person:a", "person:b", "link:ab"].map(|record| record.parse::<RecordId>().assert_ok());
 	for record in &records {
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 	}
-	let a = tx.attach_node(graph.id(), &records[0], None, None).unwrap();
-	let b = tx.attach_node(graph.id(), &records[1], None, None).unwrap();
+	let a = tx.attach_node(graph.id(), &records[0], None, None).assert_ok();
+	let b = tx.attach_node(graph.id(), &records[1], None, None).assert_ok();
 	tx.attach_edge(
 		graph.id(),
 		&records[2],
@@ -36,7 +40,7 @@ fn reachability_publication_private_invalidation_abort_and_old_snapshots() {
 		None,
 		None,
 	)
-	.unwrap();
+	.assert_ok();
 	let id = tx
 		.define_graph_index(
 			"network",
@@ -47,55 +51,58 @@ fn reachability_publication_private_invalidation_abort_and_old_snapshots() {
 				},
 				Some(1 << 20),
 			)
-			.unwrap(),
+			.assert_ok(),
 		)
-		.unwrap();
-	tx.commit().unwrap();
+		.assert_ok();
+	tx.commit().assert_ok();
 	let before_build = store.inner.current_root();
 	assert_eq!(
-		before_build.schema.graph(graph.id()).unwrap().indexes().next().unwrap().state(),
+		before_build.schema.graph(graph.id()).assert_some().indexes().next().assert_some().state(),
 		ClassIndexState::Stale
 	);
-	let result = store.execute("REBUILD INDEX reach ON GRAPH network;", &Object::new()).unwrap();
+	let result = store.execute("REBUILD INDEX reach ON GRAPH network;", &Object::new()).assert_ok();
 	assert!(result[0].result.is_ok(), "{:?}", result[0].result);
 	let ready = store.inner.current_root();
-	let artifact = ready.reachability_artifacts.get(&id).unwrap();
+	let artifact = ready.reachability_artifacts.get(&id).assert_some();
 	let source = artifact.node_components[a.slot() as usize] as usize;
 	let target = artifact.node_components[b.slot() as usize] as usize;
 	assert!(
 		artifact
 			.labels
 			.reachable(&artifact.condensation, source, target, 100, 8192, &mut || Ok(()))
-			.unwrap()
+			.assert_ok()
 			.reachable
 	);
 	assert!(before_build.reachability_artifacts.is_empty());
 	let mut old = store.begin();
 	let mut abort = store.begin();
-	abort.set_occurrence_label(graph.id(), &records[2], Some("drop".into())).unwrap();
+	abort.set_occurrence_label(graph.id(), &records[2], Some("drop".into())).assert_ok();
 	assert_eq!(
-		abort.graphs().unwrap()[0].indexes().next().unwrap().state(),
+		abort.graphs().assert_ok()[0].indexes().next().assert_some().state(),
 		ClassIndexState::Stale
 	);
 	drop(abort);
 	assert_eq!(
-		store.begin().graphs().unwrap()[0].indexes().next().unwrap().state(),
+		store.begin().graphs().assert_ok()[0].indexes().next().assert_some().state(),
 		ClassIndexState::Ready
 	);
 	let mut changed = store.begin();
-	changed.detach_occurrence(graph.id(), &records[2], false).unwrap();
+	changed.detach_occurrence(graph.id(), &records[2], false).assert_ok();
 	assert_eq!(
-		changed.graphs().unwrap()[0].indexes().next().unwrap().state(),
+		changed.graphs().assert_ok()[0].indexes().next().assert_some().state(),
 		ClassIndexState::Stale
 	);
-	changed.commit().unwrap();
+	changed.commit().assert_ok();
 	assert!(store.inner.current_root().reachability_artifacts.is_empty());
-	assert_eq!(old.graphs().unwrap()[0].indexes().next().unwrap().state(), ClassIndexState::Ready);
+	assert_eq!(
+		old.graphs().assert_ok()[0].indexes().next().assert_some().state(),
+		ClassIndexState::Ready
+	);
 	assert!(
 		artifact
 			.labels
 			.reachable(&artifact.condensation, source, target, 100, 8192, &mut || Ok(()))
-			.unwrap()
+			.assert_ok()
 			.reachable
 	);
 }
@@ -117,19 +124,19 @@ fn relation(
 		|atom| Ok(atom.raw()),
 		&mut || Ok(()),
 	)
-	.unwrap()
+	.assert_ok()
 	.condensation(8 << 20, &mut || Ok(()))
-	.unwrap()
+	.assert_ok()
 }
 
 /// Independent transitive closure of the emitted component relation.
 fn oracle(dag: &ProjectedCondensation) -> Vec<Vec<bool>> {
 	let count = dag.representatives.len();
 	let mut result = vec![vec![false; count]; count];
-	for source in 0..count {
-		result[source][source] = true;
+	for (source, row) in result.iter_mut().enumerate() {
+		row[source] = true;
 		for target in dag.forward.neighbours(source) {
-			result[source][target] = true;
+			row[target] = true;
 		}
 	}
 	for middle in 0..count {
@@ -152,6 +159,8 @@ fn limits(pages: u64) -> ReachabilityBuildLimits {
 	}
 }
 
+/// Verifies five algorithms and refinement match all pairs for projected
+/// graphs.
 #[test]
 fn five_algorithms_and_refinement_match_all_pairs_for_projected_graphs() {
 	let vertices = (0..8)
@@ -165,7 +174,7 @@ fn five_algorithms_and_refinement_match_all_pairs_for_projected_graphs() {
 				slot / 2,
 				1,
 			)
-			.unwrap()
+			.assert_ok()
 		})
 		.collect::<Vec<_>>();
 	let algorithms = [
@@ -214,12 +223,12 @@ fn five_algorithms_and_refinement_match_all_pairs_for_projected_graphs() {
 						limits(1024),
 						&mut || Ok(()),
 					)
-					.unwrap();
-					for source in 0..expected.len() {
-						for target in 0..expected.len() {
-							match labels.decision(source, target).unwrap() {
+					.assert_ok();
+					for (source, row) in expected.iter().enumerate() {
+						for (target, &expected_reachable) in row.iter().enumerate() {
+							match labels.decision(source, target).assert_ok() {
 								ReachabilityDecision::Yes => {
-									assert!(expected[source][target]);
+									assert!(expected_reachable);
 									if matches!(
 										algorithm,
 										ReachabilityAlgorithm::Grail(_)
@@ -228,14 +237,14 @@ fn five_algorithms_and_refinement_match_all_pairs_for_projected_graphs() {
 										assert_eq!(source, target);
 									}
 								}
-								ReachabilityDecision::No => assert!(!expected[source][target]),
+								ReachabilityDecision::No => assert!(!expected_reachable),
 								ReachabilityDecision::Maybe => maybe_count += 1,
 							}
 							let actual = labels
 								.reachable(&dag, source, target, 10_000, 8 << 20, &mut || Ok(()))
-								.unwrap();
+								.assert_ok();
 							assert_eq!(
-								actual.reachable, expected[source][target],
+								actual.reachable, expected_reachable,
 								"seed {seed}, {mode:?}, {direction:?}, {algorithm:?}"
 							);
 						}
@@ -248,6 +257,8 @@ fn five_algorithms_and_refinement_match_all_pairs_for_projected_graphs() {
 	assert!(maybe_count > 0);
 }
 
+/// Verifies tree cover is exact for both orientations both mode and both
+/// direction.
 #[test]
 fn tree_cover_is_exact_for_both_orientations_both_mode_and_both_direction() {
 	let vertices = (0..9)
@@ -261,7 +272,7 @@ fn tree_cover_is_exact_for_both_orientations_both_mode_and_both_direction() {
 				slot,
 				1,
 			)
-			.unwrap()
+			.assert_ok()
 		})
 		.collect::<Vec<_>>();
 	for reversed in [false, true] {
@@ -292,13 +303,13 @@ fn tree_cover_is_exact_for_both_orientations_both_mode_and_both_direction() {
 						limits(1024),
 						&mut || Ok(()),
 					)
-					.unwrap();
-					for source in 0..expected.len() {
-						for target in 0..expected.len() {
+					.assert_ok();
+					for (source, row) in expected.iter().enumerate() {
+						for (target, &expected_reachable) in row.iter().enumerate() {
 							assert_eq!(
-								labels.decision(source, target).unwrap()
+								labels.decision(source, target).assert_ok()
 									== ReachabilityDecision::Yes,
-								expected[source][target],
+								expected_reachable,
 								"reversed {reversed}, {mode:?}, {direction:?}, {family:?}, \
 								 {source}->{target}: {labels:?}"
 							);
@@ -320,12 +331,14 @@ fn tree_cover_is_exact_for_both_orientations_both_mode_and_both_direction() {
 	}
 }
 
+/// Verifies auto selects only fitting full page layouts and explicit budgets
+/// fail.
 #[test]
 fn auto_selects_only_fitting_full_page_layouts_and_explicit_budgets_fail() {
 	let vertices = (0..100)
-		.map(|slot| AtomId::from_parts(AtomKind::Node, slot, 1).unwrap())
+		.map(|slot| AtomId::from_parts(AtomKind::Node, slot, 1).assert_ok())
 		.collect::<Vec<_>>();
-	let edge = AtomId::from_parts(AtomKind::Edge, 0, 1).unwrap();
+	let edge = AtomId::from_parts(AtomKind::Edge, 0, 1).assert_ok();
 	let topologies = (1..100)
 		.map(|target| (edge, EdgeTopology::directed([vertices[0]], [vertices[target]])))
 		.collect::<Vec<_>>();
@@ -339,7 +352,7 @@ fn auto_selects_only_fitting_full_page_layouts_and_explicit_budgets_fail() {
 			limits(7),
 			&mut || Ok(())
 		)
-		.unwrap(),
+		.assert_ok(),
 		ReachabilityLabels::ChainCover { .. }
 	));
 	assert!(matches!(
@@ -350,7 +363,7 @@ fn auto_selects_only_fitting_full_page_layouts_and_explicit_budgets_fail() {
 			limits(3),
 			&mut || Ok(())
 		)
-		.unwrap(),
+		.assert_ok(),
 		ReachabilityLabels::Ferrari { .. }
 	));
 	assert!(matches!(
@@ -361,7 +374,7 @@ fn auto_selects_only_fitting_full_page_layouts_and_explicit_budgets_fail() {
 			limits(2),
 			&mut || Ok(())
 		)
-		.unwrap(),
+		.assert_ok(),
 		ReachabilityLabels::Bfl { .. }
 	));
 	assert!(matches!(
@@ -372,7 +385,7 @@ fn auto_selects_only_fitting_full_page_layouts_and_explicit_budgets_fail() {
 			limits(1),
 			&mut || Ok(())
 		)
-		.unwrap(),
+		.assert_ok(),
 		ReachabilityLabels::OnDemand { .. }
 	));
 	for algorithm in [
@@ -416,7 +429,7 @@ fn auto_selects_only_fitting_full_page_layouts_and_explicit_budgets_fail() {
 		limits(1024),
 		&mut || Ok(()),
 	)
-	.unwrap();
+	.assert_ok();
 	assert!(labels.reachable(&dag, 0, 1, 0, 8 << 20, &mut || Ok(())).is_err());
 	assert!(labels.reachable(&dag, 0, 1, 1000, 1, &mut || Ok(())).is_err());
 }

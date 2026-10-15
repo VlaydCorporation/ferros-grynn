@@ -10,9 +10,15 @@ use crate::gql_status::{FerrosGrynnResult, TextSpan};
 #[non_exhaustive]
 pub enum EventOwnerName {
 	/// Database-global class namespace.
-	Class(Identifier),
+	Class(
+		/// Database-global class namespace.
+		Identifier,
+	),
 	/// Graph occurrence namespace.
-	Graph(Identifier),
+	Graph(
+		/// Graph occurrence namespace.
+		Identifier,
+	),
 }
 
 /// Bounded asynchronous execution syntax, independent of runtime policy types.
@@ -30,9 +36,15 @@ pub struct EventAsyncName {
 #[non_exhaustive]
 pub enum EventBody {
 	/// One expression, evaluated through the common expression kernel.
-	Expression(Expr),
+	Expression(
+		/// One expression, evaluated through the common expression kernel.
+		Expr,
+	),
 	/// A lexical block with ordinary control flow.
-	Block(Block),
+	Block(
+		/// A lexical block with ordinary control flow.
+		Block,
+	),
 	/// Ordered expression list accepted by ALTER EVENT THEN.
 	Expressions {
 		/// Expressions evaluated in declaration order.
@@ -79,19 +91,31 @@ pub struct DefineEventStatement {
 #[non_exhaustive]
 pub enum EventAlterAction {
 	/// Enables durable asynchronous execution with a checked policy.
-	Async(EventAsyncName),
+	Async(
+		/// Enables durable asynchronous execution with a checked policy.
+		EventAsyncName,
+	),
 	/// Restores synchronous execution.
 	Sync,
 	/// Replaces the predicate source.
-	When(Expr),
+	When(
+		/// Replaces the predicate source.
+		Expr,
+	),
 	/// Removes the predicate; every logical change matches.
 	DropWhen,
 	/// Replaces the handler source.
-	Then(EventBody),
+	Then(
+		/// Replaces the handler source.
+		EventBody,
+	),
 	/// Removes the handler; its body becomes the ordinary none expression.
 	DropThen,
 	/// Sets a durable comment.
-	Comment(Box<str>),
+	Comment(
+		/// Sets a durable comment.
+		Box<str>,
+	),
 	/// Removes the durable comment.
 	DropComment,
 }
@@ -245,22 +269,30 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
+/// Regression tests for event behavior.
 mod tests {
 	use super::*;
 	use crate::syn::{ParserSettings, StatementKind, parse};
 
+	/// Verifies event parser accepts unicode names and policy boundaries.
 	#[test]
-	fn event_parser_accepts_unicode_names_and_policy_boundaries() -> FerrosGrynnResult<()> {
+	fn event_parser_accepts_unicode_names_and_policy_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
 		let program = parse(
 			"DEFINE EVENT `проверка` ON CLASS item ASYNC RETRY 255 MAXDEPTH 0 WHEN $event = \
 			 'CREATE' THEN { RETURN $after; }; ALTER EVENT `проверка` ON CLASS item DROP ASYNC \
 			 WHEN true THEN 1 COMMENT 'ok'; REMOVE EVENT IF EXISTS `проверка` ON CLASS item;",
 			ParserSettings::default(),
-		)?;
+		)
+		.assert_ok();
 		let StatementKind::DefineEvent(event) = &program.statements[0].kind else {
-			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-				"fixture EVENT syntax",
-			));
+			return {
+				let test_result: FerrosGrynnResult<()> = Err(
+					crate::gql_status::FerrosGrynnError::invalid_argument("fixture EVENT syntax"),
+				);
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(event.name.value.as_ref(), "проверка");
 		assert_eq!(
@@ -268,9 +300,9 @@ mod tests {
 			Some((255, 0))
 		);
 		assert!(matches!(event.then, EventBody::Block(_)));
-		Ok(())
 	}
 
+	/// Verifies event parser rejects invalid policy and missing body.
 	#[test]
 	fn event_parser_rejects_invalid_policy_and_missing_body() {
 		for source in [

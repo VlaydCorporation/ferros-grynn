@@ -295,18 +295,13 @@
     "semantic_hash": "9378bd03d56baaf78bd738ab3848f142"
   },
   "AGENTS.md": {
-    "mtime": 1791150483.3727446,
-    "ast_hash": "b82c92e852aa627fab92c08cd230c29f",
+    "mtime": 1791979877.453372,
+    "ast_hash": "6d5e88a7023c751d233c72f7f84974c0",
     "semantic_hash": ""
   },
-  "CLAUDE.md": {
-    "mtime": 1783818129.8961525,
-    "ast_hash": "200f13a851461eb4c15cdf03950c2c27",
-    "semantic_hash": "200f13a851461eb4c15cdf03950c2c27"
-  },
   "README.md": {
-    "mtime": 1791977063.5207589,
-    "ast_hash": "2902b5f13c22ba75097d1e0860e50882",
+    "mtime": 1791979593.0119882,
+    "ast_hash": "744690a98a994b6ade320780d35dc888",
     "semantic_hash": ""
   },
   "docs/disk_storage_spec.md": {
@@ -661,7 +656,7 @@
   },
   "crates/surrealdb/context7.json": {
     "mtime": 1784933295.4041705,
-    "ast_hash": "",
+    "ast_hash": "67acd68a0832e1dd3b2293bc711ba6d6",
     "semantic_hash": ""
   },
   "crates/surrealdb/fuzz/fuzz_targets/fuzz_executor.rs": {
@@ -8886,7 +8881,7 @@
   },
   "crates/surrealdb/surrealism/demo/fs/data/config.json": {
     "mtime": 1784933296.1412716,
-    "ast_hash": "",
+    "ast_hash": "d2f8f66a9197c873c9d19c49dc4a40bf",
     "semantic_hash": ""
   },
   "crates/surrealdb/surrealism/demo/src/lib.rs": {
@@ -14055,8 +14050,8 @@
     "semantic_hash": ""
   },
   "scripts/coverage.ps1": {
-    "mtime": 1791977299.7497883,
-    "ast_hash": "c67523e197cdadad388ce8b0c6926916",
+    "mtime": 1791979387.9831996,
+    "ast_hash": "5d77042342d18f596ad2665cc3df3910",
     "semantic_hash": ""
   },
   "scripts/install-hooks.ps1": {
@@ -14075,13 +14070,13 @@
     "semantic_hash": ""
   },
   ".github/workflows/build.yml": {
-    "mtime": 1791975872.108902,
-    "ast_hash": "74b0caf384aea7bd385a75ebb234ec95",
+    "mtime": 1791979487.118692,
+    "ast_hash": "2b3834e9a9aaeded42f314d24e9c24cd",
     "semantic_hash": ""
   },
   ".github/workflows/coverage.yml": {
-    "mtime": 1791975872.7618,
-    "ast_hash": "2ac9a72cd08860323f49289c9a0e266e",
+    "mtime": 1791979487.6182208,
+    "ast_hash": "ffd965417236fee5e309f885dc8d47a6",
     "semantic_hash": ""
   },
   "CLA.md": {
@@ -14090,23 +14085,23 @@
     "semantic_hash": ""
   },
   "CONTRIBUTING.md": {
-    "mtime": 1791976704.7203312,
-    "ast_hash": "f22e538f928da4ebb536c7dbb8315334",
+    "mtime": 1791980937.2573032,
+    "ast_hash": "d43b6f992a0980b6adcd7764163c33eb",
     "semantic_hash": ""
   },
   "CONTRIBUTING.ru.md": {
-    "mtime": 1791976705.2732112,
-    "ast_hash": "62e1336a5ba64a157007b0c627616150",
+    "mtime": 1791980937.9195056,
+    "ast_hash": "edd34590d99205c256e953d92bc41e58",
     "semantic_hash": ""
   },
   "README.ru.md": {
-    "mtime": 1791977091.7370484,
-    "ast_hash": "4d38c16f2bca118c6e070f8fea31fdd1",
+    "mtime": 1791979593.6103728,
+    "ast_hash": "c760962e068f7c4a5097a76e1360f9df",
     "semantic_hash": ""
   },
   "img/branding/README.md": {
-    "mtime": 1791938107.6589532,
-    "ast_hash": "601305f03ebbecbf4b85cf4f85a392e2",
+    "mtime": 1791988635.708,
+    "ast_hash": "36016d078f79d2f00091940f579bba2c",
     "semantic_hash": ""
   },
   "img/branding/sources/imagegen-prompts.md": {
@@ -14377,6 +14372,16 @@
   "img/readme/logo-horizontal-dark.svg": {
     "mtime": 1791976899.4997146,
     "ast_hash": "e23bf9f20f3288613a3bb776a825b944",
+    "semantic_hash": ""
+  },
+  ".githooks/post-checkout": {
+    "mtime": 1786300373.1570053,
+    "ast_hash": "a214b67fbaebc6cf95fce1a6e38133c1",
+    "semantic_hash": ""
+  },
+  ".githooks/post-commit": {
+    "mtime": 1786300373.1570053,
+    "ast_hash": "87e89ad7f7cb1c4f7f465c54e8aa39b7",
     "semantic_hash": ""
   }
 }

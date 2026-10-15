@@ -13,9 +13,13 @@ use super::{
 
 /// Selects one logical plane or their union.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IncidenceSide {
+	/// Select endpoints on the source side.
 	Source,
+	/// Select endpoints on the target side.
 	Target,
+	/// Select endpoints from both source and target sides.
 	Both,
 }
 

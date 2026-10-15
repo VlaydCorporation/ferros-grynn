@@ -80,6 +80,7 @@ impl Geometry {
 	/// kernel.
 	pub(crate) fn validation_scratch_bytes(&self) -> FerrosGrynnResult<usize> {
 		check_structure(self, 0, &mut 0)?;
+		/// Returns sum for `Geometry`.
 		fn sum(
 			mut values: impl Iterator<Item = FerrosGrynnResult<usize>>,
 		) -> FerrosGrynnResult<usize> {
@@ -87,6 +88,7 @@ impl Geometry {
 				total.checked_add(value?).ok_or_else(|| invalid("geometry scratch size overflows"))
 			})
 		}
+		/// Returns rings for `Geometry`.
 		fn rings(rings: &[Vec<Position>]) -> FerrosGrynnResult<usize> {
 			sum(rings.iter().map(|ring| {
 				ring.len()
@@ -95,6 +97,7 @@ impl Geometry {
 					.ok_or_else(|| invalid("geometry ring scratch overflows"))
 			}))
 		}
+		/// Returns size for `Geometry`.
 		fn size(geometry: &Geometry) -> FerrosGrynnResult<usize> {
 			match geometry {
 				Geometry::Point(_) => Ok(0),
@@ -206,6 +209,7 @@ fn check_structure(value: &Geometry, depth: usize, elements: &mut usize) -> Ferr
 /// Checks caller-constructed GeoJSON before the conversion recursion or
 /// allocation.
 pub(super) fn check_geojson_bounds(value: &GeoJsonValue) -> FerrosGrynnResult<()> {
+	/// Returns visit for this module.
 	fn visit(value: &GeoJsonValue, depth: usize, elements: &mut usize) -> FerrosGrynnResult<()> {
 		if depth > MAX_DEPTH {
 			return Err(invalid("geometry exceeds the nesting limit"));

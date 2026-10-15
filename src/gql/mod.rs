@@ -1,18 +1,23 @@
 // These internals become reachable from the public Datastore API when that
 // layer lands.
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
+/// Semantic analysis and lowering into logical plans.
 mod analysis;
 pub(crate) mod bindings;
 pub(crate) mod closure;
+/// Query continuation identities and retained spool state.
 pub(crate) mod cursor;
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
+/// Transactional query execution and result materialization.
 mod execution;
 pub(crate) mod import;
 #[allow(dead_code, reason = "the crate-private executor owns the logical IR")]
+/// Typed logical query plans and expressions.
 mod ir;
 /// Rust LIVE descriptors lower through the ordinary typed SELECT pipeline.
 pub(crate) mod live_lowering;
 pub(crate) mod optimizer;
+/// Execution settings, cancellation and resource accounting.
 mod options;
 mod pure_function;
 mod root_catalog;
@@ -32,7 +37,7 @@ pub(crate) use execution::{
 	validate_event_definition,
 };
 pub(crate) use options::{BarrierAccount, ExecutionControl};
-pub use options::{QueryCancellation, QueryExecutionOptions};
+pub use options::{QueryCancellation, QueryExecutionContext, QueryExecutionOptions};
 pub(crate) use pure_function::PureFunctionEvaluator;
 
 use crate::{
@@ -168,36 +173,66 @@ pub use crate::{
 	values::QueryCursor,
 };
 
+/// Parses and validates the input syntax for this type.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Program> {
 	crate::syn::parse(source, settings)
 }
 
+/// Public classification of the statement responsible for one query result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryStatementKind {
+	/// A EXPLAIN statement or control operation.
 	Explain,
+	/// A BEGIN statement or control operation.
 	Begin,
+	/// A COMMIT statement or control operation.
 	Commit,
+	/// A CANCEL statement or control operation.
 	Cancel,
+	/// A EXPRESSION statement or control operation.
 	Expression,
+	/// A IF statement or control operation.
 	If,
+	/// A FOR statement or control operation.
 	For,
+	/// A WHILE statement or control operation.
 	While,
+	/// A TRY statement or control operation.
 	Try,
+	/// A THROW statement or control operation.
 	Throw,
+	/// A SLEEP statement or control operation.
 	Sleep,
+	/// A ASSERT statement or control operation.
 	Assert,
+	/// A BUILD GRAPH statement or control operation.
 	BuildGraph,
+	/// A CREATE statement or control operation.
 	Create,
+	/// A UPDATE statement or control operation.
 	Update,
+	/// A UPSERT statement or control operation.
 	Upsert,
+	/// A DELETE statement or control operation.
 	Delete,
+	/// A ATTACH statement or control operation.
 	Attach,
+	/// A DETACH statement or control operation.
 	Detach,
+	/// A RELATE statement or control operation.
 	Relate,
+	/// A DEFINE statement or control operation.
 	Define,
+	/// A REMOVE statement or control operation.
 	Remove,
+	/// A ALTER statement or control operation.
 	Alter,
+	/// A INFO statement or control operation.
 	Info,
 	/// Whole-commit durable history, including explicit gaps.
 	ShowChanges,
@@ -205,14 +240,23 @@ pub enum QueryStatementKind {
 	Live,
 	/// Transactional confirmation of an issued LIVE delivery.
 	Ack,
+	/// A MAINTENANCE statement or control operation.
 	Maintenance,
+	/// A KILL statement or control operation.
 	Kill,
+	/// A LET statement or control operation.
 	Let,
+	/// A MATCH statement or control operation.
 	Match,
+	/// A RETURN statement or control operation.
 	Return,
+	/// A RETURN GRAPH statement or control operation.
 	ReturnGraph,
+	/// A SELECT statement or control operation.
 	Select,
+	/// A TRAVERSE statement or control operation.
 	Traverse,
+	/// A IMPORT statement or control operation.
 	Import,
 }
 
@@ -229,17 +273,25 @@ pub(crate) enum ExecutionMode {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Transaction command alternatives.
 pub(crate) enum TransactionCommand {
+	/// Begin case of transaction command.
 	Begin {
+		/// Options associated with this transaction command.
 		options: crate::datastore::TransactionOptions,
+		/// Execution mode associated with this transaction command.
 		execution_mode: ExecutionMode,
 	},
+	/// Commit case of transaction command.
 	Commit {
+		/// Full validation associated with this transaction command.
 		full_validation: bool,
 	},
+	/// Cancel case of transaction command.
 	Cancel,
 }
 
+/// Analyzes transaction statement.
 pub(crate) fn analyze_transaction_statement(
 	statement: &Statement,
 ) -> FerrosGrynnResult<Option<TransactionCommand>> {
@@ -285,6 +337,7 @@ pub(crate) fn analyze_transaction_statement(
 	Ok(Some(command))
 }
 
+/// Returns the statement kind result.
 pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementKind {
 	match statement {
 		StatementKind::Explain(_) => QueryStatementKind::Explain,
@@ -337,6 +390,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 	}
 }
 
+/// Returns whether the statement mutates state condition holds.
 pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 	if matches!(
 		statement,
@@ -403,15 +457,20 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 	}
 }
 
+/// Returns whether the block mutates state condition holds.
 fn block_mutates_state(block: &Block) -> bool {
 	block.statements.iter().any(|statement| statement_mutates_state(&statement.kind))
 }
 
+/// Statement outcome with elapsed time and an optional continuation cursor.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct QueryResult {
+	/// Selected operation or representation discriminator.
 	pub kind: QueryStatementKind,
+	/// Time spent executing the statement represented by this result.
 	pub elapsed: Duration,
+	/// Statement failure or successful value with its completion statuses.
 	pub result: FerrosGrynnResult<Outcome<Value>>,
 	/// Opaque continuation for the next ordered result page.
 	pub continuation: Option<QueryCursor>,

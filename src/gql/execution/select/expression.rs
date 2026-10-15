@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// Returns the eval select expr result.
 pub(super) fn eval_select_expr<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -25,6 +26,7 @@ pub(super) fn eval_select_expr<Read: QueryRead>(
 	eval(&expression, Some(row), slots, source, Some(&fields), Some(control))
 }
 
+/// Checks for select special.
 fn contains_select_special(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Aggregate {
@@ -142,6 +144,7 @@ fn contains_select_special(expression: &TypedExpr) -> bool {
 	}
 }
 
+/// Materializes specials.
 fn materialize_specials<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -385,13 +388,37 @@ fn materialize_specials<Read: QueryRead>(
 			target: target.clone(),
 			expr: Box::new(recurse(expr)?),
 		},
-		kind => kind.clone(),
+		kind => {
+			admit_layout_copy(read, expression)?;
+			kind.clone()
+		}
 	};
 	Ok(TypedExpr {
 		kind,
 		ty: expression.ty.clone(),
 		span: expression.span,
 	})
+}
+
+/// Admits the new fixed-shell delta before one deep copy of a typed leaf.
+///
+/// # Errors
+/// Returns the embedding's retained-memory limit error before cloning.
+pub(super) fn admit_layout_copy<Read: QueryRead>(
+	read: &Read,
+	expression: &TypedExpr,
+) -> FerrosGrynnResult<()> {
+	let bytes = match &expression.kind {
+		TypedExprKind::Closure(plan) => plan.boxed_layout_bytes,
+		TypedExprKind::Traversal(plan) => plan.boxed_layout_bytes,
+		_ => 0,
+	};
+	if bytes != 0
+		&& let Some(fields) = read.bounded_fields()
+	{
+		fields.admit_retained(bytes)?;
+	}
+	Ok(())
 }
 
 /// Bounded embeddings admit copied typed nodes before SELECT materialization.
@@ -466,6 +493,7 @@ pub(super) fn admit_special_copy<Read: QueryRead>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "aggregate evaluation needs the statement context")]
+/// Returns the aggregate value result.
 fn aggregate_value<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -511,7 +539,7 @@ fn aggregate_value<Read: QueryRead>(
 			}],
 			control.barrier_account(),
 			false,
-		)?;
+		);
 		let mut ordinal = 0_usize;
 		visit_group(group, fallback, |row| {
 			admit_row()?;
@@ -553,9 +581,10 @@ fn aggregate_value<Read: QueryRead>(
 	} else {
 		visit_group(group, fallback, &mut push_value)?;
 	}
-	state.finish()
+	Ok(state.finish())
 }
 
+/// Visits group.
 fn visit_group(
 	group: Option<&RowSet>,
 	fallback: &Row,
@@ -567,26 +596,57 @@ fn visit_group(
 	}
 }
 
+/// Aggregate state alternatives.
 enum AggregateState {
-	Count(usize),
-	Sum(Value),
+	/// Count case of aggregate state.
+	Count(
+		/// Count case of aggregate state.
+		usize,
+	),
+	/// Sum case of aggregate state.
+	Sum(
+		/// Sum case of aggregate state.
+		Value,
+	),
+	/// Average case of aggregate state.
 	Average {
+		/// Count associated with this aggregate state.
 		count: usize,
+		/// Accumulated sum of the values processed so far.
 		sum: f64,
 	},
-	Minimum(Option<Value>),
-	Maximum(Option<Value>),
-	ArrayGroup(Array),
+	/// Minimum case of aggregate state.
+	Minimum(
+		/// Minimum case of aggregate state.
+		Option<Value>,
+	),
+	/// Maximum case of aggregate state.
+	Maximum(
+		/// Maximum case of aggregate state.
+		Option<Value>,
+	),
+	/// Array group case of aggregate state.
+	ArrayGroup(
+		/// Array group case of aggregate state.
+		Array,
+	),
+	/// Variance case of aggregate state.
 	Variance {
+		/// Count associated with this aggregate state.
 		count: usize,
+		/// Mean associated with this aggregate state.
 		mean: f64,
+		/// M2 associated with this aggregate state.
 		m2: f64,
+		/// Sample associated with this aggregate state.
 		sample: bool,
+		/// Standard deviation associated with this aggregate state.
 		standard_deviation: bool,
 	},
 }
 
 impl AggregateState {
+	/// Creates a new `AggregateState` value.
 	fn new(function: Aggregate) -> Self {
 		match function {
 			Aggregate::Count => Self::Count(0),
@@ -617,6 +677,7 @@ impl AggregateState {
 		}
 	}
 
+	/// Pushes aggregate state.
 	fn push(&mut self, value: Value, count_all: bool) -> FerrosGrynnResult<()> {
 		if matches!(self, Self::Count(_)) {
 			if count_all || !matches!(value, Value::None | Value::Null) {
@@ -681,27 +742,26 @@ impl AggregateState {
 		Ok(())
 	}
 
-	fn finish(self) -> FerrosGrynnResult<Value> {
+	/// Finishes aggregate state.
+	fn finish(self) -> Value {
 		match self {
-			Self::Count(count) => Ok(Value::from(count)),
-			Self::Sum(sum) => Ok(sum),
+			Self::Count(count) => Value::from(count),
+			Self::Sum(sum) => sum,
 			Self::Average {
 				count: 0,
 				..
-			} => Ok(Value::None),
+			} => Value::None,
 			Self::Average {
 				count,
 				sum,
-			} => Ok(Value::from(sum / count as f64)),
-			Self::Minimum(value) | Self::Maximum(value) => Ok(value.unwrap_or(Value::None)),
-			Self::ArrayGroup(values) => Ok(Value::Array(values)),
+			} => Value::from(sum / count as f64),
+			Self::Minimum(value) | Self::Maximum(value) => value.unwrap_or(Value::None),
+			Self::ArrayGroup(values) => Value::Array(values),
 			Self::Variance {
 				count,
-				m2: _,
 				sample,
-				standard_deviation: _,
 				..
-			} if count == 0 || sample && count < 2 => Ok(Value::None),
+			} if count == 0 || sample && count < 2 => Value::None,
 			Self::Variance {
 				count,
 				m2,
@@ -715,16 +775,17 @@ impl AggregateState {
 					count
 				} as f64;
 				let variance = m2 / divisor;
-				Ok(Value::from(if standard_deviation {
+				Value::from(if standard_deviation {
 					variance.sqrt()
 				} else {
 					variance
-				}))
+				})
 			}
 		}
 	}
 }
 
+/// Returns the numeric value result.
 fn numeric_value(value: &Value) -> FerrosGrynnResult<f64> {
 	let Value::Number(number) = value else {
 		return Err(FerrosGrynnError::invalid_argument("Aggregate requires numeric values."));
@@ -735,12 +796,15 @@ fn numeric_value(value: &Value) -> FerrosGrynnResult<f64> {
 }
 
 #[cfg(test)]
+/// Regression tests for expression behavior.
 mod tests {
 	use super::*;
 
 	/// DISTINCT owns input/dedup copies only after shared bounded admission.
 	#[test]
-	fn live_recipe_distinct_clone_work_bounded() -> FerrosGrynnResult<()> {
+	fn live_recipe_distinct_clone_work_bounded() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = crate::datastore::Datastore::in_memory();
 		let root = store.inner.current_root();
 		let options = crate::gql::QueryExecutionOptions::default();
@@ -785,8 +849,8 @@ mod tests {
 				"distinct clone work ignored; used {}",
 				consumed.get()
 			))
-		})?;
+		})
+		.assert_ok();
 		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
-		Ok(())
 	}
 }

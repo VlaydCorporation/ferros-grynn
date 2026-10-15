@@ -1,6 +1,8 @@
 use std::cell::Cell;
 
 use super::*;
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
 use crate::{
 	datastore::{ClassId, SchemaId},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -25,11 +27,14 @@ use crate::{
 	values::storage::TypeTag,
 };
 
+/// Verifies split statistics are exact and auxiliary files are lazy.
 #[test]
-fn split_statistics_are_exact_and_auxiliary_files_are_lazy() -> FerrosGrynnResult<()> {
-	let graph = GraphId::new(7).ok_or_else(|| invalid("graph id absent"))?;
-	let class = ClassId::new(3).ok_or_else(|| invalid("class id absent"))?;
-	let field = SchemaId::new(4).ok_or_else(|| invalid("field id absent"))?;
+fn split_statistics_are_exact_and_auxiliary_files_are_lazy() {
+	use crate::test_assertions::AssertResult as _;
+
+	let graph = GraphId::new(7).ok_or_else(|| invalid("graph id absent")).assert_ok();
+	let class = ClassId::new(3).ok_or_else(|| invalid("class id absent")).assert_ok();
+	let field = SchemaId::new(4).ok_or_else(|| invalid("field id absent")).assert_ok();
 	let label: crate::values::Text = "Engineer".into();
 	let label_key = LabelStatisticKey {
 		kind: AtomKind::Node,
@@ -85,18 +90,19 @@ fn split_statistics_are_exact_and_auxiliary_files_are_lazy() -> FerrosGrynnResul
 			distinct_count: 2,
 		}],
 	});
-	let dictionary = LabelDictionary::from_labels([(LabelKind::Node, label.as_str())])?;
-	let files = encode_statistics(&statistics, &dictionary, PageLsn::new(5))?;
+	let dictionary = LabelDictionary::from_labels([(LabelKind::Node, label.as_str())]).assert_ok();
+	let files = encode_statistics(&statistics, &dictionary, PageLsn::new(5)).assert_ok();
 	assert_eq!(files.graph.len(), 3);
 	assert_eq!(files.labels.len(), 1);
 	assert_eq!(files.properties.len(), 1);
 
 	let (mut decoded, layout) = decode_statistics_root(
 		&files.graph[0],
-		u64_len(files.graph.len())?,
-		u64_len(files.labels.len())?,
-		u64_len(files.properties.len())?,
-	)?;
+		u64_len(files.graph.len()).assert_ok(),
+		u64_len(files.labels.len()).assert_ok(),
+		u64_len(files.properties.len()).assert_ok(),
+	)
+	.assert_ok();
 	assert_eq!(layout.degree_first, Some(PageNo::new(1)));
 	assert_eq!(layout.degree_pages, 1);
 	assert_eq!(layout.class_first, Some(PageNo::new(2)));
@@ -110,41 +116,50 @@ fn split_statistics_are_exact_and_auxiliary_files_are_lazy() -> FerrosGrynnResul
 	decoded.classes = decode_class_statistics(
 		|page, destination| copy_page(&files.graph, page, destination, &reads),
 		layout,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(reads.get(), 1);
 	decoded.degree_histograms = decode_degree_statistics(
 		|page, destination| copy_page(&files.graph, page, destination, &reads),
 		layout,
 		&dictionary,
-	)?;
+	)
+	.assert_ok();
 	decoded.labels = decode_label_statistics(
 		|page, destination| copy_page(&files.labels, page, destination, &reads),
 		layout,
 		&dictionary,
-	)?;
+	)
+	.assert_ok();
 	decoded.property_histograms = decode_property_statistics(
 		|page, destination| copy_page(&files.properties, page, destination, &reads),
 		layout,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(reads.get(), 4);
 	assert_eq!(decoded, statistics);
-	Ok(())
 }
 
+/// Verifies root rejects unreachable or extra split pages.
 #[test]
-fn root_rejects_unreachable_or_extra_split_pages() -> FerrosGrynnResult<()> {
+fn root_rejects_unreachable_or_extra_split_pages() {
+	use crate::test_assertions::AssertResult as _;
+
 	let dictionary = LabelDictionary::default();
 	let files =
-		encode_statistics(&crate::stats::GraphStatistics::default(), &dictionary, PageLsn::ZERO)?;
+		encode_statistics(&crate::stats::GraphStatistics::default(), &dictionary, PageLsn::ZERO)
+			.assert_ok();
 	assert!(decode_statistics_root(&files.graph[0], 2, 0, 0).is_err());
-	Ok(())
 }
 
+/// Verifies geometry statistics round trip bounds and continuations.
 #[test]
-fn geometry_statistics_round_trip_bounds_and_continuations() -> FerrosGrynnResult<()> {
+fn geometry_statistics_round_trip_bounds_and_continuations() {
+	use crate::test_assertions::AssertResult as _;
+
 	let key = PropertyHistogramKey {
-		class_id: ClassId::new(3).unwrap(),
-		field_id: SchemaId::new(4).unwrap(),
+		class_id: ClassId::new(3).assert_some(),
+		field_id: SchemaId::new(4).assert_some(),
 		scope: StatisticsScope::Base,
 	};
 	for count in [0, 1, 509, 510, 1018, 1024] {
@@ -163,23 +178,24 @@ fn geometry_statistics_round_trip_bounds_and_continuations() -> FerrosGrynnResul
 			},
 		};
 		let input = std::collections::BTreeMap::from([(key, histogram)]);
-		let mut pages = super::property::encode_property_statistics(&input, PageLsn::ZERO)?;
+		let mut pages =
+			super::property::encode_property_statistics(&input, PageLsn::ZERO).assert_ok();
 		let read = |page, destination: &mut crate::storage::page::AlignedPage| {
 			copy_page(&pages, page, destination, &Cell::new(0))
 		};
 		assert_eq!(
-			super::property::decode_property_statistics_range(read, pages.len() as u32)?,
+			super::property::decode_property_statistics_range(read, pages.len() as u32).assert_ok(),
 			input
 		);
 		if count == 509 || count == 1018 || count == 0 {
 			let mut extra = Box::new(crate::storage::page::AlignedPage::zeroed());
-			extra.as_bytes_mut().copy_from_slice(pages.last().unwrap().as_bytes());
+			extra.as_bytes_mut().copy_from_slice(pages.last().assert_some().as_bytes());
 			extra.as_bytes_mut()[68..70].copy_from_slice(&0_u16.to_le_bytes());
 			extra.as_bytes_mut()[70..72].copy_from_slice(&(pages.len() as u16).to_le_bytes());
 			extra.as_bytes_mut()[80..].fill(0);
-			extra.seal()?;
+			extra.seal().assert_ok();
 			pages.push(crate::storage::page::AlignedPage::zeroed());
-			pages.last_mut().unwrap().as_bytes_mut().copy_from_slice(extra.as_bytes());
+			pages.last_mut().assert_some().as_bytes_mut().copy_from_slice(extra.as_bytes());
 			assert!(
 				super::property::decode_property_statistics_range(
 					|page, destination| copy_page(&pages, page, destination, &Cell::new(0)),
@@ -206,9 +222,9 @@ fn geometry_statistics_round_trip_bounds_and_continuations() -> FerrosGrynnResul
 		)
 		.is_err()
 	);
-	Ok(())
 }
 
+/// Returns copy page for this module.
 fn copy_page(
 	pages: &[crate::storage::page::AlignedPage],
 	page: PageNo,
@@ -222,10 +238,12 @@ fn copy_page(
 	Ok(())
 }
 
+/// Returns u64 len for this module.
 fn u64_len(length: usize) -> FerrosGrynnResult<u64> {
 	u64::try_from(length).map_err(|_error| invalid("test length exceeds u64"))
 }
 
+/// Returns invalid for this module.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

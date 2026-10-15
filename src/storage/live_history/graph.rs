@@ -181,6 +181,7 @@ pub(super) fn decode(
 }
 
 #[cfg(test)]
+/// Regression tests for graph behavior.
 mod tests {
 	use std::collections::BTreeMap;
 
@@ -194,7 +195,9 @@ mod tests {
 	/// Empty graph revisions are still data, and preserve their full
 	/// checkpoint.
 	#[test]
-	fn graph_history_roundtrip_checks_framing_counts_and_limits() -> FerrosGrynnResult<()> {
+	fn graph_history_roundtrip_checks_framing_counts_and_limits() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut properties = Object::new();
 		properties.insert("payload", Value::from("x".repeat(70 * 1024)));
 		let image = Arc::new(LiveGraphImage {
@@ -214,12 +217,13 @@ mod tests {
 			})]),
 		});
 		let delta =
-			LiveGraphDelta::between(None, Arc::clone(&image), 0.into(), 5.into(), &|_, _| Ok(()))?;
+			LiveGraphDelta::between(None, Arc::clone(&image), 0.into(), 5.into(), &|_, _| Ok(()))
+				.assert_ok();
 		let batch = LiveGraphBatch {
-			id: "11111111-1111-1111-1111-111111111111".parse()?,
-			version: LiveVersion::new(1)?,
+			id: "11111111-1111-1111-1111-111111111111".parse().assert_ok(),
+			version: LiveVersion::new(1).assert_ok(),
 			committed_at: DateTime::from(
-				jiff::Timestamp::from_nanosecond(100)?.to_zoned(jiff::tz::TimeZone::UTC),
+				jiff::Timestamp::from_nanosecond(100).assert_ok().to_zoned(jiff::tz::TimeZone::UTC),
 			),
 			delta,
 			bindings: Vec::new(),
@@ -231,12 +235,16 @@ mod tests {
 			5,
 			100,
 			8 << 20,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(&encoded[..8], b"FGLB\x02\x00\x03\x00");
 		assert!(encoded.len() > CONTROL_BYTES);
-		assert!(!inspect(&encoded, encoded.len() as u64)?.is_control());
-		let LivePayload::Graph(restored) = decode_delivery(&encoded, 8 << 20)? else {
-			return Err(invalid("graph result kind was lost"));
+		assert!(!inspect(&encoded, encoded.len() as u64).assert_ok().is_control());
+		let LivePayload::Graph(restored) = decode_delivery(&encoded, 8 << 20).assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> = Err(invalid("graph result kind was lost"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(restored.delta().after().scopes, image.scopes);
 		assert_eq!(restored.delta().changes(), batch.delta().changes());
@@ -248,7 +256,8 @@ mod tests {
 				5,
 				100,
 				8 << 20
-			)?,
+			)
+			.assert_ok(),
 			encoded
 		);
 		assert!(decode_delivery(&encoded, encoded.len()).is_err());
@@ -263,7 +272,8 @@ mod tests {
 			5.into(),
 			6.into(),
 			&|_, _| Ok(()),
-		)?;
+		)
+		.assert_ok();
 		assert!(delta.changes().is_empty());
 		let mut quiet = batch;
 		quiet.delta = delta;
@@ -274,11 +284,11 @@ mod tests {
 			6,
 			100,
 			8 << 20,
-		)?;
-		assert_eq!(inspect(&encoded, encoded.len() as u64)?.events, 1);
+		)
+		.assert_ok();
+		assert_eq!(inspect(&encoded, encoded.len() as u64).assert_ok().events, 1);
 		assert!(
-			matches!(decode_delivery(&encoded, 8 << 20)?, LivePayload::Graph(batch) if batch.delta().changes().is_empty())
+			matches!(decode_delivery(&encoded, 8 << 20).assert_ok(), LivePayload::Graph(batch) if batch.delta().changes().is_empty())
 		);
-		Ok(())
 	}
 }

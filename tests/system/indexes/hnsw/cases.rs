@@ -138,18 +138,21 @@ fn recall(db: Database, rows: &[Vec<f32>], minimum_recall: f64) {
 	});
 }
 
+/// Verifies hnsw 5000 fixture sample matches independent euclidean oracle.
 #[test]
 fn hnsw_5000_fixture_sample_matches_independent_euclidean_oracle() {
 	let rows = vectors(include_bytes!("../../../data/hnsw-random-5000-20-euclidean.gz"), 5000);
 	recall(database(), &rows[..128], 1.0);
 }
 
+/// Verifies hnsw 9000 fixture sample matches independent euclidean oracle.
 #[test]
 fn hnsw_9000_fixture_sample_matches_independent_euclidean_oracle() {
 	let rows = vectors(include_bytes!("../../../data/hnsw-random-9000-20-euclidean.gz"), 9000);
 	recall(database(), &rows[..128], 1.0);
 }
 
+/// Verifies hnsw full 5000 fixture recall at 10 is at least 90 percent.
 #[test]
 #[ignore = "full 5000-vector corpus; run explicitly for the search quality gate"]
 fn hnsw_full_5000_fixture_recall_at_10_is_at_least_90_percent() {
@@ -157,6 +160,7 @@ fn hnsw_full_5000_fixture_recall_at_10_is_at_least_90_percent() {
 	recall(database(), &rows, 0.9);
 }
 
+/// Verifies hnsw full 9000 fixture recall at 10 is at least 90 percent.
 #[test]
 #[ignore = "full 9000-vector corpus; run explicitly for the search quality gate"]
 fn hnsw_full_9000_fixture_recall_at_10_is_at_least_90_percent() {
@@ -164,6 +168,7 @@ fn hnsw_full_9000_fixture_recall_at_10_is_at_least_90_percent() {
 	recall(database(), &rows, 0.9);
 }
 
+/// Verifies knn rejects wrong query dimension without changing stored vectors.
 #[test]
 fn knn_rejects_wrong_query_dimension_without_changing_stored_vectors() {
 	let db = database();
@@ -213,6 +218,8 @@ fn knn_rejects_wrong_query_dimension_without_changing_stored_vectors() {
 	});
 }
 
+/// Verifies hnsw updates and tombstones rerank results without changing old
+/// snapshots.
 #[test]
 fn hnsw_updates_and_tombstones_rerank_results_without_changing_old_snapshots() {
 	let db = database();

@@ -50,14 +50,23 @@ use crate::{
 
 /// Fully opened logical and physical state at one durable WAL boundary.
 pub(super) struct OpenedLocalState {
+	/// Root associated with this opened local state.
 	pub(super) root: DatabaseRoot,
+	/// Database superblock associated with this opened local state.
 	pub(super) database_superblock: DatabaseSuperblock,
+	/// File catalog associated with this opened local state.
 	pub(super) file_catalog: FileCatalog,
+	/// Database catalog associated with this opened local state.
 	pub(super) database_catalog: DatabaseCatalog,
+	/// Bindings associated with this opened local state.
 	pub(super) bindings: GenerationBindings,
+	/// Registry associated with this opened local state.
 	pub(super) registry: FileRegistry,
+	/// Atom superblock associated with this opened local state.
 	pub(super) atom_superblock: crate::storage::atom_store_superblock::AtomStoreSuperblock,
+	/// Graph superblocks associated with this opened local state.
 	pub(super) graph_superblocks: BTreeMap<crate::graph::GraphId, GraphSuperblock>,
+	/// Physical statistics associated with this opened local state.
 	pub(super) physical_statistics: Arc<PhysicalStatisticsFiles>,
 }
 
@@ -65,18 +74,26 @@ pub(super) struct OpenedLocalState {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct StartupTimings {
+	/// Elapsed duration of the catalog startup phase.
 	pub(super) catalog: Duration,
+	/// Elapsed duration of the registry startup phase.
 	pub(super) registry: Duration,
+	/// Elapsed duration of the materialization startup phase.
 	pub(super) materialization: Duration,
+	/// Elapsed duration of the derived startup phase.
 	pub(super) derived: Duration,
+	/// Elapsed duration of the indexes startup phase.
 	pub(super) indexes: Duration,
+	/// Elapsed duration of the statistics startup phase.
 	pub(super) statistics: Duration,
+	/// Elapsed duration of the validation startup phase.
 	pub(super) validation: Duration,
 }
 
 #[cfg(test)]
 thread_local! {
-	static LAST_STARTUP_TIMINGS: Cell<StartupTimings> = Cell::new(StartupTimings {
+	/// Latest completed local-reopen phase timings recorded on the current test thread.
+	static LAST_STARTUP_TIMINGS: Cell<StartupTimings> = const { Cell::new(StartupTimings {
 		catalog: Duration::ZERO,
 		registry: Duration::ZERO,
 		materialization: Duration::ZERO,
@@ -84,7 +101,7 @@ thread_local! {
 		indexes: Duration::ZERO,
 		statistics: Duration::ZERO,
 		validation: Duration::ZERO,
-	});
+	}) };
 }
 
 /// Returns the latest reopen timings recorded on this test thread.
@@ -529,6 +546,7 @@ fn load_graph_artifacts(
 	Ok(())
 }
 
+/// Reads catalog.
 fn read_catalog(
 	wal: &FrameWal,
 	registry: &FileRegistry,
@@ -557,6 +575,7 @@ fn read_catalog(
 	)
 }
 
+/// Returns the bindings result.
 fn bindings(
 	files: &FileCatalog,
 	database: &DatabaseCatalog,
@@ -611,6 +630,7 @@ fn bindings(
 	})
 }
 
+/// Validates opened root.
 fn validate_opened_root(
 	root: &DatabaseRoot,
 	database: &DatabaseCatalog,
@@ -619,7 +639,7 @@ fn validate_opened_root(
 ) -> FerrosGrynnResult<()> {
 	if root.commit_ts != snapshot.commit_ts().get()
 		|| database.atom_store.generation > root.commit_ts
-		|| usize::try_from(database.graphs.len()).ok() != Some(root.graphs.len())
+		|| database.graphs.len() != root.graphs.len()
 		|| database.graphs.iter().any(|graph| graph.generation > root.commit_ts)
 		|| files.next_file_instance_id < database.atom_store.primary.file_id.instance_id()
 	{

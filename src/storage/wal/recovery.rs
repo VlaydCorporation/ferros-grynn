@@ -80,11 +80,20 @@ pub(in crate::storage::wal) enum RecordRead {
 	/// Clean end exactly between records.
 	Eof,
 	/// Physical EOF inside an otherwise bounded record.
-	Truncated(String),
+	Truncated(
+		/// Physical EOF inside an otherwise bounded record.
+		String,
+	),
 	/// Complete checksummed record.
-	Record(RawRecord),
+	Record(
+		/// Complete checksummed record.
+		RawRecord,
+	),
 	/// Complete bytes that violate a format or checksum invariant.
-	Corrupt(String),
+	Corrupt(
+		/// Complete bytes that violate a format or checksum invariant.
+		String,
+	),
 }
 
 /// Exact-read outcome that distinguishes a clean boundary from truncation.

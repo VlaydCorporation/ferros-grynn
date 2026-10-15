@@ -10,6 +10,7 @@ use super::{
 	SourceOperator,
 };
 
+/// Verifies canonical integer encoding does not use native width or endian.
 #[test]
 fn canonical_integer_encoding_does_not_use_native_width_or_endian() {
 	let mut writer = CanonicalHasher::versioned(7, b"test");
@@ -24,6 +25,7 @@ fn canonical_integer_encoding_does_not_use_native_width_or_endian() {
 	assert!(writer.as_bytes().starts_with(b"FGCP"));
 }
 
+/// Verifies physical plan hash is stable and sensitive to operator choice.
 #[test]
 fn physical_plan_hash_is_stable_and_sensitive_to_operator_choice() {
 	let source = PhysicalSource {
@@ -52,7 +54,7 @@ fn physical_plan_hash_is_stable_and_sensitive_to_operator_choice() {
 		cost: PlanCost::default(),
 		warnings: Vec::new(),
 	});
-	assert_eq!(plan.hash(), plan.clone().hash());
+	assert_eq!(plan.hash(), plan.hash());
 	let estimates_changed = PhysicalPlan::Select(PhysicalSelectPlan {
 		sources: vec![PhysicalSource {
 			cardinality: Cardinality::unknown(30),

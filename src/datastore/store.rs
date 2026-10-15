@@ -42,30 +42,14 @@ use crate::{
 
 /// Database owning one global atom registry and any number of graph views.
 pub struct Datastore {
+	/// Inner associated with this datastore.
 	pub(crate) inner: Arc<StoreInner>,
 	/// Background transactions retain storage without extending user ownership.
 	owns_handle: bool,
 }
 
-#[cfg(test)]
-mod ownership_tests {
-	use super::*;
-
-	#[test]
-	fn event_background_transaction_does_not_extend_user_lifetime() {
-		let store = Datastore::in_memory();
-		let background = Datastore::background(Arc::clone(&store.inner));
-		let transaction = background.begin();
-		assert_eq!(background.inner.datastore_handles.load(Ordering::Acquire), 1);
-		drop(store);
-		assert_eq!(background.inner.datastore_handles.load(Ordering::Acquire), 0);
-		assert!(background.inner.maintenance.is_stopping());
-		drop(transaction);
-		drop(background);
-	}
-}
-
 impl Clone for Datastore {
+	/// Returns an owned clone of this `Datastore`.
 	fn clone(&self) -> Self {
 		if self.owns_handle
 			&& self
@@ -86,6 +70,7 @@ impl Clone for Datastore {
 }
 
 impl Drop for Datastore {
+	/// Runs cleanup for this `Datastore` before its fields are released.
 	fn drop(&mut self) {
 		if self.owns_handle && self.inner.datastore_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
 			{
@@ -434,7 +419,14 @@ impl Datastore {
 	}
 
 	/// Creates and exclusively opens a new local database directory.
-	pub fn create_local(path: impl AsRef<Path>, options: LocalOptions) -> FerrosGrynnResult<Self> {
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
+	pub fn create_local<PathArg: AsRef<Path>>(
+		path: PathArg,
+		options: LocalOptions,
+	) -> FerrosGrynnResult<Self> {
 		let validated = validate_local_options(options)?;
 		let (local, root) = LocalStore::create(
 			path.as_ref(),
@@ -453,7 +445,14 @@ impl Datastore {
 	}
 
 	/// Opens, recovers, and exclusively owns an existing local database.
-	pub fn open_local(path: impl AsRef<Path>, options: LocalOptions) -> FerrosGrynnResult<Self> {
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
+	pub fn open_local<PathArg: AsRef<Path>>(
+		path: PathArg,
+		options: LocalOptions,
+	) -> FerrosGrynnResult<Self> {
 		let validated = validate_local_options(options)?;
 		let (local, root) = crate::storage::with_external_sort_options(
 			options.maintenance.max_memory_bytes,
@@ -477,6 +476,7 @@ impl Datastore {
 		Ok(store)
 	}
 
+	/// Creates from parts.
 	fn from_parts(options: DatastoreOptions, backend: StoreBackend, root: DatabaseRoot) -> Self {
 		let next_schema_id = root.schema.next_schema_id;
 		let next_graph_id = root.schema.next_graph_id;
@@ -540,6 +540,11 @@ impl Datastore {
 	}
 
 	/// Returns one durable maintenance job, if it exists.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn job(&self, id: super::JobId) -> FerrosGrynnResult<Option<MaintenanceJobInfo>> {
 		if let Some(invocation) = self.inner.current_root().event_outbox().invocations.get(&id) {
 			return self.inner.event_job_info(invocation).map(Some);
@@ -548,6 +553,11 @@ impl Datastore {
 	}
 
 	/// Returns all retained active and terminal maintenance jobs.
+	///
+	/// # Errors
+	///
+	/// Returns an error if a retained EVENT invocation cannot be projected as
+	/// job metadata.
 	pub fn jobs(&self) -> FerrosGrynnResult<Vec<MaintenanceJobInfo>> {
 		let mut jobs = self.inner.maintenance.jobs();
 		for invocation in self.inner.current_root().event_outbox().invocations.values() {
@@ -558,6 +568,11 @@ impl Datastore {
 	}
 
 	/// Cooperatively cancels one queued or running maintenance job.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn kill_job(&self, id: super::JobId) -> FerrosGrynnResult<MaintenanceJobInfo> {
 		if self.inner.current_root().event_outbox().invocations.contains_key(&id) {
 			return self.kill_event_job(id);
@@ -626,6 +641,7 @@ impl Datastore {
 		})
 	}
 
+	/// Returns the enqueue maintenance result.
 	pub(crate) fn enqueue_maintenance(
 		&self,
 		kind: MaintenanceJobKind,
@@ -635,6 +651,7 @@ impl Datastore {
 		self.enqueue_maintenance_with_analysis(kind, target, options, None)
 	}
 
+	/// Returns the enqueue maintenance coalesced result.
 	pub(crate) fn enqueue_maintenance_coalesced(
 		&self,
 		kind: MaintenanceJobKind,
@@ -648,6 +665,7 @@ impl Datastore {
 		self.inner.maintenance.enqueue_coalesced(&self.inner, kind, target, options, None)
 	}
 
+	/// Returns the enqueue maintenance with analysis result.
 	pub(crate) fn enqueue_maintenance_with_analysis(
 		&self,
 		kind: MaintenanceJobKind,
@@ -679,6 +697,7 @@ impl Datastore {
 		self.inner.maintenance.enqueue(&self.inner, kind, target, selected, analyze_mode)
 	}
 
+	/// Records deferred index change.
 	pub(crate) fn record_deferred_index_change(
 		&self,
 		target: MaintenanceTarget,
@@ -695,6 +714,7 @@ impl Datastore {
 		self.inner.maintenance.record_deferred_index_change(&self.inner, target, revision, selected)
 	}
 
+	/// Returns the run foreground maintenance result.
 	pub(crate) fn run_foreground_maintenance(
 		&self,
 		kind: MaintenanceJobKind,
@@ -704,6 +724,7 @@ impl Datastore {
 		self.run_foreground_maintenance_with_analysis(kind, target, options, None)
 	}
 
+	/// Returns the run foreground maintenance with analysis result.
 	pub(crate) fn run_foreground_maintenance_with_analysis(
 		&self,
 		kind: MaintenanceJobKind,
@@ -727,6 +748,7 @@ impl Datastore {
 		self.inner.run_foreground_maintenance(kind, target, options, analyze_mode)
 	}
 
+	/// Constructs from root for test for `Datastore`.
 	#[cfg(test)]
 	pub(crate) fn from_root_for_test(options: InMemoryOptions, root: DatabaseRoot) -> Self {
 		Self::from_parts(DatastoreOptions::InMemory(options), StoreBackend::InMemory, root)
@@ -815,6 +837,11 @@ impl Datastore {
 	}
 
 	/// Runs explicit local maintenance; volatile stores have no checkpoint.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<bool> {
 		self.inner.checkpoint(mode)
 	}
@@ -842,5 +869,25 @@ impl Datastore {
 	/// Resolves a class by its stable identity.
 	pub fn class_by_id(&self, id: ClassId) -> Option<Arc<ClassSchema>> {
 		self.schema_catalog().class_by_id(id)
+	}
+}
+
+#[cfg(test)]
+/// Regression tests for store behavior.
+mod ownership_tests {
+	use super::*;
+
+	/// Verifies event background transaction does not extend user lifetime.
+	#[test]
+	fn event_background_transaction_does_not_extend_user_lifetime() {
+		let store = Datastore::in_memory();
+		let background = Datastore::background(Arc::clone(&store.inner));
+		let transaction = background.begin();
+		assert_eq!(background.inner.datastore_handles.load(Ordering::Acquire), 1);
+		drop(store);
+		assert_eq!(background.inner.datastore_handles.load(Ordering::Acquire), 0);
+		assert!(background.inner.maintenance.is_stopping());
+		drop(transaction);
+		drop(background);
 	}
 }

@@ -29,6 +29,8 @@ fn dictionary_sample() -> Vec<(String, String)> {
 	sample
 }
 
+/// Verifies fulltext dictionary mapper returns expected inflections and matches
+/// scan.
 #[test]
 fn fulltext_dictionary_mapper_returns_expected_inflections_and_matches_scan() {
 	let db = database();
@@ -100,6 +102,7 @@ fn fulltext_dictionary_mapper_returns_expected_inflections_and_matches_scan() {
 	});
 }
 
+/// Verifies fulltext update delete and rollback preserve old snapshot results.
 #[test]
 fn fulltext_update_delete_and_rollback_preserve_old_snapshot_results() {
 	let db = database();
@@ -148,6 +151,8 @@ fn fulltext_update_delete_and_rollback_preserve_old_snapshot_results() {
 	});
 }
 
+/// Verifies fulltext unicode highlights refer to original text and scores match
+/// scan.
 #[test]
 fn fulltext_unicode_highlights_refer_to_original_text_and_scores_match_scan() {
 	let db = database();
@@ -171,6 +176,8 @@ fn fulltext_unicode_highlights_refer_to_original_text_and_scores_match_scan() {
 	db.assert_committed(|store| assert_eq!(value(store, query, &Object::new()), expected));
 }
 
+/// Verifies effective fulltext scope indexes overlay without changing base
+/// search.
 #[test]
 fn effective_fulltext_scope_indexes_overlay_without_changing_base_search() {
 	let db = database();

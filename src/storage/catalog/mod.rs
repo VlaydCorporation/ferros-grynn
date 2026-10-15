@@ -1,7 +1,9 @@
 //! Candidate-v1 database and physical-file catalogs.
 
 mod database;
+/// Physical catalog file descriptors and bindings.
 mod file;
+/// Bounded catalog page chains and their validation.
 mod page_chain;
 
 pub(super) use database::{
@@ -14,7 +16,6 @@ pub(super) use database::{
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
 	FunctionCatalogEntry,
-	FunctionParameterCatalogEntry,
 	GraphCatalogEntry,
 	GraphPropertyCatalogEntry,
 	LiveBindingCatalogEntry,

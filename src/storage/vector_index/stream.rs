@@ -104,6 +104,7 @@ pub(in crate::storage) fn write_vector_index_stream<V: Borrow<crate::values::Vec
 	})
 }
 
+/// Returns the location result.
 fn location(location: ImmutableStreamLocation) -> StreamLocation {
 	StreamLocation {
 		first: location.first,
@@ -111,11 +112,13 @@ fn location(location: ImmutableStreamLocation) -> StreamLocation {
 	}
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for stream behavior.
 mod tests {
 	use std::{
 		fs,
@@ -124,6 +127,8 @@ mod tests {
 	};
 
 	use super::write_vector_index_stream;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{
 			ClassId,
@@ -148,11 +153,18 @@ mod tests {
 		values::{PropertyKeyId, Vector, VectorKind, storage::DiskAtomRef},
 	};
 
+	/// Process-local suffix counter that separates temporary vector-index
+	/// stream files.
 	static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
-	struct TestFile(std::path::PathBuf);
+	/// Temporary file owner used by vector-index streaming tests.
+	struct TestFile(
+		/// Path retained for the lifetime of the temporary file owner.
+		std::path::PathBuf,
+	);
 
 	impl TestFile {
+		/// Constructs `TestFile` from the supplied initial state.
 		fn new() -> Self {
 			Self(std::env::temp_dir().join(format!(
 				"fg-vector-stream-{:016x}.fgidx",
@@ -162,25 +174,28 @@ mod tests {
 	}
 
 	impl Drop for TestFile {
+		/// Runs cleanup for this `TestFile` before its fields are released.
 		fn drop(&mut self) {
 			drop(fs::remove_file(&self.0));
 		}
 	}
 
+	/// Verifies streamed vector file round trips without retaining encoded
+	/// pages.
 	#[test]
 	fn streamed_vector_file_round_trips_without_retaining_encoded_pages() {
 		let options = DiskAnnIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
 			true,
 		)
-		.unwrap();
+		.assert_ok();
 		let spec = VectorBuildSpec {
-			index: IndexId::new(7).unwrap(),
+			index: IndexId::new(7).assert_some(),
 			index_version: SchemaVersion::INITIAL,
 			scope: IndexScope::Base,
-			class: ClassId::new(3).unwrap(),
+			class: ClassId::new(3).assert_some(),
 			field: PropertyKeyId::new(2),
 			options: ClassIndexOptions::DiskAnn(options),
 			build_revision: 11,
@@ -188,10 +203,10 @@ mod tests {
 		};
 		let documents = (1..=96_u64)
 			.map(|slot| VectorDocument {
-				atom: DiskAtomRef::from_parts(AtomKind::Node, slot).unwrap(),
+				atom: DiskAtomRef::from_parts(AtomKind::Node, slot).assert_ok(),
 				vector: Vector::from(vec![
-					f32::from(u16::try_from(slot).unwrap()),
-					f32::from(u16::try_from(slot % 7).unwrap()),
+					f32::from(u16::try_from(slot).assert_ok()),
+					f32::from(u16::try_from(slot % 7).assert_ok()),
 				]),
 			})
 			.collect();
@@ -199,18 +214,18 @@ mod tests {
 			unreachable!("built-in distance must not invoke a UDF")
 		};
 		let (entrypoint, nodes) =
-			build_vector_graph_with_distance(spec, documents, &mut unavailable).unwrap();
+			build_vector_graph_with_distance(spec, documents, &mut unavailable).assert_ok();
 		let path = TestFile::new();
-		let file = DirectFile::create_new(&path.0).unwrap();
-		let built = write_vector_index_stream(&file, spec, entrypoint, &nodes).unwrap();
+		let file = DirectFile::create_new(&path.0).assert_ok();
+		let built = write_vector_index_stream(&file, spec, entrypoint, &nodes).assert_ok();
 		assert_eq!(built.page_count, file.page_count());
 
-		let mut pages = Vec::with_capacity(usize::try_from(file.page_count()).unwrap());
+		let mut pages = Vec::with_capacity(usize::try_from(file.page_count()).assert_ok());
 		for page_no in 0..file.page_count() {
 			pages.push(AlignedPage::zeroed());
-			file.read_page(PageNo::new(page_no), pages.last_mut().unwrap()).unwrap();
+			file.read_page(PageNo::new(page_no), pages.last_mut().assert_some()).assert_ok();
 		}
-		let decoded = decode_vector_index(&pages).unwrap();
+		let decoded = decode_vector_index(&pages).assert_ok();
 		assert_eq!(decoded.spec, spec);
 		assert_eq!(decoded.entrypoint, entrypoint);
 		assert_eq!(decoded.nodes, nodes);

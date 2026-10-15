@@ -16,26 +16,38 @@ use ferros_grynn::{
 	values::{Object, PropertyKeyId, PropertyMap, RecordId, Value},
 };
 
+/// Default record population for mutation and maintenance measurements.
 const DEFAULT_ROWS: usize = 10_000;
+/// Process-local suffix counter that separates temporary benchmark directories.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Seeded datastore, records and property key used by mutation benchmarks.
 struct MutationFixture {
+	/// Datastore retained by the fixture or operation.
 	store: Datastore,
+	/// Stable record identities seeded for the scenario.
 	records: Vec<RecordId>,
+	/// Interned property-name identifier used for value lookup.
 	key: PropertyKeyId,
 }
 
+/// Mutation fixture backed by a local database directory.
 struct LocalMaintenanceFixture {
+	/// Directory retaining the local files used by the scenario.
 	_store_directory: PathBuf,
+	/// Seeded datastore and mutation inputs retained by the enclosing scenario.
 	fixture: MutationFixture,
 }
 
 impl Drop for LocalMaintenanceFixture {
+	/// Runs cleanup for this `LocalMaintenanceFixture` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self._store_directory));
 	}
 }
 
+/// Returns rows for this module.
 fn rows() -> usize {
 	std::env::var("FG_STAGE_GATE_ROWS")
 		.ok()
@@ -44,6 +56,7 @@ fn rows() -> usize {
 		.max(1)
 }
 
+/// Returns assert query for this module.
 fn assert_query(store: &Datastore, query: &str) -> Value {
 	let results = store.execute(query, &Object::new()).expect("gate query must execute");
 	if let Some(error) = results.iter().find_map(|result| result.result.as_ref().err()) {
@@ -56,10 +69,12 @@ fn assert_query(store: &Datastore, query: &str) -> Value {
 		.unwrap_or(Value::None)
 }
 
+/// Builds the mutation fixture used by nearby scenarios.
 fn mutation_fixture(mode: &str) -> MutationFixture {
 	prepare_mutation_fixture(Datastore::in_memory(), mode)
 }
 
+/// Builds the prepare mutation fixture used by nearby scenarios.
 fn prepare_mutation_fixture(store: Datastore, mode: &str) -> MutationFixture {
 	assert_query(
 		&store,
@@ -99,6 +114,7 @@ fn prepare_mutation_fixture(store: Datastore, mode: &str) -> MutationFixture {
 	}
 }
 
+/// Builds the local maintenance fixture used by nearby scenarios.
 fn local_maintenance_fixture() -> LocalMaintenanceFixture {
 	let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 	let directory =
@@ -113,6 +129,7 @@ fn local_maintenance_fixture() -> LocalMaintenanceFixture {
 	}
 }
 
+/// Returns mutate all for this module.
 fn mutate_all(fixture: &mut MutationFixture) {
 	let mut transaction = fixture.store.begin();
 	for (ordinal, record) in fixture.records.iter().enumerate() {
@@ -123,6 +140,7 @@ fn mutate_all(fixture: &mut MutationFixture) {
 	black_box(transaction.commit().expect("mutation batch must commit"));
 }
 
+/// Returns wait for jobs for this module.
 fn wait_for_jobs(store: &Datastore) {
 	let deadline = Instant::now() + Duration::from_secs(60);
 	loop {
@@ -141,6 +159,7 @@ fn wait_for_jobs(store: &Datastore) {
 	}
 }
 
+/// Measures stage20 with the benchmark harness.
 fn benchmark_stage20(criterion: &mut Criterion) {
 	let mut deferred = criterion.benchmark_group("gql_stage20/deferred_mutation");
 	deferred.warm_up_time(Duration::from_secs(1));
@@ -220,6 +239,7 @@ fn benchmark_stage20(criterion: &mut Criterion) {
 	ledger.finish();
 }
 
+/// Measures stage21 with the benchmark harness.
 fn benchmark_stage21(criterion: &mut Criterion) {
 	let store = Datastore::in_memory();
 	assert_query(

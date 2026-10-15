@@ -26,6 +26,7 @@ use super::{
 	rebuild_lookup_index_store,
 };
 use crate::{
+	datastore::OccurrenceStateRef,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeTopology, GraphId, GraphRef},
 	stats::StatisticsStore,
@@ -34,7 +35,8 @@ use crate::{
 
 /// One immutable MVCC root spanning base atoms and every graph occurrence.
 #[derive(Clone)]
-pub(crate) struct DatabaseRoot {
+pub struct DatabaseRoot {
+	/// Commit ts associated with this database root.
 	pub(crate) commit_ts: u64,
 	/// Persistent origin for portable changefeed cursors.
 	pub(crate) database_uuid: uuid::Uuid,
@@ -45,10 +47,15 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) committed_at_ns: i128,
 	/// One shared history binding, with selective inner copy-on-write maps.
 	history_binding: Arc<HistoryRoot>,
+	/// Schema associated with this database root.
 	pub(crate) schema: Arc<SchemaCatalog>,
+	/// Dictionary associated with this database root.
 	pub(crate) dictionary: Arc<PropertyDictionary>,
+	/// Atoms associated with this database root.
 	pub(crate) atoms: Arc<AtomStoreRoot>,
+	/// Indexes associated with this database root.
 	pub(crate) indexes: Arc<IndexStoreRoot>,
+	/// Statistics associated with this database root.
 	pub(crate) statistics: Arc<StatisticsStore>,
 	/// Immutable geometry page generations retained by RAM snapshots.
 	pub(crate) resident_geometry: Arc<BTreeMap<IndexId, crate::storage::ResidentGeometryIndex>>,
@@ -60,7 +67,9 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) path_artifacts: Arc<BTreeMap<IndexId, Arc<super::LandmarkPathArtifact>>>,
 	/// Full qualified incidence generations retained by old logical snapshots.
 	pub(crate) tensor_artifacts: Arc<BTreeMap<IndexId, Arc<super::TensorArtifact>>>,
+	/// Graphs associated with this database root.
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
+	/// Versions associated with this database root.
 	pub(super) versions: Arc<super::versions::VersionStore>,
 }
 
@@ -71,7 +80,7 @@ struct HistoryRoot {
 	events: Arc<super::EventOutbox>,
 	/// Snapshot-exact physical journal descriptors, separate from logical
 	/// payloads.
-	event_segments: Arc<Vec<crate::storage::HistorySegment>>,
+	event_segments: Arc<[crate::storage::HistorySegment]>,
 	/// Reactive definitions share snapshot ownership with retained history.
 	live: Arc<super::LiveCatalog>,
 	/// Definitions survive removal of the current schema owner.
@@ -94,15 +103,21 @@ type ChangeHistory =
 pub(super) type LiveHistoryGroups = Arc<BTreeMap<(crate::live::LiveId, u64), Arc<[u8]>>>;
 
 /// Complete normalized-state violations collected for `ASSERT INVARIANTS`.
-pub(crate) struct InvariantViolationReport {
+pub struct InvariantViolationReport {
+	/// Total associated with this invariant violation report.
 	total: usize,
+	/// Totals associated with this invariant violation report.
 	totals: BTreeMap<&'static str, usize>,
+	/// Details associated with this invariant violation report.
 	details: Vec<(&'static str, String)>,
+	/// Detail limit associated with this invariant violation report.
 	detail_limit: usize,
+	/// First associated with this invariant violation report.
 	first: Option<FerrosGrynnError>,
 }
 
 impl InvariantViolationReport {
+	/// Creates a new `InvariantViolationReport` value.
 	pub(crate) fn new(detail_limit: usize) -> Self {
 		Self {
 			total: 0,
@@ -113,6 +128,7 @@ impl InvariantViolationReport {
 		}
 	}
 
+	/// Pushes invariant violation report.
 	pub(crate) fn push(&mut self, category: &'static str, error: FerrosGrynnError) {
 		self.total = self.total.saturating_add(1);
 		*self.totals.entry(category).or_default() += 1;
@@ -124,32 +140,39 @@ impl InvariantViolationReport {
 		}
 	}
 
+	/// Returns the total result.
 	pub(crate) const fn total(&self) -> usize {
 		self.total
 	}
 
+	/// Returns whether there are no logical elements.
 	pub(crate) const fn is_empty(&self) -> bool {
 		self.total == 0
 	}
 
+	/// Returns the totals result.
 	pub(crate) fn totals(&self) -> &BTreeMap<&'static str, usize> {
 		&self.totals
 	}
 
+	/// Returns the details result.
 	pub(crate) fn details(&self) -> &[(&'static str, String)] {
 		&self.details
 	}
 
+	/// Returns the first error result.
 	pub(crate) fn first_error(&self) -> Option<&FerrosGrynnError> {
 		self.first.as_ref()
 	}
 
+	/// Converts this value into first error.
 	fn into_first_error(self) -> Option<FerrosGrynnError> {
 		self.first
 	}
 }
 
 impl Default for DatabaseRoot {
+	/// Constructs the default initial state of `DatabaseRoot`.
 	fn default() -> Self {
 		Self {
 			commit_ts: 0,
@@ -209,7 +232,7 @@ impl DatabaseRoot {
 	}
 
 	/// Borrows durable outbox reachability without loading payload pages.
-	pub(crate) fn event_outbox_segments(&self) -> &Arc<Vec<crate::storage::HistorySegment>> {
+	pub(crate) fn event_outbox_segments(&self) -> &Arc<[crate::storage::HistorySegment]> {
 		&self.history_binding.event_segments
 	}
 
@@ -217,7 +240,7 @@ impl DatabaseRoot {
 	/// snapshot.
 	pub(crate) fn set_event_outbox_segments(
 		&mut self,
-		segments: Arc<Vec<crate::storage::HistorySegment>>,
+		segments: Arc<[crate::storage::HistorySegment]>,
 	) {
 		Arc::make_mut(&mut self.history_binding).event_segments = segments;
 	}
@@ -405,10 +428,8 @@ impl DatabaseRoot {
 						}
 					}
 			})
-			.map(|entry| entry.id)
-			.collect::<Vec<_>>();
+			.map(|entry| entry.id);
 		let updates = sources
-			.into_iter()
 			.map(|id| {
 				let mut definition = self
 					.changefeeds()
@@ -495,6 +516,7 @@ impl DatabaseRoot {
 		Ok(affected)
 	}
 
+	/// Inserts atom.
 	pub(crate) fn insert_atom(
 		&mut self,
 		class: &ClassSchema,
@@ -513,6 +535,7 @@ impl DatabaseRoot {
 		Ok(id)
 	}
 
+	/// Inserts atom at.
 	pub(crate) fn insert_atom_at(
 		&mut self,
 		id: GlobalAtomId,
@@ -532,22 +555,27 @@ impl DatabaseRoot {
 		Ok(())
 	}
 
+	/// Returns the atom result.
 	pub(crate) fn atom(&self, id: GlobalAtomId) -> Option<&BaseAtom> {
 		self.atoms.atom(id)
 	}
 
+	/// Returns the atom arc result.
 	pub(crate) fn atom_arc(&self, id: GlobalAtomId) -> Option<Arc<BaseAtom>> {
 		self.atoms.atom_arc(id)
 	}
 
+	/// Returns the atom by record result.
 	pub(crate) fn atom_by_record(&self, record_id: &RecordId) -> Option<&BaseAtom> {
 		self.atoms.resolve(record_id).and_then(|id| self.atom(id))
 	}
 
+	/// Resolves atom.
 	pub(crate) fn resolve_atom(&self, record_id: &RecordId) -> Option<GlobalAtomId> {
 		self.atoms.resolve(record_id)
 	}
 
+	/// Sets base property.
 	pub(crate) fn set_base_property(
 		&mut self,
 		global: GlobalAtomId,
@@ -557,6 +585,7 @@ impl DatabaseRoot {
 		self.change_base_property(global, key, Some(value))
 	}
 
+	/// Removes base property.
 	pub(crate) fn remove_base_property(
 		&mut self,
 		global: GlobalAtomId,
@@ -565,6 +594,7 @@ impl DatabaseRoot {
 		self.change_base_property(global, key, None)
 	}
 
+	/// Returns the change base property result.
 	fn change_base_property(
 		&mut self,
 		global: GlobalAtomId,
@@ -646,6 +676,7 @@ impl DatabaseRoot {
 		Ok(previous)
 	}
 
+	/// Removes atom.
 	pub(crate) fn remove_atom(&mut self, global: GlobalAtomId) -> FerrosGrynnResult<BaseAtom> {
 		let atom = self
 			.atom(global)
@@ -673,6 +704,7 @@ impl DatabaseRoot {
 		Ok(removed)
 	}
 
+	/// Restores property name.
 	pub(crate) fn restore_property_name(
 		&mut self,
 		key: PropertyKeyId,
@@ -681,6 +713,7 @@ impl DatabaseRoot {
 		Arc::make_mut(&mut self.dictionary).restore(key, name)
 	}
 
+	/// Returns the add graph result.
 	pub(crate) fn add_graph(&mut self, reference: GraphRef) -> FerrosGrynnResult<()> {
 		if self.graphs.contains_key(&reference.id()) {
 			return Err(FerrosGrynnError::graph_already_exists(reference.name().to_string()));
@@ -689,6 +722,7 @@ impl DatabaseRoot {
 		Ok(())
 	}
 
+	/// Returns the install class result.
 	pub(crate) fn install_class(
 		&mut self,
 		mut class: ClassSchema,
@@ -728,6 +762,7 @@ impl DatabaseRoot {
 		Ok(id)
 	}
 
+	/// Returns the install graph result.
 	pub(crate) fn install_graph(
 		&mut self,
 		mut schema: GraphSchema,
@@ -759,6 +794,7 @@ impl DatabaseRoot {
 		Ok(reference)
 	}
 
+	/// Returns the graph result.
 	pub(crate) fn graph(&self, graph: GraphId) -> Option<&GraphRoot> {
 		self.graphs.get(&graph).map(Arc::as_ref)
 	}
@@ -939,6 +975,7 @@ impl DatabaseRoot {
 		report
 	}
 
+	/// Collects graph violations.
 	fn collect_graph_violations(
 		&self,
 		graph_id: GraphId,
@@ -952,7 +989,7 @@ impl DatabaseRoot {
 		match self.schema.graph(graph_id) {
 			Some(schema) if schema.reference() == graph.reference() => {}
 			Some(_) => {
-				report.push("graph_root", invalid("graph root identity disagrees with its schema"))
+				report.push("graph_root", invalid("graph root identity disagrees with its schema"));
 			}
 			None => report.push("graph_root", invalid("graph root has no schema definition")),
 		}
@@ -1015,6 +1052,7 @@ impl DatabaseRoot {
 		}
 	}
 
+	/// Validates base atom.
 	fn validate_base_atom(&self, atom: &BaseAtom) -> FerrosGrynnResult<()> {
 		let class = self
 			.schema
@@ -1032,6 +1070,7 @@ impl DatabaseRoot {
 		Arc::make_mut(&mut self.indexes).defer_explicit_indexes(retain_unique);
 	}
 
+	/// Attaches node.
 	pub(crate) fn attach_node(
 		&mut self,
 		graph: GraphId,
@@ -1066,6 +1105,7 @@ impl DatabaseRoot {
 		Ok(local)
 	}
 
+	/// Attaches node at.
 	pub(crate) fn attach_node_at(
 		&mut self,
 		graph: GraphId,
@@ -1101,6 +1141,7 @@ impl DatabaseRoot {
 		Ok(())
 	}
 
+	/// Attaches edge.
 	pub(crate) fn attach_edge(
 		&mut self,
 		graph: GraphId,
@@ -1144,6 +1185,7 @@ impl DatabaseRoot {
 		Ok(local)
 	}
 
+	/// Attaches edge at.
 	pub(crate) fn attach_edge_at(
 		&mut self,
 		graph: GraphId,
@@ -1236,12 +1278,14 @@ impl DatabaseRoot {
 		Ok(())
 	}
 
+	/// Validates graph endpoints.
 	pub(crate) fn validate_graph_endpoints(&self, graph: GraphId) -> FerrosGrynnResult<()> {
 		self.graph(graph)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
 			.validate_restored_endpoints()
 	}
 
+	/// Detaches database root.
 	pub(crate) fn detach(
 		&mut self,
 		graph: GraphId,
@@ -1305,18 +1349,22 @@ impl DatabaseRoot {
 		Ok(removed)
 	}
 
+	/// Returns the occurrence result.
 	pub(crate) fn occurrence(&self, graph: GraphId, local: AtomId) -> Option<&GraphOccurrence> {
 		self.graph(graph)?.occurrence(local)
 	}
 
+	/// Returns the membership result.
 	pub(crate) fn membership(&self, graph: GraphId, global: GlobalAtomId) -> Option<AtomId> {
 		self.graph(graph)?.local_id(global)
 	}
 
+	/// Returns the memberships result.
 	pub(crate) fn memberships(&self, global: GlobalAtomId) -> Option<&BTreeMap<GraphId, AtomId>> {
 		self.atoms.memberships(global)
 	}
 
+	/// Returns whether the inherits property condition holds.
 	pub(crate) fn inherits_property(
 		&self,
 		graph: GraphId,
@@ -1328,6 +1376,7 @@ impl DatabaseRoot {
 			.is_some_and(|occurrence| occurrence.inherits(key))
 	}
 
+	/// Sets overlay.
 	pub(crate) fn set_overlay(
 		&mut self,
 		graph: GraphId,
@@ -1340,6 +1389,7 @@ impl DatabaseRoot {
 		})
 	}
 
+	/// Returns the hide property result.
 	pub(crate) fn hide_property(
 		&mut self,
 		graph: GraphId,
@@ -1351,6 +1401,7 @@ impl DatabaseRoot {
 		})
 	}
 
+	/// Resets property.
 	pub(crate) fn reset_property(
 		&mut self,
 		graph: GraphId,
@@ -1360,6 +1411,7 @@ impl DatabaseRoot {
 		self.replace_occurrence(graph, local, |occurrence| occurrence.reset_overlay(key))
 	}
 
+	/// Sets occurrence label.
 	pub(crate) fn set_occurrence_label(
 		&mut self,
 		graph: GraphId,
@@ -1369,16 +1421,17 @@ impl DatabaseRoot {
 		self.replace_occurrence(graph, local, |occurrence| occurrence.set_label(label))
 	}
 
+	/// Replaces occurrence state.
 	pub(crate) fn replace_occurrence_state(
 		&mut self,
 		graph: GraphId,
 		local: AtomId,
 		state: OccurrenceState,
 	) -> FerrosGrynnResult<()> {
-		if let OccurrenceState::Edge {
+		if let OccurrenceStateRef::Edge {
 			topology,
 			..
-		} = &state
+		} = state.view()
 		{
 			self.validate_qualified_incidence(graph, topology)?;
 		}
@@ -1388,6 +1441,7 @@ impl DatabaseRoot {
 		self.replace_occurrence(graph, local, |occurrence| occurrence.replace_state(state))
 	}
 
+	/// Returns the effective property result.
 	pub(crate) fn effective_property(
 		&self,
 		graph: GraphId,
@@ -1403,21 +1457,7 @@ impl DatabaseRoot {
 		Ok(occurrence.effective_value(base.properties().get(key), key))
 	}
 
-	pub(crate) fn base_index_lookup(&self, index: IndexId, key: &[u8]) -> Vec<GlobalAtomId> {
-		self.indexes.base_index(index).map_or_else(Vec::new, |index| index.entries.lookup(key))
-	}
-
-	pub(crate) fn effective_index_lookup(
-		&self,
-		graph: GraphId,
-		index: IndexId,
-		key: &[u8],
-	) -> Vec<AtomId> {
-		self.indexes
-			.graph_index(graph, index)
-			.map_or_else(Vec::new, |index| index.entries.lookup(key))
-	}
-
+	/// Replaces occurrence.
 	fn replace_occurrence(
 		&mut self,
 		graph: GraphId,
@@ -1433,28 +1473,28 @@ impl DatabaseRoot {
 		let mut after = before.clone();
 		change(&mut after);
 		let cost_changed = before != after;
-		let weight_changed = matches!((before.state(), after.state()), (OccurrenceState::Edge { weight: before, .. }, OccurrenceState::Edge { weight: after, .. }) if before != after);
+		let weight_changed = matches!((before.state().view(), after.state().view()), (OccurrenceStateRef::Edge { weight: before, .. }, OccurrenceStateRef::Edge { weight: after, .. }) if before != after);
 		let tensor_changed = before.label() != after.label() || before.state() != after.state();
 		let class = self.schema.class_by_id(atom.class_id());
 		let relation_changed = before.label() != after.label() && local.is_edge()
-			|| match (before.state(), after.state()) {
+			|| match (before.state().view(), after.state().view()) {
 				(
-					OccurrenceState::Edge {
+					OccurrenceStateRef::Edge {
 						topology: before,
 						transition_graph: before_graph,
 						..
 					},
-					OccurrenceState::Edge {
+					OccurrenceStateRef::Edge {
 						topology: after,
 						transition_graph: after_graph,
 						..
 					},
 				) => before != after || before_graph != after_graph,
 				(
-					OccurrenceState::Node {
+					OccurrenceStateRef::Node {
 						nested_graph: before,
 					},
-					OccurrenceState::Node {
+					OccurrenceStateRef::Node {
 						nested_graph: after,
 					},
 				) => before != after,
@@ -1493,6 +1533,7 @@ impl DatabaseRoot {
 		Ok(())
 	}
 
+	/// Returns the version result.
 	pub(crate) fn version(&self, key: ConflictKey) -> u64 {
 		if let ConflictKey::SchemaClass(class) = key {
 			return self.schema.class_versions.get(&class).copied().unwrap_or(0);
@@ -1500,16 +1541,17 @@ impl DatabaseRoot {
 		self.versions.get(&key).copied().unwrap_or(0)
 	}
 
+	/// Marks version.
 	pub(crate) fn mark_version(&mut self, key: ConflictKey, commit_ts: u64) {
 		Arc::make_mut(&mut self.versions).insert(key, commit_ts);
 		if let ConflictKey::GraphIncidence(graph, _) | ConflictKey::GraphMembership(graph, _) = key
+			&& let Some(root) = self.graphs.get_mut(&graph)
 		{
-			if let Some(root) = self.graphs.get_mut(&graph) {
-				Arc::make_mut(root).tensor_revision = commit_ts;
-			}
+			Arc::make_mut(root).tensor_revision = commit_ts;
 		}
 	}
 
+	/// Advances identity clocks.
 	pub(crate) fn advance_identity_clocks(&mut self, next_schema_id: u64, next_graph_id: u64) {
 		if self.schema.next_schema_id == next_schema_id
 			&& self.schema.next_graph_id == next_graph_id
@@ -1521,6 +1563,7 @@ impl DatabaseRoot {
 		catalog.next_graph_id = next_graph_id;
 	}
 
+	/// Publishes statistics revision.
 	pub(crate) fn publish_statistics_revision(&mut self, revision: u64) {
 		if !self.statistics.has_revision_updates() {
 			return;
@@ -1528,6 +1571,7 @@ impl DatabaseRoot {
 		Arc::make_mut(&mut self.statistics).publish_revision(revision);
 	}
 
+	/// Returns the graph mut result.
 	fn graph_mut(&mut self, graph: GraphId) -> FerrosGrynnResult<&mut GraphRoot> {
 		self.graphs
 			.get_mut(&graph)
@@ -1635,16 +1679,7 @@ impl DatabaseRoot {
 		}
 	}
 
-	fn occurrence_mut(
-		&mut self,
-		graph: GraphId,
-		local: AtomId,
-	) -> FerrosGrynnResult<&mut GraphOccurrence> {
-		self.graph_mut(graph)?
-			.occurrence_mut(local)
-			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("occurrence", local.to_string()))
-	}
-
+	/// Returns the require kind result.
 	fn require_kind(&self, global: GlobalAtomId, expected: AtomKind) -> FerrosGrynnResult<()> {
 		let atom = self
 			.atom(global)
@@ -1660,6 +1695,7 @@ impl DatabaseRoot {
 	}
 }
 
+/// Validates properties.
 fn validate_properties<'value>(
 	class: &ClassSchema,
 	properties: impl IntoIterator<Item = (PropertyKeyId, &'value Value)>,
@@ -1678,6 +1714,7 @@ fn validate_properties<'value>(
 	Ok(())
 }
 
+/// Returns whether the compatible type condition holds.
 fn compatible_type(expected: &Type, actual: &Type) -> bool {
 	expected == actual
 		|| matches!(expected, Type::Any)
@@ -1687,49 +1724,73 @@ fn compatible_type(expected: &Type, actual: &Type) -> bool {
 		|| matches!(expected, Type::Union(types) if types.iter().any(|ty| compatible_type(ty, actual)))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for root behavior.
 mod tests {
 	use std::sync::Arc;
 
 	use super::DatabaseRoot;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{ClassId, ClassSchema, GraphRoot},
 		graph::{AtomKind, EdgeTopology, GraphId, GraphKind, GraphRef, GraphStorageMode},
 		values::{Number, PropertyKeyId, PropertyMap, RecordId, RecordIdPart, Value},
 	};
 
+	/// Returns class for this module.
 	fn class(id: u32, name: &str, kind: AtomKind) -> ClassSchema {
-		let mut class = ClassSchema::new(name, kind, []).unwrap();
+		let mut class = ClassSchema::new(name, kind, []).assert_ok();
 		class.id = ClassId::new(id);
 		class
 	}
 
+	/// Returns graph for this module.
 	fn graph(id: u64, name: &str) -> GraphRef {
-		GraphRef::new(GraphId::new(id).unwrap(), name, GraphKind::Graph, GraphStorageMode::InMemory)
-			.unwrap()
+		GraphRef::new(
+			GraphId::new(id).assert_some(),
+			name,
+			GraphKind::Graph,
+			GraphStorageMode::InMemory,
+		)
+		.assert_ok()
 	}
 
 	/// One component's COW must preserve both sibling handles and the old root.
 	#[test]
-	fn changefeed_binding_detaches_selectively() -> crate::gql_status::FerrosGrynnResult<()> {
+	fn changefeed_binding_detaches_selectively() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut original = DatabaseRoot::default();
 		let feed = crate::changefeed::ChangefeedId::allocate();
-		let duration = "P1D".parse::<crate::values::Duration>().map_err(|error| {
-			crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-		})?;
-		Arc::make_mut(original.changefeeds_mut()).configure(
-			crate::changefeed::ChangefeedSource::Class(ClassId::new(1).ok_or_else(|| {
-				crate::gql_status::FerrosGrynnError::invalid_argument("fixture class identity")
-			})?),
-			feed,
-			"item".into(),
-			Some(crate::changefeed::ChangefeedConfig::new(duration)?),
-			0,
-		)?;
+		let duration = "P1D"
+			.parse::<crate::values::Duration>()
+			.map_err(|error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+			})
+			.assert_ok();
+		Arc::make_mut(original.changefeeds_mut())
+			.configure(
+				crate::changefeed::ChangefeedSource::Class(
+					ClassId::new(1)
+						.ok_or_else(|| {
+							crate::gql_status::FerrosGrynnError::invalid_argument(
+								"fixture class identity",
+							)
+						})
+						.assert_ok(),
+				),
+				feed,
+				"item".into(),
+				Some(crate::changefeed::ChangefeedConfig::new(duration).assert_ok()),
+				0,
+			)
+			.assert_ok();
 		for component in 0..3 {
 			let mut changed = original.clone();
 			match component {
@@ -1751,9 +1812,9 @@ mod tests {
 			assert!(original.changefeeds().definitions.contains_key(&feed));
 			assert_eq!(changed.changefeeds().definitions.contains_key(&feed), component != 0);
 		}
-		Ok(())
 	}
 
+	/// Verifies invariant report counts all violations and bounds details.
 	#[test]
 	fn invariant_report_counts_all_violations_and_bounds_details() {
 		let mut root = DatabaseRoot::default();
@@ -1768,6 +1829,7 @@ mod tests {
 		assert_eq!(report.details().len(), 1);
 	}
 
+	/// Verifies shares base and isolates lazy overlays.
 	#[test]
 	fn shares_base_and_isolates_lazy_overlays() {
 		let name = PropertyKeyId::new(1);
@@ -1778,45 +1840,46 @@ mod tests {
 		let global = root
 			.insert_atom(
 				&person,
-				RecordId::new("person", RecordIdPart::String("ada".into())).unwrap(),
+				RecordId::new("person", RecordIdPart::String("ada".into())).assert_ok(),
 				properties,
 			)
-			.unwrap();
+			.assert_ok();
 		let first = graph(1, "first");
 		let second = graph(2, "second");
 		let first_id = first.id();
 		let second_id = second.id();
 		install_graph(&mut root, first, 10);
 		install_graph(&mut root, second, 12);
-		let first_local = root.attach_node(first_id, global, Some("A".into()), None).unwrap();
-		let second_local = root.attach_node(second_id, global, Some("B".into()), None).unwrap();
+		let first_local = root.attach_node(first_id, global, Some("A".into()), None).assert_ok();
+		let second_local = root.attach_node(second_id, global, Some("B".into()), None).assert_ok();
 
 		assert_eq!(
-			root.effective_property(first_id, first_local, name).unwrap(),
+			root.effective_property(first_id, first_local, name).assert_ok(),
 			Some(&Value::from("base"))
 		);
-		assert!(!root.occurrence(first_id, first_local).unwrap().has_overlay());
-		root.set_overlay(first_id, first_local, name, Value::from("private")).unwrap();
-		root.set_base_property(global, name, Value::from("updated")).unwrap();
+		assert!(!root.occurrence(first_id, first_local).assert_some().has_overlay());
+		root.set_overlay(first_id, first_local, name, Value::from("private")).assert_ok();
+		root.set_base_property(global, name, Value::from("updated")).assert_ok();
 		assert_eq!(
-			root.effective_property(first_id, first_local, name).unwrap(),
+			root.effective_property(first_id, first_local, name).assert_ok(),
 			Some(&Value::from("private"))
 		);
 		assert_eq!(
-			root.effective_property(second_id, second_local, name).unwrap(),
+			root.effective_property(second_id, second_local, name).assert_ok(),
 			Some(&Value::from("updated"))
 		);
 
-		root.hide_property(first_id, first_local, name).unwrap();
-		assert_eq!(root.effective_property(first_id, first_local, name).unwrap(), None);
-		root.reset_property(first_id, first_local, name).unwrap();
+		root.hide_property(first_id, first_local, name).assert_ok();
+		assert_eq!(root.effective_property(first_id, first_local, name).assert_ok(), None);
+		root.reset_property(first_id, first_local, name).assert_ok();
 		assert_eq!(
-			root.effective_property(first_id, first_local, name).unwrap(),
+			root.effective_property(first_id, first_local, name).assert_ok(),
 			Some(&Value::from("updated"))
 		);
-		assert!(!root.occurrence(first_id, first_local).unwrap().has_overlay());
+		assert!(!root.occurrence(first_id, first_local).assert_some().has_overlay());
 	}
 
+	/// Verifies global node and edge use distinct atom store slots.
 	#[test]
 	fn global_node_and_edge_use_distinct_atom_store_slots() {
 		let mut root = DatabaseRoot::default();
@@ -1825,32 +1888,34 @@ mod tests {
 		let node_id = root
 			.insert_atom(
 				&node,
-				RecordId::new("person", RecordIdPart::Int(1)).unwrap(),
+				RecordId::new("person", RecordIdPart::Int(1)).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 		let edge_id = root
 			.insert_atom(
 				&edge,
-				RecordId::new("knows", RecordIdPart::Int(1)).unwrap(),
+				RecordId::new("knows", RecordIdPart::Int(1)).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 
 		assert_ne!(node_id.slot(), edge_id.slot());
 	}
 
+	/// Verifies permits unattached property records.
 	#[test]
 	fn permits_unattached_property_records() {
 		let mut root = DatabaseRoot::default();
 		let property = class(1, "property", AtomKind::Node);
-		let record = RecordId::new("property", RecordIdPart::Int(42)).unwrap();
-		let global = root.insert_atom(&property, record.clone(), PropertyMap::new()).unwrap();
+		let record = RecordId::new("property", RecordIdPart::Int(42)).assert_ok();
+		let global = root.insert_atom(&property, record.clone(), PropertyMap::new()).assert_ok();
 
-		assert_eq!(root.atom_by_record(&record).unwrap().id(), global);
+		assert_eq!(root.atom_by_record(&record).assert_some().id(), global);
 		assert!(root.memberships(global).is_none());
 	}
 
+	/// Verifies one global edge has independent graph topology.
 	#[test]
 	fn one_global_edge_has_independent_graph_topology() {
 		let mut root = DatabaseRoot::default();
@@ -1859,34 +1924,34 @@ mod tests {
 		let left = root
 			.insert_atom(
 				&person,
-				RecordId::new("person", RecordIdPart::String("left".into())).unwrap(),
+				RecordId::new("person", RecordIdPart::String("left".into())).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 		let right = root
 			.insert_atom(
 				&person,
-				RecordId::new("person", RecordIdPart::String("right".into())).unwrap(),
+				RecordId::new("person", RecordIdPart::String("right".into())).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 		let edge = root
 			.insert_atom(
 				&relation,
-				RecordId::new("knows", RecordIdPart::String("edge".into())).unwrap(),
+				RecordId::new("knows", RecordIdPart::String("edge".into())).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 		let first = graph(1, "first");
 		let second = graph(2, "second");
 		let first_id = first.id();
 		let second_id = second.id();
 		install_graph(&mut root, first, 10);
 		install_graph(&mut root, second, 12);
-		let first_left = root.attach_node(first_id, left, None, None).unwrap();
-		let first_right = root.attach_node(first_id, right, None, None).unwrap();
-		let second_left = root.attach_node(second_id, left, None, None).unwrap();
-		let second_right = root.attach_node(second_id, right, None, None).unwrap();
+		let first_left = root.attach_node(first_id, left, None, None).assert_ok();
+		let first_right = root.attach_node(first_id, right, None, None).assert_ok();
+		let second_left = root.attach_node(second_id, left, None, None).assert_ok();
+		let second_right = root.attach_node(second_id, right, None, None).assert_ok();
 		let first_edge = root
 			.attach_edge(
 				first_id,
@@ -1896,7 +1961,7 @@ mod tests {
 				Some(Number::from(1_i64)),
 				None,
 			)
-			.unwrap();
+			.assert_ok();
 		let second_edge = root
 			.attach_edge(
 				second_id,
@@ -1906,29 +1971,33 @@ mod tests {
 				Some(Number::from(2_i64)),
 				None,
 			)
-			.unwrap();
+			.assert_ok();
 
 		assert_ne!(
-			root.occurrence(first_id, first_edge).unwrap().state(),
-			root.occurrence(second_id, second_edge).unwrap().state()
+			root.occurrence(first_id, first_edge).assert_some().state(),
+			root.occurrence(second_id, second_edge).assert_some().state()
 		);
-		assert_eq!(root.memberships(edge).unwrap().len(), 2);
+		assert_eq!(root.memberships(edge).assert_some().len(), 2);
 	}
 
+	/// Returns install graph for this module.
 	fn install_graph(root: &mut DatabaseRoot, reference: GraphRef, first_index: u32) {
 		use crate::datastore::{GraphSchema, IndexId, SchemaVersion, SystemIndex, SystemIndexKind};
 
 		let schema = GraphSchema::new(
 			SchemaVersion::INITIAL,
 			reference,
-			SystemIndex::new(IndexId::new(first_index).unwrap(), SystemIndexKind::Label),
-			SystemIndex::new(IndexId::new(first_index + 1).unwrap(), SystemIndexKind::Adjacency),
+			SystemIndex::new(IndexId::new(first_index).assert_some(), SystemIndexKind::Label),
+			SystemIndex::new(
+				IndexId::new(first_index + 1).assert_some(),
+				SystemIndexKind::Adjacency,
+			),
 			crate::values::PropertyMap::new(),
 			crate::graph::GraphTopologyConstraints::empty(),
 			None,
 			None,
 			0,
 		);
-		root.install_graph(schema, 0).unwrap();
+		root.install_graph(schema, 0).assert_ok();
 	}
 }

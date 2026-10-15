@@ -1,13 +1,19 @@
+#![cfg(test)]
 #![allow(
 	clippy::expect_used,
 	clippy::unwrap_used,
 	reason = "integration tests fail immediately when public datastore operations return an error"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 #[cfg(test)]
+/// Assertions shared by integration-test targets regression tests.
 mod common;
 
 #[cfg(test)]
+/// Regression tests for in memory datastore behavior.
 mod tests {
 	use ferros_grynn::{
 		datastore::Datastore,
@@ -21,6 +27,7 @@ mod tests {
 		exercise_normalized_atom_model,
 	};
 
+	/// Verifies commit is visible through the public graph api.
 	#[test]
 	fn commit_is_visible_through_the_public_graph_api() {
 		let store = Datastore::in_memory();
@@ -30,6 +37,7 @@ mod tests {
 		assert_people_graph(&store, &reference, &alice, name);
 	}
 
+	/// Verifies dropped transaction discards its graph.
 	#[test]
 	fn dropped_transaction_discards_its_graph() {
 		let store = Datastore::in_memory();
@@ -38,12 +46,16 @@ mod tests {
 		assert!(GraphRef::read(&reference, &store.begin()).is_err());
 	}
 
+	/// Verifies normalized atom model preserves shared base and isolates graph
+	/// state.
 	#[test]
 	fn normalized_atom_model_preserves_shared_base_and_isolates_graph_state() {
 		let store = Datastore::in_memory();
 		exercise_normalized_atom_model(&store);
 	}
 
+	/// Verifies geometry index is snapshot exact and enforces type on ram
+	/// writes.
 	#[test]
 	fn geometry_index_is_snapshot_exact_and_enforces_type_on_ram_writes() {
 		use ferros_grynn::values::{Geometry, Object, Value};

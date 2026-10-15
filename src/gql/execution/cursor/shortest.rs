@@ -9,26 +9,40 @@ use std::{
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Canonical hop state.
 struct CanonicalHop {
+	/// Edge associated with this canonical hop.
 	edge: crate::graph::AtomRef,
+	/// Target associated with this canonical hop.
 	target: crate::graph::AtomRef,
+	/// Direction associated with this canonical hop.
 	direction: PathDirection,
+	/// Role associated with this canonical hop.
 	role: EndpointRole,
 }
 
 #[derive(Debug, Clone)]
+/// Shortest-path frontier entry retaining its endpoint, candidate hops, cost
+/// and resource charge.
 struct SearchState {
+	/// Endpoint associated with this search state.
 	endpoint: AtomId,
+	/// Hops associated with this search state.
 	hops: Vec<TraversalCandidate>,
+	/// Canonical associated with this search state.
 	canonical: Vec<CanonicalHop>,
+	/// Cost associated with this search state.
 	cost: Number,
 	/// Admissible completion bound used only for frontier ordering.
 	priority: Number,
+	/// Serial associated with this search state.
 	serial: u64,
+	/// Accounted bytes associated with this search state.
 	accounted_bytes: usize,
 }
 
 impl SearchState {
+	/// Returns the estimated heap bytes result.
 	fn estimated_heap_bytes(&self) -> usize {
 		let identities = self.canonical.iter().fold(0_usize, |bytes, hop| {
 			bytes.saturating_add(canonical_atom_bytes(&hop.edge, &hop.target))
@@ -91,6 +105,7 @@ pub(in crate::gql::execution) fn extend_path_buffers<Hop: Clone, Canonical: Clon
 }
 
 impl PartialEq for SearchState {
+	/// Compares this `SearchState` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		(self.priority, self.cost, &self.canonical, self.serial)
 			== (other.priority, other.cost, &other.canonical, other.serial)
@@ -100,12 +115,15 @@ impl PartialEq for SearchState {
 impl Eq for SearchState {}
 
 impl PartialOrd for SearchState {
+	/// Compares this `SearchState` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for SearchState {
+	/// Compares this `SearchState` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		other
 			.priority
@@ -116,9 +134,18 @@ impl Ord for SearchState {
 	}
 }
 
+/// Search frontier alternatives.
 enum SearchFrontier {
-	Breadth(VecDeque<SearchState>),
-	Weighted(BinaryHeap<SearchState>),
+	/// Breadth case of search frontier.
+	Breadth(
+		/// Breadth case of search frontier.
+		VecDeque<SearchState>,
+	),
+	/// Weighted case of search frontier.
+	Weighted(
+		/// Weighted case of search frontier.
+		BinaryHeap<SearchState>,
+	),
 }
 
 /// Exact terminal row, ordered by runtime cost and the complete canonical path.
@@ -132,6 +159,7 @@ pub(in crate::gql::execution) struct CompletedPath<State> {
 }
 
 impl<State: PartialEq> PartialEq for CompletedPath<State> {
+	/// Compares this `CompletedPath<State>` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.state == other.state
 	}
@@ -140,12 +168,16 @@ impl<State: PartialEq> PartialEq for CompletedPath<State> {
 impl<State: Eq> Eq for CompletedPath<State> {}
 
 impl<State: Ord> PartialOrd for CompletedPath<State> {
+	/// Compares this `CompletedPath<State>` with another value when they are
+	/// ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl<State: Ord> Ord for CompletedPath<State> {
+	/// Compares this `CompletedPath<State>` with another value using its
+	/// ordering contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.state.cmp(&other.state)
 	}
@@ -188,120 +220,8 @@ pub(in crate::gql::execution) fn monotone_path_prefix(cost: Number) -> bool {
 	}
 }
 
-#[cfg(test)]
-mod numeric_tests {
-	use super::*;
-
-	#[test]
-	fn path_buffer_admission_precedes_all_prefix_clones() {
-		struct CountedClone(Rc<std::cell::Cell<usize>>, u8);
-		impl Clone for CountedClone {
-			fn clone(&self) -> Self {
-				self.0.set(self.0.get() + 1);
-				Self(self.0.clone(), self.1)
-			}
-		}
-		let clones = Rc::new(std::cell::Cell::new(0));
-		let hops = [CountedClone(clones.clone(), 1), CountedClone(clones.clone(), 2)];
-		let canonical = [CountedClone(clones.clone(), 3)];
-		let mut admitted = false;
-		let error = extend_path_buffers(
-			&hops,
-			CountedClone(clones.clone(), 4),
-			&canonical,
-			CountedClone(clones.clone(), 5),
-			64,
-			&mut |_| {
-				admitted = true;
-				Err(FerrosGrynnError::control_limit_exceeded("test admission", 1))
-			},
-		);
-		assert!(error.is_err());
-		assert!(admitted);
-		assert_eq!(clones.get(), 0);
-		let (grown_hops, grown_canonical, bytes) = extend_path_buffers(
-			&hops,
-			CountedClone(clones.clone(), 4),
-			&canonical,
-			CountedClone(clones.clone(), 5),
-			64,
-			&mut |bytes| {
-				assert_eq!(clones.get(), 0);
-				assert_eq!(bytes, 64 + 5 * size_of::<CountedClone>());
-				Ok(())
-			},
-		)
-		.unwrap();
-		assert_eq!(bytes, 64 + 5 * size_of::<CountedClone>());
-		assert_eq!(clones.get(), 3);
-		assert_eq!(grown_hops.iter().map(|item| item.1).collect::<Vec<_>>(), [1, 2, 4]);
-		assert_eq!(grown_canonical.iter().map(|item| item.1).collect::<Vec<_>>(), [3, 5]);
-		assert!(
-			extend_path_buffers(
-				&hops,
-				CountedClone(clones.clone(), 4),
-				&canonical,
-				CountedClone(clones.clone(), 5),
-				usize::MAX,
-				&mut |_| { panic!("overflow must precede admission") },
-			)
-			.is_err()
-		);
-		assert_eq!(clones.get(), 3);
-	}
-
-	#[test]
-	fn completion_bounds_enclose_runtime_reductions_at_numeric_boundaries() -> FerrosGrynnResult<()>
-	{
-		let numbers = [
-			Number::Int(0),
-			Number::Int(1),
-			Number::Int(9_007_199_254_740_993),
-			Number::Int(i64::MAX),
-			Number::Float(f64::from_bits(1)),
-			Number::Float(f64::MIN_POSITIVE),
-			Number::Float(0.1),
-			Number::Float(f64::MAX),
-			Number::Decimal(rust_decimal::Decimal::MAX),
-			Number::Decimal("0.0000000000000000000000000001".parse().map_err(|cause| {
-				FerrosGrynnError::invalid_argument("test decimal").with_technical_source(cause)
-			})?),
-		];
-		for prefix in numbers {
-			for first in numbers {
-				for second in numbers {
-					let mut cost = prefix;
-					let mut suffix = crate::graph::DistanceInterval::ZERO;
-					for length in 1..=30 {
-						let edge = if length % 2 == 0 {
-							first
-						} else {
-							second
-						};
-						let Ok(next) = add_path_cost(cost, edge) else {
-							break;
-						};
-						cost = next;
-						suffix = suffix.add(crate::graph::DistanceInterval::from_number(edge)?);
-						let bound = completion_bound(prefix, Number::Float(suffix.lower), length)?;
-						assert!(
-							bound <= cost,
-							"prefix={prefix:?} first={first:?} second={second:?} length={length} \
-							 bound={bound:?} cost={cost:?}"
-						);
-					}
-				}
-			}
-		}
-		let prefix = Number::Int(9_007_199_254_740_993);
-		let actual = add_path_cost(prefix, Number::Float(0.0))?;
-		assert!(actual < prefix);
-		assert!(completion_bound(prefix, Number::Int(0), 1)? <= actual);
-		Ok(())
-	}
-}
-
 impl SearchFrontier {
+	/// Creates a new `SearchFrontier` value.
 	fn new(objective: crate::syn::MatchPathObjective) -> Self {
 		match objective {
 			crate::syn::MatchPathObjective::Shortest
@@ -311,6 +231,7 @@ impl SearchFrontier {
 		}
 	}
 
+	/// Pushes search frontier.
 	fn push(&mut self, state: SearchState) {
 		match self {
 			Self::Breadth(frontier) => frontier.push_back(state),
@@ -318,6 +239,7 @@ impl SearchFrontier {
 		}
 	}
 
+	/// Pops search frontier.
 	fn pop(&mut self) -> Option<SearchState> {
 		match self {
 			Self::Breadth(frontier) => frontier.pop_front(),
@@ -325,6 +247,7 @@ impl SearchFrontier {
 		}
 	}
 
+	/// Clears search frontier.
 	fn clear(&mut self) {
 		match self {
 			Self::Breadth(frontier) => frontier.clear(),
@@ -332,6 +255,7 @@ impl SearchFrontier {
 		}
 	}
 
+	/// Returns the number of logical elements.
 	fn len(&self) -> usize {
 		match self {
 			Self::Breadth(frontier) => frontier.len(),
@@ -350,7 +274,9 @@ impl SearchFrontier {
 
 /// Emits one canonical shortest path for each matching source-target pair.
 pub(in crate::gql::execution) struct ShortestPathCursor<'a, Read: QueryRead, Graph> {
+	/// Input associated with this shortest path cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Graph associated with this shortest path cursor.
 	graph: Rc<Graph>,
 	/// Transaction adapter for snapshot-exact lower bounds.
 	read: &'a Read,
@@ -362,20 +288,32 @@ pub(in crate::gql::execution) struct ShortestPathCursor<'a, Read: QueryRead, Gra
 	heuristic_target: Option<AtomId>,
 	/// Terminal states await proof against every pending completion bound.
 	completed: BinaryHeap<CompletedPath<SearchState>>,
+	/// Graph ref associated with this shortest path cursor.
 	graph_ref: Arc<GraphRef>,
+	/// Index associated with this shortest path cursor.
 	index: Rc<TraversalIndex>,
 	/// Seed algorithms retain their incidence relation, including undirected
 	/// edges.
 	relation_direction: Option<TraversalDirection>,
+	/// Expand associated with this shortest path cursor.
 	expand: ResolvedPathExpand,
+	/// Predicate associated with this shortest path cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Trace associated with this shortest path cursor.
 	trace: Option<Rc<RefCell<MatchPathTrace>>>,
+	/// Row associated with this shortest path cursor.
 	row: Option<Row>,
+	/// Source associated with this shortest path cursor.
 	source: Option<AtomId>,
+	/// Bound target associated with this shortest path cursor.
 	bound_target: bool,
+	/// Frontier associated with this shortest path cursor.
 	frontier: SearchFrontier,
+	/// Seen targets associated with this shortest path cursor.
 	seen_targets: BTreeSet<crate::graph::AtomRef>,
+	/// Memory admission account retained with the owned data.
 	account: Option<BarrierAccount>,
+	/// Next serial associated with this shortest path cursor.
 	next_serial: u64,
 }
 
@@ -384,6 +322,7 @@ impl<'a, Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'a, Read, Graph> 
 		clippy::too_many_arguments,
 		reason = "the concrete shortest operator keeps all physical-plan inputs explicit"
 	)]
+	/// Creates a new `ShortestPathCursor<'a, Read, Graph>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
@@ -430,6 +369,7 @@ impl<'a, Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'a, Read, Graph> 
 		self
 	}
 
+	/// Pushes state.
 	fn push_state(
 		&mut self,
 		mut state: SearchState,
@@ -450,6 +390,7 @@ impl<'a, Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'a, Read, Graph> 
 		Ok(())
 	}
 
+	/// Returns the start row result.
 	fn start_row(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<bool> {
 		let Some(row) = self.input.next(control)? else {
 			return Ok(false);
@@ -520,6 +461,7 @@ impl<'a, Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'a, Read, Graph> 
 		Ok(true)
 	}
 
+	/// Finishes row.
 	fn finish_row(&mut self) {
 		self.frontier.clear();
 		if let Some(account) = &mut self.account {
@@ -571,6 +513,7 @@ impl<'a, Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'a, Read, Graph> 
 }
 
 impl<Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'_, Read, Graph> {
+	/// Returns the ordered candidates result.
 	fn ordered_candidates(
 		&self,
 		endpoint: AtomId,
@@ -619,6 +562,7 @@ impl<Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'_, Read, Graph> {
 		Ok(candidates)
 	}
 
+	/// Returns the expand state result.
 	fn expand_state(
 		&mut self,
 		state: &SearchState,
@@ -744,6 +688,7 @@ impl<Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'_, Read, Graph> {
 		Ok(())
 	}
 
+	/// Returns the output row result.
 	fn output_row(
 		&mut self,
 		state: &SearchState,
@@ -771,8 +716,7 @@ impl<Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'_, Read, Graph> {
 			})?,
 			state.endpoint,
 			&state.hops,
-			self.graph.as_ref(),
-			&self.graph_ref,
+			(self.graph.as_ref(), &self.graph_ref),
 			self.predicate,
 			control,
 			self.trace.as_ref(),
@@ -788,6 +732,8 @@ impl<Read: QueryRead, Graph: GraphRead> ShortestPathCursor<'_, Read, Graph> {
 }
 
 impl<Read: QueryRead, Graph: GraphRead> RowCursor for ShortestPathCursor<'_, Read, Graph> {
+	/// Advances this `ShortestPathCursor<'_, Read, Graph>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -890,5 +836,145 @@ impl<Read: QueryRead, Graph: GraphRead> RowCursor for ShortestPathCursor<'_, Rea
 				return Ok(output);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+/// Regression tests for shortest behavior.
+mod numeric_tests {
+	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
+
+	/// Verifies path buffer admission precedes all prefix clones.
+	#[test]
+	fn path_buffer_admission_precedes_all_prefix_clones() {
+		/// Test payload counting clones to verify admission occurs before
+		/// duplication.
+		struct CountedClone(
+			/// Shared counter incremented by each payload clone.
+			Rc<std::cell::Cell<usize>>,
+			/// Distinct payload byte used to identify the copied path element.
+			u8,
+		);
+		impl Clone for CountedClone {
+			/// Returns an owned clone of this `CountedClone`.
+			fn clone(&self) -> Self {
+				self.0.set(self.0.get() + 1);
+				Self(self.0.clone(), self.1)
+			}
+		}
+		let clones = Rc::new(std::cell::Cell::new(0));
+		let hops = [CountedClone(clones.clone(), 1), CountedClone(clones.clone(), 2)];
+		let canonical = [CountedClone(clones.clone(), 3)];
+		let mut admitted = false;
+		let error = extend_path_buffers(
+			&hops,
+			CountedClone(clones.clone(), 4),
+			&canonical,
+			CountedClone(clones.clone(), 5),
+			64,
+			&mut |_| {
+				admitted = true;
+				Err(FerrosGrynnError::control_limit_exceeded("test admission", 1))
+			},
+		);
+		assert!(error.is_err());
+		assert!(admitted);
+		assert_eq!(clones.get(), 0);
+		let (grown_hops, grown_canonical, bytes) = extend_path_buffers(
+			&hops,
+			CountedClone(clones.clone(), 4),
+			&canonical,
+			CountedClone(clones.clone(), 5),
+			64,
+			&mut |bytes| {
+				assert_eq!(clones.get(), 0);
+				assert_eq!(bytes, 64 + 5 * size_of::<CountedClone>());
+				Ok(())
+			},
+		)
+		.assert_ok();
+		assert_eq!(bytes, 64 + 5 * size_of::<CountedClone>());
+		assert_eq!(clones.get(), 3);
+		assert_eq!(grown_hops.iter().map(|item| item.1).collect::<Vec<_>>(), [1, 2, 4]);
+		assert_eq!(grown_canonical.iter().map(|item| item.1).collect::<Vec<_>>(), [3, 5]);
+		let admission_calls = std::cell::Cell::new(0);
+		assert!(
+			extend_path_buffers(
+				&hops,
+				CountedClone(clones.clone(), 4),
+				&canonical,
+				CountedClone(clones.clone(), 5),
+				usize::MAX,
+				&mut |_| {
+					admission_calls.set(admission_calls.get() + 1);
+					Ok(())
+				},
+			)
+			.is_err()
+		);
+		assert_eq!(clones.get(), 3);
+		assert_eq!(admission_calls.get(), 0, "overflow must precede admission");
+	}
+
+	/// Verifies completion bounds enclose runtime reductions at numeric
+	/// boundaries.
+	#[test]
+	fn completion_bounds_enclose_runtime_reductions_at_numeric_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
+		let numbers = [
+			Number::Int(0),
+			Number::Int(1),
+			Number::Int(9_007_199_254_740_993),
+			Number::Int(i64::MAX),
+			Number::Float(f64::from_bits(1)),
+			Number::Float(f64::MIN_POSITIVE),
+			Number::Float(0.1),
+			Number::Float(f64::MAX),
+			Number::Decimal(rust_decimal::Decimal::MAX),
+			Number::Decimal(
+				"0.0000000000000000000000000001"
+					.parse()
+					.map_err(|cause| {
+						FerrosGrynnError::invalid_argument("test decimal")
+							.with_technical_source(cause)
+					})
+					.assert_ok(),
+			),
+		];
+		for prefix in numbers {
+			for first in numbers {
+				for second in numbers {
+					let mut cost = prefix;
+					let mut suffix = crate::graph::DistanceInterval::ZERO;
+					for length in 1..=30 {
+						let edge = if length % 2 == 0 {
+							first
+						} else {
+							second
+						};
+						let Ok(next) = add_path_cost(cost, edge) else {
+							break;
+						};
+						cost = next;
+						suffix = suffix
+							.add(crate::graph::DistanceInterval::from_number(edge).assert_ok());
+						let bound = completion_bound(prefix, Number::Float(suffix.lower), length)
+							.assert_ok();
+						assert!(
+							bound <= cost,
+							"prefix={prefix:?} first={first:?} second={second:?} length={length} \
+							 bound={bound:?} cost={cost:?}"
+						);
+					}
+				}
+			}
+		}
+		let prefix = Number::Int(9_007_199_254_740_993);
+		let actual = add_path_cost(prefix, Number::Float(0.0)).assert_ok();
+		assert!(actual < prefix);
+		assert!(completion_bound(prefix, Number::Int(0), 1).assert_ok() <= actual);
 	}
 }

@@ -8,7 +8,13 @@ use super::{
 	operation_image::{self, CaptureBudget, same_number, same_object, same_value},
 };
 use crate::{
-	datastore::{ConflictKey, GlobalAtomId, OccurrenceState, SubscriptionHandle},
+	datastore::{
+		ConflictKey,
+		GlobalAtomId,
+		OccurrenceState,
+		OccurrenceStateRef,
+		SubscriptionHandle,
+	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{
 		AtomKind,
@@ -38,9 +44,15 @@ use crate::{
 #[derive(Clone, Copy)]
 enum Atom<'a> {
 	/// One mapped node.
-	Node(&'a LiveGraphNode),
+	Node(
+		/// One mapped node.
+		&'a LiveGraphNode,
+	),
 	/// One mapped connector with qualified topology.
-	Edge(&'a LiveGraphEdge),
+	Edge(
+		/// One mapped connector with qualified topology.
+		&'a LiveGraphEdge,
+	),
 }
 
 impl<'a> Atom<'a> {
@@ -134,22 +146,22 @@ fn stale(tx: &Transaction) -> FerrosGrynnError {
 
 /// Weights use the engine's numeric equality, including representation changes.
 fn state_equal(left: &OccurrenceState, right: &OccurrenceState) -> bool {
-	match (left, right) {
+	match (left.view(), right.view()) {
 		(
-			OccurrenceState::Node {
+			OccurrenceStateRef::Node {
 				nested_graph: left,
 			},
-			OccurrenceState::Node {
+			OccurrenceStateRef::Node {
 				nested_graph: right,
 			},
 		) => left == right,
 		(
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology: lt,
 				weight: lw,
 				transition_graph: lg,
 			},
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology: rt,
 				weight: rw,
 				transition_graph: rg,
@@ -281,16 +293,14 @@ impl Transaction {
 								tx.working.atom(global).ok_or_else(unmapped)?.properties().len()
 									as u64,
 							)?;
-							if let Some(graph) = graph {
-								if let Some(local) = tx.working.membership(graph, global) {
-									if let Some(overlay) = tx
-										.working
-										.occurrence(graph, local)
-										.and_then(|value| value.overlay())
-									{
-										budget.take(overlay.iter().len() as u64)?;
-									}
-								}
+							if let Some(graph) = graph
+								&& let Some(local) = tx.working.membership(graph, global)
+								&& let Some(overlay) = tx
+									.working
+									.occurrence(graph, local)
+									.and_then(|value| value.overlay())
+							{
+								budget.take(overlay.iter().len() as u64)?;
 							}
 							tx.require_live_graph_atom(global, graph)?;
 							let actual = operation_image::image(
@@ -348,10 +358,10 @@ impl Transaction {
 								}
 								None
 							};
-							if new.is_none() {
-								if let Some(graph) = graph {
-									removals.entry(graph).or_default().insert(global);
-								}
+							if new.is_none()
+								&& let Some(graph) = graph
+							{
+								removals.entry(graph).or_default().insert(global);
 							}
 							writes.push(Write {
 								id,
@@ -387,10 +397,10 @@ impl Transaction {
 							.get(&(*graph, occurrence.global_id()))
 							.copied()
 							.unwrap_or_else(|| occurrence.state());
-						if let OccurrenceState::Edge {
+						if let OccurrenceStateRef::Edge {
 							topology,
 							..
-						} = desired
+						} = desired.view()
 						{
 							for endpoint in topology.endpoints() {
 								budget.admit(0)?;
@@ -417,34 +427,28 @@ impl Transaction {
 					};
 					let local = tx.working.membership(graph, write.global).ok_or_else(unmapped)?;
 					let current = tx.working.occurrence(graph, local).ok_or_else(unmapped)?.state();
-					let binding = match (current, desired) {
+					let binding = match (current.view(), desired.view()) {
 						(
-							OccurrenceState::Node {
+							OccurrenceStateRef::Node {
 								nested_graph: old,
 							},
-							OccurrenceState::Node {
+							OccurrenceStateRef::Node {
 								nested_graph: new,
 							},
-						) if old != new => Some(OccurrenceState::Node {
-							nested_graph: *new,
-						}),
+						) if old != new => Some(OccurrenceState::node(*new)),
 						(
-							OccurrenceState::Edge {
+							OccurrenceStateRef::Edge {
 								topology,
 								weight,
 								transition_graph: old,
 							},
-							OccurrenceState::Edge {
+							OccurrenceStateRef::Edge {
 								transition_graph: new,
 								..
 							},
 						) if old != new => {
 							budget.admit(crate::graph::estimated_topology_heap_bytes(topology))?;
-							Some(OccurrenceState::Edge {
-								topology: topology.clone(),
-								weight: *weight,
-								transition_graph: *new,
-							})
+							Some(OccurrenceState::edge(topology.clone(), *weight, *new))
 						}
 						_ => None,
 					};
@@ -631,9 +635,9 @@ impl Transaction {
 		check_binding: bool,
 	) -> FerrosGrynnResult<OccurrenceState> {
 		match atom {
-			Atom::Node(node) => Ok(OccurrenceState::Node {
-				nested_graph: self.live_graph_child(image, node.child.as_ref())?,
-			}),
+			Atom::Node(node) => {
+				Ok(OccurrenceState::node(self.live_graph_child(image, node.child.as_ref())?))
+			}
 			Atom::Edge(edge) => {
 				let source = edge
 					.inputs
@@ -654,11 +658,11 @@ impl Transaction {
 					EdgeDirection::Bidirectional => EdgeTopology::bidirectional(source, target),
 					EdgeDirection::Undirected => EdgeTopology::undirected(source),
 				};
-				Ok(OccurrenceState::Edge {
+				Ok(OccurrenceState::edge(
 					topology,
-					weight: edge.weight,
-					transition_graph: self.live_graph_child(image, edge.child.as_ref())?,
-				})
+					edge.weight,
+					self.live_graph_child(image, edge.child.as_ref())?,
+				))
 			}
 		}
 	}

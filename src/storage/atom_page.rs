@@ -325,6 +325,7 @@ pub(super) fn read_atom_hot_slot(
 	Ok((GlobalAtomId::from_raw(atom.raw()), slot))
 }
 
+/// Validates atom hot page.
 fn validate_atom_hot_page(page: &AlignedPage, page_no: PageNo) -> FerrosGrynnResult<()> {
 	let header = page.validate(page_no)?;
 	if header.page_type() != PageType::AtomHot || !header.flags().is_empty() {
@@ -336,6 +337,7 @@ fn validate_atom_hot_page(page: &AlignedPage, page_no: PageNo) -> FerrosGrynnRes
 	Ok(())
 }
 
+/// Decodes atom slot.
 fn decode_atom_slot(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -440,53 +442,64 @@ fn invalid_atom_page(page: PageNo, reason: impl Into<String>) -> FerrosGrynnErro
 	FerrosGrynnError::invalid_storage_page(page.get(), reason)
 }
 
+/// Compile-time check that atom-page fields leave exactly the specified
+/// padding.
 const _: () = {
 	assert!(ATOM_PADDING_OFFSET == 16_352);
 	assert!(ATOM_PADDING_OFFSET + 32 == PAGE_SIZE);
 };
 
 #[cfg(test)]
+/// Regression tests for atom page behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies atom hot page round trips live slots and canonical tombstones.
 	#[test]
-	fn atom_hot_page_round_trips_live_slots_and_canonical_tombstones() -> FerrosGrynnResult<()> {
-		let id = AtomId::from_parts(AtomKind::Edge, 341, 7)?;
+	fn atom_hot_page_round_trips_live_slots_and_canonical_tombstones() {
+		use crate::test_assertions::AssertResult as _;
+
+		let id = AtomId::from_parts(AtomKind::Edge, 341, 7).assert_ok();
 		let id = GlobalAtomId::from_raw(id.raw());
-		let mut page = AtomHotPage::new(PageNo::new(1), PageLsn::new(9))?;
+		let mut page = AtomHotPage::new(PageNo::new(1), PageLsn::new(9)).assert_ok();
 		page.write(
 			id,
 			AtomHotSlot::live(
 				AtomKind::Edge,
-				ClassId::new(11).ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file("test ClassId is invalid")
-				})?,
-				PropertyRef::inline(PageNo::new(3), 4, 21)?,
-				PropertyRef::large(PageNo::new(5), 9_000)?,
-			)?,
-		)?;
+				ClassId::new(11)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("test ClassId is invalid")
+					})
+					.assert_ok(),
+				PropertyRef::inline(PageNo::new(3), 4, 21).assert_ok(),
+				PropertyRef::large(PageNo::new(5), 9_000).assert_ok(),
+			)
+			.assert_ok(),
+		)
+		.assert_ok();
 
-		let page = AtomHotPage::from_page(page.finish(), PageNo::new(1))?;
-		let (decoded_id, decoded) = page.read(1)?;
+		let page = AtomHotPage::from_page(page.finish(), PageNo::new(1)).assert_ok();
+		let (decoded_id, decoded) = page.read(1).assert_ok();
 		assert_eq!(decoded_id, id);
 		assert!(matches!(decoded, AtomHotSlot::Live {
 			kind: AtomKind::Edge,
 			..
 		}));
-		assert!(matches!(page.read(0)?.1, AtomHotSlot::Tombstone));
-		Ok(())
+		assert!(matches!(page.read(0).assert_ok().1, AtomHotSlot::Tombstone));
 	}
 
+	/// Verifies atom hot page rejects noncanonical tombstone.
 	#[test]
-	fn atom_hot_page_rejects_noncanonical_tombstone() -> FerrosGrynnResult<()> {
-		let page = AtomHotPage::new(PageNo::new(0), PageLsn::new(0))?.finish();
+	fn atom_hot_page_rejects_noncanonical_tombstone() {
+		use crate::test_assertions::AssertResult as _;
+
+		let page = AtomHotPage::new(PageNo::new(0), PageLsn::new(0)).assert_ok().finish();
 		let mut bytes = *page.as_bytes();
 		bytes[PAGE_HEADER_SIZE + 4..PAGE_HEADER_SIZE + 8].copy_from_slice(&1_u32.to_le_bytes());
 		let mut corrupt = Box::new(AlignedPage::zeroed());
 		corrupt.as_bytes_mut().copy_from_slice(&bytes);
-		corrupt.seal()?;
+		corrupt.seal().assert_ok();
 
 		assert!(AtomHotPage::from_page(corrupt, PageNo::new(0)).is_err());
-		Ok(())
 	}
 }

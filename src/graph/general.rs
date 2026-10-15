@@ -53,18 +53,26 @@ use crate::{
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
 
+/// Configured inline incidence value.
 const INLINE_INCIDENCE: usize = 4;
 
 #[derive(Debug, Clone)]
+/// General storage state.
 pub(super) struct GeneralStorage {
+	/// Nodes associated with this general storage.
 	pub(super) nodes: NodeColumns,
+	/// Edges associated with this general storage.
 	pub(super) edges: EdgeColumns,
+	/// Node inner associated with this general storage.
 	node_inner: CowVec<Option<Arc<Graph<Frozen>>>>,
+	/// Edge transition associated with this general storage.
 	edge_transition: CowVec<Option<Arc<Graph<Frozen>>>>,
+	/// Incidence associated with this general storage.
 	incidence: Arc<RapidHashMap<EdgeEndpoint, SmallVec<AtomId, INLINE_INCIDENCE>>>,
 }
 
 impl GeneralStorage {
+	/// Creates a new `GeneralStorage` value.
 	fn new() -> Self {
 		Self {
 			nodes: NodeColumns::new(),
@@ -75,6 +83,7 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Configures capacity.
 	fn with_capacity(nodes: usize, edges: usize) -> Self {
 		Self {
 			nodes: NodeColumns::with_capacity(nodes),
@@ -85,6 +94,7 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Inserts node new.
 	fn insert_node_new(
 		&mut self,
 		record_id: RecordId,
@@ -98,6 +108,7 @@ impl GeneralStorage {
 		Ok(id)
 	}
 
+	/// Inserts node at.
 	fn insert_node_at(
 		&mut self,
 		id: AtomId,
@@ -112,6 +123,7 @@ impl GeneralStorage {
 		Ok(())
 	}
 
+	/// Inserts edge new.
 	fn insert_edge_new(
 		&mut self,
 		record_id: RecordId,
@@ -128,6 +140,7 @@ impl GeneralStorage {
 		Ok(id)
 	}
 
+	/// Inserts edge at.
 	fn insert_edge_at(
 		&mut self,
 		id: AtomId,
@@ -145,6 +158,7 @@ impl GeneralStorage {
 		Ok(())
 	}
 
+	/// Removes edge raw.
 	fn remove_edge_raw(&mut self, id: AtomId) {
 		let Some(topology) = self.edges.topology(id).cloned() else {
 			return;
@@ -156,6 +170,7 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Sets edge topology.
 	fn set_edge_topology(&mut self, id: AtomId, topology: EdgeTopology) -> FerrosGrynnResult<()> {
 		self.validate_topology(&topology)?;
 		let previous = self.edges.topology(id).cloned().ok_or_else(|| atom_does_not_exist(id))?;
@@ -165,14 +180,17 @@ impl GeneralStorage {
 		Ok(())
 	}
 
+	/// Returns the node inner result.
 	fn node_inner(&self, id: AtomId) -> Option<&Graph<Frozen>> {
 		self.nodes.contains(id).then(|| self.node_inner.get(id.slot() as usize)?.as_deref())?
 	}
 
+	/// Returns the edge transition result.
 	fn edge_transition(&self, id: AtomId) -> Option<&Graph<Frozen>> {
 		self.edges.contains(id).then(|| self.edge_transition.get(id.slot() as usize)?.as_deref())?
 	}
 
+	/// Validates topology.
 	fn validate_topology(&self, topology: &EdgeTopology) -> FerrosGrynnResult<()> {
 		if topology.endpoint_count() == 0 {
 			return Err(FerrosGrynnError::edge_creation_error()
@@ -203,6 +221,7 @@ impl GeneralStorage {
 		Ok(())
 	}
 
+	/// Checks for endpoint.
 	fn contains_endpoint(&self, endpoint: &EdgeEndpoint) -> bool {
 		match endpoint {
 			EdgeEndpoint::Local(id) => self.contains(*id),
@@ -210,6 +229,7 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Checks for qualified.
 	fn contains_qualified(&self, qualified: &QualifiedAtomId) -> bool {
 		let mut scope = qualified.scope().iter().copied();
 		let Some(first) = scope.next() else {
@@ -249,6 +269,7 @@ impl GeneralStorage {
 		Ok(())
 	}
 
+	/// Checks for general storage.
 	fn contains(&self, id: AtomId) -> bool {
 		match id.kind() {
 			Some(AtomKind::Node) => self.nodes.contains(id),
@@ -257,10 +278,12 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Returns the incident edges result.
 	fn incident_edges(&self, endpoint: &EdgeEndpoint) -> &[AtomId] {
 		self.incidence.get(endpoint).map_or(&[], SmallVec::as_slice)
 	}
 
+	/// Registers incidence.
 	fn register_incidence(&mut self, id: AtomId, topology: &EdgeTopology) {
 		let incidence = Arc::make_mut(&mut self.incidence);
 		for endpoint in topology.endpoints().cloned() {
@@ -268,6 +291,7 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Unregisters incidence.
 	fn unregister_incidence(&mut self, id: AtomId, topology: &EdgeTopology) {
 		let incidence = Arc::make_mut(&mut self.incidence);
 		for endpoint in topology.endpoints() {
@@ -285,6 +309,7 @@ impl GeneralStorage {
 		}
 	}
 
+	/// Collects dependent edges.
 	fn collect_dependent_edges(&self, id: AtomId) -> BTreeSet<AtomId> {
 		let mut pending = Vec::new();
 		let mut edges = BTreeSet::new();
@@ -310,12 +335,14 @@ impl GeneralStorage {
 		edges
 	}
 
+	/// Ensures node slot.
 	fn ensure_node_slot(&mut self, index: usize) {
 		while self.node_inner.len() <= index {
 			self.node_inner.push(None);
 		}
 	}
 
+	/// Ensures edge slot.
 	fn ensure_edge_slot(&mut self, index: usize) {
 		while self.edge_transition.len() <= index {
 			self.edge_transition.push(None);
@@ -324,14 +351,19 @@ impl GeneralStorage {
 }
 
 impl Default for GeneralStorage {
+	/// Constructs the default initial state of `GeneralStorage`.
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
+/// General graph-family materialization with atom storage and graph metadata.
 pub struct Graph<State = Frozen> {
+	/// Metadata associated with this graph.
 	pub(super) metadata: GraphMetadata,
+	/// Storage associated with this graph.
 	pub(super) storage: GeneralStorage,
+	/// State associated with this graph.
 	state: PhantomData<State>,
 }
 
@@ -339,6 +371,7 @@ pub type MutableGraph = Graph<Mutable>;
 pub type FrozenGraph = Graph<Frozen>;
 
 impl Graph<Mutable> {
+	/// Constructs `Graph<Mutable>` from the supplied initial state.
 	pub fn new() -> Self {
 		Self {
 			metadata: GraphMetadata::new(),
@@ -347,6 +380,7 @@ impl Graph<Mutable> {
 		}
 	}
 
+	/// Creates an empty collection with the requested initial capacity.
 	pub fn with_capacity(nodes: usize, edges: usize) -> Self {
 		Self {
 			metadata: GraphMetadata::new(),
@@ -355,6 +389,11 @@ impl Graph<Mutable> {
 		}
 	}
 
+	/// Returns add node for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn add_node(
 		&mut self,
 		label: Option<Text>,
@@ -363,6 +402,12 @@ impl Graph<Mutable> {
 		self.add_node_with_id(generated_record_id(AtomKind::Node)?, label, properties)
 	}
 
+	/// Returns add node with id for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn add_node_with_id(
 		&mut self,
 		record_id: RecordId,
@@ -372,6 +417,11 @@ impl Graph<Mutable> {
 		self.add_node_raw(record_id, label, properties, None)
 	}
 
+	/// Returns add metavertex for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn add_metavertex(
 		&mut self,
 		inner: Graph<Frozen>,
@@ -381,6 +431,11 @@ impl Graph<Mutable> {
 		self.add_node_raw(generated_record_id(AtomKind::Node)?, label, properties, Some(inner))
 	}
 
+	/// Returns add edge for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn add_edge(
 		&mut self,
 		topology: EdgeTopology,
@@ -390,6 +445,12 @@ impl Graph<Mutable> {
 		self.add_edge_with_id(generated_record_id(AtomKind::Edge)?, topology, label, properties)
 	}
 
+	/// Returns add edge with id for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn add_edge_with_id(
 		&mut self,
 		record_id: RecordId,
@@ -400,6 +461,11 @@ impl Graph<Mutable> {
 		self.add_edge_raw(record_id, topology, label, properties, None, None)
 	}
 
+	/// Returns add metaedge for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn add_metaedge(
 		&mut self,
 		topology: EdgeTopology,
@@ -417,6 +483,11 @@ impl Graph<Mutable> {
 		)
 	}
 
+	/// Sets node label for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn set_node_label(&mut self, id: AtomId, label: Option<Text>) -> FerrosGrynnResult<()> {
 		self.check_node(id)?;
 		self.metadata.ensure_can_bump()?;
@@ -426,6 +497,11 @@ impl Graph<Mutable> {
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
+	/// Sets edge label for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn set_edge_label(&mut self, id: AtomId, label: Option<Text>) -> FerrosGrynnResult<()> {
 		self.check_edge(id)?;
 		self.metadata.ensure_can_bump()?;
@@ -435,6 +511,11 @@ impl Graph<Mutable> {
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
+	/// Sets edge weight for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn set_edge_weight(&mut self, id: AtomId, weight: Option<Number>) -> FerrosGrynnResult<()> {
 		self.check_edge(id)?;
 		self.metadata.ensure_can_bump()?;
@@ -444,6 +525,8 @@ impl Graph<Mutable> {
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
+	/// Replaces edge topology.
+	#[cfg(test)]
 	pub(crate) fn replace_edge_topology(
 		&mut self,
 		id: AtomId,
@@ -455,6 +538,11 @@ impl Graph<Mutable> {
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
+	/// Replaces inner graph for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn replace_inner_graph(
 		&mut self,
 		id: AtomId,
@@ -468,6 +556,11 @@ impl Graph<Mutable> {
 		Ok(previous)
 	}
 
+	/// Replaces transition graph for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn replace_transition_graph(
 		&mut self,
 		id: AtomId,
@@ -481,6 +574,11 @@ impl Graph<Mutable> {
 		Ok(previous)
 	}
 
+	/// Removes atom for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn remove_atom(&mut self, id: AtomId) -> FerrosGrynnResult<()> {
 		if !self.storage.contains(id) {
 			return Err(atom_does_not_exist(id));
@@ -500,6 +598,7 @@ impl Graph<Mutable> {
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
+	/// Returns freeze for `Graph<Mutable>`.
 	pub fn freeze(self) -> Graph<Frozen> {
 		Graph {
 			metadata: self.metadata.into_frozen(),
@@ -508,6 +607,11 @@ impl Graph<Mutable> {
 		}
 	}
 
+	/// Performs the flush operation for `Graph<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
@@ -520,6 +624,7 @@ impl Graph<Mutable> {
 		Ok(())
 	}
 
+	/// Performs the adopt external revision operation.
 	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
 		self.metadata.adopt_external_revision(revision);
 	}
@@ -529,6 +634,7 @@ impl Graph<Mutable> {
 		self.metadata.clear_dirty();
 	}
 
+	/// Returns the clone preserving state result.
 	pub(crate) fn clone_preserving_state(&self) -> Self {
 		Self {
 			metadata: self.metadata.clone(),
@@ -537,6 +643,7 @@ impl Graph<Mutable> {
 		}
 	}
 
+	/// Returns the writeback context result.
 	pub(crate) fn writeback_context(
 		&self,
 	) -> FerrosGrynnResult<(MaterializationOrigin, Vec<DirtyTarget>)> {
@@ -548,26 +655,28 @@ impl Graph<Mutable> {
 		Ok((origin, self.metadata.dirty().cloned().collect()))
 	}
 
+	/// Finishes writeback.
 	pub(crate) fn finish_writeback(&mut self) {
 		self.metadata.clear_dirty();
 	}
 
+	/// Returns the transaction dirty result.
+	#[cfg(test)]
 	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
 		self.metadata.dirty().cloned().collect()
 	}
 
-	pub(crate) fn transaction_snapshot(&self) -> Graph<Frozen> {
-		self.clone_preserving_state().freeze()
-	}
-
+	/// Sets topology constraints.
 	pub(crate) fn set_topology_constraints(&mut self, constraints: GraphTopologyConstraints) {
 		self.metadata.set_topology_constraints(constraints);
 	}
 
+	/// Creates from read preserving.
 	pub(crate) fn from_read_preserving<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		copy_from_read(source, true)
 	}
 
+	/// Returns the query flat with heap estimate result.
 	pub(crate) fn query_flat_with_heap_estimate<R: GraphRead>(
 		source: &R,
 	) -> FerrosGrynnResult<Option<(Self, usize)>> {
@@ -670,6 +779,7 @@ impl Graph<Mutable> {
 		self.metadata.set_origin(MaterializationOrigin::new(source, source_atoms));
 	}
 
+	/// Returns the add node raw result.
 	fn add_node_raw(
 		&mut self,
 		record_id: RecordId,
@@ -684,6 +794,7 @@ impl Graph<Mutable> {
 		Ok(id)
 	}
 
+	/// Returns the add edge raw result.
 	fn add_edge_raw(
 		&mut self,
 		record_id: RecordId,
@@ -705,119 +816,14 @@ impl Graph<Mutable> {
 }
 
 impl Default for Graph<Mutable> {
+	/// Constructs the default initial state of `Graph<Mutable>`.
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-pub fn merge_transaction_graph(
-	base: &Graph<Frozen>,
-	changed: Graph<Mutable>,
-	latest: Graph<Frozen>,
-	dirty: &[DirtyTarget],
-) -> FerrosGrynnResult<Graph<Frozen>> {
-	let mut merged = latest.thaw();
-	for target in dirty {
-		if matches!(target, DirtyTarget::Graph) {
-			*merged.properties_mut()? = changed.properties().clone();
-		}
-	}
-	for kind in [AtomKind::Node, AtomKind::Edge] {
-		for target in dirty {
-			let DirtyTarget::Atom(id) = target else {
-				continue;
-			};
-			if id.kind() != Some(kind) {
-				continue;
-			}
-			merge_transaction_atom(base, &changed, &mut merged, *id)?;
-		}
-	}
-	Ok(merged.freeze())
-}
-
-fn merge_transaction_atom(
-	base: &Graph<Frozen>,
-	changed: &Graph<Mutable>,
-	merged: &mut Graph<Mutable>,
-	id: AtomId,
-) -> FerrosGrynnResult<()> {
-	let existed = base.contains(id);
-	if !changed.contains(id) {
-		if merged.contains(id) {
-			merged.remove_atom(id)?;
-		}
-		return Ok(());
-	}
-
-	match id.kind() {
-		Some(AtomKind::Node) => {
-			let node = changed.node(id).ok_or_else(|| atom_does_not_exist(id))?;
-			if !existed {
-				ensure_unique_record(
-					&merged.storage.nodes,
-					&merged.storage.edges,
-					node.record_id(),
-				)?;
-				merged.storage.insert_node_at(
-					id,
-					node.record_id().clone(),
-					node.label_text().cloned(),
-					node.properties().clone(),
-					node.inner_graph().cloned(),
-				)?;
-				merged.metadata.bump(Some(DirtyTarget::Atom(id)))?;
-				return Ok(());
-			}
-			if !merged.contains(id) {
-				return Err(atom_does_not_exist(id));
-			}
-			*merged.node_properties_mut(id)? = node.properties().clone();
-			merged.set_node_label(id, node.label_text().cloned())?;
-			merged.replace_inner_graph(id, node.inner_graph().cloned())?;
-		}
-		Some(AtomKind::Edge) => {
-			let edge = changed.edge(id).ok_or_else(|| atom_does_not_exist(id))?;
-			if !existed {
-				ensure_unique_record(
-					&merged.storage.nodes,
-					&merged.storage.edges,
-					edge.record_id(),
-				)?;
-				merged.storage.validate_topology(edge.topology())?;
-				merged.storage.insert_edge_at(
-					id,
-					edge.record_id().clone(),
-					edge.topology().clone(),
-					edge.label_text().cloned(),
-					edge.properties().clone(),
-					edge.weight(),
-					edge.transition_graph().cloned(),
-				)?;
-				merged.metadata.bump(Some(DirtyTarget::Atom(id)))?;
-				return Ok(());
-			}
-			if !merged.contains(id) {
-				return Err(atom_does_not_exist(id));
-			}
-			let current = merged.edge(id).ok_or_else(|| atom_does_not_exist(id))?;
-			if current.topology() != edge.topology() {
-				return Err(FerrosGrynnError::graph_constraint_violation(
-					"graph",
-					"edge topology cannot be replaced inside a transaction",
-				));
-			}
-			*merged.edge_properties_mut(id)? = edge.properties().clone();
-			merged.set_edge_label(id, edge.label_text().cloned())?;
-			merged.set_edge_weight(id, edge.weight())?;
-			merged.replace_transition_graph(id, edge.transition_graph().cloned())?;
-		}
-		None => return Err(atom_does_not_exist(id)),
-	}
-	Ok(())
-}
-
 impl Graph<Frozen> {
+	/// Returns thaw for `Graph<Frozen>`.
 	pub fn thaw(self) -> Graph<Mutable> {
 		Graph {
 			metadata: self.metadata,
@@ -828,6 +834,7 @@ impl Graph<Frozen> {
 }
 
 impl Clone for Graph<Frozen> {
+	/// Returns an owned clone of this `Graph<Frozen>`.
 	fn clone(&self) -> Self {
 		Self {
 			metadata: self.metadata.clone(),
@@ -912,18 +919,7 @@ impl<State> Graph<State> {
 		Ok(())
 	}
 
-	pub(crate) fn restore_free_slot(
-		&mut self,
-		kind: AtomKind,
-		slot: u64,
-		generation: u32,
-	) -> FerrosGrynnResult<()> {
-		match kind {
-			AtomKind::Node => self.storage.nodes.restore_free(slot, generation),
-			AtomKind::Edge => self.storage.edges.restore_free(slot, generation),
-		}
-	}
-
+	/// Returns the slot capacity result.
 	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
 		match kind {
 			AtomKind::Node => self.storage.nodes.slot_capacity(),
@@ -931,75 +927,81 @@ impl<State> Graph<State> {
 		}
 	}
 
-	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
-		match kind {
-			AtomKind::Node => self.storage.nodes.slot_generation(slot),
-			AtomKind::Edge => self.storage.edges.slot_generation(slot),
-		}
-	}
-
+	/// Returns identity for `Graph<State>`.
 	pub const fn identity(&self) -> Uuid {
 		self.metadata.identity()
 	}
 
+	/// Returns revision for `Graph<State>`.
 	pub const fn revision(&self) -> u64 {
 		self.metadata.revision()
 	}
 
+	/// Returns kind for `Graph<State>`.
 	pub const fn kind(&self) -> GraphKind {
 		GraphKind::Graph
 	}
 
+	/// Returns properties for `Graph<State>`.
 	pub const fn properties(&self) -> &PropertyMap {
 		self.metadata.properties()
 	}
 
+	/// Returns topology constraints for `Graph<State>`.
 	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
 		self.metadata.topology_constraints()
 	}
 
+	/// Returns node count for `Graph<State>`.
 	pub const fn node_count(&self) -> usize {
 		self.storage.nodes.len()
 	}
 
+	/// Returns edge count for `Graph<State>`.
 	pub const fn edge_count(&self) -> usize {
 		self.storage.edges.len()
 	}
 
+	/// Reports whether the contains condition holds for `Graph<State>`.
 	pub fn contains(&self, id: AtomId) -> bool {
 		self.storage.contains(id)
 	}
 
+	/// Returns node for `Graph<State>`.
 	pub fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
 		Some(NodeView::new(
 			id,
 			self.storage.nodes.record_id(id)?,
-			self.storage.nodes.label(id)?,
+			self.storage.nodes.label(id)?.as_ref(),
 			self.storage.nodes.properties(id)?,
 			self.storage.node_inner(id),
 		))
 	}
 
+	/// Returns edge for `Graph<State>`.
 	pub fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
 		Some(EdgeView::new(
 			id,
 			self.storage.edges.record_id(id)?,
 			self.storage.edges.topology(id)?,
-			self.storage.edges.label(id)?,
+			self.storage.edges.label(id)?.as_ref(),
 			self.storage.edges.properties(id)?,
-			self.storage.edges.weight(id)?,
+			self.storage.edges.weight(id)?.as_ref().copied(),
 			self.storage.edge_transition(id),
 		))
 	}
 
+	/// Returns nodes for `Graph<State>`.
 	pub fn nodes(&self) -> impl Iterator<Item = NodeView<'_>> {
 		self.storage.nodes.ids().iter().filter_map(|id| self.node(*id))
 	}
 
+	/// Returns edges for `Graph<State>`.
 	pub fn edges(&self) -> impl Iterator<Item = EdgeView<'_>> {
 		self.storage.edges.ids().iter().filter_map(|id| self.edge(*id))
 	}
 
+	/// Returns incident edges for `Graph<State>`.
 	pub fn incident_edges(
 		&self,
 		endpoint: AtomId,
@@ -1007,6 +1009,7 @@ impl<State> Graph<State> {
 		self.incident_edges_at(&EdgeEndpoint::Local(endpoint))
 	}
 
+	/// Returns incident edges at for `Graph<State>`.
 	pub fn incident_edges_at(
 		&self,
 		endpoint: &EdgeEndpoint,
@@ -1014,18 +1017,22 @@ impl<State> Graph<State> {
 		self.storage.incident_edges(endpoint).iter().copied()
 	}
 
+	/// Reads view for `Graph<State>`.
 	pub const fn read_view(&self, snapshot: SnapshotId) -> GraphReadView<'_, Self> {
 		GraphReadView::new(self, snapshot)
 	}
 
+	/// Returns materialization origin for `Graph<State>`.
 	pub const fn materialization_origin(&self) -> Option<&MaterializationOrigin> {
 		self.metadata.origin()
 	}
 
+	/// Converts this value into raw.
 	pub(super) fn into_raw(self) -> (GraphMetadata, GeneralStorage) {
 		(self.metadata, self.storage)
 	}
 
+	/// Creates from raw.
 	pub(super) const fn from_raw(metadata: GraphMetadata, storage: GeneralStorage) -> Self {
 		Self {
 			metadata,
@@ -1034,6 +1041,7 @@ impl<State> Graph<State> {
 		}
 	}
 
+	/// Checks node.
 	fn check_node(&self, id: AtomId) -> FerrosGrynnResult<()> {
 		if id.kind() != Some(AtomKind::Node) {
 			return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -1041,6 +1049,7 @@ impl<State> Graph<State> {
 		self.storage.nodes.contains(id).then_some(()).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Checks edge.
 	fn check_edge(&self, id: AtomId) -> FerrosGrynnResult<()> {
 		if id.kind() != Some(AtomKind::Edge) {
 			return Err(atom_kind_mismatch(id, AtomKind::Edge));
@@ -1067,34 +1076,42 @@ impl<State> GraphRead for Graph<State> {
 	where
 		Self: 'a;
 
+	/// Returns identity for `Graph<State>`.
 	fn identity(&self) -> Uuid {
 		self.identity()
 	}
 
+	/// Returns revision for `Graph<State>`.
 	fn revision(&self) -> u64 {
 		self.revision()
 	}
 
+	/// Returns kind for `Graph<State>`.
 	fn kind(&self) -> GraphKind {
 		GraphKind::Graph
 	}
 
+	/// Returns properties for `Graph<State>`.
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		Ok(Cow::Borrowed(self.properties()))
 	}
 
+	/// Returns topology constraints for `Graph<State>`.
 	fn topology_constraints(&self) -> GraphTopologyConstraints {
 		self.topology_constraints()
 	}
 
+	/// Returns node ids for `Graph<State>`.
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.nodes.ids().iter())))
 	}
 
+	/// Returns edge ids for `Graph<State>`.
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.edges.ids().iter())))
 	}
 
+	/// Returns node for `Graph<State>`.
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		let Some(record_id) = self.storage.nodes.record_id(id) else {
 			return Ok(None);
@@ -1105,9 +1122,16 @@ impl<State> GraphRead for Graph<State> {
 		let Some(properties) = self.storage.nodes.properties(id) else {
 			return Ok(None);
 		};
-		Ok(Some(NodeView::new(id, record_id, label, properties, self.storage.node_inner(id))))
+		Ok(Some(NodeView::new(
+			id,
+			record_id,
+			label.as_ref(),
+			properties,
+			self.storage.node_inner(id),
+		)))
 	}
 
+	/// Returns edge for `Graph<State>`.
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		let Some(record_id) = self.storage.edges.record_id(id) else {
 			return Ok(None);
@@ -1128,73 +1152,85 @@ impl<State> GraphRead for Graph<State> {
 			id,
 			record_id,
 			topology,
-			label,
+			label.as_ref(),
 			properties,
-			weight,
+			weight.as_ref().copied(),
 			self.storage.edge_transition(id),
 		)))
 	}
 
+	/// Returns storage mode for `Graph<State>`.
 	fn storage_mode(&self) -> GraphStorageMode {
 		self.metadata.storage_mode()
 	}
 
+	/// Returns graph ref for `Graph<State>`.
 	fn graph_ref(&self) -> Option<&super::GraphRef> {
 		self.metadata.graph_ref()
 	}
 
+	/// Returns materialization origin for `Graph<State>`.
 	fn materialization_origin(&self) -> Option<&MaterializationOrigin> {
 		self.metadata.origin()
 	}
 }
 
 impl GraphMut for Graph<Mutable> {
+	/// Returns properties mut for `Graph<Mutable>`.
 	fn properties_mut(&mut self) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.metadata.properties_mut()
 	}
 
+	/// Returns node label mut for `Graph<Mutable>`.
 	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
 		self.check_node(id)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.nodes.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Returns node properties mut for `Graph<Mutable>`.
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.check_node(id)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.nodes.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Returns edge label mut for `Graph<Mutable>`.
 	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
 		self.check_edge(id)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.edges.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Returns edge properties mut for `Graph<Mutable>`.
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.check_edge(id)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.edges.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Removes atom for `Graph<Mutable>`.
 	fn remove_atom(&mut self, id: AtomId) -> FerrosGrynnResult<()> {
 		Graph::<Mutable>::remove_atom(self, id)
 	}
 }
 
 impl QueryMaterialize for Graph<Mutable> {
+	/// Returns query from for `Graph<Mutable>`.
 	fn query_from<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		copy_from_read(source, false)
 	}
 }
 
 impl QueryMaterialize for Graph<Frozen> {
+	/// Returns query from for `Graph<Frozen>`.
 	fn query_from<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		copy_from_read(source, false).map(Graph::freeze)
 	}
 }
 
 impl<State> Debug for Graph<State> {
+	/// Formats `Graph<State>` using the requested formatter.
 	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("Graph")
@@ -1207,6 +1243,7 @@ impl<State> Debug for Graph<State> {
 }
 
 impl<State> PartialEq for Graph<State> {
+	/// Compares this `Graph<State>` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.identity() == other.identity() && self.revision() == other.revision()
 	}
@@ -1215,24 +1252,29 @@ impl<State> PartialEq for Graph<State> {
 impl<State> Eq for Graph<State> {}
 
 impl<State> PartialOrd for Graph<State> {
+	/// Compares this `Graph<State>` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl<State> Ord for Graph<State> {
+	/// Compares this `Graph<State>` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		(self.identity(), self.revision()).cmp(&(other.identity(), other.revision()))
 	}
 }
 
 impl<State> Hash for Graph<State> {
+	/// Feeds this `Graph<State>` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.identity().hash(state);
 		self.revision().hash(state);
 	}
 }
 
+/// Returns the copy from read result.
 fn copy_from_read<R: GraphRead>(
 	source: &R,
 	preserve_ids: bool,
@@ -1245,6 +1287,7 @@ fn copy_from_read<R: GraphRead>(
 	}
 }
 
+/// Returns the copy from read inner result.
 fn copy_from_read_inner<R: GraphRead>(
 	source: &R,
 	preserve_ids: bool,
@@ -1367,7 +1410,8 @@ fn copy_from_read_inner<R: GraphRead>(
 	Ok(Some((result, estimated_bytes)))
 }
 
-pub(crate) fn remap_topology(
+/// Returns the remap topology result.
+pub fn remap_topology(
 	topology: &EdgeTopology,
 	ids: &BTreeMap<AtomId, AtomId>,
 ) -> FerrosGrynnResult<EdgeTopology> {
@@ -1385,6 +1429,7 @@ pub(crate) fn remap_topology(
 	})
 }
 
+/// Returns the atom does not exist result.
 pub(super) fn atom_does_not_exist(id: AtomId) -> FerrosGrynnError {
 	FerrosGrynnError::atom_does_not_exist(
 		id.kind().map_or_else(|| "null".to_owned(), |kind| kind.to_string()),
@@ -1392,6 +1437,7 @@ pub(super) fn atom_does_not_exist(id: AtomId) -> FerrosGrynnError {
 	)
 }
 
+/// Returns the atom kind mismatch result.
 pub(super) fn atom_kind_mismatch(id: AtomId, expected: AtomKind) -> FerrosGrynnError {
 	FerrosGrynnError::atom_kind_mismatch(
 		id.to_string(),
@@ -1400,6 +1446,7 @@ pub(super) fn atom_kind_mismatch(id: AtomId, expected: AtomKind) -> FerrosGrynnE
 	)
 }
 
+/// Returns the endpoint kind result.
 fn endpoint_kind(endpoint: &EdgeEndpoint) -> String {
 	match endpoint {
 		EdgeEndpoint::Local(id) => {
@@ -1412,8 +1459,11 @@ fn endpoint_kind(endpoint: &EdgeEndpoint) -> String {
 }
 
 #[cfg(test)]
+/// Regression tests for general behavior.
 mod tests {
 	use super::Graph;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		gql_status::Domain,
 		values::{
@@ -1430,21 +1480,23 @@ mod tests {
 		},
 	};
 
+	/// Verifies supports node edge edge edge and cross level incidence.
 	#[test]
 	fn supports_node_edge_edge_edge_and_cross_level_incidence() {
 		let mut inner = Graph::<Mutable>::new();
-		let inner_node = inner.add_node(Some("inner".into()), PropertyMap::new()).unwrap();
+		let inner_node = inner.add_node(Some("inner".into()), PropertyMap::new()).assert_ok();
 		let mut graph = Graph::<Mutable>::new();
-		let meta =
-			graph.add_metavertex(inner.freeze(), Some("meta".into()), PropertyMap::new()).unwrap();
-		let right = graph.add_node(Some("right".into()), PropertyMap::new()).unwrap();
+		let meta = graph
+			.add_metavertex(inner.freeze(), Some("meta".into()), PropertyMap::new())
+			.assert_ok();
+		let right = graph.add_node(Some("right".into()), PropertyMap::new()).assert_ok();
 		let edge = graph
 			.add_edge(EdgeTopology::directed([meta], [right]), None, PropertyMap::new())
-			.unwrap();
+			.assert_ok();
 		let connector = graph
 			.add_edge(EdgeTopology::directed([edge], [right]), None, PropertyMap::new())
-			.unwrap();
-		let nested = QualifiedAtomId::new(vec![meta], inner_node).unwrap();
+			.assert_ok();
+		let nested = QualifiedAtomId::new(vec![meta], inner_node).assert_ok();
 		let cross = graph
 			.add_edge(
 				EdgeTopology::directed([EdgeEndpoint::Nested(nested)], [EdgeEndpoint::Local(
@@ -1453,48 +1505,51 @@ mod tests {
 				None,
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 
 		assert!(graph.edge(connector).is_some());
-		assert!(graph.edge(cross).unwrap().topology().is_cross_level());
+		assert!(graph.edge(cross).assert_some().topology().is_cross_level());
 		assert_eq!(graph.incident_edges(edge).collect::<Vec<_>>(), [connector]);
 	}
 
+	/// Verifies universal graph allows directed self loops.
 	#[test]
 	fn universal_graph_allows_directed_self_loops() {
 		let mut graph = Graph::<Mutable>::new();
-		let node = graph.add_node(None, PropertyMap::new()).unwrap();
+		let node = graph.add_node(None, PropertyMap::new()).assert_ok();
 		let edge = graph
 			.add_edge(EdgeTopology::directed([node], [node]), None, PropertyMap::new())
-			.unwrap();
+			.assert_ok();
 		assert_eq!(
-			graph.edge(edge).unwrap().topology().local_binary(),
+			graph.edge(edge).assert_some().topology().local_binary(),
 			Some((node, node, EdgeDirection::Directed,))
 		);
 	}
 
+	/// Verifies removal cascades through edge endpoints and reuses generation.
 	#[test]
 	fn removal_cascades_through_edge_endpoints_and_reuses_generation() {
 		let mut graph = Graph::<Mutable>::new();
-		let left = graph.add_node(None, PropertyMap::new()).unwrap();
-		let right = graph.add_node(None, PropertyMap::new()).unwrap();
+		let left = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let right = graph.add_node(None, PropertyMap::new()).assert_ok();
 		let edge = graph
 			.add_edge(EdgeTopology::directed([left], [right]), None, PropertyMap::new())
-			.unwrap();
+			.assert_ok();
 		let connector = graph
 			.add_edge(EdgeTopology::directed([edge], [right]), None, PropertyMap::new())
-			.unwrap();
+			.assert_ok();
 
-		graph.remove_atom(edge).unwrap();
+		graph.remove_atom(edge).assert_ok();
 		assert!(!graph.contains(edge));
 		assert!(!graph.contains(connector));
 		let replacement = graph
 			.add_edge(EdgeTopology::directed([left], [right]), None, PropertyMap::new())
-			.unwrap();
+			.assert_ok();
 		assert_eq!(replacement.slot(), connector.slot());
 		assert_ne!(replacement.generation(), connector.generation());
 	}
 
+	/// Verifies invalid edges are transactional and use graph statuses.
 	#[test]
 	fn invalid_edges_are_transactional_and_use_graph_statuses() {
 		let mut graph = Graph::<Mutable>::new();
@@ -1502,7 +1557,7 @@ mod tests {
 		let revision = graph.revision();
 		let error = graph
 			.add_edge(EdgeTopology::undirected([unknown]), None, PropertyMap::new())
-			.unwrap_err();
+			.assert_err();
 
 		assert_eq!(error.status().code().to_string(), "FG-G2F02");
 		assert_eq!(error.status().domain(), Domain::Graph);
@@ -1510,14 +1565,15 @@ mod tests {
 		assert_eq!(graph.edge_count(), 0);
 	}
 
+	/// Verifies freeze thaw preserves identity ids and topology.
 	#[test]
 	fn freeze_thaw_preserves_identity_ids_and_topology() {
 		let mut graph = Graph::<Mutable>::new();
-		let left = graph.add_node(None, PropertyMap::new()).unwrap();
-		let right = graph.add_node(None, PropertyMap::new()).unwrap();
+		let left = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let right = graph.add_node(None, PropertyMap::new()).assert_ok();
 		let edge = graph
 			.add_edge(EdgeTopology::bidirectional([left], [right]), None, PropertyMap::new())
-			.unwrap();
+			.assert_ok();
 		let identity = graph.identity();
 		let revision = graph.revision();
 
@@ -1529,13 +1585,16 @@ mod tests {
 		assert!(graph.contains(edge));
 	}
 
+	/// Verifies record index rejects cross kind duplicates and releases removed
+	/// ids.
 	#[test]
 	fn record_index_rejects_cross_kind_duplicates_and_releases_removed_ids() {
 		let mut graph = Graph::<Mutable>::new();
-		let left = graph.add_node(None, PropertyMap::new()).unwrap();
-		let right = graph.add_node(None, PropertyMap::new()).unwrap();
-		let record = "atom:stable".parse::<RecordId>().unwrap();
-		let duplicate = graph.add_node_with_id(record.clone(), None, PropertyMap::new()).unwrap();
+		let left = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let right = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let record = "atom:stable".parse::<RecordId>().assert_ok();
+		let duplicate =
+			graph.add_node_with_id(record.clone(), None, PropertyMap::new()).assert_ok();
 
 		assert!(
 			graph
@@ -1547,7 +1606,7 @@ mod tests {
 				)
 				.is_err()
 		);
-		graph.remove_atom(duplicate).unwrap();
+		graph.remove_atom(duplicate).assert_ok();
 		assert!(
 			graph
 				.add_edge_with_id(

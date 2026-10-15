@@ -1,8 +1,20 @@
+/// Owned-heap estimates and reusable estimator caches.
 mod measurable;
+pub use measurable::{
+	HeapEstimatorCache,
+	Measurable,
+	NO_HEAP_ESTIMATOR_CACHE_INSTANCE,
+	NoHeapEstimatorCache,
+};
+/// Allocator forwarding when allocation tracking is disabled.
 mod notrack;
+/// Weak registration and aggregation of external memory reporters.
+#[cfg(test)]
 mod registry;
+/// Optional allocator wrapper with thread-local batched byte tracking.
 mod track;
 
+#[cfg(test)]
 pub use registry::{
 	MemoryReporter,
 	cleanup_memory_reporters,
@@ -10,6 +22,22 @@ pub use registry::{
 	memory_reporters_allocated_total,
 	register_memory_reporter,
 };
+/// Flushes this test thread's pending allocation delta.
+#[cfg(all(test, feature = "allocation-tracking"))]
+pub use track::flush_local_allocations;
+
+/// Returns allocator-tracked bytes, or zero when tracking is disabled.
+#[cfg(test)]
+pub fn allocated_bytes() -> usize {
+	#[cfg(feature = "allocation-tracking")]
+	{
+		track::memory_allocated()
+	}
+	#[cfg(not(feature = "allocation-tracking"))]
+	{
+		0
+	}
+}
 
 /// Reserves complete initial B-tree nodes and sparse node occupancy.
 /// The fixed reserve covers root/split scratch; four slots per entry cover
@@ -45,6 +73,7 @@ pub fn tree_allocation_bytes(
 	)),
 ))]
 #[global_allocator]
+/// Mimalloc-backed global allocator with batched allocation tracking.
 pub static ALLOC: track::TrackAlloc<mimalloc_pprof::MiMalloc> =
 	track::TrackAlloc::new(mimalloc_pprof::MiMalloc);
 
@@ -57,6 +86,7 @@ pub static ALLOC: track::TrackAlloc<mimalloc_pprof::MiMalloc> =
 	)
 ))]
 #[global_allocator]
+/// Jemalloc-backed global allocator with batched allocation tracking.
 pub static ALLOC: track::TrackAlloc<tikv_jemallocator::Jemalloc> =
 	track::TrackAlloc::new(tikv_jemallocator::Jemalloc);
 
@@ -70,6 +100,7 @@ pub static ALLOC: track::TrackAlloc<tikv_jemallocator::Jemalloc> =
 	))
 ))]
 #[global_allocator]
+/// Mimalloc-backed global allocator without allocation tracking.
 pub static ALLOC: notrack::NotrackAlloc<mimalloc_pprof::MiMalloc> =
 	notrack::NotrackAlloc::new(mimalloc_pprof::MiMalloc);
 
@@ -82,5 +113,18 @@ pub static ALLOC: notrack::NotrackAlloc<mimalloc_pprof::MiMalloc> =
 	)
 ))]
 #[global_allocator]
+/// Jemalloc-backed global allocator without allocation tracking.
 pub static ALLOC: notrack::NotrackAlloc<tikv_jemallocator::Jemalloc> =
 	notrack::NotrackAlloc::new(tikv_jemallocator::Jemalloc);
+
+/// Contract checks for the disabled-tracking observation path.
+#[cfg(test)]
+#[cfg(not(feature = "allocation-tracking"))]
+mod tests {
+	/// A normal allocator build must not report estimated or process memory as
+	/// tracked bytes.
+	#[test]
+	fn inspection_reports_zero_without_tracking() {
+		assert_eq!(super::allocated_bytes(), 0);
+	}
+}

@@ -1,37 +1,43 @@
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{ClassSchema, Datastore, Transaction},
 	graph::{AtomKind, EdgeTopology, GraphKind},
 	values::{Object, PropertyMap, RecordId},
 };
 
+/// Returns row count for this module.
 fn row_count(transaction: &mut Transaction, source: &str) -> usize {
-	transaction.execute(source, &Object::new()).unwrap()[0]
+	transaction.execute(source, &Object::new()).assert_ok()[0]
 		.result
 		.as_ref()
-		.unwrap()
+		.assert_ok()
 		.value()
 		.as_array()
-		.unwrap()
+		.assert_some()
 		.len()
 }
 
+/// Verifies atomwalk respects all incidence directions and topology kinds.
 #[test]
 fn atomwalk_respects_all_incidence_directions_and_topology_kinds() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("atomwalk_directions", GraphKind::Graph).unwrap();
-	let a = "person:a".parse::<RecordId>().unwrap();
-	let b = "person:b".parse::<RecordId>().unwrap();
-	let directed = "relation:directed".parse::<RecordId>().unwrap();
-	let bidirectional = "relation:bidirectional".parse::<RecordId>().unwrap();
-	let undirected = "relation:undirected".parse::<RecordId>().unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("atomwalk_directions", GraphKind::Graph).assert_ok();
+	let a = "person:a".parse::<RecordId>().assert_ok();
+	let b = "person:b".parse::<RecordId>().assert_ok();
+	let directed = "relation:directed".parse::<RecordId>().assert_ok();
+	let bidirectional = "relation:bidirectional".parse::<RecordId>().assert_ok();
+	let undirected = "relation:undirected".parse::<RecordId>().assert_ok();
 	for record in [&a, &b, &directed, &bidirectional, &undirected] {
-		seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 	}
-	let a_local = seed.attach_node(graph.id(), &a, None, None).unwrap();
-	let b_local = seed.attach_node(graph.id(), &b, None, None).unwrap();
+	let a_local = seed.attach_node(graph.id(), &a, None, None).assert_ok();
+	let b_local = seed.attach_node(graph.id(), &b, None, None).assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&directed,
@@ -40,7 +46,7 @@ fn atomwalk_respects_all_incidence_directions_and_topology_kinds() {
 		None,
 		None,
 	)
-	.unwrap();
+	.assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&bidirectional,
@@ -49,7 +55,7 @@ fn atomwalk_respects_all_incidence_directions_and_topology_kinds() {
 		None,
 		None,
 	)
-	.unwrap();
+	.assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&undirected,
@@ -58,8 +64,8 @@ fn atomwalk_respects_all_incidence_directions_and_topology_kinds() {
 		None,
 		None,
 	)
-	.unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	for (query, expected) in [

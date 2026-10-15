@@ -4,49 +4,8 @@
 //! durable references retain only logical identities. A Tokio runtime with
 //! time enabled runs bridge IO while the existing executor runs on its blocking
 //! pool. External mirror failures remain visible in
-//! [`BridgeQueryResult::effects`].
-//!
-//! ```
-//! use ferros_grynn::{
-//! 	bridge::{
-//! 		Bridge,
-//! 		BridgeContext,
-//! 		BridgeData,
-//! 		BridgeFuture,
-//! 		BridgeOperation,
-//! 		FerrosQueryBridgeExt,
-//! 	},
-//! 	datastore::Datastore,
-//! 	gql_status::FerrosGrynnResult,
-//! 	values::Value,
-//! };
-//! struct Source;
-//! impl Bridge for Source {
-//! 	fn execute(&self, _: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_> {
-//! 		Box::pin(async move {
-//! 			context.check()?;
-//! 			Ok(Value::Null)
-//! 		})
-//! 	}
-//! }
-//! # fn main() -> FerrosGrynnResult<()> {
-//! let runtime =
-//! 	tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| {
-//! 		ferros_grynn::gql_status::FerrosGrynnError::bridge_operation_error(
-//! 			"example runtime failed",
-//! 		)
-//! 		.with_technical_source(error)
-//! 	})?;
-//! let store = Datastore::in_memory();
-//! let query = FerrosQueryBridgeExt::use_bridge(
-//! 	store.query("RETURN $bridge"),
-//! 	Source,
-//! 	BridgeData::ExternalQuery("native source", None),
-//! );
-//! let result = runtime.block_on(query.execute())?;
-//! assert_eq!(result.results[0].result.clone()?.into_parts().0, Value::Null);
-//! # Ok(()) }
-//! ```
+//! [`crate::bridge::BridgeQueryResult::effects`].
+#![doc = include_str!("../../docs/rustdoc/bridge-example-01.md")]
 
 mod ferros;
 mod query;
@@ -100,11 +59,21 @@ pub enum BridgeOperation {
 		variables: Object,
 	},
 	/// A record or class read, without importing local atoms.
-	RecordOrClass(Text),
+	RecordOrClass(
+		/// A record or class read, without importing local atoms.
+		Text,
+	),
 	/// Exact external records requested by the shared FETCH walker.
-	Records(Vec<crate::values::RecordId>),
+	Records(
+		/// Exact external records requested by the shared FETCH walker.
+		Vec<crate::values::RecordId>,
+	),
 	/// Idempotent relation creation or verification using a reserved identity.
-	Mirror(BridgeMirrorRequest),
+	Mirror(
+		/// Idempotent relation creation or verification using a reserved
+		/// identity.
+		BridgeMirrorRequest,
+	),
 }
 
 /// Open port implemented by application adapters and the supplied bridges.
@@ -123,44 +92,60 @@ pub trait Bridge: Send + Sync {
 	fn execute(&self, operation: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_>;
 }
 
-/// Concrete boundary capabilities required by actual GQL operations.
-#[derive(Debug, Clone, Copy)]
-pub struct BridgeCapabilities {
-	/// Native query and record/class sources are available.
-	pub queries: bool,
-	/// Source queries obey the Ferros-Grynn read-only effect ceiling.
-	pub internal_queries: bool,
-	/// Exact property-object batch reads are available.
-	pub records: bool,
-	/// Idempotent relation verification/creation is available.
-	pub mirror: bool,
+bitflags::bitflags! {
+	/// Independent capabilities required by bridge operations.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub struct BridgeCapabilities: u8 {
+		/// Native query and record/class sources are available.
+		const QUERIES = 0b0001;
+		/// Source queries obey the Ferros-Grynn read-only effect ceiling.
+		const INTERNAL_QUERIES = 0b0010;
+		/// Exact property-object batch reads are available.
+		const RECORDS = 0b0100;
+		/// Idempotent relation verification/creation is available.
+		const MIRROR = 0b1000;
+	}
 }
+
 impl BridgeCapabilities {
 	/// Full embedded adapter including checked idempotent relation mirroring.
-	pub const FULL: Self = Self {
-		queries: true,
-		internal_queries: false,
-		records: true,
-		mirror: true,
-	};
+	pub const FULL: Self = Self::QUERIES.union(Self::RECORDS).union(Self::MIRROR);
 	/// Query-only adapters do not implicitly accept writes.
-	pub const READ_ONLY: Self = Self {
-		queries: true,
-		internal_queries: false,
-		records: false,
-		mirror: false,
-	};
+	pub const READ_ONLY: Self = Self::QUERIES;
+
+	/// Reports whether native query and record/class sources are supported.
+	pub const fn queries(self) -> bool {
+		self.contains(Self::QUERIES)
+	}
+
+	/// Reports whether source queries enforce the read-only GQL effect ceiling.
+	pub const fn internal_queries(self) -> bool {
+		self.contains(Self::INTERNAL_QUERIES)
+	}
+
+	/// Reports whether exact property-object batch reads are supported.
+	pub const fn records(self) -> bool {
+		self.contains(Self::RECORDS)
+	}
+
+	/// Reports whether idempotent relation mirroring is supported.
+	pub const fn mirror(self) -> bool {
+		self.contains(Self::MIRROR)
+	}
 }
 
 impl<B: Bridge + ?Sized> Bridge for std::sync::Arc<B> {
+	/// Returns database for `std::sync::Arc<B>`.
 	fn database(&self) -> Option<BridgeDatabaseRef> {
 		self.as_ref().database()
 	}
 
+	/// Returns capabilities for `std::sync::Arc<B>`.
 	fn capabilities(&self) -> BridgeCapabilities {
 		self.as_ref().capabilities()
 	}
 
+	/// Forwards the operation and execution context to the wrapped bridge.
 	fn execute(&self, operation: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_> {
 		self.as_ref().execute(operation, context)
 	}
@@ -234,15 +219,13 @@ impl BridgeContext {
 	/// Returns overflow, cancellation, timeout or the common resource status.
 	pub fn admit_bytes(&self, bytes: usize) -> crate::gql_status::FerrosGrynnResult<()> {
 		self.check()?;
-		if let Some(account) = &self.options.bridge_memory {
-			if !account.lock().reserve(bytes) {
-				return Err(
-					crate::gql_status::FerrosGrynnError::traversal_resource_limit_exceeded(
-						"bridge retained values",
-						self.options.barrier_memory_bytes.get() as u64,
-					),
-				);
-			}
+		if let Some(account) = &self.options.context.bridge_memory
+			&& !account.lock().reserve(bytes)
+		{
+			return Err(crate::gql_status::FerrosGrynnError::traversal_resource_limit_exceeded(
+				"bridge retained values",
+				self.options.barrier_memory_bytes.get() as u64,
+			));
 		}
 		Ok(())
 	}
@@ -298,9 +281,26 @@ fn check_value_shape(
 #[non_exhaustive]
 pub enum BridgeData<'a> {
 	/// Native class/record spelling and the receiving parameter name.
-	RecordOrClass(&'a str, &'a str),
+	RecordOrClass(
+		/// Native record or class spelling interpreted by the selected bridge.
+		&'a str,
+		/// Name of the query parameter receiving the selected external data.
+		&'a str,
+	),
 	/// External native query and optional Object-field to parameter mapping.
-	ExternalQuery(&'a str, Option<std::collections::HashMap<&'a str, &'a str>>),
+	ExternalQuery(
+		/// Query text evaluated by the external database through its bridge.
+		&'a str,
+		/// Optional mapping from external object field names to query parameter
+		/// names.
+		Option<std::collections::HashMap<&'a str, &'a str>>,
+	),
 	/// Read-only GQL query and optional Object-field to parameter mapping.
-	InternalQuery(&'a str, Option<std::collections::HashMap<&'a str, &'a str>>),
+	InternalQuery(
+		/// Read-only GrynnQL source evaluated against the local datastore.
+		&'a str,
+		/// Optional mapping from local result object fields to query parameter
+		/// names.
+		Option<std::collections::HashMap<&'a str, &'a str>>,
+	),
 }

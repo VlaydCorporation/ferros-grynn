@@ -28,7 +28,7 @@ use crate::{
 
 /// One property histogram requested by the current logical plan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PlannerPropertyDemand {
+pub struct PlannerPropertyDemand {
 	/// Owning class name resolved by typed analysis.
 	pub(crate) class: Box<str>,
 	/// Declared field name.
@@ -39,28 +39,35 @@ pub(crate) struct PlannerPropertyDemand {
 
 /// Lazy statistics requested while constructing a planner snapshot.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PlannerDemand {
+pub struct PlannerDemand {
 	/// Atom classes participating in the logical plan.
 	pub(crate) classes: BTreeSet<Box<str>>,
 	/// Exact graphs participating in the logical plan.
 	pub(crate) graphs: BTreeSet<GraphId>,
 	/// Whether an unbounded graph-catalog source requires every visible graph.
 	pub(crate) all_graphs: bool,
-	/// Whether an explicit approximate step needs Ready sketch bindings.
-	pub(crate) neighbourhood_sketches: bool,
-	/// Whether a shortest-path objective needs directed landmark bindings.
-	pub(crate) landmark_paths: bool,
-	/// Whether tensor-backed consumers need snapshot-exact cache metadata.
-	pub(crate) tensor_caches: bool,
+	/// Immutable artifact families needed by the physical plan.
+	pub(crate) artifacts: PlannerArtifactDemand,
 	/// Property distributions used by predicates, grouping, or ordering.
 	pub(crate) properties: BTreeSet<PlannerPropertyDemand>,
 	/// Degree distributions used by current MATCH estimates.
 	pub(crate) degrees: BTreeMap<GraphId, BTreeSet<DegreeHistogramKey>>,
 }
 
+/// Independently requested graph artifact families.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlannerArtifactDemand {
+	/// Whether an explicit approximate step needs Ready sketch bindings.
+	pub(crate) neighbourhood_sketches: bool,
+	/// Whether a shortest-path objective needs directed landmark bindings.
+	pub(crate) landmark_paths: bool,
+	/// Whether tensor-backed consumers need snapshot-exact cache metadata.
+	pub(crate) tensor_caches: bool,
+}
+
 /// One declared field retained by the planner.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannerField {
+pub struct PlannerField {
 	/// Stable field identity.
 	pub(crate) id: SchemaId,
 	/// Class-local field name.
@@ -71,7 +78,7 @@ pub(crate) struct PlannerField {
 
 /// Transaction-visible index definition and physical availability.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannerIndex {
+pub struct PlannerIndex {
 	/// Stable logical index identity.
 	pub(crate) id: IndexId,
 	/// Definition version.
@@ -94,13 +101,13 @@ pub(crate) struct PlannerIndex {
 
 /// Class metadata and exact cardinalities used by source planning.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannerClass {
+pub struct PlannerClass {
 	/// Stable class identity.
 	pub(crate) id: ClassId,
 	/// Definition version.
-	pub(crate) version: SchemaVersion,
+	pub(crate) _version: SchemaVersion,
 	/// Case-sensitive class name.
-	pub(crate) name: Text,
+	pub(crate) _name: Text,
 	/// Declared fields in catalog order.
 	pub(crate) fields: Vec<PlannerField>,
 	/// Declared indexes in catalog order.
@@ -113,7 +120,7 @@ pub(crate) struct PlannerClass {
 
 /// Scalar freshness information shared by all histograms in one scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PlannerStatisticsMeta {
+pub struct PlannerStatisticsMeta {
 	/// Revision represented by exact counters.
 	pub(crate) revision: u64,
 	/// Revision represented by bulk distributions.
@@ -124,11 +131,11 @@ pub(crate) struct PlannerStatisticsMeta {
 
 /// Graph catalog identity and exact topology counters.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannerGraph {
+pub struct PlannerGraph {
 	/// Public graph reference.
 	pub(crate) reference: GraphRef,
 	/// Graph schema version.
-	pub(crate) version: SchemaVersion,
+	pub(crate) _version: SchemaVersion,
 	/// Histogram freshness for this graph-effective population.
 	pub(crate) statistics: PlannerStatisticsMeta,
 	/// Exact node occurrence count.
@@ -158,7 +165,7 @@ pub(crate) struct PlannerGraph {
 
 /// One demanded histogram together with its build method.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannerPropertyHistogram {
+pub struct PlannerPropertyHistogram {
 	/// Exact resolved identity.
 	pub(crate) key: PropertyHistogramKey,
 	/// Exact or sampled distribution.
@@ -169,7 +176,7 @@ pub(crate) struct PlannerPropertyHistogram {
 
 /// Planner-owned projection of one immutable statement snapshot.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PlannerSnapshot {
+pub struct PlannerSnapshot {
 	/// Database commit timestamp captured for the statement.
 	pub(crate) revision: u64,
 	/// Base histogram freshness.

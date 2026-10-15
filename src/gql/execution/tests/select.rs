@@ -12,12 +12,18 @@ use std::{
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{Datastore, ImportOptions, InMemoryOptions},
 	gql::{QueryCancellation, QueryExecutionOptions},
 	values::{Object, PropertyMap, RecordId, Value, Vector},
 };
 
+/// Verifies geometry index refines mbr false positives and preserves error
+/// order.
 #[test]
 fn geometry_index_refines_mbr_false_positives_and_preserves_error_order() {
 	let store = Datastore::in_memory();
@@ -33,7 +39,7 @@ fn geometry_index_refines_mbr_false_positives_and_preserves_error_order() {
 		 DEFINE INDEX by_shape ON CLASS place FIELDS shape GEOMETRY SCOPE BASE;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()), "{setup:?}");
 	let polygon = "<geometry>{type:'Polygon', \
 	               coordinates:[[[0,0],[6,0],[6,6],[0,6],[0,0]],[[2,2],[4,2],[4,4],[2,4],[2,2]]]}";
@@ -44,7 +50,7 @@ fn geometry_index_refines_mbr_false_positives_and_preserves_error_order() {
 	assert_eq!(value(&store, &indexed), value(&store, &scan));
 	assert_eq!(
 		value(&store, &indexed),
-		Value::Array(vec![Value::from("place:inside".parse::<RecordId>().unwrap())].into())
+		Value::Array(vec![Value::from("place:inside".parse::<RecordId>().assert_ok())].into())
 	);
 	let outside =
 		"<geometry>{type:'Polygon', coordinates:[[[20,20],[21,20],[21,21],[20,21],[20,20]]]}";
@@ -57,17 +63,22 @@ fn geometry_index_refines_mbr_false_positives_and_preserves_error_order() {
 	let explain = value(&store, &format!("EXPLAIN FULL FORMAT JSON {indexed}"));
 	assert!(format!("{explain:?}").contains("GeometryIndexScan"), "{explain:?}");
 	let analyzed = value(&store, &format!("EXPLAIN ANALYZE FORMAT JSON {indexed}"));
-	let Value::Object(explain) = analyzed else {
-		panic!("EXPLAIN did not return an object");
-	};
-	let Some(Value::Object(actual)) = explain.get("analyze") else {
-		panic!("EXPLAIN actual metrics absent: {explain:?}");
-	};
+	let explain = match analyzed {
+		Value::Object(explain) => Some(explain),
+		_ => None,
+	}
+	.assert_some_with("EXPLAIN did not return an object");
+	let actual = match explain.get("analyze") {
+		Some(Value::Object(actual)) => Some(actual),
+		_ => None,
+	}
+	.assert_some_with(format_args!("EXPLAIN actual metrics absent: {explain:?}"));
 	assert_eq!(actual.get("spatial_candidates"), Some(&Value::from(3_i64)));
 	assert_eq!(actual.get("spatial_refinements"), Some(&Value::from(3_i64)));
 	assert_eq!(actual.get("spatial_tree_pages"), Some(&Value::from(1_i64)));
 }
 
+/// Verifies fulltext exact scan scores and highlights snapshot rows.
 #[test]
 fn fulltext_exact_scan_scores_and_highlights_snapshot_rows() {
 	let store = Datastore::in_memory();
@@ -80,7 +91,7 @@ fn fulltext_exact_scan_scores_and_highlights_snapshot_rows() {
 			 SET title = 'Rust storage'; CREATE document:c SET title = 'Graph only';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 
 	let result = rows(value(
@@ -89,9 +100,15 @@ fn fulltext_exact_scan_scores_and_highlights_snapshot_rows() {
 		 document WITH NOINDEX WHERE title @7@ 'rust' ORDER BY score DESC, id;",
 	));
 	assert_eq!(result.len(), 2);
-	assert_eq!(result[0].get("id"), Some(&Value::from("document:a".parse::<RecordId>().unwrap())));
+	assert_eq!(
+		result[0].get("id"),
+		Some(&Value::from("document:a".parse::<RecordId>().assert_ok()))
+	);
 	assert_eq!(result[0].get("snippet"), Some(&Value::from("[Rust] graph")));
-	assert_eq!(result[1].get("id"), Some(&Value::from("document:b".parse::<RecordId>().unwrap())));
+	assert_eq!(
+		result[1].get("id"),
+		Some(&Value::from("document:b".parse::<RecordId>().assert_ok()))
+	);
 	assert_eq!(result[1].get("snippet"), Some(&Value::from("[Rust] storage")));
 	assert!(matches!(result[0].get("score"), Some(Value::Number(_))));
 
@@ -100,6 +117,7 @@ fn fulltext_exact_scan_scores_and_highlights_snapshot_rows() {
 	assert!(unknown_slot.to_string().contains("unknown Fulltext slot 8"));
 }
 
+/// Verifies exact knn uses bounded top k and stable ties.
 #[test]
 fn exact_knn_uses_bounded_top_k_and_stable_ties() {
 	let store = Datastore::in_memory();
@@ -109,7 +127,7 @@ fn exact_knn_uses_bounded_top_k_and_stable_ties() {
 			 TYPE vector<f32>;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	for (name, vector) in
 		[("a", vec![1.0_f32, 0.0]), ("b", vec![0.0_f32, 1.0]), ("c", vec![-1.0_f32, 0.0])]
 	{
@@ -117,7 +135,7 @@ fn exact_knn_uses_bounded_top_k_and_stable_ties() {
 		parameters.insert("vector", Value::Vector(Vector::F32(vector)));
 		let results = store
 			.execute(&format!("CREATE document:{name} SET embedding = $vector;"), &parameters)
-			.unwrap();
+			.assert_ok();
 		assert!(results[0].result.is_ok());
 	}
 	let mut parameters = Object::new();
@@ -127,14 +145,14 @@ fn exact_knn_uses_bounded_top_k_and_stable_ties() {
 			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 2, COSINE |> $query;",
 			&parameters,
 		)
-		.unwrap();
-	let actual = results[0].result.as_ref().unwrap().value().clone();
+		.assert_ok();
+	let actual = results[0].result.as_ref().assert_ok().value().clone();
 	assert_eq!(
 		actual,
 		Value::Array(
 			[
-				Value::from("document:a".parse::<RecordId>().unwrap()),
-				Value::from("document:b".parse::<RecordId>().unwrap()),
+				Value::from("document:a".parse::<RecordId>().assert_ok()),
+				Value::from("document:b".parse::<RecordId>().assert_ok()),
 			]
 			.into_iter()
 			.collect(),
@@ -142,64 +160,77 @@ fn exact_knn_uses_bounded_top_k_and_stable_ties() {
 	);
 }
 
+/// Returns value for this module.
 fn value(store: &Datastore, source: &str) -> Value {
-	store.execute(source, &Object::new()).unwrap()[0].result.as_ref().unwrap().value().clone()
+	store.execute(source, &Object::new()).assert_ok()[0].result.as_ref().assert_ok().value().clone()
 }
 
+/// Returns value with options for this module.
 fn value_with_options(store: &Datastore, source: &str, options: QueryExecutionOptions) -> Value {
-	store.execute_with_options(source, &Object::new(), options).unwrap()[0]
+	store.execute_with_options(source, &Object::new(), options).assert_ok()[0]
 		.result
 		.as_ref()
-		.unwrap()
+		.assert_ok()
 		.value()
 		.clone()
 }
 
+/// Returns rows for this module.
 fn rows(value: Value) -> Vec<Object> {
-	let Value::Array(values) = value else {
-		panic!("SELECT must return an array");
-	};
+	let values = match value {
+		Value::Array(values) => Some(values),
+		_ => None,
+	}
+	.assert_some_with("SELECT must return an array");
 	values
 		.into_iter()
 		.map(|value| {
-			let Value::Object(object) = value else {
-				panic!("SELECT row must be an object");
-			};
-			object
+			match value {
+				Value::Object(object) => Some(object),
+				_ => None,
+			}
+			.assert_some_with("SELECT row must be an object")
 		})
 		.collect()
 }
 
+/// Returns statement error for this module.
 fn statement_error(store: &Datastore, source: &str) -> crate::gql_status::FerrosGrynnError {
-	store.execute(source, &Object::new()).unwrap()[0].result.clone().unwrap_err()
+	store.execute(source, &Object::new()).assert_ok()[0].result.clone().assert_err()
 }
 
 /// Special SELECT inputs preserve normal argument order and lazy branches.
 #[test]
-fn select_specials_preserve_argument_errors_and_lazy_branches()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn select_specials_preserve_argument_errors_and_lazy_branches() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	tx.define_class(crate::datastore::ClassSchema::new(
-		"person",
-		crate::graph::AtomKind::Node,
-		[],
-	)?)?;
-	tx.define_function(crate::datastore::SchemaFunction::new(
-		"fn",
-		"two",
-		vec![
-			crate::datastore::SchemaFunctionParameter::new("left", crate::values::Type::Any)?,
-			crate::datastore::SchemaFunctionParameter::new("right", crate::values::Type::Any)?,
-		],
-		crate::values::Type::Any,
-		crate::datastore::FunctionEffect::Pure,
-		false,
-		None,
-		"{ RETURN $left; }",
-	)?)?;
-	tx.commit()?;
-	let setup = store.execute("CREATE person:a; CREATE person:b;", &Object::new())?;
+	tx.define_class(
+		crate::datastore::ClassSchema::new("person", crate::graph::AtomKind::Node, []).assert_ok(),
+	)
+	.assert_ok();
+	tx.define_function(
+		crate::datastore::SchemaFunction::new(
+			"fn",
+			"two",
+			vec![
+				crate::datastore::SchemaFunctionParameter::new("left", crate::values::Type::Any)
+					.assert_ok(),
+				crate::datastore::SchemaFunctionParameter::new("right", crate::values::Type::Any)
+					.assert_ok(),
+			],
+			crate::values::Type::Any,
+			crate::datastore::FunctionEffect::Pure,
+			false,
+			None,
+			"{ RETURN $left; }",
+		)
+		.assert_ok(),
+	)
+	.assert_ok();
+	tx.commit().assert_ok();
+	let setup = store.execute("CREATE person:a; CREATE person:b;", &Object::new()).assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()), "{setup:?}");
 	let expected = statement_error(&store, "SELECT VALUE 1 / 0 FROM person;");
 	let actual = statement_error(
@@ -223,9 +254,9 @@ fn select_specials_preserve_argument_errors_and_lazy_branches()
 		};
 		assert_eq!(result, Value::Array(vec![expected].into()), "{expression}");
 	}
-	Ok(())
 }
 
+/// Verifies forced scalar indexes and count lookup match scan results.
 #[test]
 fn forced_scalar_indexes_and_count_lookup_match_scan_results() {
 	let store = Datastore::in_memory();
@@ -237,7 +268,7 @@ fn forced_scalar_indexes_and_count_lookup_match_scan_results() {
 			 age = 20; CREATE person:c SET age = 30;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	let indexed = value(
 		&store,
@@ -254,6 +285,7 @@ fn forced_scalar_indexes_and_count_lookup_match_scan_results() {
 	);
 }
 
+/// Verifies composite index prefix and range match scan results.
 #[test]
 fn composite_index_prefix_and_range_match_scan_results() {
 	let store = Datastore::in_memory();
@@ -267,7 +299,7 @@ fn composite_index_prefix_and_range_match_scan_results() {
 			 country = 'ca', age = 25;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	let indexed = value(
 		&store,
@@ -289,6 +321,7 @@ fn composite_index_prefix_and_range_match_scan_results() {
 	assert_eq!(prefix, Value::Array(vec![Value::from(25_i64)].into()));
 }
 
+/// Verifies statistics freshness changes estimates without changing results.
 #[test]
 fn statistics_freshness_changes_estimates_without_changing_results() {
 	let store = Datastore::in_memory();
@@ -298,8 +331,8 @@ fn statistics_freshness_changes_estimates_without_changing_results() {
 			 int;",
 			&Object::new(),
 		)
-		.unwrap();
-	let score = store.property_dictionary().get("score").unwrap();
+		.assert_ok();
+	let score = store.property_dictionary().get("score").assert_some();
 	store
 		.import(ImportOptions::default(), |session| {
 			for ordinal in 0..4 {
@@ -307,22 +340,24 @@ fn statistics_freshness_changes_estimates_without_changing_results() {
 					let mut properties = PropertyMap::new();
 					properties.insert(score, Value::from(ordinal));
 					transaction.create_atom(
-						format!("person:r{ordinal}").parse::<RecordId>().unwrap(),
+						format!("person:r{ordinal}").parse::<RecordId>().assert_ok(),
 						properties,
 					)
 				})?;
 			}
 			Ok(())
 		})
-		.unwrap();
+		.assert_ok();
 	let root = (*store.inner.current_root()).clone();
 	let query = "SELECT VALUE id FROM person WHERE score = 2;";
 	let explain = "EXPLAIN FULL FORMAT JSON SELECT VALUE id FROM person WHERE score = 2;";
 	let projection = |store: &Datastore| {
 		let result = value(store, query);
-		let Value::Object(explain) = value(store, explain) else {
-			panic!("EXPLAIN JSON must return an object");
-		};
+		let explain = match value(store, explain) {
+			Value::Object(explain) => Some(explain),
+			_ => None,
+		}
+		.assert_some_with("EXPLAIN JSON must return an object");
 		(result, explain)
 	};
 
@@ -366,6 +401,8 @@ fn statistics_freshness_changes_estimates_without_changing_results() {
 	);
 }
 
+/// Verifies unique index supplies forward and reverse order without changing
+/// results.
 #[test]
 fn unique_index_supplies_forward_and_reverse_order_without_changing_results() {
 	let store = Datastore::in_memory();
@@ -376,7 +413,7 @@ fn unique_index_supplies_forward_and_reverse_order_without_changing_results() {
 			 person:c SET rank = 3; CREATE person:a SET rank = 1; CREATE person:b SET rank = 2;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	assert_eq!(
 		value(&store, "SELECT VALUE rank FROM person ORDER BY rank ASC NULLS FIRST LIMIT 2;",),
@@ -388,6 +425,7 @@ fn unique_index_supplies_forward_and_reverse_order_without_changing_results() {
 	);
 }
 
+/// Verifies unicode collation and numeric ordering use canonical ties.
 #[test]
 fn unicode_collation_and_numeric_ordering_use_canonical_ties() {
 	let store = Datastore::in_memory();
@@ -399,7 +437,7 @@ fn unicode_collation_and_numeric_ordering_use_canonical_ties() {
 			 CREATE item:f SET text = 'E';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	assert_eq!(
 		value(
@@ -434,6 +472,8 @@ fn unicode_collation_and_numeric_ordering_use_canonical_ties() {
 	);
 }
 
+/// Verifies index ordered cursor seeks inside its exact snapshot without a
+/// spool.
 #[test]
 fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 	let store = Datastore::in_memory_with(InMemoryOptions {
@@ -447,7 +487,7 @@ fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 			 person:a SET rank = 1; CREATE person:c SET rank = 3; CREATE person:e SET rank = 5;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let scratch =
 		std::env::temp_dir().join(format!("fg-index-seek-{}", crate::values::Uuid::now_v7()));
 	let options = QueryExecutionOptions {
@@ -463,11 +503,14 @@ fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 			&Object::new(),
 			options.clone(),
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0);
-	assert_eq!(first.result.unwrap().into_parts().0, Value::Array(vec![Value::from(1_i64)].into()));
+	assert_eq!(
+		first.result.assert_ok().into_parts().0,
+		Value::Array(vec![Value::from(1_i64)].into())
+	);
 	assert_eq!(directory_bytes(&scratch), 0, "index seek must not materialize a spool");
-	let first_cursor = first.continuation.unwrap();
+	let first_cursor = first.continuation.assert_some();
 	let mut read_committed_session = store.session();
 	let read_committed_first = read_committed_session
 		.execute_with_options(
@@ -476,24 +519,31 @@ fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 			&Object::new(),
 			options.clone(),
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0);
-	let read_committed_cursor = read_committed_first.continuation.unwrap();
+	let read_committed_cursor = read_committed_first.continuation.assert_some();
 
-	store.execute("CREATE person:b SET rank = 2;", &Object::new()).unwrap();
+	store.execute("CREATE person:b SET rank = 2;", &Object::new()).assert_ok();
 	let mut variables = Object::new();
 	variables.insert("cursor", Value::from(first_cursor));
 	let continuation = "SELECT VALUE rank FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS \
 	                    FIRST LIMIT 1 START AFTER $cursor;";
-	let second =
-		session.execute_with_options(continuation, &variables, options.clone()).unwrap().remove(0);
-	let replay =
-		session.execute_with_options(continuation, &variables, options.clone()).unwrap().remove(0);
+	let second = session
+		.execute_with_options(continuation, &variables, options.clone())
+		.assert_ok()
+		.remove(0);
+	let replay = session
+		.execute_with_options(continuation, &variables, options.clone())
+		.assert_ok()
+		.remove(0);
 	assert_eq!(
-		second.result.as_ref().unwrap().value(),
+		second.result.as_ref().assert_ok().value(),
 		&Value::Array(vec![Value::from(3_i64)].into())
 	);
-	assert_eq!(second.result.as_ref().unwrap().value(), replay.result.as_ref().unwrap().value());
+	assert_eq!(
+		second.result.as_ref().assert_ok().value(),
+		replay.result.as_ref().assert_ok().value()
+	);
 	assert_eq!(second.continuation, replay.continuation);
 	assert_eq!(directory_bytes(&scratch), 0, "replayed seek must not materialize a spool");
 	let mut read_committed_variables = Object::new();
@@ -505,25 +555,31 @@ fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 			&read_committed_variables,
 			options.clone(),
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0);
 	assert_eq!(
-		read_committed.result.unwrap().into_parts().0,
+		read_committed.result.assert_ok().into_parts().0,
 		Value::Array(vec![Value::from(2_i64)].into())
 	);
 	if let Some(cursor) = read_committed.continuation {
-		read_committed_session.close_cursor(&cursor).unwrap();
+		read_committed_session.close_cursor(&cursor).assert_ok();
 	}
 	assert_eq!(directory_bytes(&scratch), 0, "READ COMMITTED seek must not build a spool");
 
-	variables.insert("cursor", Value::from(second.continuation.unwrap()));
-	let last = session.execute_with_options(continuation, &variables, options).unwrap().remove(0);
-	assert_eq!(last.result.unwrap().into_parts().0, Value::Array(vec![Value::from(5_i64)].into()));
+	variables.insert("cursor", Value::from(second.continuation.assert_some()));
+	let last =
+		session.execute_with_options(continuation, &variables, options).assert_ok().remove(0);
+	assert_eq!(
+		last.result.assert_ok().into_parts().0,
+		Value::Array(vec![Value::from(5_i64)].into())
+	);
 	assert!(last.continuation.is_none());
 	assert_eq!(directory_bytes(&scratch), 0);
 	drop(fs::remove_dir_all(scratch));
 }
 
+/// Verifies index cursor filters duplicate anchor after reading its whole
+/// posting group.
 #[test]
 fn index_cursor_filters_duplicate_anchor_after_reading_its_whole_posting_group() {
 	let store = Datastore::in_memory();
@@ -534,7 +590,7 @@ fn index_cursor_filters_duplicate_anchor_after_reading_its_whole_posting_group()
 			 SET rank = 1; CREATE person:b SET rank = 1; CREATE person:c SET rank = 2;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	for (predicate, expected) in
 		[("rank = 1", &["a", "b"][..]), ("rank >= 1", &["a", "b", "c"][..])]
@@ -553,11 +609,12 @@ fn index_cursor_filters_duplicate_anchor_after_reading_its_whole_posting_group()
 				"SELECT VALUE id FROM person WITH INDEX by_rank WHERE {predicate} ORDER BY rank \
 				 ASC NULLS FIRST LIMIT 1{continuation};"
 			);
-			let result = session.execute(&source, &variables).unwrap().remove(0);
+			let result = session.execute(&source, &variables).assert_ok().remove(0);
 			assert_eq!(
-				result.result.unwrap().into_parts().0,
+				result.result.assert_ok().into_parts().0,
 				Value::Array(
-					vec![Value::from(format!("person:{key}").parse::<RecordId>().unwrap())].into()
+					vec![Value::from(format!("person:{key}").parse::<RecordId>().assert_ok())]
+						.into()
 				)
 			);
 			cursor = result.continuation;
@@ -566,6 +623,7 @@ fn index_cursor_filters_duplicate_anchor_after_reading_its_whole_posting_group()
 	}
 }
 
+/// Verifies standard index orders duplicate keys by public record id.
 #[test]
 fn standard_index_orders_duplicate_keys_by_public_record_id() {
 	let store = Datastore::in_memory();
@@ -576,7 +634,7 @@ fn standard_index_orders_duplicate_keys_by_public_record_id() {
 			 SET rank = 1; CREATE person:a SET rank = 1; CREATE person:m SET rank = 2;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	for direction in ["ASC NULLS FIRST", "DESC"] {
 		let indexed = value(
@@ -591,6 +649,7 @@ fn standard_index_orders_duplicate_keys_by_public_record_id() {
 	}
 }
 
+/// Verifies forced index must be ready and match its source.
 #[test]
 fn forced_index_must_be_ready_and_match_its_source() {
 	let store = Datastore::in_memory();
@@ -601,7 +660,7 @@ fn forced_index_must_be_ready_and_match_its_source() {
 			 CLASS person PREPARE REMOVE;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let error = statement_error(
 		&store,
 		"SELECT VALUE age FROM person WITH INDEX person.by_age WHERE age = 10;",
@@ -609,14 +668,17 @@ fn forced_index_must_be_ready_and_match_its_source() {
 	assert!(error.to_string().contains("not Ready"));
 	let fallback =
 		value(&store, "EXPLAIN FULL FORMAT JSON SELECT VALUE age FROM person WHERE age = 10;");
-	let Value::Object(fallback) = fallback else {
-		panic!("EXPLAIN fallback must be an object");
-	};
+	let fallback = match fallback {
+		Value::Object(fallback) => Some(fallback),
+		_ => None,
+	}
+	.assert_some_with("EXPLAIN fallback must be an object");
 	assert!(
 		matches!(fallback.get("warnings"), Some(Value::Array(warnings)) if !warnings.is_empty())
 	);
 }
 
+/// Verifies index hints select one candidate per qualified source.
 #[test]
 fn index_hints_select_one_candidate_per_qualified_source() {
 	let store = Datastore::in_memory();
@@ -630,7 +692,7 @@ fn index_hints_select_one_candidate_per_qualified_source() {
 			 BASE; CREATE person:a SET code = 'd', age = 30; CREATE department:d SET code = 'd';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	let ambiguous = statement_error(
 		&store,
@@ -644,10 +706,11 @@ fn index_hints_select_one_candidate_per_qualified_source() {
 	);
 	assert_eq!(
 		result,
-		Value::Array(vec![Value::from("person:a".parse::<RecordId>().unwrap())].into())
+		Value::Array(vec![Value::from("person:a".parse::<RecordId>().assert_ok())].into())
 	);
 }
 
+/// Verifies effective index matches graph scan and preserves ties.
 #[test]
 fn effective_index_matches_graph_scan_and_preserves_ties() {
 	let store = Datastore::in_memory();
@@ -661,7 +724,7 @@ fn effective_index_matches_graph_scan_and_preserves_ties() {
 			 SET score = 0;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	let indexed = value(
 		&store,
@@ -675,6 +738,7 @@ fn effective_index_matches_graph_scan_and_preserves_ties() {
 	assert_eq!(indexed, scanned);
 }
 
+/// Verifies selects graph catalog rows and durable properties.
 #[test]
 fn selects_graph_catalog_rows_and_durable_properties() {
 	let store = Datastore::in_memory();
@@ -684,7 +748,7 @@ fn selects_graph_catalog_rows_and_durable_properties() {
 			 {owner: 'risk'};",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	let result = rows(value(
 		&store,
@@ -697,6 +761,7 @@ fn selects_graph_catalog_rows_and_durable_properties() {
 	assert_eq!(result[1].get("owner"), Some(&Value::from("analytics")));
 }
 
+/// Verifies executes join group order and derived source.
 #[test]
 fn executes_join_group_order_and_derived_source() {
 	let store = Datastore::in_memory();
@@ -713,7 +778,7 @@ fn executes_join_group_order_and_derived_source() {
 			 'Carol';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 
 	let joined = rows(value(
@@ -743,6 +808,7 @@ fn executes_join_group_order_and_derived_source() {
 	assert_eq!(derived[0].get("people"), Some(&Value::from(1_i64)));
 }
 
+/// Verifies dp and greedy join orders match fixed left deep results.
 #[test]
 fn dp_and_greedy_join_orders_match_fixed_left_deep_results() {
 	let store = Datastore::in_memory();
@@ -752,16 +818,19 @@ fn dp_and_greedy_join_orders_match_fixed_left_deep_results() {
 			 int; CREATE sample:a SET code = 1; CREATE sample:b SET code = 1;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 
 	for sources in [8_usize, 10] {
 		let query = |kind: &str| {
 			let mut query = "SELECT VALUE count() FROM sample AS s0".to_owned();
 			for index in 1..sources {
-				query.push_str(&format!(
+				use std::fmt::Write as _;
+				write!(
+					query,
 					" {kind} JOIN sample AS s{index} ON s{}.code = s{index}.code",
 					index - 1
-				));
+				)
+				.assert_ok();
 			}
 			query.push_str(" GROUP ALL;");
 			query
@@ -773,6 +842,7 @@ fn dp_and_greedy_join_orders_match_fixed_left_deep_results() {
 	}
 }
 
+/// Verifies executes split omit only and scalar subquery.
 #[test]
 fn executes_split_omit_only_and_scalar_subquery() {
 	let store = Datastore::in_memory();
@@ -782,7 +852,7 @@ fn executes_split_omit_only_and_scalar_subquery() {
 			 SET name = 'Alice', tags = ['rust', 'graph']; ATTACH person:alice TO GRAPH social;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 
 	let split = rows(value(
@@ -810,6 +880,7 @@ fn executes_split_omit_only_and_scalar_subquery() {
 	assert_eq!(graphs[0].get("people"), Some(&Value::from(1_i64)));
 }
 
+/// Verifies persistent session replays exact ordered pages.
 #[test]
 fn persistent_session_replays_exact_ordered_pages() {
 	let store = Datastore::in_memory();
@@ -820,15 +891,15 @@ fn persistent_session_replays_exact_ordered_pages() {
 			 CREATE person:e SET rank = 5;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let query = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 2;";
-	assert!(store.execute(query, &Object::new()).unwrap()[0].continuation.is_none());
+	assert!(store.execute(query, &Object::new()).assert_ok()[0].continuation.is_none());
 
 	let mut session = store.session();
-	let first = session.execute(query, &Object::new()).unwrap().remove(0);
-	let cursor = first.continuation.unwrap();
+	let first = session.execute(query, &Object::new()).assert_ok().remove(0);
+	let cursor = first.continuation.assert_some();
 	assert_eq!(
-		first.result.unwrap().into_parts().0,
+		first.result.assert_ok().into_parts().0,
 		Value::Array(vec![Value::from(1_i64), Value::from(2_i64)].into())
 	);
 
@@ -836,23 +907,32 @@ fn persistent_session_replays_exact_ordered_pages() {
 	variables.insert("cursor", Value::from(cursor));
 	let continuation = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 2 \
 	                    START AFTER $cursor;";
-	let second = session.execute(continuation, &variables).unwrap().remove(0);
-	let replay = session.execute(continuation, &variables).unwrap().remove(0);
-	assert_eq!(second.result.as_ref().unwrap().value(), replay.result.as_ref().unwrap().value());
+	let second = session.execute(continuation, &variables).assert_ok().remove(0);
+	let replay = session.execute(continuation, &variables).assert_ok().remove(0);
+	assert_eq!(
+		second.result.as_ref().assert_ok().value(),
+		replay.result.as_ref().assert_ok().value()
+	);
 	assert_eq!(second.continuation, replay.continuation);
 
 	let mut other = store.session();
-	let rejected = other.execute(continuation, &variables).unwrap().remove(0);
+	let rejected = other.execute(continuation, &variables).assert_ok().remove(0);
 	assert!(rejected.result.is_err());
 
-	variables.insert("cursor", Value::from(second.continuation.unwrap()));
-	let last = session.execute(continuation, &variables).unwrap().remove(0);
+	variables.insert("cursor", Value::from(second.continuation.assert_some()));
+	let last = session.execute(continuation, &variables).assert_ok().remove(0);
 	assert!(last.continuation.is_none());
-	assert_eq!(last.result.unwrap().into_parts().0, Value::Array(vec![Value::from(5_i64)].into()));
+	assert_eq!(
+		last.result.assert_ok().into_parts().0,
+		Value::Array(vec![Value::from(5_i64)].into())
+	);
 }
 
+/// Verifies duration explain nested error retires cursor.
 #[test]
-fn duration_explain_nested_error_retires_cursor() -> crate::gql_status::FerrosGrynnResult<()> {
+fn duration_explain_nested_error_retires_cursor() {
+	use crate::test_assertions::AssertResult as _;
+
 	for prefix in ["", "EXPLAIN ", "EXPLAIN FULL ", "EXPLAIN ANALYZE "] {
 		for (duration, timeout) in
 			[("0ms", "$deadline"), ("-PT1S", "$deadline"), ("0ms", "18446744073709549568s")]
@@ -861,66 +941,90 @@ fn duration_explain_nested_error_retires_cursor() -> crate::gql_status::FerrosGr
 			let mut session = store.session();
 			let inputs = Object::from_iter([(
 				"duration",
-				Value::from(duration.parse::<crate::values::Duration>()?),
+				Value::from(duration.parse::<crate::values::Duration>().assert_ok()),
 			)]);
-			for result in session.execute(
-				"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; CREATE \
-				 person:b SET rank = 2; LIVE LET $deadline = $duration;",
-				&inputs,
-			)? {
-				result.result?;
+			for result in session
+				.execute(
+					"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; \
+					 CREATE person:b SET rank = 2; LIVE LET $deadline = $duration;",
+					&inputs,
+				)
+				.assert_ok()
+			{
+				result.result.assert_ok();
 			}
-			let first = session.execute(
-				"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;",
-				&Object::new(),
-			)?;
-			let cursor = first[0].continuation.ok_or_else(|| {
-				crate::gql_status::FerrosGrynnError::invalid_argument("test continuation missing")
-			})?;
+			let first = session
+				.execute(
+					"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;",
+					&Object::new(),
+				)
+				.assert_ok();
+			let cursor = first[0]
+				.continuation
+				.ok_or_else(|| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(
+						"test continuation missing",
+					)
+				})
+				.assert_ok();
 			let inputs = Object::from_iter([("cursor", Value::from(cursor))]);
-			let failed = session.execute(
-				&format!(
-					"IF true {{ {prefix}SELECT VALUE properties.rank FROM person ORDER BY \
-					 properties.rank LIMIT 1 START AFTER $cursor TIMEOUT {timeout}; }};"
-				),
-				&inputs,
-			)?;
+			let failed = session
+				.execute(
+					&format!(
+						"IF true {{ {prefix}SELECT VALUE properties.rank FROM person ORDER BY \
+						 properties.rank LIMIT 1 START AFTER $cursor TIMEOUT {timeout}; }};"
+					),
+					&inputs,
+				)
+				.assert_ok();
 			assert!(failed[0].result.is_err());
-			let resumed = session.execute(
-				"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 START \
-				 AFTER $cursor;",
-				&inputs,
-			)?;
-			let error = resumed[0].result.as_ref().err().ok_or_else(|| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(format!(
-					"failed block retained its supplied cursor: {prefix}/{duration}/{timeout}"
-				))
-			})?;
+			let resumed = session
+				.execute(
+					"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 \
+					 START AFTER $cursor;",
+					&inputs,
+				)
+				.assert_ok();
+			let error = resumed[0]
+				.result
+				.as_ref()
+				.err()
+				.ok_or_else(|| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+						"failed block retained its supplied cursor: {prefix}/{duration}/{timeout}"
+					))
+				})
+				.assert_ok();
 			assert_eq!(error.status().code().to_string(), "FG-22F20");
 		}
 	}
-	Ok(())
 }
 
+/// Verifies duration explain invocation cancellation retires cursor.
 #[test]
-fn duration_explain_invocation_cancellation_retires_cursor()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn duration_explain_invocation_cancellation_retires_cursor() {
 	use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 	use super::super::{ControlRuntime, TransactionRead, execute_statement, initialize_slots};
-	use crate::gql::{
-		ExecutionControl,
-		analysis::analyze,
-		closure::LanguageClosureState,
-		cursor::CursorRuntime,
+	use crate::{
+		gql::{
+			ExecutionControl,
+			analysis::analyze,
+			closure::LanguageClosureState,
+			cursor::CursorRuntime,
+		},
+		test_assertions::AssertResult as _,
 	};
 	let store = Datastore::in_memory();
-	for result in store.execute(
-		"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; CREATE person:b \
-		 SET rank = 2;",
-		&Object::new(),
-	)? {
-		result.result?;
+	for result in store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; CREATE \
+			 person:b SET rank = 2;",
+			&Object::new(),
+		)
+		.assert_ok()
+	{
+		result.result.assert_ok();
 	}
 	let cursors = Arc::new(parking_lot::Mutex::new(CursorRuntime::new(Duration::from_secs(60))));
 	let closures = Arc::new(LanguageClosureState::default());
@@ -933,7 +1037,8 @@ fn duration_explain_invocation_cancellation_retires_cursor()
 	let mut transaction = store.begin();
 	let mut bindings = Object::new();
 	let first_source = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;";
-	let first_program = crate::gql::parse(first_source, crate::syn::ParserSettings::default())?;
+	let first_program =
+		crate::gql::parse(first_source, crate::syn::ParserSettings::default()).assert_ok();
 	let first = super::super::execute_parsed_statement_with_bindings(
 		&mut transaction,
 		first_source,
@@ -941,23 +1046,27 @@ fn duration_explain_invocation_cancellation_retires_cursor()
 		&mut bindings,
 		&BTreeSet::new(),
 		&mut healthy,
-	)?;
-	first.result?;
-	let cursor = first.continuation.ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("test continuation missing")
-	})?;
+	)
+	.assert_ok();
+	first.result.assert_ok();
+	let cursor = first
+		.continuation
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test continuation missing")
+		})
+		.assert_ok();
 	let mut bindings = Object::from_iter([("cursor", Value::from(cursor))]);
 	let source = "EXPLAIN SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT \
 	              1 START AFTER $cursor;";
-	let program = crate::gql::parse(source, crate::syn::ParserSettings::default())?;
-	let snapshot = transaction.query_snapshot()?;
+	let program = crate::gql::parse(source, crate::syn::ParserSettings::default()).assert_ok();
+	let snapshot = transaction.query_snapshot().assert_ok();
 	let mut read = TransactionRead {
 		scalar_graph: None,
 		transaction: &mut transaction,
 		snapshot,
 		metadata_only: false,
 	};
-	let logical = analyze(&program, source, &read, &bindings)?;
+	let logical = analyze(&program, source, &read, &bindings).assert_ok();
 	let mut slots = initialize_slots(&logical, &bindings);
 	let cancellation = QueryCancellation::default();
 	cancellation.cancel();
@@ -981,7 +1090,7 @@ fn duration_explain_invocation_cancellation_retires_cursor()
 	drop(read);
 	let source = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 START \
 	              AFTER $cursor;";
-	let program = crate::gql::parse(source, crate::syn::ParserSettings::default())?;
+	let program = crate::gql::parse(source, crate::syn::ParserSettings::default()).assert_ok();
 	let resumed = super::super::execute_parsed_statement_with_bindings(
 		&mut transaction,
 		source,
@@ -989,18 +1098,25 @@ fn duration_explain_invocation_cancellation_retires_cursor()
 		&mut bindings,
 		&BTreeSet::new(),
 		&mut healthy,
-	)?;
-	let error = resumed.result.err().ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument(
-			"cancelled invocation retained its cursor",
-		)
-	})?;
+	)
+	.assert_ok();
+	let error = resumed
+		.result
+		.err()
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(
+				"cancelled invocation retained its cursor",
+			)
+		})
+		.assert_ok();
 	assert_eq!(error.status().code().to_string(), "FG-22F20");
-	Ok(())
 }
 
+/// Verifies cancellation closes the supplied cursor spool.
 #[test]
-fn cancellation_closes_the_supplied_cursor_spool() -> crate::gql_status::FerrosGrynnResult<()> {
+fn cancellation_closes_the_supplied_cursor_spool() {
+	use crate::test_assertions::AssertResult as _;
+
 	for prefix in ["", "EXPLAIN ", "EXPLAIN FULL ", "EXPLAIN ANALYZE "] {
 		for timeout in ["", " TIMEOUT 1s", " TIMEOUT $deadline"] {
 			let store = Datastore::in_memory();
@@ -1010,20 +1126,20 @@ fn cancellation_closes_the_supplied_cursor_spool() -> crate::gql_status::FerrosG
 					 CREATE person:b SET rank = 2;",
 					&Object::new(),
 				)
-				.unwrap();
+				.assert_ok();
 			let mut session = store.session();
-			let duration = "1s".parse::<crate::values::Duration>()?;
+			let duration = "1s".parse::<crate::values::Duration>().assert_ok();
 			let inputs = Object::from_iter([("duration", Value::from(duration))]);
-			let binding = session.execute("LIVE LET $deadline = $duration;", &inputs)?;
-			binding[0].result.as_ref().map_err(Clone::clone)?;
+			let binding = session.execute("LIVE LET $deadline = $duration;", &inputs).assert_ok();
+			binding[0].result.as_ref().map_err(Clone::clone).assert_ok();
 			let first = session
 				.execute(
 					"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;",
 					&Object::new(),
 				)
-				.unwrap()
+				.assert_ok()
 				.remove(0);
-			let cursor = first.continuation.unwrap();
+			let cursor = first.continuation.assert_some();
 			let mut variables = Object::new();
 			variables.insert("cursor", Value::from(cursor));
 			let cancellation = QueryCancellation::default();
@@ -1040,10 +1156,10 @@ fn cancellation_closes_the_supplied_cursor_spool() -> crate::gql_status::FerrosG
 						..QueryExecutionOptions::default()
 					},
 				)
-				.unwrap()
+				.assert_ok()
 				.remove(0)
 				.result
-				.unwrap_err();
+				.assert_err();
 			assert_eq!(cancelled.status().code().to_string(), "FG-50F05");
 			let closed = session
 				.execute(
@@ -1051,16 +1167,16 @@ fn cancellation_closes_the_supplied_cursor_spool() -> crate::gql_status::FerrosG
 					 START AFTER $cursor;",
 					&variables,
 				)
-				.unwrap()
+				.assert_ok()
 				.remove(0)
 				.result
-				.unwrap_err();
+				.assert_err();
 			assert_eq!(closed.status().code().to_string(), "FG-22F20");
 		}
 	}
-	Ok(())
 }
 
+/// Verifies spills ordered cursor and removes its run on close.
 #[test]
 fn spills_ordered_cursor_and_removes_its_run_on_close() {
 	let store = Datastore::in_memory();
@@ -1070,11 +1186,11 @@ fn spills_ordered_cursor_and_removes_its_run_on_close() {
 			 person:b SET rank = 1; CREATE person:c SET rank = 2;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let scratch =
 		std::env::temp_dir().join(format!("fg-select-spill-{}", crate::values::Uuid::now_v7()));
 	let options = QueryExecutionOptions {
-		barrier_memory_bytes: NonZeroUsize::new(64).unwrap(),
+		barrier_memory_bytes: NonZeroUsize::new(64).assert_some(),
 		temporary_directory: Some(scratch.clone()),
 		..QueryExecutionOptions::default()
 	};
@@ -1085,20 +1201,21 @@ fn spills_ordered_cursor_and_removes_its_run_on_close() {
 			&Object::new(),
 			options,
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0);
 	assert_eq!(
-		result.result.as_ref().unwrap().value(),
+		result.result.as_ref().assert_ok().value(),
 		&Value::Array(vec![Value::from(1_i64)].into())
 	);
-	let cursor = result.continuation.expect("ordered spill must retain a cursor");
+	let cursor = result.continuation.assert_some_with("ordered spill must retain a cursor");
 	let run_root = scratch.join("tmp").join("query");
-	assert_eq!(std::fs::read_dir(&run_root).unwrap().count(), 1);
-	session.close_cursor(&cursor).unwrap();
-	assert_eq!(std::fs::read_dir(&run_root).unwrap().count(), 0);
+	assert_eq!(std::fs::read_dir(&run_root).assert_ok().count(), 1);
+	session.close_cursor(&cursor).assert_ok();
+	assert_eq!(std::fs::read_dir(&run_root).assert_ok().count(), 0);
 	drop(std::fs::remove_dir_all(scratch));
 }
 
+/// Verifies bounded streaming select stops without creating query runs.
 #[test]
 fn bounded_streaming_select_stops_without_creating_query_runs() {
 	let store = Datastore::in_memory();
@@ -1108,11 +1225,11 @@ fn bounded_streaming_select_stops_without_creating_query_runs() {
 			 person:b SET rank = 2; CREATE person:c SET rank = 3;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let scratch =
 		std::env::temp_dir().join(format!("fg-select-stream-{}", crate::values::Uuid::now_v7()));
 	let options = QueryExecutionOptions {
-		barrier_memory_bytes: NonZeroUsize::new(64).unwrap(),
+		barrier_memory_bytes: NonZeroUsize::new(64).assert_some(),
 		temporary_directory: Some(scratch.clone()),
 		..QueryExecutionOptions::default()
 	};
@@ -1132,6 +1249,7 @@ fn bounded_streaming_select_stops_without_creating_query_runs() {
 	drop(std::fs::remove_dir_all(scratch));
 }
 
+/// Verifies partitioned join and group match the in memory result.
 #[test]
 fn partitioned_join_and_group_match_the_in_memory_result() {
 	let store = Datastore::in_memory();
@@ -1146,14 +1264,14 @@ fn partitioned_join_and_group_match_the_in_memory_result() {
 			 SET department = 'b', score = 2; CREATE person:d SET score = 3;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let join = "SELECT p.id AS person, d.name AS department FROM person AS p LEFT JOIN department \
 	            AS d ON p.department = d.code;";
 	let expected = value(&store, join);
 	let scratch = std::env::temp_dir()
 		.join(format!("fg-select-partitioned-{}", crate::values::Uuid::now_v7()));
 	let options = QueryExecutionOptions {
-		barrier_memory_bytes: NonZeroUsize::new(64).unwrap(),
+		barrier_memory_bytes: NonZeroUsize::new(64).assert_some(),
 		temporary_directory: Some(scratch.clone()),
 		..QueryExecutionOptions::default()
 	};
@@ -1167,6 +1285,8 @@ fn partitioned_join_and_group_match_the_in_memory_result() {
 	drop(std::fs::remove_dir_all(scratch));
 }
 
+/// Verifies resolves graph sources wildcards effective properties and
+/// ambiguity.
 #[test]
 fn resolves_graph_sources_wildcards_effective_properties_and_ambiguity() {
 	let store = Datastore::in_memory();
@@ -1179,12 +1299,12 @@ fn resolves_graph_sources_wildcards_effective_properties_and_ambiguity() {
 			 IN GRAPH social SET a = 9, extra = 'scoped';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 
 	let all_graphs = rows(value(&store, "SELECT name FROM GRAPHS;"));
 	assert_eq!(
-		all_graphs.iter().map(|row| row.get("name").cloned().unwrap()).collect::<Vec<_>>(),
+		all_graphs.iter().map(|row| row.get("name").cloned().assert_some()).collect::<Vec<_>>(),
 		vec![Value::from("sales"), Value::from("fraud"), Value::from("social")]
 	);
 	let one_graph = rows(value(&store, "SELECT name, properties.owner FROM GRAPH @sales;"));
@@ -1206,6 +1326,7 @@ fn resolves_graph_sources_wildcards_effective_properties_and_ambiguity() {
 	assert_eq!(error.status().code().to_string(), "FG-22N11");
 }
 
+/// Verifies preserves join bags and subquery cardinality.
 #[test]
 fn preserves_join_bags_and_subquery_cardinality() {
 	let store = Datastore::in_memory();
@@ -1218,7 +1339,7 @@ fn preserves_join_bags_and_subquery_cardinality() {
 			 department = null, rank = 2; CREATE person:carol SET rank = 3;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 
 	let joined = rows(value(
@@ -1257,12 +1378,13 @@ fn preserves_join_bags_and_subquery_cardinality() {
 				 FROM person:alice AS p;",
 				&Object::new(),
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
 }
 
+/// Verifies fetches records and graphs without exposing storage ids.
 #[test]
 fn fetches_records_and_graphs_without_exposing_storage_ids() {
 	let store = Datastore::in_memory();
@@ -1273,41 +1395,49 @@ fn fetches_records_and_graphs_without_exposing_storage_ids() {
 			 'Alice';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let mut record_variables = Object::new();
 	record_variables
-		.insert("friend", Value::from("person:bob".parse::<crate::values::RecordId>().unwrap()));
+		.insert("friend", Value::from("person:bob".parse::<crate::values::RecordId>().assert_ok()));
 	let update =
-		store.execute("UPDATE person:alice SET friend = $friend;", &record_variables).unwrap();
+		store.execute("UPDATE person:alice SET friend = $friend;", &record_variables).assert_ok();
 	assert!(update[0].result.is_ok());
 	let fetched =
 		rows(value(&store, "SELECT properties.friend AS friend FROM person:alice FETCH friend;"));
-	let Some(Value::Object(friend)) = fetched[0].get("friend") else {
-		panic!("FETCH must materialize a record object");
-	};
-	let Some(Value::Object(properties)) = friend.get("properties") else {
-		panic!("fetched record must retain its property object");
-	};
+	let friend = match fetched[0].get("friend") {
+		Some(Value::Object(friend)) => Some(friend),
+		_ => None,
+	}
+	.assert_some_with("FETCH must materialize a record object");
+	let properties = match friend.get("properties") {
+		Some(Value::Object(properties)) => Some(properties),
+		_ => None,
+	}
+	.assert_some_with("fetched record must retain its property object");
 	assert_eq!(properties.get("name"), Some(&Value::from("Bob")));
 	assert!(!friend.contains_key("atom_id"));
 
 	let graph = value(&store, "SELECT ONLY VALUE id FROM GRAPH @social;");
 	let mut variables = Object::new();
 	variables.insert("graph", graph);
-	let update =
-		store.execute("UPDATE GRAPH social SET properties.related = $graph;", &variables).unwrap();
+	let update = store
+		.execute("UPDATE GRAPH social SET properties.related = $graph;", &variables)
+		.assert_ok();
 	assert!(update[0].result.is_ok());
 	let graph = rows(value(
 		&store,
 		"SELECT properties.related AS related FROM GRAPH @social FETCH related;",
 	));
-	let Some(Value::Object(related)) = graph[0].get("related") else {
-		panic!("FETCH must materialize graph metadata");
-	};
+	let related = match graph[0].get("related") {
+		Some(Value::Object(related)) => Some(related),
+		_ => None,
+	}
+	.assert_some_with("FETCH must materialize graph metadata");
 	assert_eq!(related.get("name"), Some(&Value::from("social")));
 	assert_eq!(related.get("node_count"), Some(&Value::from(0_i64)));
 }
 
+/// Verifies implements empty and numeric aggregate contracts.
 #[test]
 fn implements_empty_and_numeric_aggregate_contracts() {
 	let store = Datastore::in_memory();
@@ -1318,7 +1448,7 @@ fn implements_empty_and_numeric_aggregate_contracts() {
 			 score = 3; CREATE sample:d SET score = null; CREATE sample:e SET label = 'missing';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let aggregate = rows(value(
 		&store,
 		"SELECT count() AS rows, count(properties.score) AS present, sum(properties.score) AS \
@@ -1350,6 +1480,7 @@ fn implements_empty_and_numeric_aggregate_contracts() {
 	assert_eq!(empty[0].get("average"), Some(&Value::None));
 }
 
+/// Verifies groups collections and rejects illegal aggregate shapes.
 #[test]
 fn groups_collections_and_rejects_illegal_aggregate_shapes() {
 	let store = Datastore::in_memory();
@@ -1360,7 +1491,7 @@ fn groups_collections_and_rejects_illegal_aggregate_shapes() {
 			 = 'missing';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let grouped =
 		rows(value(&store, "SELECT array::group(properties.item) AS items FROM sample GROUP ALL;"));
 	assert_eq!(
@@ -1385,14 +1516,14 @@ fn groups_collections_and_rejects_illegal_aggregate_shapes() {
 				"SELECT properties.label, count() FROM sample GROUP BY properties.item;",
 				&Object::new(),
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
 	assert!(
 		store
 			.execute("SELECT sum(count(properties.item)) FROM sample GROUP ALL;", &Object::new(),)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
@@ -1402,12 +1533,13 @@ fn groups_collections_and_rejects_illegal_aggregate_shapes() {
 				"SELECT count() AS count FROM sample ORDER BY properties.item;",
 				&Object::new(),
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
 }
 
+/// Verifies applies inner limits and only to derived sources.
 #[test]
 fn applies_inner_limits_and_only_to_derived_sources() {
 	let store = Datastore::in_memory();
@@ -1417,7 +1549,7 @@ fn applies_inner_limits_and_only_to_derived_sources() {
 			 sample:b SET rank = 2; CREATE sample:c SET rank = 3;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let rows = rows(value(
 		&store,
 		"SELECT s.rank FROM (SELECT properties.rank AS rank FROM sample ORDER BY properties.rank \
@@ -1434,10 +1566,11 @@ fn applies_inner_limits_and_only_to_derived_sources() {
 	assert_eq!(error.status().code().to_string(), "FG-22F22");
 }
 
+/// Verifies constant folding preserves empty source error semantics.
 #[test]
 fn constant_folding_preserves_empty_source_error_semantics() {
 	let store = Datastore::in_memory();
-	store.execute("DEFINE CLASS sample TYPE NODE;", &Object::new()).unwrap();
+	store.execute("DEFINE CLASS sample TYPE NODE;", &Object::new()).assert_ok();
 	assert_eq!(
 		value(&store, "SELECT VALUE 1 + 2 FROM sample;"),
 		Value::Array(Vec::<Value>::new().into())
@@ -1446,13 +1579,14 @@ fn constant_folding_preserves_empty_source_error_semantics() {
 		value(&store, "SELECT VALUE 1 / 0 FROM sample;"),
 		Value::Array(Vec::<Value>::new().into())
 	);
-	store.execute("CREATE sample:one;", &Object::new()).unwrap();
+	store.execute("CREATE sample:one;", &Object::new()).assert_ok();
 	assert_eq!(
 		value(&store, "SELECT VALUE 1 + 2 FROM sample;"),
 		Value::Array(vec![Value::from(3_i64)].into())
 	);
 }
 
+/// Verifies expires exact cursors and reexecutes read committed after anchor.
 #[test]
 fn expires_exact_cursors_and_reexecutes_read_committed_after_anchor() {
 	let store = Datastore::in_memory_with(InMemoryOptions {
@@ -1465,12 +1599,12 @@ fn expires_exact_cursors_and_reexecutes_read_committed_after_anchor() {
 			 person:c SET rank = 3; CREATE person:e SET rank = 5;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let query = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;";
 	let mut session = store.session();
-	let first = session.execute(query, &Object::new()).unwrap().remove(0);
-	let cursor = first.continuation.unwrap();
-	store.execute("CREATE person:b SET rank = 2;", &Object::new()).unwrap();
+	let first = session.execute(query, &Object::new()).assert_ok().remove(0);
+	let cursor = first.continuation.assert_some();
+	store.execute("CREATE person:b SET rank = 2;", &Object::new()).assert_ok();
 	let mut variables = Object::new();
 	variables.insert("cursor", Value::from(cursor));
 	let rc = session
@@ -1479,15 +1613,15 @@ fn expires_exact_cursors_and_reexecutes_read_committed_after_anchor() {
 			 AFTER $cursor READ COMMITTED;",
 			&variables,
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0);
 	assert_eq!(
-		rc.result.unwrap().into_parts().0,
+		rc.result.assert_ok().into_parts().0,
 		Value::Array(vec![Value::from(2_i64), Value::from(3_i64)].into())
 	);
 
-	let first = session.execute(query, &Object::new()).unwrap().remove(0);
-	let cursor = first.continuation.unwrap();
+	let first = session.execute(query, &Object::new()).assert_ok().remove(0);
+	let cursor = first.continuation.assert_some();
 	thread::sleep(Duration::from_millis(150));
 	variables.insert("cursor", Value::from(cursor));
 	let expired = session
@@ -1496,14 +1630,14 @@ fn expires_exact_cursors_and_reexecutes_read_committed_after_anchor() {
 			 AFTER $cursor;",
 			&variables,
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0)
 		.result
-		.unwrap_err();
+		.assert_err();
 	assert_eq!(expired.status().code().to_string(), "FG-25F07");
 
-	let first = session.execute(query, &Object::new()).unwrap().remove(0);
-	let cursor = first.continuation.unwrap();
+	let first = session.execute(query, &Object::new()).assert_ok().remove(0);
+	let cursor = first.continuation.assert_some();
 	thread::sleep(Duration::from_millis(150));
 	variables.insert("cursor", Value::from(cursor));
 	let refreshed = session
@@ -1512,15 +1646,16 @@ fn expires_exact_cursors_and_reexecutes_read_committed_after_anchor() {
 			 AFTER $cursor READ COMMITTED;",
 			&variables,
 		)
-		.unwrap()
+		.assert_ok()
 		.remove(0)
 		.result
-		.unwrap()
+		.assert_ok()
 		.into_parts()
 		.0;
 	assert_eq!(refreshed, Value::Array(vec![Value::from(2_i64)].into()));
 }
 
+/// Verifies enforces cursor limit and order offset contract.
 #[test]
 fn enforces_cursor_limit_and_order_offset_contract() {
 	let store = Datastore::in_memory();
@@ -1531,7 +1666,7 @@ fn enforces_cursor_limit_and_order_offset_contract() {
 			 'missing'; CREATE person:e SET rank = 2;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let page = rows(value(
 		&store,
 		"SELECT id, properties.rank AS rank FROM person ORDER BY rank ASC NULLS FIRST START AT 1 \
@@ -1545,24 +1680,26 @@ fn enforces_cursor_limit_and_order_offset_contract() {
 	let only = statement_error(&store, "SELECT ONLY VALUE id FROM person;");
 	assert_eq!(only.status().code().to_string(), "FG-22F22");
 	assert_eq!(value(&store, "SELECT ONLY VALUE id FROM person WHERE false;"), Value::None);
-	let Value::Array(random) =
-		value(&store, "SELECT VALUE id FROM person ORDER BY RAND() LIMIT 1;")
-	else {
-		panic!("RAND ordering must return a SELECT array");
-	};
+	let random = match value(&store, "SELECT VALUE id FROM person ORDER BY RAND() LIMIT 1;") {
+		Value::Array(random) => Some(random),
+		_ => None,
+	}
+	.assert_some_with("RAND ordering must return a SELECT array");
 	assert_eq!(random.len(), 1);
 
 	let mut session = store.session();
 	let query = "SELECT VALUE id FROM person ORDER BY id LIMIT 1;";
 	for _index in 0..64 {
-		let result = session.execute(query, &Object::new()).unwrap().remove(0);
+		let result = session.execute(query, &Object::new()).assert_ok().remove(0);
 		assert!(result.result.is_ok());
 		assert!(result.continuation.is_some());
 	}
-	let limit = session.execute(query, &Object::new()).unwrap().remove(0).result.unwrap_err();
+	let limit = session.execute(query, &Object::new()).assert_ok().remove(0).result.assert_err();
 	assert_eq!(limit.status().code().to_string(), "FG-54F10");
 }
 
+/// Verifies splits cartesian fields and keeps null and none group keys
+/// distinct.
 #[test]
 fn splits_cartesian_fields_and_keeps_null_and_none_group_keys_distinct() {
 	let store = Datastore::in_memory();
@@ -1573,7 +1710,7 @@ fn splits_cartesian_fields_and_keeps_null_and_none_group_keys_distinct() {
 			 CREATE item:d SET label = 'missing';",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let split = rows(value(
 		&store,
 		"SELECT properties.left AS left, properties.right AS right FROM item:a SPLIT \
@@ -1602,6 +1739,7 @@ fn splits_cartesian_fields_and_keeps_null_and_none_group_keys_distinct() {
 	}));
 }
 
+/// Verifies gql stage 13 simple select probe.
 #[test]
 #[ignore = "stage-13 profiling gate"]
 fn gql_stage_13_simple_select_probe() {
@@ -1625,8 +1763,8 @@ fn gql_stage_13_simple_select_probe() {
 			 person:seed SET score = 0;",
 			&Object::new(),
 		)
-		.unwrap();
-	let key = store.property_dictionary().get("score").unwrap();
+		.assert_ok();
+	let key = store.property_dictionary().get("score").assert_some();
 	store
 		.import(
 			ImportOptions {
@@ -1639,7 +1777,7 @@ fn gql_stage_13_simple_select_probe() {
 						let mut properties = PropertyMap::new();
 						properties.insert(key, Value::from(ordinal));
 						transaction.create_atom(
-							format!("person:r{ordinal}").parse::<RecordId>().unwrap(),
+							format!("person:r{ordinal}").parse::<RecordId>().assert_ok(),
 							properties,
 						)
 					})?;
@@ -1647,7 +1785,7 @@ fn gql_stage_13_simple_select_probe() {
 				Ok(())
 			},
 		)
-		.unwrap();
+		.assert_ok();
 	let query = format!("SELECT VALUE score FROM person LIMIT {limit};");
 	for _iteration in 0..3 {
 		std::hint::black_box(value(&store, &query));
@@ -1657,9 +1795,11 @@ fn gql_stage_13_simple_select_probe() {
 		let started = Instant::now();
 		let selected = value(&store, &query);
 		let elapsed = started.elapsed().as_nanos() as f64;
-		let Value::Array(values) = selected else {
-			panic!("SELECT probe must return an array");
-		};
+		let values = match selected {
+			Value::Array(values) => Some(values),
+			_ => None,
+		}
+		.assert_some_with("SELECT probe must return an array");
 		assert_eq!(values.len(), limit.min(row_count));
 		std::hint::black_box(values);
 		samples.push(elapsed);
@@ -1673,6 +1813,7 @@ fn gql_stage_13_simple_select_probe() {
 	);
 }
 
+/// Verifies gql stage 13 resource probe.
 #[test]
 #[ignore = "stage-13 resource and barrier profiling gate"]
 fn gql_stage_13_resource_probe() {
@@ -1689,7 +1830,7 @@ fn gql_stage_13_resource_probe() {
 	let setup_elapsed = setup_started.elapsed();
 	let query = stage13_resource_query(&mode, limit, force_tempfiles);
 	let options = QueryExecutionOptions {
-		barrier_memory_bytes: NonZeroUsize::new(budget).unwrap(),
+		barrier_memory_bytes: NonZeroUsize::new(budget).assert_some(),
 		temporary_directory: Some(scratch.clone()),
 		..QueryExecutionOptions::default()
 	};
@@ -1702,16 +1843,17 @@ fn gql_stage_13_resource_probe() {
 	};
 	let started = Instant::now();
 	let mut session = store.session();
-	let result = session.execute_with_options(&query, &Object::new(), options).unwrap().remove(0);
+	let result =
+		session.execute_with_options(&query, &Object::new(), options).assert_ok().remove(0);
 	let elapsed = started.elapsed();
-	let value = result.result.as_ref().unwrap().value();
+	let value = result.result.as_ref().assert_ok().value();
 	std::hint::black_box(value);
 	let retained_temp_bytes = directory_bytes(&scratch);
 	if let Some(cursor) = result.continuation {
-		session.close_cursor(&cursor).unwrap();
+		session.close_cursor(&cursor).assert_ok();
 	}
 	running.store(false, Ordering::Release);
-	let (rss_peak, temp_peak) = sampler.join().unwrap();
+	let (rss_peak, temp_peak) = sampler.join().assert_ok();
 	drop(session);
 	assert_eq!(directory_bytes(&scratch), 0, "query-run files must be released");
 	drop(fs::remove_dir_all(&scratch));
@@ -1727,6 +1869,7 @@ fn gql_stage_13_resource_probe() {
 	);
 }
 
+/// Returns stage13 resource store for this module.
 pub(super) fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> Datastore {
 	let store = Datastore::in_memory_with(InMemoryOptions {
 		max_snapshot_age: Duration::from_secs(3_600),
@@ -1741,14 +1884,14 @@ pub(super) fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> 
 			 CLASS department TYPE string;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let dictionary = store.property_dictionary();
-	let score = dictionary.get("score").unwrap();
-	let bucket = dictionary.get("bucket").unwrap();
-	let department = dictionary.get("department").unwrap();
-	let payload = dictionary.get("payload").unwrap();
-	let code = dictionary.get("code").unwrap();
-	let name = dictionary.get("name").unwrap();
+	let score = dictionary.get("score").assert_some();
+	let bucket = dictionary.get("bucket").assert_some();
+	let department = dictionary.get("department").assert_some();
+	let payload = dictionary.get("payload").assert_some();
+	let code = dictionary.get("code").assert_some();
+	let name = dictionary.get("name").assert_some();
 	let payload_value = "x".repeat(payload_bytes);
 	store
 		.import(
@@ -1765,7 +1908,7 @@ pub(super) fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> 
 						properties.insert(department, format!("d{:04}", ordinal % 1_024));
 						properties.insert(payload, payload_value.clone());
 						transaction.create_atom(
-							format!("person:r{ordinal}").parse::<RecordId>().unwrap(),
+							format!("person:r{ordinal}").parse::<RecordId>().assert_ok(),
 							properties,
 						)
 					})?;
@@ -1777,7 +1920,7 @@ pub(super) fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> 
 						properties.insert(code, identity.clone());
 						properties.insert(name, format!("Department {ordinal}"));
 						transaction.create_atom(
-							format!("department:{identity}").parse::<RecordId>().unwrap(),
+							format!("department:{identity}").parse::<RecordId>().assert_ok(),
 							properties,
 						)
 					})?;
@@ -1785,10 +1928,11 @@ pub(super) fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> 
 				Ok(())
 			},
 		)
-		.unwrap();
+		.assert_ok();
 	store
 }
 
+/// Returns stage13 resource query for this module.
 fn stage13_resource_query(mode: &str, limit: usize, force_tempfiles: bool) -> String {
 	let tempfiles = if force_tempfiles {
 		" TEMPFILES"
@@ -1808,16 +1952,18 @@ fn stage13_resource_query(mode: &str, limit: usize, force_tempfiles: bool) -> St
 			"SELECT p.id AS person, d.name AS department FROM person AS p LEFT JOIN department AS \
 			 d ON p.department = d.code LIMIT {limit}{tempfiles};"
 		),
-		other => panic!("unsupported FG_SELECT_MODE '{other}'"),
+		other => Err::<String, _>(format!("unsupported FG_SELECT_MODE '{other}'")).assert_ok(),
 	}
 }
 
+/// Returns profile usize for this module.
 pub(super) fn profile_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
+/// Returns profile resources for this module.
 fn profile_resources(running: &AtomicBool, scratch: &Path, initial_rss: u64) -> (u64, u64) {
-	let pid = Pid::from(usize::try_from(std::process::id()).unwrap());
+	let pid = Pid::from(usize::try_from(std::process::id()).assert_ok());
 	let mut system = System::new();
 	let mut rss_peak = initial_rss;
 	let mut temp_peak = 0;
@@ -1836,8 +1982,9 @@ fn profile_resources(running: &AtomicBool, scratch: &Path, initial_rss: u64) -> 
 	(rss_peak, temp_peak)
 }
 
+/// Returns profile rss for this module.
 fn profile_rss() -> u64 {
-	let pid = Pid::from(usize::try_from(std::process::id()).unwrap());
+	let pid = Pid::from(usize::try_from(std::process::id()).assert_ok());
 	let mut system = System::new();
 	system.refresh_processes_specifics(
 		ProcessesToUpdate::Some(&[pid]),
@@ -1847,6 +1994,7 @@ fn profile_rss() -> u64 {
 	system.process(pid).map_or(0, sysinfo::Process::memory)
 }
 
+/// Returns directory bytes for this module.
 fn directory_bytes(root: &Path) -> u64 {
 	let mut total = 0_u64;
 	let mut directories = vec![root.to_path_buf()];

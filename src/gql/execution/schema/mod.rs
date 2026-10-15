@@ -16,6 +16,7 @@ use crate::{
 		ClassIndexState,
 		ClassSchema,
 		ClassSchemaMode,
+		FieldUpdate,
 		FunctionEffect,
 		GraphSchema,
 		IndexMaintenanceMode,
@@ -103,9 +104,11 @@ pub(super) fn execute_schema(
 				*constraints,
 				root.as_ref(),
 				content.as_ref(),
-				slots,
-				source,
-				control,
+				SchemaEvaluation {
+					slots,
+					source,
+					control,
+				},
 			)?;
 			if !skipped && let Some(config) = changefeed {
 				super::changefeed::configure(transaction, true, false, name, Some(*config))?;
@@ -166,8 +169,10 @@ pub(super) fn execute_schema(
 			fields,
 			*options,
 			*scope,
-			*maintenance,
-			*concurrently,
+			IndexBuildOptions {
+				maintenance: *maintenance,
+				concurrently: *concurrently,
+			},
 		),
 		LogicalSchemaStatement::DefineGraphIndex {
 			mode,
@@ -445,6 +450,7 @@ pub(super) fn execute_schema(
 /// LIVE command execution only adapts owned recipes to the existing SDK.
 mod live;
 
+/// Returns the define analyzer result.
 fn define_analyzer(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -467,6 +473,7 @@ fn define_analyzer(
 	Ok(Value::None)
 }
 
+/// Removes analyzer.
 fn remove_analyzer(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -479,14 +486,15 @@ fn remove_analyzer(
 	Ok(Value::None)
 }
 
+/// Returns the alter analyzer result.
 fn alter_analyzer(
 	transaction: &mut Transaction,
 	if_exists: bool,
 	name: &str,
-	function: Option<Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion)>>,
+	function: Option<FieldUpdate<(crate::datastore::FunctionId, crate::datastore::SchemaVersion)>>,
 	tokenizers: Option<&[AnalyzerTokenizer]>,
 	filters: Option<&[AnalyzerFilter]>,
-	comment: Option<Option<crate::values::Text>>,
+	comment: Option<FieldUpdate<crate::values::Text>>,
 ) -> FerrosGrynnResult<Value> {
 	let Some(existing) = transaction.analyzer(name)? else {
 		if if_exists {
@@ -502,12 +510,14 @@ fn alter_analyzer(
 	let selected_filters = filters
 		.map(<[AnalyzerFilter]>::to_vec)
 		.unwrap_or_else(|| existing.filters().cloned().collect());
-	let selected_function = function.unwrap_or(existing.function());
+	let selected_function = function.map(FieldUpdate::into_optional).unwrap_or(existing.function());
 	let mut replacement = SchemaAnalyzer::new(name, selected_tokenizers, selected_filters)?;
 	if let Some((id, version)) = selected_function {
 		replacement = replacement.with_function(id, version)?;
 	}
-	if let Some(comment) = comment.unwrap_or_else(|| existing.comment().cloned()) {
+	if let Some(comment) =
+		comment.map(FieldUpdate::into_optional).unwrap_or_else(|| existing.comment().cloned())
+	{
 		replacement = replacement.with_comment(comment);
 	}
 	transaction.replace_analyzer(name, replacement)?;
@@ -518,6 +528,7 @@ fn alter_analyzer(
 	clippy::too_many_arguments,
 	reason = "function DDL forwards the fixed catalog definition fields"
 )]
+/// Returns the define function result.
 fn define_function(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -560,6 +571,7 @@ fn define_function(
 	clippy::too_many_arguments,
 	reason = "function replacement forwards the fixed catalog definition fields"
 )]
+/// Returns the new function result.
 fn new_function(
 	namespace: &str,
 	name: &str,
@@ -591,6 +603,7 @@ fn new_function(
 	Ok(function)
 }
 
+/// Returns the define parameter result.
 fn define_parameter(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -610,7 +623,11 @@ fn define_parameter(
 			DefinitionMode::Overwrite => {
 				let value = eval(value, None, slots, source, None, Some(control))?;
 				value.ensure_storable()?;
-				transaction.replace_parameter(name, Some(value), Some(comment.cloned()))?;
+				transaction.replace_parameter(
+					name,
+					Some(value),
+					Some(FieldUpdate::from_optional(comment.cloned())),
+				)?;
 				Ok(Value::None)
 			}
 		};
@@ -625,12 +642,13 @@ fn define_parameter(
 	Ok(Value::None)
 }
 
+/// Returns the alter parameter result.
 fn alter_parameter(
 	transaction: &mut Transaction,
 	if_exists: bool,
 	name: &str,
 	value: Option<&crate::gql::ir::TypedExpr>,
-	comment: Option<Option<crate::values::Text>>,
+	comment: Option<FieldUpdate<crate::values::Text>>,
 	slots: &[Value],
 	source: &str,
 	control: &crate::gql::ExecutionControl,
@@ -652,6 +670,25 @@ fn alter_parameter(
 	Ok(Value::None)
 }
 
+/// Borrowed execution frame used to evaluate graph-definition operands.
+struct SchemaEvaluation<'a> {
+	/// Bound values used by the current statement.
+	slots: &'a [Value],
+	/// Original text retained for expression diagnostics.
+	source: &'a str,
+	/// Existing deadline, cancellation and resource authority.
+	control: &'a crate::gql::ExecutionControl,
+}
+
+/// Publication policy for one index definition.
+struct IndexBuildOptions {
+	/// Immediate or deferred index maintenance policy.
+	maintenance: IndexMaintenanceMode,
+	/// Whether the definition is published in the Stale state.
+	concurrently: bool,
+}
+
+/// Returns the define graph result.
 fn define_graph(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -660,10 +697,14 @@ fn define_graph(
 	constraints: crate::graph::GraphTopologyConstraints,
 	root: Option<&crate::gql::ir::TypedExpr>,
 	content: Option<&crate::gql::ir::TypedExpr>,
-	slots: &[Value],
-	source: &str,
-	control: &crate::gql::ExecutionControl,
+	evaluation: SchemaEvaluation<'_>,
 ) -> FerrosGrynnResult<Value> {
+	let SchemaEvaluation {
+		slots,
+		source,
+		control,
+	} = evaluation;
+
 	let root = root
 		.map(|root| {
 			let value = eval(root, None, slots, source, None, Some(control))?;
@@ -704,6 +745,7 @@ fn define_graph(
 	Ok(Value::None)
 }
 
+/// Returns the define class result.
 fn define_class(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -728,6 +770,7 @@ fn define_class(
 	Ok(Value::None)
 }
 
+/// Returns the define field result.
 fn define_field(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -749,6 +792,7 @@ fn define_field(
 	Ok(Value::None)
 }
 
+/// Returns the define index result.
 fn define_index(
 	transaction: &mut Transaction,
 	mode: DefinitionMode,
@@ -758,9 +802,13 @@ fn define_index(
 	fields: &[Box<str>],
 	options: ClassIndexOptions,
 	scope: IndexScope,
-	maintenance: IndexMaintenanceMode,
-	concurrently: bool,
+	build: IndexBuildOptions,
 ) -> FerrosGrynnResult<Value> {
+	let IndexBuildOptions {
+		maintenance,
+		concurrently,
+	} = build;
+
 	let schema = require_class(transaction, class)?;
 	let exists = schema.indexes().any(|index| index.name().as_str() == name);
 	if mode == DefinitionMode::IfNotExists && exists {
@@ -803,6 +851,7 @@ fn define_index(
 	Ok(Value::None)
 }
 
+/// Returns the only index field result.
 fn only_index_field(fields: &[Box<str>]) -> FerrosGrynnResult<&str> {
 	match fields {
 		[field] => Ok(field.as_ref()),
@@ -812,6 +861,7 @@ fn only_index_field(fields: &[Box<str>]) -> FerrosGrynnResult<&str> {
 	}
 }
 
+/// Removes graph.
 fn remove_graph(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -824,6 +874,7 @@ fn remove_graph(
 	Ok(Value::None)
 }
 
+/// Removes class.
 fn remove_class(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -836,6 +887,7 @@ fn remove_class(
 	Ok(Value::None)
 }
 
+/// Removes field.
 fn remove_field(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -855,6 +907,7 @@ fn remove_field(
 	Ok(Value::None)
 }
 
+/// Removes index.
 fn remove_index(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -874,6 +927,7 @@ fn remove_index(
 	Ok(Value::None)
 }
 
+/// Removes parameter.
 fn remove_parameter(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -886,6 +940,7 @@ fn remove_parameter(
 	Ok(Value::None)
 }
 
+/// Removes function.
 fn remove_function(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -910,6 +965,7 @@ fn remove_function(
 	clippy::too_many_arguments,
 	reason = "named-function execution shares one explicit statement context"
 )]
+/// Returns the alter function result.
 fn alter_function(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -918,9 +974,9 @@ fn alter_function(
 	signature: Option<&[Type]>,
 	effect: Option<FunctionEffect>,
 	cost: Option<bool>,
-	max_depth: Option<Option<u8>>,
+	max_depth: Option<FieldUpdate<u8>>,
 	body: Option<&crate::values::Text>,
-	comment: Option<Option<crate::values::Text>>,
+	comment: Option<FieldUpdate<crate::values::Text>>,
 ) -> FerrosGrynnResult<Value> {
 	let Some(existing) = resolve_function(transaction, namespace, name, signature)? else {
 		if if_exists {
@@ -941,16 +997,18 @@ fn alter_function(
 		existing.result().clone(),
 		effect.unwrap_or(existing.effect()),
 		cost.unwrap_or(existing.is_cost()),
-		max_depth.unwrap_or(existing.max_depth()),
+		max_depth.map(FieldUpdate::into_optional).unwrap_or(existing.max_depth()),
 		body.cloned().unwrap_or_else(|| existing.body().clone()),
 	)?;
 	replacement.id = existing.id();
 	replacement.version = existing.version();
-	replacement.comment = comment.unwrap_or_else(|| existing.comment().cloned());
+	replacement.comment =
+		comment.map(FieldUpdate::into_optional).unwrap_or_else(|| existing.comment().cloned());
 	transaction.replace_function(replacement)?;
 	Ok(Value::None)
 }
 
+/// Resolves function.
 fn resolve_function(
 	transaction: &mut Transaction,
 	namespace: &str,
@@ -972,10 +1030,12 @@ fn resolve_function(
 	}
 }
 
+/// Returns the function missing result.
 fn function_missing(namespace: &str, name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("function '{namespace}::{name}' does not exist"))
 }
 
+/// Returns the alter class result.
 fn alter_class(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -989,6 +1049,7 @@ fn alter_class(
 	Ok(Value::None)
 }
 
+/// Returns the alter field result.
 fn alter_field(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -1009,6 +1070,7 @@ fn alter_field(
 	Ok(Value::None)
 }
 
+/// Returns the require class result.
 fn require_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<ClassSchema> {
 	transaction
 		.class(name)?
@@ -1016,6 +1078,7 @@ fn require_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult
 		.ok_or_else(|| FerrosGrynnError::class_does_not_exist(name))
 }
 
+/// Returns the info database result.
 fn info_database(transaction: &mut Transaction) -> FerrosGrynnResult<Value> {
 	let analyzers = transaction
 		.analyzers()?
@@ -1053,12 +1116,14 @@ fn info_database(transaction: &mut Transaction) -> FerrosGrynnResult<Value> {
 	])))
 }
 
+/// Returns the info analyzer result.
 fn info_analyzer(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Value> {
 	transaction.analyzer(name)?.map(|analyzer| analyzer_info(&analyzer)).ok_or_else(|| {
 		FerrosGrynnError::invalid_argument(format!("analyzer '{name}' does not exist"))
 	})
 }
 
+/// Returns the analyzer info result.
 fn analyzer_info(analyzer: &SchemaAnalyzer) -> Value {
 	let tokenizers = analyzer
 		.tokenizers()
@@ -1082,6 +1147,7 @@ fn analyzer_info(analyzer: &SchemaAnalyzer) -> Value {
 	]))
 }
 
+/// Returns the analyzer tokenizer name result.
 const fn analyzer_tokenizer_name(tokenizer: AnalyzerTokenizer) -> &'static str {
 	match tokenizer {
 		AnalyzerTokenizer::Blank => "blank",
@@ -1091,6 +1157,7 @@ const fn analyzer_tokenizer_name(tokenizer: AnalyzerTokenizer) -> &'static str {
 	}
 }
 
+/// Returns the analyzer filter info result.
 fn analyzer_filter_info(filter: &AnalyzerFilter) -> Value {
 	match filter {
 		AnalyzerFilter::Nfc => Value::from("nfc"),
@@ -1133,6 +1200,7 @@ fn analyzer_filter_info(filter: &AnalyzerFilter) -> Value {
 	}
 }
 
+/// Returns the analyzer language name result.
 const fn analyzer_language_name(language: AnalyzerLanguage) -> &'static str {
 	match language {
 		AnalyzerLanguage::Arabic => "arabic",
@@ -1156,6 +1224,7 @@ const fn analyzer_language_name(language: AnalyzerLanguage) -> &'static str {
 	}
 }
 
+/// Returns the info function result.
 fn info_function(
 	transaction: &mut Transaction,
 	namespace: &str,
@@ -1167,6 +1236,7 @@ fn info_function(
 		.ok_or_else(|| function_missing(namespace, name))
 }
 
+/// Returns the function info result.
 fn function_info(function: &SchemaFunction) -> Value {
 	let effect = match function.effect() {
 		FunctionEffect::Pure => "pure",
@@ -1200,6 +1270,7 @@ fn function_info(function: &SchemaFunction) -> Value {
 	]))
 }
 
+/// Returns the function info key result.
 fn function_info_key(function: &SchemaFunction) -> crate::values::Text {
 	let parameters = function
 		.parameters()
@@ -1213,12 +1284,14 @@ fn function_info_key(function: &SchemaFunction) -> crate::values::Text {
 	))
 }
 
+/// Returns the info parameter result.
 fn info_parameter(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Value> {
 	transaction.parameter(name)?.map(|parameter| parameter_info(&parameter)).ok_or_else(|| {
 		FerrosGrynnError::invalid_argument(format!("parameter '${name}' does not exist"))
 	})
 }
 
+/// Returns the parameter info result.
 fn parameter_info(parameter: &SchemaParameter) -> Value {
 	Value::from(Object::from_iter([
 		("comment", parameter.comment().cloned().map_or(Value::None, Value::from)),
@@ -1397,6 +1470,7 @@ fn graph_index_info(index: &crate::datastore::GraphIndex) -> FerrosGrynnResult<V
 	])))
 }
 
+/// Returns the info index result.
 fn info_index(transaction: &mut Transaction, class: &str, name: &str) -> FerrosGrynnResult<Value> {
 	let schema = require_class(transaction, class)?;
 	if matches!(name, "class" | "primary") {
@@ -1417,6 +1491,7 @@ fn info_index(transaction: &mut Transaction, class: &str, name: &str) -> FerrosG
 	Ok(index_info(class, index, &graphs, active_job.as_ref()))
 }
 
+/// Returns the graph definition result.
 fn graph_definition(reference: &GraphRef) -> Value {
 	let suffix = match reference.kind() {
 		GraphKind::Graph => String::new(),
@@ -1425,6 +1500,7 @@ fn graph_definition(reference: &GraphRef) -> Value {
 	Value::from(format!("DEFINE GRAPH {}{suffix}", quote_name(reference.name().as_str())))
 }
 
+/// Returns the class definition result.
 fn class_definition(schema: &ClassSchema) -> Value {
 	let kind = match schema.kind() {
 		AtomKind::Node => "NODE",
@@ -1437,6 +1513,7 @@ fn class_definition(schema: &ClassSchema) -> Value {
 	Value::from(format!("DEFINE CLASS {} TYPE {kind} {mode}", quote_name(schema.name().as_str())))
 }
 
+/// Returns the field definition result.
 fn field_definition(class: &str, field: &ClassField) -> Value {
 	Value::from(format!(
 		"DEFINE FIELD {} ON CLASS {} TYPE {}",
@@ -1446,6 +1523,7 @@ fn field_definition(class: &str, field: &ClassField) -> Value {
 	))
 }
 
+/// Returns the index info result.
 fn index_info(
 	class: &str,
 	index: &ClassIndex,
@@ -1485,6 +1563,7 @@ fn index_info(
 	]))
 }
 
+/// Returns the system index info result.
 fn system_index_info(class: &str, name: &str) -> Value {
 	Value::from(Object::from_iter([
 		("building", Value::from(Object::from_iter([("status", Value::from("ready"))]))),
@@ -1494,6 +1573,7 @@ fn system_index_info(class: &str, name: &str) -> Value {
 	]))
 }
 
+/// Returns the index definition result.
 fn index_definition(class: &str, index: &ClassIndex, graphs: &[GraphSchema]) -> Value {
 	let body = match index.kind() {
 		ClassIndexKind::Count => "COUNT".to_owned(),
@@ -1557,6 +1637,7 @@ fn index_definition(class: &str, index: &ClassIndex, graphs: &[GraphSchema]) -> 
 	))
 }
 
+/// Returns the index state name result.
 const fn index_state_name(state: ClassIndexState) -> &'static str {
 	match state {
 		ClassIndexState::Ready => "ready",
@@ -1565,6 +1646,7 @@ const fn index_state_name(state: ClassIndexState) -> &'static str {
 	}
 }
 
+/// Returns the quote name result.
 fn quote_name(name: &str) -> String {
 	format!("`{}`", name.replace('`', "``"))
 }

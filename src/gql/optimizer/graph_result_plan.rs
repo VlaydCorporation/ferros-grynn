@@ -244,6 +244,7 @@ pub(in crate::gql) fn plan_build_graph(
 	clippy::too_many_arguments,
 	reason = "one concrete graph-result node exposes its fixed contract"
 )]
+/// Returns the graph plan result.
 fn graph_plan(
 	operator: GraphResultOperator,
 	mode: GraphResultMode,
@@ -298,6 +299,7 @@ fn graph_plan(
 	})
 }
 
+/// Returns the output cardinality result.
 fn output_cardinality(plan: &PhysicalPlan) -> Cardinality {
 	match plan {
 		PhysicalPlan::Select(plan) => plan.cardinality,

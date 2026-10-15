@@ -314,6 +314,7 @@ fn reserve_journal<T>(
 }
 
 #[cfg(test)]
+/// Regression tests for changefeed journal behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -340,36 +341,42 @@ mod tests {
 		Ok((store, record, graph.id(), key))
 	}
 
+	/// Verifies changefeed create admits metadata before private allocation.
 	#[test]
-	fn changefeed_create_admits_metadata_before_private_allocation() -> FerrosGrynnResult<()> {
-		let (store, _record, _graph, _key) = setup(InMemoryOptions::default())?;
+	fn changefeed_create_admits_metadata_before_private_allocation() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, _graph, _key) = setup(InMemoryOptions::default()).assert_ok();
 		let root = (*store.inner.current_root()).clone();
 		let metadata = size_of::<CaptureOperation>() + size_of::<CaptureIntent>();
-		let mut options = InMemoryOptions::default();
-		options.max_write_set_bytes =
-			crate::datastore::consts::BASE_ATOM_WRITE_BYTES + metadata - 1;
+		let options_defaults = InMemoryOptions::default();
+		let options = InMemoryOptions {
+			max_write_set_bytes: crate::datastore::consts::BASE_ATOM_WRITE_BYTES + metadata - 1,
+			..options_defaults
+		};
 		let limited = Datastore::from_root_for_test(options, root);
 		let mut tx = limited.begin();
-		let record = "item:rejected".parse::<RecordId>()?;
+		let record = "item:rejected".parse::<RecordId>().assert_ok();
 		assert!(tx.create_atom(record.clone(), PropertyMap::new()).is_err());
 		assert!(tx.working.resolve_atom(&record).is_none());
 		assert_eq!(tx.write_set_bytes(), 0);
 		assert!(tx.change_journal.operations.is_empty());
 		assert!(tx.change_journal.intents.is_empty());
-		Ok(())
 	}
 
+	/// Verifies changefeed journal tracks noops and groups internal setters.
 	#[test]
-	fn changefeed_journal_tracks_noops_and_groups_internal_setters() -> FerrosGrynnResult<()> {
-		let (store, record, graph, key) = setup(InMemoryOptions::default())?;
+	fn changefeed_journal_tracks_noops_and_groups_internal_setters() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, graph, key) = setup(InMemoryOptions::default()).assert_ok();
 		let mut tx = store.begin();
 		let missing = crate::values::PropertyKeyId::new(99);
-		tx.remove_base_property(&record, missing)?;
-		tx.reset_property(graph, &record, key)?;
-		tx.set_occurrence_label(graph, &record, None)?;
-		tx.replace_occurrence_state(graph, &record, crate::datastore::OccurrenceState::Node {
-			nested_graph: None,
-		})?;
+		tx.remove_base_property(&record, missing).assert_ok();
+		tx.reset_property(graph, &record, key).assert_ok();
+		tx.set_occurrence_label(graph, &record, None).assert_ok();
+		tx.replace_occurrence_state(graph, &record, crate::datastore::OccurrenceState::node(None))
+			.assert_ok();
 		assert_eq!(tx.change_journal.operations.len(), 4);
 		assert!(
 			tx.change_journal.operations.iter().all(|operation| operation.mutations.is_empty())
@@ -377,10 +384,11 @@ mod tests {
 		for (ordinal, operation) in tx.change_journal.operations.iter().enumerate() {
 			assert_eq!(operation.ordinal, ordinal as u64);
 		}
-		for outcome in
-			tx.execute("UPDATE item:a SET value = 1, extra = 2 RETURN NONE", &Object::new())?
+		for outcome in tx
+			.execute("UPDATE item:a SET value = 1, extra = 2 RETURN NONE", &Object::new())
+			.assert_ok()
 		{
-			let _result = outcome.result?;
+			let _result = outcome.result.assert_ok();
 		}
 		assert_eq!(tx.change_journal.operations.len(), 5);
 		let operation = &tx.change_journal.operations[4];
@@ -390,9 +398,9 @@ mod tests {
 		assert_eq!(tx.change_journal.operations.len(), before.operations);
 		assert_eq!(tx.change_journal.bytes, before.bytes);
 		for outcome in
-			tx.execute("UPDATE item:missing SET value = 3 RETURN NONE", &Object::new())?
+			tx.execute("UPDATE item:missing SET value = 3 RETURN NONE", &Object::new()).assert_ok()
 		{
-			let _result = outcome.result?;
+			let _result = outcome.result.assert_ok();
 		}
 		assert_eq!(tx.change_journal.operations.len(), before.operations);
 		let rollback = tx.atomic_mutation(|transaction| -> FerrosGrynnResult<()> {
@@ -403,20 +411,28 @@ mod tests {
 		assert_eq!(tx.change_journal.operations.len(), before.operations);
 		assert_eq!(tx.change_journal.bytes, before.bytes);
 		assert_eq!(
-			tx.atom(&record)?
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture atom is absent"))?
+			tx.atom(&record)
+				.assert_ok()
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture atom is absent"))
+				.assert_ok()
 				.properties()
 				.get(key),
 			Some(&Value::from(1))
 		);
-		Ok(())
 	}
 
+	/// Verifies changefeed journal caps and ordinals survive rollback and
+	/// seals.
 	#[test]
-	fn changefeed_journal_caps_and_ordinals_survive_rollback_and_seals() -> FerrosGrynnResult<()> {
-		let mut options = InMemoryOptions::default();
-		options.max_write_set_bytes = 16 * crate::datastore::consts::SCHEMA_WRITE_BYTES;
-		let (store, record, _graph, _key) = setup(options)?;
+	fn changefeed_journal_caps_and_ordinals_survive_rollback_and_seals() {
+		use crate::test_assertions::AssertResult as _;
+
+		let options_defaults = InMemoryOptions::default();
+		let options = InMemoryOptions {
+			max_write_set_bytes: 16 * crate::datastore::consts::SCHEMA_WRITE_BYTES,
+			..options_defaults
+		};
+		let (store, record, _graph, _key) = setup(options).assert_ok();
 		let mut tx = store.begin();
 		let missing = crate::values::PropertyKeyId::new(99);
 		tx.change_journal.next_ordinal = u64::MAX;
@@ -424,10 +440,10 @@ mod tests {
 		assert!(tx.change_journal.operations.is_empty());
 		assert_eq!(tx.change_journal.bytes, 0);
 		tx.change_journal.next_ordinal = 0;
-		tx.remove_base_property(&record, missing)?;
-		let _captured = tx.seal_import_segment(tx.snapshot.commit_ts)?;
+		tx.remove_base_property(&record, missing).assert_ok();
+		let _captured = tx.seal_import_segment(tx.snapshot.commit_ts).assert_ok();
 		assert_eq!(tx.change_journal.next_ordinal, 1);
-		tx.remove_base_property(&record, missing)?;
+		tx.remove_base_property(&record, missing).assert_ok();
 		assert_eq!(tx.change_journal.operations[0].ordinal, 1);
 		loop {
 			if tx.remove_base_property(&record, missing).is_err() {
@@ -436,20 +452,22 @@ mod tests {
 		}
 		assert!(tx.write_set_bytes() <= store.inner.transaction_limits().max_write_set_bytes);
 		assert!(tx.mutations.is_empty());
-		Ok(())
 	}
 
+	/// Verifies changefeed replay ranges share rebased allocation map.
 	#[test]
-	fn changefeed_replay_ranges_share_rebased_allocation_map() -> FerrosGrynnResult<()> {
-		let (store, _record, _graph, key) = setup(InMemoryOptions::default())?;
+	fn changefeed_replay_ranges_share_rebased_allocation_map() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, _graph, key) = setup(InMemoryOptions::default()).assert_ok();
 		let mut left = store.begin();
 		let mut right = store.begin();
-		let first = "item:left".parse::<RecordId>()?;
-		let second = "item:right".parse::<RecordId>()?;
-		left.create_atom(first.clone(), PropertyMap::new())?;
-		left.set_base_property(&first, key, Value::from(9))?;
-		right.create_atom(second.clone(), PropertyMap::new())?;
-		right.commit()?;
+		let first = "item:left".parse::<RecordId>().assert_ok();
+		let second = "item:right".parse::<RecordId>().assert_ok();
+		left.create_atom(first.clone(), PropertyMap::new()).assert_ok();
+		left.set_base_property(&first, key, Value::from(9)).assert_ok();
+		right.create_atom(second.clone(), PropertyMap::new()).assert_ok();
+		right.commit().assert_ok();
 		let mut replay = (*store.inner.current_root()).clone();
 		let mut remap = super::super::commit::ReplayRemap::default();
 		let published_at = replay.commit_ts + 1;
@@ -460,19 +478,21 @@ mod tests {
 				published_at,
 				true,
 				&mut remap,
-			)?;
+			)
+			.assert_ok();
 		}
 		let global = replay
 			.resolve_atom(&first)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("replayed atom is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("replayed atom is absent"))
+			.assert_ok();
 		assert_eq!(
 			replay.atom(global).and_then(|atom| atom.properties().get(key)),
 			Some(&Value::from(9))
 		);
 		let other = replay
 			.resolve_atom(&second)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("concurrent atom is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("concurrent atom is absent"))
+			.assert_ok();
 		assert!(replay.atom(other).is_some_and(|atom| atom.properties().get(key).is_none()));
-		Ok(())
 	}
 }

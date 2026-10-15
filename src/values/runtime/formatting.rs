@@ -3,6 +3,7 @@ use std::fmt::{self, Display, Formatter};
 use super::{Value, Vector};
 
 impl Display for Value {
+	/// Formats `Value` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::None => f.write_str("none"),
@@ -76,11 +77,13 @@ impl Display for Value {
 	}
 }
 
+/// Writes json string.
 fn write_json_string(formatter: &mut Formatter<'_>, value: &str) -> fmt::Result {
 	let value = serde_json::to_string(value).map_err(|_err| fmt::Error)?;
 	formatter.write_str(&value)
 }
 
+/// Writes sequence.
 fn write_sequence<'a>(
 	formatter: &mut Formatter<'_>,
 	prefix: &str,
@@ -97,6 +100,7 @@ fn write_sequence<'a>(
 	formatter.write_str(suffix)
 }
 
+/// Writes debug sequence.
 fn write_debug_sequence<T: fmt::Debug>(
 	formatter: &mut Formatter<'_>,
 	prefix: &str,

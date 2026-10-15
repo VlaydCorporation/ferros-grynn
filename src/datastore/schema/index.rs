@@ -22,7 +22,10 @@ pub enum VectorDistance {
 	/// Sum of absolute component differences.
 	Manhattan,
 	/// Minkowski distance with the supplied exponent.
-	Minkowski(f64),
+	Minkowski(
+		/// Minkowski distance with the supplied exponent.
+		f64,
+	),
 	/// Negative dot product, so lower remains a better distance.
 	InnerProduct,
 	/// Cosine distance after normalizing a derived search copy.
@@ -54,6 +57,7 @@ impl VectorDistance {
 		Ok(())
 	}
 
+	/// Returns the rank result.
 	fn rank(self) -> u8 {
 		match self {
 			Self::Euclidean => 0,
@@ -70,6 +74,7 @@ impl VectorDistance {
 }
 
 impl PartialEq for VectorDistance {
+	/// Compares this `VectorDistance` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -78,12 +83,15 @@ impl PartialEq for VectorDistance {
 impl Eq for VectorDistance {}
 
 impl PartialOrd for VectorDistance {
+	/// Compares this `VectorDistance` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for VectorDistance {
+	/// Compares this `VectorDistance` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.rank().cmp(&other.rank()).then_with(|| match (*self, *other) {
 			(Self::Minkowski(left), Self::Minkowski(right)) => left.total_cmp(&right),
@@ -103,6 +111,7 @@ impl Ord for VectorDistance {
 }
 
 impl Hash for VectorDistance {
+	/// Feeds this `VectorDistance` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.rank().hash(state);
 		match *self {
@@ -122,10 +131,15 @@ impl Hash for VectorDistance {
 /// Fulltext-specific definition payload stored by one class index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FulltextIndexOptions {
+	/// Analyzer associated with this fulltext index options.
 	pub(crate) analyzer: AnalyzerId,
+	/// Analyzer version associated with this fulltext index options.
 	pub(crate) analyzer_version: SchemaVersion,
+	/// K1 bits associated with this fulltext index options.
 	pub(crate) k1_bits: u64,
+	/// B bits associated with this fulltext index options.
 	pub(crate) b_bits: u64,
+	/// Highlights associated with this fulltext index options.
 	pub(crate) highlights: bool,
 }
 
@@ -172,22 +186,27 @@ impl FulltextIndexOptions {
 		}
 	}
 
+	/// Returns the stored analyzer of this `FulltextIndexOptions`.
 	pub const fn analyzer(self) -> AnalyzerId {
 		self.analyzer
 	}
 
+	/// Returns the stored analyzer version of this `FulltextIndexOptions`.
 	pub const fn analyzer_version(self) -> SchemaVersion {
 		self.analyzer_version
 	}
 
+	/// Returns k1 for `FulltextIndexOptions`.
 	pub fn k1(self) -> f64 {
 		f64::from_bits(self.k1_bits)
 	}
 
+	/// Returns b for `FulltextIndexOptions`.
 	pub fn b(self) -> f64 {
 		f64::from_bits(self.b_bits)
 	}
 
+	/// Returns the stored highlights of this `FulltextIndexOptions`.
 	pub const fn highlights(self) -> bool {
 		self.highlights
 	}
@@ -196,11 +215,17 @@ impl FulltextIndexOptions {
 /// Durable HNSW construction and search contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HnswIndexOptions {
+	/// Element associated with this hnsw index options.
 	pub(crate) element: VectorKind,
+	/// Dimension associated with this hnsw index options.
 	pub(crate) dimension: NonZeroU16,
+	/// Distance associated with this hnsw index options.
 	pub(crate) distance: VectorDistance,
+	/// M associated with this hnsw index options.
 	pub(crate) m: NonZeroU16,
+	/// Ef construction associated with this hnsw index options.
 	pub(crate) ef_construction: NonZeroU16,
+	/// M0 associated with this hnsw index options.
 	pub(crate) m0: NonZeroU16,
 }
 
@@ -262,26 +287,32 @@ impl HnswIndexOptions {
 		)
 	}
 
+	/// Returns the stored element of this `HnswIndexOptions`.
 	pub const fn element(self) -> VectorKind {
 		self.element
 	}
 
+	/// Returns the stored dimension of this `HnswIndexOptions`.
 	pub const fn dimension(self) -> NonZeroU16 {
 		self.dimension
 	}
 
+	/// Returns the stored distance of this `HnswIndexOptions`.
 	pub const fn distance(self) -> VectorDistance {
 		self.distance
 	}
 
+	/// Returns the stored m of this `HnswIndexOptions`.
 	pub const fn m(self) -> NonZeroU16 {
 		self.m
 	}
 
+	/// Returns the stored ef construction of this `HnswIndexOptions`.
 	pub const fn ef_construction(self) -> NonZeroU16 {
 		self.ef_construction
 	}
 
+	/// Returns the stored m0 of this `HnswIndexOptions`.
 	pub const fn m0(self) -> NonZeroU16 {
 		self.m0
 	}
@@ -295,12 +326,19 @@ impl HnswIndexOptions {
 /// Durable page-backed DiskANN construction and search contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DiskAnnIndexOptions {
+	/// Element associated with this disk ann index options.
 	pub(crate) element: VectorKind,
+	/// Dimension associated with this disk ann index options.
 	pub(crate) dimension: NonZeroU16,
+	/// Distance associated with this disk ann index options.
 	pub(crate) distance: VectorDistance,
+	/// Degree associated with this disk ann index options.
 	pub(crate) degree: NonZeroU16,
+	/// Build list size associated with this disk ann index options.
 	pub(crate) build_list_size: NonZeroU16,
+	/// Alpha bits associated with this disk ann index options.
 	pub(crate) alpha_bits: u32,
+	/// Hashed vector associated with this disk ann index options.
 	pub(crate) hashed_vector: bool,
 }
 
@@ -379,35 +417,43 @@ impl DiskAnnIndexOptions {
 		)
 	}
 
+	/// Returns the stored element of this `DiskAnnIndexOptions`.
 	pub const fn element(self) -> VectorKind {
 		self.element
 	}
 
+	/// Returns the stored dimension of this `DiskAnnIndexOptions`.
 	pub const fn dimension(self) -> NonZeroU16 {
 		self.dimension
 	}
 
+	/// Returns the stored distance of this `DiskAnnIndexOptions`.
 	pub const fn distance(self) -> VectorDistance {
 		self.distance
 	}
 
+	/// Returns the stored degree of this `DiskAnnIndexOptions`.
 	pub const fn degree(self) -> NonZeroU16 {
 		self.degree
 	}
 
+	/// Returns the stored build list size of this `DiskAnnIndexOptions`.
 	pub const fn build_list_size(self) -> NonZeroU16 {
 		self.build_list_size
 	}
 
+	/// Returns alpha for `DiskAnnIndexOptions`.
 	pub fn alpha(self) -> f32 {
 		f32::from_bits(self.alpha_bits)
 	}
 
+	/// Returns the stored hashed vector of this `DiskAnnIndexOptions`.
 	pub const fn hashed_vector(self) -> bool {
 		self.hashed_vector
 	}
 }
 
+/// Returns the invalid ann defaults result.
 fn invalid_ann_defaults() -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument("internal ANN defaults contain zero")
 }
@@ -480,12 +526,30 @@ impl GeometryIndexOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClassIndexOptions {
+/// Class index options alternatives.
+pub enum ClassIndexOptions {
+	/// Scalar case of class index options.
 	Scalar,
-	Fulltext(FulltextIndexOptions),
-	Hnsw(HnswIndexOptions),
-	DiskAnn(DiskAnnIndexOptions),
-	Geometry(GeometryIndexOptions),
+	/// Fulltext case of class index options.
+	Fulltext(
+		/// Fulltext case of class index options.
+		FulltextIndexOptions,
+	),
+	/// Hnsw case of class index options.
+	Hnsw(
+		/// Hnsw case of class index options.
+		HnswIndexOptions,
+	),
+	/// Disk ann case of class index options.
+	DiskAnn(
+		/// Disk ann case of class index options.
+		DiskAnnIndexOptions,
+	),
+	/// Geometry case of class index options.
+	Geometry(
+		/// Geometry case of class index options.
+		GeometryIndexOptions,
+	),
 }
 
 /// Transaction-visible usability state of one declared class index.
@@ -531,6 +595,7 @@ pub struct ClassIndex {
 	pub(crate) scope: IndexScope,
 	/// Indexed fields in composite-key order.
 	pub(crate) fields: Vec<Text>,
+	/// Options associated with this class index.
 	pub(crate) options: ClassIndexOptions,
 }
 
@@ -593,6 +658,11 @@ impl ClassIndex {
 	}
 
 	/// Creates a Fulltext definition over exactly one string field.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn new_fulltext<IntoText: Into<Text>, IntoField: Into<Text>>(
 		name: IntoText,
 		scope: IndexScope,
@@ -609,6 +679,11 @@ impl ClassIndex {
 	}
 
 	/// Creates an HNSW definition over exactly one vector field.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn new_hnsw<IntoText: Into<Text>, IntoField: Into<Text>>(
 		name: IntoText,
 		scope: IndexScope,
@@ -625,6 +700,11 @@ impl ClassIndex {
 	}
 
 	/// Creates a DiskANN definition over exactly one vector field.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn new_disk_ann<IntoText: Into<Text>, IntoField: Into<Text>>(
 		name: IntoText,
 		scope: IndexScope,
@@ -640,6 +720,7 @@ impl ClassIndex {
 		)
 	}
 
+	/// Returns the new specialized result.
 	fn new_specialized(
 		name: Text,
 		kind: ClassIndexKind,

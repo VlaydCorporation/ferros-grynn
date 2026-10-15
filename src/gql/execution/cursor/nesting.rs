@@ -7,33 +7,51 @@ use super::*;
 /// Direct or bounded transitive containment relation after expression
 /// resolution.
 pub(in crate::gql::execution) struct ResolvedWithin {
+	/// Child associated with this resolved within.
 	pub(in crate::gql::execution) child: ResolvedMatchBinding,
+	/// Owner associated with this resolved within.
 	pub(in crate::gql::execution) owner: ResolvedMatchBinding,
+	/// Min associated with this resolved within.
 	pub(in crate::gql::execution) min: u32,
+	/// Max associated with this resolved within.
 	pub(in crate::gql::execution) max: u32,
 }
 
+/// Pending row state.
 struct PendingRow {
+	/// Row associated with this pending row.
 	row: Row,
+	/// Bytes associated with this pending row.
 	bytes: usize,
 }
 
 /// Joins visible meta owners to atoms in their direct or transitive child
 /// graphs. Rows are buffered only up to the shared statement memory budget.
 pub(in crate::gql::execution) struct WithinCursor<'a, Read: QueryRead> {
+	/// Input associated with this within cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Read associated with this within cursor.
 	read: &'a Read,
+	/// Snapshot associated with this within cursor.
 	snapshot: Snapshot,
+	/// Root associated with this within cursor.
 	root: Arc<GraphRef>,
+	/// Fields associated with this within cursor.
 	fields: &'a MatchGraphFields<'a, Read>,
+	/// Relation associated with this within cursor.
 	relation: ResolvedWithin,
+	/// Mode associated with this within cursor.
 	mode: crate::syn::MatchMode,
+	/// Predicate associated with this within cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Pending associated with this within cursor.
 	pending: VecDeque<PendingRow>,
+	/// Memory admission account retained with the owned data.
 	account: Option<BarrierAccount>,
 }
 
 impl<'a, Read: QueryRead> WithinCursor<'a, Read> {
+	/// Creates a new `WithinCursor<'a, Read>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		read: &'a Read,
@@ -58,6 +76,7 @@ impl<'a, Read: QueryRead> WithinCursor<'a, Read> {
 		}
 	}
 
+	/// Returns the fill result.
 	fn fill(&mut self, input: &Row, control: &ExecutionControl) -> FerrosGrynnResult<()> {
 		control.record_match_graph_open();
 		let graph = self.read.graph(self.snapshot, &self.root)?;
@@ -119,6 +138,8 @@ impl<'a, Read: QueryRead> WithinCursor<'a, Read> {
 }
 
 impl<Read: QueryRead> RowCursor for WithinCursor<'_, Read> {
+	/// Advances this `WithinCursor<'_, Read>` and returns its next element, if
+	/// any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -137,6 +158,7 @@ impl<Read: QueryRead> RowCursor for WithinCursor<'_, Read> {
 }
 
 #[allow(clippy::too_many_arguments, reason = "the recursive walk keeps one explicit bounded state")]
+/// Returns the descend within result.
 fn descend_within<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -235,10 +257,12 @@ fn descend_within<Read: QueryRead>(
 	Ok(())
 }
 
+/// Returns the containment state bytes result.
 fn containment_state_bytes() -> usize {
 	std::mem::size_of::<BoundAtom>().saturating_add(std::mem::size_of::<usize>().saturating_mul(4))
 }
 
+/// Reserves containment state.
 fn reserve_containment_state(
 	account: &mut BarrierAccount,
 	control: &ExecutionControl,
@@ -252,6 +276,7 @@ fn reserve_containment_state(
 	))
 }
 
+/// Returns the nested graph reference result.
 pub(in crate::gql::execution) fn nested_graph_reference<Graph: GraphRead>(
 	graph: &Graph,
 	owner: AtomId,

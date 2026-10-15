@@ -260,10 +260,10 @@ impl Transaction {
 			else {
 				continue;
 			};
-			let crate::datastore::OccurrenceState::Edge {
+			let crate::datastore::OccurrenceStateRef::Edge {
 				topology,
 				..
-			} = connector.state()
+			} = connector.state().view()
 			else {
 				continue;
 			};

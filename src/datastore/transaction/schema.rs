@@ -11,6 +11,7 @@ use crate::{
 		ClassSchema,
 		ClassSchemaMode,
 		ConflictKey,
+		FieldUpdate,
 		FunctionEffect,
 		FunctionId,
 		GraphIndex,
@@ -117,6 +118,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Validates analyzer function.
 	fn validate_analyzer_function(&mut self, analyzer: &SchemaAnalyzer) -> FerrosGrynnResult<()> {
 		let Some((id, version)) = analyzer.function() else {
 			return Ok(());
@@ -141,6 +143,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Returns the intern analyzer mapper keys result.
 	fn intern_analyzer_mapper_keys(&mut self, analyzer: &SchemaAnalyzer) -> FerrosGrynnResult<()> {
 		for filter in analyzer.filters() {
 			if let AnalyzerFilter::Mapper(entries) = filter {
@@ -303,7 +306,7 @@ impl Transaction {
 		&mut self,
 		name: &str,
 		value: Option<crate::values::Value>,
-		comment: Option<Option<crate::values::Text>>,
+		comment: Option<FieldUpdate<crate::values::Text>>,
 	) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
@@ -322,7 +325,7 @@ impl Transaction {
 			replacement.value = value;
 		}
 		if let Some(comment) = comment {
-			replacement.comment = comment;
+			replacement.comment = comment.into_optional();
 		}
 		replacement.version = replacement.version.next()?;
 		self.working.replace_parameter(replacement.clone(), self.snapshot.commit_ts)?;
@@ -608,6 +611,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Replaces graph properties.
 	pub(crate) fn replace_graph_properties(
 		&mut self,
 		name: &str,
@@ -629,6 +633,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Replaces graph definition.
 	pub(crate) fn replace_graph_definition(
 		&mut self,
 		name: &str,
@@ -768,7 +773,7 @@ impl Transaction {
 			.indexes
 			.iter()
 			.position(|current| current.name() == index.name())
-			.ok_or_else(|| self.index_missing(class, index.name().as_str()))?;
+			.ok_or_else(|| Self::index_missing(class, index.name().as_str()))?;
 		index.id = definition.indexes[position].id;
 		index.version = definition.indexes[position].version.next()?;
 		definition.indexes.remove(position);
@@ -789,7 +794,7 @@ impl Transaction {
 			.indexes
 			.iter_mut()
 			.find(|index| index.name().as_str() == name)
-			.ok_or_else(|| self.index_missing(class, name))?;
+			.ok_or_else(|| Self::index_missing(class, name))?;
 		index.state = ClassIndexState::PreparedForRemoval;
 		index.version = index.version.next()?;
 		self.publish_class_replacement(definition)
@@ -808,7 +813,7 @@ impl Transaction {
 			.indexes
 			.iter()
 			.position(|index| index.name().as_str() == name)
-			.ok_or_else(|| self.index_missing(class, name))?;
+			.ok_or_else(|| Self::index_missing(class, name))?;
 		definition.indexes.remove(position);
 		self.publish_class_replacement(definition)
 	}
@@ -890,9 +895,7 @@ impl Transaction {
 			.graph(graph)
 			.into_iter()
 			.flat_map(crate::datastore::GraphRoot::occurrences)
-			.map(|occurrence| {
-				self.atom_domain(occurrence.global_id()).map(|(class, kind)| (class, kind))
-			})
+			.map(|occurrence| self.atom_domain(occurrence.global_id()))
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		let removed = self
 			.working
@@ -919,6 +922,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Publishes class replacement.
 	fn publish_class_replacement(&mut self, mut definition: ClassSchema) -> FerrosGrynnResult<()> {
 		definition.version = definition.version.next()?;
 		self.working.replace_class(definition.clone(), self.snapshot.commit_ts)?;
@@ -927,6 +931,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Returns the require class result.
 	fn require_class(&self, name: &str) -> FerrosGrynnResult<ClassSchema> {
 		self.working
 			.schema
@@ -935,6 +940,7 @@ impl Transaction {
 			.ok_or_else(|| FerrosGrynnError::class_does_not_exist(name))
 	}
 
+	/// Validates index scope.
 	fn validate_index_scope(&self, scope: IndexScope) -> FerrosGrynnResult<()> {
 		if let IndexScope::Effective {
 			graph,
@@ -946,6 +952,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Returns the class property is populated result.
 	fn class_property_is_populated(
 		&self,
 		class: &ClassSchema,
@@ -976,6 +983,7 @@ impl Transaction {
 		Ok(false)
 	}
 
+	/// Returns whether the class has undeclared properties condition holds.
 	fn class_has_undeclared_properties(&self, class: &ClassSchema) -> bool {
 		let Some(class_id) = class.id() else {
 			return true;
@@ -992,29 +1000,37 @@ impl Transaction {
 			.any(|atom| atom.properties().iter().any(|(key, _value)| !declared.contains(&key)))
 	}
 
-	fn index_missing(&self, class: &str, name: &str) -> FerrosGrynnError {
+	/// Returns the index missing result.
+	fn index_missing(class: &str, name: &str) -> FerrosGrynnError {
 		FerrosGrynnError::invalid_argument(format!("index '{class}.{name}' does not exist"))
 	}
 }
 
+/// Returns the parameter exists result.
 fn parameter_exists(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("parameter '${name}' already exists"))
 }
 
+/// Returns the parameter missing result.
 fn parameter_missing(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("parameter '${name}' does not exist"))
 }
 
+/// Returns the analyzer exists result.
 fn analyzer_exists(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("analyzer '{name}' already exists"))
 }
 
+/// Returns the analyzer missing result.
 fn analyzer_missing(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("analyzer '{name}' does not exist"))
 }
 
 #[cfg(test)]
+/// Regression tests for schema behavior.
 mod tests {
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{
 			ClassField,
@@ -1028,46 +1044,50 @@ mod tests {
 		values::{AtomKind, Type},
 	};
 
+	/// Verifies class ddl preserves identities and rebuilds indexes.
 	#[test]
 	fn class_ddl_preserves_identities_and_rebuilds_indexes() {
 		let store = Datastore::in_memory();
 		let mut transaction = store.begin();
 		let class_id = transaction
-			.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap())
-			.unwrap();
-		transaction.define_field("person", ClassField::new("email", Type::String)).unwrap();
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		transaction.define_field("person", ClassField::new("email", Type::String)).assert_ok();
 		transaction
 			.define_index(
 				"person",
 				ClassIndex::new("by_email", ClassIndexKind::Unique, IndexScope::Base, ["email"])
-					.unwrap(),
+					.assert_ok(),
 			)
-			.unwrap();
-		transaction.set_class_schema_mode("person", ClassSchemaMode::Schemafull).unwrap();
-		transaction.commit().unwrap();
+			.assert_ok();
+		transaction.set_class_schema_mode("person", ClassSchemaMode::Schemafull).assert_ok();
+		transaction.commit().assert_ok();
 
-		let class = store.class("person").unwrap();
+		let class = store.class("person").assert_some();
 		assert_eq!(class.id(), Some(class_id));
 		assert_eq!(class.fields().len(), 1);
 		assert_eq!(class.indexes().len(), 1);
 		assert_eq!(class.schema_mode(), ClassSchemaMode::Schemafull);
 	}
 
+	/// Verifies class removal rejects live atoms.
 	#[test]
 	fn class_removal_rejects_live_atoms() {
 		let store = Datastore::in_memory();
 		let mut transaction = store.begin();
-		transaction.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+		transaction
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
 		transaction
 			.create_atom(
 				crate::values::RecordId::new(
 					"person",
 					crate::values::RecordIdPart::String("alice".into()),
 				)
-				.unwrap(),
+				.assert_ok(),
 				crate::values::PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 		assert!(transaction.remove_class("person").is_err());
 	}
 }

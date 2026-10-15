@@ -51,6 +51,7 @@ pub struct Readiness<'a> {
 impl Future for Readiness<'_> {
 	type Output = FerrosGrynnResult<()>;
 
+	/// Polls this `Readiness<'_>` with the current task context.
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.get_mut();
 		if this.handle.fused
@@ -76,11 +77,12 @@ impl Future for Readiness<'_> {
 }
 
 impl Drop for Readiness<'_> {
+	/// Runs cleanup for this `Readiness<'_>` before its fields are released.
 	fn drop(&mut self) {
-		if let Some(registration) = self.registration {
-			if let Some(store) = self.handle.store.upgrade() {
-				store.live_consumers.cancel_ready(self.handle.key, registration);
-			}
+		if let Some(registration) = self.registration
+			&& let Some(store) = self.handle.store.upgrade()
+		{
+			store.live_consumers.cancel_ready(self.handle.key, registration);
 		}
 	}
 }
@@ -175,11 +177,11 @@ impl SubscriptionHandle {
 	/// Transfers the accepted activation image without looking at newer roots.
 	pub(crate) fn take_graph_checkpoint(&mut self) -> Option<Arc<crate::live::LiveGraphBatch>> {
 		let graph = self.graph_checkpoint.take();
-		if graph.is_some() {
-			if let Some(store) = self.store.upgrade() {
-				let _commit = store.commit.lock();
-				store.live_consumers.release_registration_graph(self.key);
-			}
+		if graph.is_some()
+			&& let Some(store) = self.store.upgrade()
+		{
+			let _commit = store.commit.lock();
+			store.live_consumers.release_registration_graph(self.key);
 		}
 		graph
 	}
@@ -195,10 +197,10 @@ impl SubscriptionHandle {
 			if checkpoint.versionstamp() <= self.cursor.versionstamp() {
 				return Ok(Some((Arc::clone(&checkpoint.delta.after), checkpoint.versionstamp())));
 			}
-			if checkpoint.delta().base() <= self.cursor.versionstamp() {
-				if let Some(before) = &checkpoint.delta.before {
-					return Ok(Some((Arc::clone(before), checkpoint.delta().base())));
-				}
+			if checkpoint.delta().base() <= self.cursor.versionstamp()
+				&& let Some(before) = &checkpoint.delta.before
+			{
+				return Ok(Some((Arc::clone(before), checkpoint.delta().base())));
 			}
 		}
 		let Some(replay) = &mut self.replay else {
@@ -376,6 +378,8 @@ impl SubscriptionHandle {
 }
 
 impl Drop for SubscriptionHandle {
+	/// Runs cleanup for this `SubscriptionHandle` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		if !self.fused
 			&& let Some(store) = self.store.upgrade()
@@ -389,6 +393,7 @@ impl Drop for SubscriptionHandle {
 }
 
 #[cfg(test)]
+/// Regression tests for handle behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -401,6 +406,8 @@ mod tests {
 
 	/// Three successors force bootstrap to inspect and buffer retained history.
 	fn buffered_graph_replay() -> FerrosGrynnResult<(Datastore, crate::live::LiveSubscription)> {
+		use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
+
 		let store = Datastore::in_memory();
 		let mut seed = store.begin();
 		let class = seed.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
@@ -428,40 +435,48 @@ mod tests {
 		let initial = resumed.inner.graph_bootstrap()?.ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("retained graph predecessor absent")
 		})?;
-		assert_eq!(initial.1, saved.versionstamp());
-		assert!(resumed.inner.buffered_replay.is_some());
-		assert_eq!(resumed.cursor(), &saved);
+		(&(initial.1), &(saved.versionstamp())).assert_equal();
+		(resumed.inner.buffered_replay.is_some()).assert_true();
+		(&(resumed.cursor()), &(&saved)).assert_equal();
 		Ok((store, resumed))
 	}
 
+	/// Verifies graph bootstrap terminal paths release buffered history.
 	#[test]
-	fn graph_bootstrap_terminal_paths_release_buffered_history() -> FerrosGrynnResult<()> {
-		let (_store, mut subscription) = buffered_graph_replay()?;
-		subscription.close()?;
+	fn graph_bootstrap_terminal_paths_release_buffered_history() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (_store, mut subscription) = buffered_graph_replay().assert_ok();
+		subscription.close().assert_ok();
 		assert!(subscription.inner.buffered_replay.is_none());
 		assert!(subscription.inner.replay.is_none());
 		assert!(subscription.inner.graph_checkpoint.is_none());
-		let (store, mut subscription) = buffered_graph_replay()?;
+		let (store, mut subscription) = buffered_graph_replay().assert_ok();
 		drop(store);
-		assert!(matches!(subscription.next()?, LiveNext::Closed));
+		assert!(matches!(subscription.next().assert_ok(), LiveNext::Closed));
 		assert!(subscription.inner.buffered_replay.is_none());
 		assert!(subscription.inner.replay.is_none());
-		Ok(())
 	}
 
 	/// A losing future releases its slot; publication wakes only outside locks.
 	#[test]
-	fn live_readiness_cancellation_publication_and_shutdown_are_race_safe() -> FerrosGrynnResult<()>
-	{
+	fn live_readiness_cancellation_publication_and_shutdown_are_race_safe() {
 		use std::{
 			sync::atomic::{AtomicUsize, Ordering},
 			task::{Wake, Waker},
 		};
+
+		use crate::test_assertions::AssertResult as _;
+		/// Waker test fixture observing notifications without owning the
+		/// datastore.
 		struct Probe {
+			/// Backing blob store used to resolve unloaded tree nodes.
 			store: Weak<StoreInner>,
+			/// Shared counter recording wakes observed by the test fixture.
 			wakes: AtomicUsize,
 		}
 		impl Wake for Probe {
+			/// Returns wake for `Probe`.
 			fn wake(self: Arc<Self>) {
 				if let Some(store) = self.store.upgrade() {
 					assert!(store.commit.try_lock().is_some(), "wake called under commit mutex");
@@ -471,10 +486,12 @@ mod tests {
 		}
 		let store = Datastore::in_memory();
 		let mut seed = store.begin();
-		let class = seed.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-		seed.commit()?;
+		let class =
+			seed.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
+		seed.commit().assert_ok();
 		let mut subscription = store
-			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
 		let probe = Arc::new(Probe {
 			store: Arc::downgrade(&store.inner),
 			wakes: AtomicUsize::new(0),
@@ -486,26 +503,34 @@ mod tests {
 			assert!(Pin::new(&mut readiness).poll(&mut context).is_pending());
 		}
 		let mut write = store.begin();
-		write.create_atom("item:a".parse()?, PropertyMap::new())?;
-		write.commit()?;
+		write.create_atom("item:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		write.commit().assert_ok();
 		assert_eq!(probe.wakes.load(Ordering::Relaxed), 0);
-		let LiveNext::Delivery(delivery) = subscription.next()? else {
-			return Err(FerrosGrynnError::invalid_argument("ready delivery absent"));
+		let LiveNext::Delivery(delivery) = subscription.next().assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("ready delivery absent"));
+				test_result.assert_ok();
+			};
 		};
-		subscription.ack(delivery.token())?;
+		subscription.ack(delivery.token()).assert_ok();
 		{
 			let mut readiness = subscription.inner.ready(false);
 			assert!(Pin::new(&mut readiness).poll(&mut context).is_pending());
 			let mut write = store.begin();
-			write.create_atom("item:b".parse()?, PropertyMap::new())?;
-			write.commit()?;
+			write.create_atom("item:b".parse().assert_ok(), PropertyMap::new()).assert_ok();
+			write.commit().assert_ok();
 			assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
 			assert!(matches!(Pin::new(&mut readiness).poll(&mut context), Poll::Ready(Ok(()))));
 		}
-		let LiveNext::Delivery(delivery) = subscription.next()? else {
-			return Err(FerrosGrynnError::invalid_argument("second delivery absent"));
+		let LiveNext::Delivery(delivery) = subscription.next().assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("second delivery absent"));
+				test_result.assert_ok();
+			};
 		};
-		subscription.ack(delivery.token())?;
+		subscription.ack(delivery.token()).assert_ok();
 		{
 			let mut readiness = subscription.inner.ready(false);
 			assert!(Pin::new(&mut readiness).poll(&mut context).is_pending());
@@ -513,7 +538,6 @@ mod tests {
 			assert_eq!(probe.wakes.load(Ordering::Relaxed), 2);
 			assert!(matches!(Pin::new(&mut readiness).poll(&mut context), Poll::Ready(Ok(()))));
 		}
-		assert!(matches!(subscription.next()?, LiveNext::Closed));
-		Ok(())
+		assert!(matches!(subscription.next().assert_ok(), LiveNext::Closed));
 	}
 }

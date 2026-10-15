@@ -9,9 +9,14 @@ use super::*;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AttachStatement {
+	/// Record target addressed by the attachment or detachment.
 	pub record: DmlTarget,
+	/// Graph materialization or physical graph files retained by the operation.
 	pub graph: Option<Identifier>,
+	/// Optional label supplied for the created graph occurrence.
 	pub label: Option<Identifier>,
+	/// Optional policy retaining named containment levels while mutating
+	/// records.
 	pub keep_levelpath: Option<KeepLevelPathClause>,
 }
 
@@ -19,8 +24,11 @@ pub struct AttachStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DetachStatement {
+	/// Record target addressed by the attachment or detachment.
 	pub record: DmlTarget,
+	/// Graph materialization or physical graph files retained by the operation.
 	pub graph: Option<Identifier>,
+	/// Whether dependent contents may be removed with the selected target.
 	pub cascade: bool,
 }
 
@@ -28,19 +36,36 @@ pub struct DetachStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RelateStatement {
+	/// Optional external-database bridge clause attached to this graph
+	/// operation.
 	pub bridge: Option<Box<BridgeClause>>,
+	/// Whether relation endpoints use atom rather than node-only semantics.
 	pub atom_endpoints: bool,
+	/// Input source or initial endpoint selected by this syntax element.
 	pub source: RelateEndpoint,
+	/// Edge target or edge pattern defining the relation incidence.
 	pub edge: DmlTarget,
+	/// Optional name assigned to the produced value or source.
 	pub alias: Option<Identifier>,
+	/// Optional label supplied for the created graph occurrence.
 	pub label: Option<Identifier>,
+	/// Traversal orientation or requested sort direction selected by this
+	/// element.
 	pub direction: MatchDirection,
+	/// Target endpoint or schema object selected by the operation.
 	pub target: RelateEndpoint,
+	/// Graph materialization or physical graph files retained by the operation.
 	pub graph: Option<Identifier>,
+	/// Optional expression producing the relation weight.
 	pub weight: Option<Expr>,
+	/// Payload bytes, elements or retained storage backing this representation.
 	pub data: Option<DmlData>,
+	/// Optional policy retaining named containment levels while mutating
+	/// records.
 	pub keep_levelpath: Option<KeepLevelPathClause>,
+	/// Optional projection of values returned after the data mutation.
 	pub returning: Option<DmlReturn>,
+	/// Optional existence or predicate requirement checked before the mutation.
 	pub expect: Option<ExpectClause>,
 }
 
@@ -62,20 +87,29 @@ pub struct RelateEndpoint {
 #[non_exhaustive]
 pub enum RelateEndpointTarget {
 	/// An exact class-qualified record with a dynamically evaluated key.
-	Record(DmlTarget),
+	Record(
+		/// An exact class-qualified record with a dynamically evaluated key.
+		DmlTarget,
+	),
 	/// A lexical reference or idiom evaluated by the ordinary expression
 	/// kernel.
-	Reference(Expr),
+	Reference(
+		/// A lexical reference or idiom evaluated by the ordinary expression
+		/// kernel.
+		Expr,
+	),
 }
 
 /// Explicit request to persist the canonical graph-local LevelPath overlay.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct KeepLevelPathClause {
+	/// Containment-level names retained by the level-path policy.
 	pub aliases: Vec<Identifier>,
 }
 
 impl Parser<'_> {
+	/// Attaches statement.
 	pub(in crate::syn) async fn attach_statement(
 		&mut self,
 		context: &mut Stk,
@@ -106,6 +140,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Detaches statement.
 	pub(in crate::syn) async fn detach_statement(
 		&mut self,
 		context: &mut Stk,
@@ -130,6 +165,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the relate statement syntax.
 	pub(in crate::syn) async fn relate_statement(
 		&mut self,
 		context: &mut Stk,
@@ -253,6 +289,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the keep levelpath clause syntax.
 	pub(super) fn keep_levelpath_clause(
 		&mut self,
 	) -> FerrosGrynnResult<Option<KeepLevelPathClause>> {
@@ -275,6 +312,7 @@ impl Parser<'_> {
 		}))
 	}
 
+	/// Parses the exact graph target syntax.
 	async fn exact_graph_target(
 		&mut self,
 		context: &mut Stk,

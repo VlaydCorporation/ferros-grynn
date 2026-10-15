@@ -1,6 +1,29 @@
 //! EXPLAIN planning, projection, and optional single execution.
 
-use super::*;
+use super::{
+	Array,
+	ControlFlow,
+	ControlRuntime,
+	ExecutionControl,
+	FerrosGrynnError,
+	FerrosGrynnResult,
+	Instant,
+	LogicalDmlKind,
+	LogicalGraphDmlStatement,
+	LogicalSelectSourceKind,
+	LogicalStatement,
+	Object,
+	QueryRead,
+	QueryStatementKind,
+	Snapshot,
+	TraverseStepKind,
+	Value,
+	changefeed,
+	execute_statement,
+	live_planning,
+	resolve_match_graph,
+	resolve_match_max_depth,
+};
 use crate::{
 	gql::optimizer::{
 		Cardinality,
@@ -21,16 +44,27 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
+/// Analyze observation state.
 struct AnalyzeObservation {
+	/// Actual rows associated with this analyze observation.
 	actual_rows: u64,
+	/// Pulls associated with this analyze observation.
 	pulls: u64,
+	/// Affected rows associated with this analyze observation.
 	affected_rows: u64,
+	/// Elapsed ns associated with this analyze observation.
 	elapsed_ns: u64,
+	/// Peak memory associated with this analyze observation.
 	peak_memory: u64,
+	/// Spill bytes associated with this analyze observation.
 	spill_bytes: u64,
+	/// Spill runs associated with this analyze observation.
 	spill_runs: u64,
+	/// Path expansions associated with this analyze observation.
 	path_expansions: u64,
+	/// Match metrics associated with this analyze observation.
 	match_metrics: crate::gql::options::MatchMetricsSnapshot,
+	/// Graph assembly associated with this analyze observation.
 	graph_assembly: crate::gql::options::GraphAssemblyMetricsSnapshot,
 	/// Actual candidates, refinements, fallbacks, tree pages and delta records.
 	spatial: [u64; 5],
@@ -38,10 +72,12 @@ struct AnalyzeObservation {
 	neighbourhood: [u64; 4],
 	/// Logical history reader counters, with admitted scratch peak last.
 	changefeed: [u64; 9],
+	/// Publication associated with this analyze observation.
 	publication: &'static str,
 }
 
 #[allow(clippy::too_many_arguments, reason = "EXPLAIN reuses the statement interpreter context")]
+/// Executes explain.
 pub(super) fn execute_explain<Read: QueryRead>(
 	read: &mut Read,
 	explain: &crate::gql::ir::LogicalExplain,
@@ -216,6 +252,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 	Ok(ControlFlow::Value(value))
 }
 
+/// Returns the physical plan result.
 fn physical_plan(
 	statement: &LogicalStatement,
 	snapshot: &PlannerSnapshot,
@@ -273,6 +310,7 @@ fn physical_plan(
 }
 
 #[allow(clippy::too_many_arguments, reason = "the explain envelope has fixed contract fields")]
+/// Returns the explain json result.
 fn explain_json(
 	mode: ExplainMode,
 	statement: &LogicalStatement,
@@ -325,10 +363,13 @@ fn bridge_metadata(statement: &LogicalStatement) -> Vec<Value> {
 		]))
 	};
 	match statement {
-		LogicalStatement::GraphDml(LogicalGraphDmlStatement::Relate {
-			bridge: Some(alias),
-			..
-		}) => vec![item(alias, "local commit -> Pending mirror -> Ready confirmation")],
+		LogicalStatement::GraphDml(LogicalGraphDmlStatement::Relate(relate)) => {
+			if let Some(alias) = &relate.bridge {
+				vec![item(alias, "local commit -> Pending mirror -> Ready confirmation")]
+			} else {
+				Vec::new()
+			}
+		}
 		LogicalStatement::ReturnGraph(graph) => graph
 			.bridge
 			.as_deref()
@@ -360,6 +401,7 @@ fn bridge_metadata(statement: &LogicalStatement) -> Vec<Value> {
 }
 
 #[allow(clippy::too_many_arguments, reason = "the explain envelope has fixed contract fields")]
+/// Returns the explain text result.
 fn explain_text(
 	mode: ExplainMode,
 	statement: &LogicalStatement,
@@ -494,6 +536,7 @@ fn explain_text(
 	Value::from(lines.join("\n"))
 }
 
+/// Returns the logical nodes result.
 fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 	let mut nodes = Vec::new();
 	if let Some((_, operation)) = live_planning::command(statement) {
@@ -588,6 +631,7 @@ fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 	nodes
 }
 
+/// Returns the physical nodes result.
 fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value> {
 	match plan {
 		PhysicalPlan::Select(select) => select_nodes(select, snapshot),
@@ -656,6 +700,7 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 	}
 }
 
+/// Returns the graph result nodes result.
 fn graph_result_nodes(plan: &PhysicalGraphResultPlan, snapshot: &PlannerSnapshot) -> Vec<Value> {
 	let mut root = node_object(
 		0,
@@ -694,6 +739,7 @@ fn graph_result_nodes(plan: &PhysicalGraphResultPlan, snapshot: &PlannerSnapshot
 	nodes
 }
 
+/// Returns the traversal nodes result.
 fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
 	plan.nodes
 		.iter()
@@ -825,11 +871,12 @@ fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
 		.collect()
 }
 
+/// Returns the traversal operator name result.
 fn traversal_operator_name(operator: &TraversalOperator) -> &'static str {
 	match operator {
-		TraversalOperator::Source(TraversalSourceOperator::ValueSource) => "ValueSource",
-		TraversalOperator::Source(TraversalSourceOperator::MatchSource) => "MatchSource",
-		TraversalOperator::Source(TraversalSourceOperator::SelectSource) => "SelectSource",
+		TraversalOperator::Source(TraversalSourceOperator::Value) => "ValueSource",
+		TraversalOperator::Source(TraversalSourceOperator::Match) => "MatchSource",
+		TraversalOperator::Source(TraversalSourceOperator::Select) => "SelectSource",
 		TraversalOperator::Project => "Project",
 		TraversalOperator::Step(kind) => traversal_step_name(*kind),
 		TraversalOperator::Tensor {
@@ -844,6 +891,7 @@ fn traversal_operator_name(operator: &TraversalOperator) -> &'static str {
 	}
 }
 
+/// Returns the traversal step name result.
 fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
 	match kind {
 		TraverseStepKind::Vertices => "Vertices",
@@ -928,6 +976,7 @@ fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
 	}
 }
 
+/// Matches operator name.
 fn match_operator_name(operator: &MatchOperator) -> &'static str {
 	match operator {
 		MatchOperator::MatchSeed => "MatchSeed",
@@ -975,6 +1024,7 @@ fn match_operator_name(operator: &MatchOperator) -> &'static str {
 	}
 }
 
+/// Projects match operator.
 fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 	match operator {
 		MatchOperator::FixedExpand {
@@ -1184,12 +1234,13 @@ fn project_tensor(node: &mut Object, projection: &crate::gql::optimizer::TensorP
 	}
 }
 
+/// Returns the select nodes result.
 fn select_nodes(plan: &PhysicalSelectPlan, snapshot: &PlannerSnapshot) -> Vec<Value> {
 	let mut nodes = Vec::new();
 	for source in &plan.sources {
 		let mut node = node_object(
 			source.node_id,
-			&source_operator_name(&source.operator),
+			source_operator_name(&source.operator),
 			Some(source.cardinality),
 			Some(source.cost),
 		);
@@ -1273,6 +1324,7 @@ fn select_nodes(plan: &PhysicalSelectPlan, snapshot: &PlannerSnapshot) -> Vec<Va
 	nodes
 }
 
+/// Returns the node object result.
 fn node_object(
 	id: u32,
 	operator: &str,
@@ -1292,6 +1344,7 @@ fn node_object(
 	node
 }
 
+/// Returns the planner index result.
 fn planner_index(
 	snapshot: &PlannerSnapshot,
 	index: crate::datastore::IndexId,
@@ -1303,6 +1356,7 @@ fn planner_index(
 		.find(|candidate| candidate.id == index)
 }
 
+/// Returns the statistics object result.
 fn statistics_object(snapshot: &PlannerSnapshot) -> Object {
 	let mut object = Object::new();
 	object.insert("revision", snapshot.base_statistics.revision);
@@ -1329,6 +1383,7 @@ fn statistics_object(snapshot: &PlannerSnapshot) -> Object {
 	object
 }
 
+/// Returns the ordering projection result.
 fn ordering_projection(
 	statement: &LogicalStatement,
 	plan: &PhysicalPlan,
@@ -1395,6 +1450,7 @@ fn ordering_projection(
 	(required, provided)
 }
 
+/// Pushes node.
 fn push_node(
 	nodes: &mut Vec<Value>,
 	id: u32,
@@ -1405,6 +1461,7 @@ fn push_node(
 	nodes.push(Value::Object(node_object(id, operator, estimate, cost)));
 }
 
+/// Returns the cardinality object result.
 fn cardinality_object(value: Cardinality) -> Object {
 	let mut object = Object::new();
 	object.insert("lower", value.lower);
@@ -1413,6 +1470,7 @@ fn cardinality_object(value: Cardinality) -> Object {
 	object
 }
 
+/// Returns the cost object result.
 fn cost_object(value: PlanCost) -> Object {
 	let mut object = Object::new();
 	object.insert("startup", value.startup);
@@ -1426,6 +1484,7 @@ fn cost_object(value: PlanCost) -> Object {
 	object
 }
 
+/// Returns the observation object result.
 fn observation_object(value: &AnalyzeObservation) -> Object {
 	let mut object = Object::new();
 	object.insert("actual_rows", value.actual_rows);
@@ -1499,6 +1558,7 @@ fn observation_object(value: &AnalyzeObservation) -> Object {
 	object
 }
 
+/// Returns the plan warnings result.
 fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 	let warnings = match plan {
 		PhysicalPlan::Select(plan) => &plan.warnings,
@@ -1540,6 +1600,7 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 	values
 }
 
+/// Returns the plan rules result.
 fn plan_rules(plan: &PhysicalPlan) -> Vec<Value> {
 	let PhysicalPlan::Select(plan) = plan else {
 		return Vec::new();
@@ -1547,6 +1608,7 @@ fn plan_rules(plan: &PhysicalPlan) -> Vec<Value> {
 	plan.rules.iter().map(|rule| Value::from(format!("{rule:?}"))).collect()
 }
 
+/// Returns the source operator name result.
 fn source_operator_name(operator: &SourceOperator) -> &'static str {
 	match operator {
 		SourceOperator::PointGet(_) => "PointGet",
@@ -1582,6 +1644,7 @@ fn source_operator_name(operator: &SourceOperator) -> &'static str {
 	}
 }
 
+/// Returns the source name result.
 fn source_name(source: &LogicalSelectSourceKind) -> &'static str {
 	match source {
 		LogicalSelectSourceKind::Empty {
@@ -1600,6 +1663,7 @@ fn source_name(source: &LogicalSelectSourceKind) -> &'static str {
 	}
 }
 
+/// Returns the statement name result.
 fn statement_name(statement: &LogicalStatement) -> &'static str {
 	if let Some((_, operation)) = live_planning::command(statement) {
 		return operation.name();
@@ -1623,9 +1687,7 @@ fn statement_name(statement: &LogicalStatement) -> &'static str {
 			LogicalGraphDmlStatement::Detach {
 				..
 			} => "DETACH",
-			LogicalGraphDmlStatement::Relate {
-				..
-			} => "RELATE",
+			LogicalGraphDmlStatement::Relate(_) => "RELATE",
 		},
 		LogicalStatement::Schema(statement) => match statement.statement_kind() {
 			QueryStatementKind::ShowChanges => "SHOW CHANGES",
@@ -1640,6 +1702,7 @@ fn statement_name(statement: &LogicalStatement) -> &'static str {
 	}
 }
 
+/// Returns the mode name result.
 fn mode_name(mode: ExplainMode) -> &'static str {
 	match mode {
 		ExplainMode::Logical => "LOGICAL",
@@ -1648,6 +1711,7 @@ fn mode_name(mode: ExplainMode) -> &'static str {
 	}
 }
 
+/// Returns whether the logical mutates condition holds.
 fn logical_mutates(statement: &LogicalStatement) -> bool {
 	if let Some((schema, _)) = live_planning::command(statement) {
 		return !schema.is_read();
@@ -1667,6 +1731,7 @@ fn logical_mutates(statement: &LogicalStatement) -> bool {
 	)
 }
 
+/// Returns the result rows result.
 fn result_rows(value: &Value) -> u64 {
 	match value {
 		Value::Array(values) => u64::try_from(values.len()).unwrap_or(u64::MAX),
@@ -1675,6 +1740,7 @@ fn result_rows(value: &Value) -> u64 {
 	}
 }
 
+/// Returns the compact node result.
 fn compact_node(value: &Value) -> String {
 	let Value::Object(object) = value else {
 		return value_text(value);
@@ -1734,6 +1800,7 @@ fn compact_node(value: &Value) -> String {
 	text
 }
 
+/// Returns the value text result.
 fn value_text(value: &Value) -> String {
 	match value {
 		Value::String(value) => value.to_string(),
@@ -1742,6 +1809,7 @@ fn value_text(value: &Value) -> String {
 	}
 }
 
+/// Returns the nanos result.
 fn nanos(value: std::time::Duration) -> u64 {
 	u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
 }

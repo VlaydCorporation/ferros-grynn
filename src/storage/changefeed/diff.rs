@@ -70,13 +70,17 @@ pub(super) fn decode(
 }
 
 #[cfg(test)]
+/// Regression tests for diff behavior.
 mod tests {
 	use super::{HEADER_BYTES, decode, encode};
-	use crate::{gql_status::FerrosGrynnResult, storage::changefeed::CodecBudget};
+	use crate::storage::changefeed::CodecBudget;
 
+	/// Verifies changefeed inverse diff roundtrips insert delete restore and
+	/// common edges.
 	#[test]
-	fn changefeed_inverse_diff_roundtrips_insert_delete_restore_and_common_edges()
-	-> FerrosGrynnResult<()> {
+	fn changefeed_inverse_diff_roundtrips_insert_delete_restore_and_common_edges() {
+		use crate::test_assertions::AssertResult as _;
+
 		for (before, after) in [
 			(b"".as_slice(), b"".as_slice()),
 			(b"abc", b""),
@@ -86,41 +90,49 @@ mod tests {
 			(b"aaa", b"aa"),
 			(b"abc", b"xyz"),
 		] {
-			let mut budget = CodecBudget::new(1024, 0)?;
-			let diff = encode(before, after, &mut budget)?;
-			assert_eq!(decode(&diff, after, &mut budget)?, before);
+			let mut budget = CodecBudget::new(1024, 0).assert_ok();
+			let diff = encode(before, after, &mut budget).assert_ok();
+			assert_eq!(decode(&diff, after, &mut budget).assert_ok(), before);
 		}
-		let mut budget = CodecBudget::new(1024, 0)?;
-		let diff = encode(b"abc", b"abc", &mut budget)?;
+		let mut budget = CodecBudget::new(1024, 0).assert_ok();
+		let diff = encode(b"abc", b"abc", &mut budget).assert_ok();
 		let mut golden = Vec::new();
 		for field in [3_u64, 3, 0, 0] {
 			golden.extend_from_slice(&field.to_le_bytes());
 		}
 		assert_eq!(diff, golden);
 		assert_eq!(diff.len(), HEADER_BYTES);
-		Ok(())
 	}
 
+	/// Verifies changefeed inverse diff rejects overlap overflow truncation and
+	/// budget.
 	#[test]
-	fn changefeed_inverse_diff_rejects_overlap_overflow_truncation_and_budget()
-	-> FerrosGrynnResult<()> {
-		let mut budget = CodecBudget::new(1024, 0)?;
-		let valid = encode(b"prefix-old-suffix", b"prefix-new-suffix", &mut budget)?;
+	fn changefeed_inverse_diff_rejects_overlap_overflow_truncation_and_budget() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut budget = CodecBudget::new(1024, 0).assert_ok();
+		let valid = encode(b"prefix-old-suffix", b"prefix-new-suffix", &mut budget).assert_ok();
 		for count in 0..valid.len() {
 			assert!(
-				decode(&valid[..count], b"prefix-new-suffix", &mut CodecBudget::new(1024, 0)?)
-					.is_err()
+				decode(
+					&valid[..count],
+					b"prefix-new-suffix",
+					&mut CodecBudget::new(1024, 0).assert_ok()
+				)
+				.is_err()
 			);
 		}
 		for field in 0..4 {
 			let mut invalid = valid.clone();
 			invalid[field * 8..field * 8 + 8].copy_from_slice(&u64::MAX.to_le_bytes());
 			assert!(
-				decode(&invalid, b"prefix-new-suffix", &mut CodecBudget::new(1024, 0)?).is_err()
+				decode(&invalid, b"prefix-new-suffix", &mut CodecBudget::new(1024, 0).assert_ok())
+					.is_err()
 			);
 		}
-		assert!(decode(&valid, b"prefix-new-suffix", &mut CodecBudget::new(1, 0)?).is_err());
-		assert!(encode(b"a", b"b", &mut CodecBudget::new(1, 0)?).is_err());
-		Ok(())
+		assert!(
+			decode(&valid, b"prefix-new-suffix", &mut CodecBudget::new(1, 0).assert_ok()).is_err()
+		);
+		assert!(encode(b"a", b"b", &mut CodecBudget::new(1, 0).assert_ok()).is_err());
 	}
 }

@@ -229,6 +229,7 @@ impl Datastore {
 }
 
 #[cfg(test)]
+/// Regression tests for live observation behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -242,45 +243,55 @@ mod tests {
 	/// Publication, first issue and ACK are counted once while gauges track
 	/// retained data.
 	#[test]
-	fn live_statistics_publication_delivery_ack_and_disabled_paths() -> FerrosGrynnResult<()> {
+	fn live_statistics_publication_delivery_ack_and_disabled_paths() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
-		assert_eq!(store.live_statistics()?, LiveStatistics::default());
+		assert_eq!(store.live_statistics().assert_ok(), LiveStatistics::default());
 		let mut setup = store.begin();
-		let class =
-			setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-				"value",
-				Type::Int,
-			)])?)?;
-		let key = setup.intern_property("value")?;
-		setup.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::new("P1D".parse()?)?,
-		)?;
-		let record: RecordId = "item:a".parse()?;
-		setup.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))?;
-		setup.commit()?;
-		assert_eq!(store.live_statistics()?.query_evaluation_attempts, 0);
-		assert_eq!(store.live_statistics()?.published_events, 0);
+		let class = setup
+			.define_class(
+				ClassSchema::new("item", AtomKind::Node, [ClassField::new("value", Type::Int)])
+					.assert_ok(),
+			)
+			.assert_ok();
+		let key = setup.intern_property("value").assert_ok();
+		setup
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::new("P1D".parse().assert_ok()).assert_ok(),
+			)
+			.assert_ok();
+		let record: RecordId = "item:a".parse().assert_ok();
+		setup
+			.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))
+			.assert_ok();
+		setup.commit().assert_ok();
+		assert_eq!(store.live_statistics().assert_ok().query_evaluation_attempts, 0);
+		assert_eq!(store.live_statistics().assert_ok().published_events, 0);
 		let mut binding = store.begin();
-		binding.define_live_binding(
-			crate::live::LiveExpr::Literal(1.into()),
-			crate::values::Object::new(),
-			crate::live::LiveBindingOptions::default(),
-		)?;
-		binding.commit()?;
-		assert!(store.live_statistics()?.binding_evaluation_attempts > 0);
-		assert_eq!(store.live_statistics()?.registered_bindings, 1);
+		binding
+			.define_live_binding(
+				crate::live::LiveExpr::Literal(1.into()),
+				crate::values::Object::new(),
+				crate::live::LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		binding.commit().assert_ok();
+		assert!(store.live_statistics().assert_ok().binding_evaluation_attempts > 0);
+		assert_eq!(store.live_statistics().assert_ok().registered_bindings, 1);
 		let mut handle = store
-			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-		let initial = store.live_statistics()?;
+			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
+		let initial = store.live_statistics().assert_ok();
 		assert!(initial.query_evaluation_attempts > 0);
 		assert_eq!(initial.acknowledgements, 0, "registration is not ACK");
 		assert_eq!(initial.consumers, 1);
-		assert!(matches!(handle.next()?, LiveNext::Idle));
+		assert!(matches!(handle.next().assert_ok(), LiveNext::Idle));
 		let mut update = store.begin();
-		update.set_base_property(&record, key, 2.into())?;
-		update.commit()?;
-		let published = store.live_statistics()?;
+		update.set_base_property(&record, key, 2.into()).assert_ok();
+		update.commit().assert_ok();
+		let published = store.live_statistics().assert_ok();
 		assert_eq!(published.published_batches - initial.published_batches, 1);
 		assert_eq!(published.published_events - initial.published_events, 1);
 		assert_eq!(published.durable_history_groups - initial.durable_history_groups, 1);
@@ -288,71 +299,95 @@ mod tests {
 		assert!(published.admitted_evaluation_work > initial.admitted_evaluation_work);
 		assert!(published.peak_admitted_scratch_bytes > 0);
 		assert_eq!(published.queued_events, 1);
-		let LiveNext::Delivery(delivery) = handle.next()? else {
-			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-				"statistics delivery missing",
-			));
+		let LiveNext::Delivery(delivery) = handle.next().assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+						"statistics delivery missing",
+					));
+				test_result.assert_ok();
+			};
 		};
-		let issued = store.live_statistics()?;
+		let issued = store.live_statistics().assert_ok();
 		assert_eq!(issued.deliveries_issued - initial.deliveries_issued, 1);
-		let LiveNext::Delivery(repeated) = handle.next()? else {
-			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-				"statistics repeated delivery missing",
-			));
+		let LiveNext::Delivery(repeated) = handle.next().assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+						"statistics repeated delivery missing",
+					));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(delivery.token(), repeated.token());
-		assert_eq!(store.live_statistics()?.deliveries_issued, issued.deliveries_issued);
-		handle.ack(delivery.token())?;
-		let confirmed = store.live_statistics()?;
+		assert_eq!(store.live_statistics().assert_ok().deliveries_issued, issued.deliveries_issued);
+		handle.ack(delivery.token()).assert_ok();
+		let confirmed = store.live_statistics().assert_ok();
 		assert_eq!(confirmed.acknowledgements, initial.acknowledgements + 1);
 		assert_eq!(confirmed.queued_events, 0);
-		handle.ack(delivery.token())?;
-		assert_eq!(store.live_statistics()?.acknowledgements, confirmed.acknowledgements);
-		handle.close()?;
-		let closed = store.live_statistics()?;
+		handle.ack(delivery.token()).assert_ok();
+		assert_eq!(
+			store.live_statistics().assert_ok().acknowledgements,
+			confirmed.acknowledgements
+		);
+		handle.close().assert_ok();
+		let closed = store.live_statistics().assert_ok();
 		assert_eq!(closed.consumers, 0);
 		assert_eq!(closed.retained_consumer_bytes, 0);
 		assert_eq!(closed.published_batches, published.published_batches);
-		Ok(())
 	}
 
 	/// Import suppression preserves live batches while durable controls remain
 	/// explicit.
 	#[test]
-	fn live_statistics_import_capture_and_suppression() -> FerrosGrynnResult<()> {
-		use crate::datastore::{ImportChangefeedMode, ImportOptions};
+	fn live_statistics_import_capture_and_suppression() {
+		use crate::{
+			datastore::{ImportChangefeedMode, ImportOptions},
+			test_assertions::AssertResult as _,
+		};
 		for mode in [ImportChangefeedMode::On, ImportChangefeedMode::Off] {
 			let store = Datastore::in_memory();
 			let mut setup = store.begin();
-			let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [
-				ClassField::new("value", Type::Int),
-			])?)?;
-			let key = setup.intern_property("value")?;
-			let record: RecordId = "item:a".parse()?;
-			setup.create_atom(record.clone(), PropertyMap::from_iter([(key, 1.into())]))?;
-			setup.configure_changefeed(
-				ChangefeedSource::Class(class),
-				ChangefeedConfig::new("P1D".parse()?)?,
-			)?;
-			setup.commit()?;
+			let class = setup
+				.define_class(
+					ClassSchema::new("item", AtomKind::Node, [ClassField::new("value", Type::Int)])
+						.assert_ok(),
+				)
+				.assert_ok();
+			let key = setup.intern_property("value").assert_ok();
+			let record: RecordId = "item:a".parse().assert_ok();
+			setup
+				.create_atom(record.clone(), PropertyMap::from_iter([(key, 1.into())]))
+				.assert_ok();
+			setup
+				.configure_changefeed(
+					ChangefeedSource::Class(class),
+					ChangefeedConfig::new("P1D".parse().assert_ok()).assert_ok(),
+				)
+				.assert_ok();
+			setup.commit().assert_ok();
 			let mut handle = store
-				.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-			let before = store.live_statistics()?;
-			store.import(
-				ImportOptions {
-					changefeed: mode,
-					segment_size: 1,
-					..ImportOptions::default()
-				},
-				|session| {
-					for value in [2_i64, 3] {
-						session
-							.apply_item(|tx| tx.set_base_property(&record, key, value.into()))?;
-					}
-					Ok(())
-				},
-			)?;
-			let after = store.live_statistics()?;
+				.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+				.assert_ok();
+			let before = store.live_statistics().assert_ok();
+			store
+				.import(
+					ImportOptions {
+						changefeed: mode,
+						segment_size: 1,
+						..ImportOptions::default()
+					},
+					|session| {
+						for value in [2_i64, 3] {
+							session.apply_item(|tx| {
+								tx.set_base_property(&record, key, value.into())
+							})?;
+						}
+						Ok(())
+					},
+				)
+				.assert_ok();
+			let after = store.live_statistics().assert_ok();
 			assert_eq!(after.published_batches - before.published_batches, 1);
 			assert_eq!(after.published_events - before.published_events, 1);
 			assert_eq!(after.durable_history_groups - before.durable_history_groups, 1);
@@ -361,43 +396,51 @@ mod tests {
 				u64::from(mode == ImportChangefeedMode::Off)
 			);
 			assert!(
-				matches!(handle.next()?, LiveNext::Delivery(delivery) if matches!(delivery.payload(), LivePayload::Batch(_)))
+				matches!(handle.next().assert_ok(), LiveNext::Delivery(delivery) if matches!(delivery.payload(), LivePayload::Batch(_)))
 			);
-			handle.close()?;
+			handle.close().assert_ok();
 		}
-		Ok(())
 	}
 
 	/// Fresh historical registration counts all newly durable envelopes,
 	/// without recounting ACKs.
 	#[test]
-	fn live_statistics_registration_backfill_and_replay() -> FerrosGrynnResult<()> {
+	fn live_statistics_registration_backfill_and_replay() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class =
-			setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-				"value",
-				Type::Int,
-			)])?)?;
-		let key = setup.intern_property("value")?;
-		setup.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::new("P1D".parse()?)?,
-		)?;
-		let floor = setup.commit()?.versionstamp();
-		let record: RecordId = "item:a".parse()?;
+		let class = setup
+			.define_class(
+				ClassSchema::new("item", AtomKind::Node, [ClassField::new("value", Type::Int)])
+					.assert_ok(),
+			)
+			.assert_ok();
+		let key = setup.intern_property("value").assert_ok();
+		setup
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::new("P1D".parse().assert_ok()).assert_ok(),
+			)
+			.assert_ok();
+		let floor = setup.commit().assert_ok().versionstamp();
+		let record: RecordId = "item:a".parse().assert_ok();
 		let mut create = store.begin();
-		create.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))?;
-		create.commit()?;
+		create
+			.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))
+			.assert_ok();
+		create.commit().assert_ok();
 		let mut update = store.begin();
-		update.set_base_property(&record, key, 2.into())?;
-		update.commit()?;
-		let before = store.live_statistics()?;
-		let mut handle = store.subscribe_live(
-			LiveQuery::new(LiveSource::Class(class)),
-			LiveOptions::default().with_since(crate::live::LiveSince::Versionstamp(floor)),
-		)?;
-		let published = store.live_statistics()?;
+		update.set_base_property(&record, key, 2.into()).assert_ok();
+		update.commit().assert_ok();
+		let before = store.live_statistics().assert_ok();
+		let mut handle = store
+			.subscribe_live(
+				LiveQuery::new(LiveSource::Class(class)),
+				LiveOptions::default().with_since(crate::live::LiveSince::Versionstamp(floor)),
+			)
+			.assert_ok();
+		let published = store.live_statistics().assert_ok();
 		assert_eq!(published.durable_history_groups - before.durable_history_groups, 2);
 		assert!(published.durable_history_bytes > before.durable_history_bytes);
 		assert_eq!(
@@ -405,32 +448,39 @@ mod tests {
 			"no current-stamp delta was synthesized"
 		);
 		for _ in 0..2 {
-			let LiveNext::Delivery(delivery) = handle.next()? else {
-				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-					"statistics historical delivery missing",
-				));
+			let LiveNext::Delivery(delivery) = handle.next().assert_ok() else {
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+							"statistics historical delivery missing",
+						));
+					test_result.assert_ok();
+				};
 			};
-			let first = store.live_statistics()?;
+			let first = store.live_statistics().assert_ok();
 			assert!(first.admitted_replay_work > 0);
-			let LiveNext::Delivery(repeated) = handle.next()? else {
-				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-					"statistics repeated history missing",
-				));
+			let LiveNext::Delivery(repeated) = handle.next().assert_ok() else {
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+							"statistics repeated history missing",
+						));
+					test_result.assert_ok();
+				};
 			};
 			assert_eq!(repeated.token(), delivery.token());
-			let again = store.live_statistics()?;
+			let again = store.live_statistics().assert_ok();
 			assert_eq!(again.admitted_replay_work, first.admitted_replay_work);
 			assert_eq!(again.deliveries_issued, first.deliveries_issued);
-			handle.ack(delivery.token())?;
+			handle.ack(delivery.token()).assert_ok();
 		}
-		assert!(matches!(handle.next()?, LiveNext::Idle));
-		let after = store.live_statistics()?;
+		assert!(matches!(handle.next().assert_ok(), LiveNext::Idle));
+		let after = store.live_statistics().assert_ok();
 		assert_eq!(
 			after.durable_history_groups, published.durable_history_groups,
 			"ACK did not republish old envelopes"
 		);
 		assert_eq!(after.history_page_reads, 0, "RAM history has no physical page requests");
-		handle.close()?;
-		Ok(())
+		handle.close().assert_ok();
 	}
 }

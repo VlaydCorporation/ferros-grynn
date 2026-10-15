@@ -1,6 +1,10 @@
 //! Exact ownership/packing and malformed reachability metadata checks.
 
 use super::*;
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{
 		ClassSchema,
@@ -15,24 +19,26 @@ use crate::{
 	values::{PropertyMap, RecordId},
 };
 
+/// Verifies snapshot artifacts pack complete definition maps and same
+/// condensation.
 #[test]
 fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = tx.define_graph("network", GraphKind::Graph).unwrap();
+	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = tx.define_graph("network", GraphKind::Graph).assert_ok();
 	let mut nodes = Vec::new();
 	for value in 0..7 {
-		let record = format!("person:{value}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
-		nodes.push(tx.attach_node(graph.id(), &record, None, None).unwrap());
+		let record = format!("person:{value}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		nodes.push(tx.attach_node(graph.id(), &record, None, None).assert_ok());
 	}
 	for (ordinal, (source, target)) in
 		[(0, 1), (1, 0), (1, 2), (2, 3), (4, 5)].into_iter().enumerate()
 	{
-		let record = format!("link:{ordinal}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		let record = format!("link:{ordinal}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 		tx.attach_edge(
 			graph.id(),
 			&record,
@@ -41,7 +47,7 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 			None,
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
 	for (ordinal, algorithm) in [
 		ReachabilityAlgorithm::Grail(2),
@@ -61,15 +67,15 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 				},
 				Some(8 << 20),
 			)
-			.unwrap()
+			.assert_ok()
 			.with_edge_labels(["keep"])
-			.unwrap(),
+			.assert_ok(),
 		)
-		.unwrap();
+		.assert_ok();
 	}
-	tx.commit().unwrap();
+	tx.commit().assert_ok();
 	let database = store.inner.current_root();
-	for index in database.schema.graph(graph.id()).unwrap().indexes() {
+	for index in database.schema.graph(graph.id()).assert_some().indexes() {
 		let artifact = ReachabilityArtifact::build(
 			&database,
 			index,
@@ -77,10 +83,10 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 			8 << 20,
 			&mut || Ok(()),
 		)
-		.unwrap()
-		.unwrap();
-		assert_eq!(artifact.descriptor, index.descriptor().unwrap());
-		assert_eq!(artifact.layout.header.identity.fingerprint, index.fingerprint().unwrap());
+		.assert_ok()
+		.assert_some();
+		assert_eq!(artifact.descriptor, index.descriptor().assert_ok());
+		assert_eq!(artifact.layout.header.identity.fingerprint, index.fingerprint().assert_ok());
 		assert_eq!(
 			artifact.node_components[nodes[0].slot() as usize],
 			artifact.node_components[nodes[1].slot() as usize]
@@ -104,14 +110,14 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 				},
 				&mut || Ok(()),
 			)
-			.unwrap();
+			.assert_ok();
 		assert_eq!(next_page, artifact.layout.page_count);
 		let decoded = crate::storage::ReachabilityLayout::decode_header(
 			&pages[0],
 			artifact.layout.header.identity,
 			pages.len() as u64,
 		)
-		.unwrap();
+		.assert_ok();
 		for section in decoded.sections {
 			section
 				.visit(
@@ -127,7 +133,7 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 						Ok(())
 					},
 				)
-				.unwrap();
+				.assert_ok();
 		}
 		let mut stored_index = index.clone();
 		stored_index.build_revision = artifact.layout.header.identity.revision;
@@ -141,16 +147,16 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 				},
 				&mut || Ok(()),
 			)
-			.unwrap();
+			.assert_ok();
 		let restored = ReachabilityArtifact::restore(
-			database.graph(graph.id()).unwrap(),
+			database.graph(graph.id()).assert_some(),
 			&stored_index,
 			decoded.clone(),
 			data.clone(),
 			8 << 20,
 			&mut || Ok(()),
 		)
-		.unwrap();
+		.assert_ok();
 		assert_eq!(restored.node_components, artifact.node_components);
 		assert_eq!(restored.condensation.forward, artifact.condensation.forward);
 		assert_eq!(restored.condensation.reverse, artifact.condensation.reverse);
@@ -159,8 +165,8 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 			for ordinal in 0..section.count {
 				let mut expected = vec![0; usize::from(section.width)];
 				let mut actual = expected.clone();
-				artifact.encode_element(section.kind, ordinal, &mut expected).unwrap();
-				restored.encode_element(section.kind, ordinal, &mut actual).unwrap();
+				artifact.encode_element(section.kind, ordinal, &mut expected).assert_ok();
+				restored.encode_element(section.kind, ordinal, &mut actual).assert_ok();
 				assert_eq!(actual, expected);
 			}
 		}
@@ -169,7 +175,7 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 			malformed[section][0] = 255;
 			assert!(
 				ReachabilityArtifact::restore(
-					database.graph(graph.id()).unwrap(),
+					database.graph(graph.id()).assert_some(),
 					&stored_index,
 					decoded.clone(),
 					malformed,
@@ -180,16 +186,25 @@ fn snapshot_artifacts_pack_complete_definition_maps_and_same_condensation() {
 				"section {section}"
 			);
 		}
+		let read_calls = std::cell::Cell::new(0);
 		assert!(
 			decoded
-				.load_sections(1, |_, _| panic!("allocation/read must be rejected"), &mut || Ok(()))
+				.load_sections(
+					1,
+					|_, _| {
+						read_calls.set(read_calls.get() + 1);
+						Ok(())
+					},
+					&mut || Ok(())
+				)
 				.is_err()
 		);
+		assert_eq!(read_calls.get(), 0, "allocation must be rejected before reads");
 		let mut collision = data;
 		collision[7][0] ^= 1;
 		assert!(
 			ReachabilityArtifact::restore(
-				database.graph(graph.id()).unwrap(),
+				database.graph(graph.id()).assert_some(),
 				&stored_index,
 				decoded,
 				collision,
@@ -266,8 +281,11 @@ fn image(layout: &ReachabilityLayout) -> FerrosGrynnResult<Vec<AlignedPage>> {
 	Ok(pages)
 }
 
+/// Verifies every algorithm round trips exact full page projection and payload.
 #[test]
-fn every_algorithm_round_trips_exact_full_page_projection_and_payload() -> FerrosGrynnResult<()> {
+fn every_algorithm_round_trips_exact_full_page_projection_and_payload() {
+	use crate::test_assertions::AssertResult as _;
+
 	for (algorithm, parameter, chains) in [
 		(ReachabilityTag::TreeCover, 0, 0),
 		(ReachabilityTag::Grail, 32, 0),
@@ -275,52 +293,57 @@ fn every_algorithm_round_trips_exact_full_page_projection_and_payload() -> Ferro
 		(ReachabilityTag::Bfl, 4096, 0),
 		(ReachabilityTag::ChainCover, 0, 7),
 	] {
-		let layout = ReachabilityLayout::new(header(algorithm, parameter, chains))?;
-		let pages = image(&layout)?;
+		let layout = ReachabilityLayout::new(header(algorithm, parameter, chains)).assert_ok();
+		let pages = image(&layout).assert_ok();
 		let decoded = ReachabilityLayout::decode_header(
 			&pages[0],
 			layout.header.identity,
 			pages.len() as u64,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(decoded, layout);
 		assert_eq!(&pages[0].as_bytes()[32..40], &[3, 0, 0, 0, 4, 0, 0, 0]);
 		assert_eq!(&pages[0].as_bytes()[196..200], &[algorithm as u8, 1, 1, 2]);
 		for section in decoded.sections {
 			let mut visited = 0;
-			section.visit(
-				decoded.page_count,
-				|at, page| {
-					page.as_bytes_mut().copy_from_slice(pages[at.get() as usize].as_bytes());
-					Ok(())
-				},
-				|ordinal, bytes| {
-					assert_eq!(ordinal, visited);
-					assert!(
-						bytes
-							.iter()
-							.all(|byte| *byte == (ordinal % 251) as u8 ^ section.kind as u8)
-					);
-					visited += 1;
-					Ok(())
-				},
-			)?;
+			section
+				.visit(
+					decoded.page_count,
+					|at, page| {
+						page.as_bytes_mut().copy_from_slice(pages[at.get() as usize].as_bytes());
+						Ok(())
+					},
+					|ordinal, bytes| {
+						assert_eq!(ordinal, visited);
+						assert!(
+							bytes
+								.iter()
+								.all(|byte| *byte == (ordinal % 251) as u8 ^ section.kind as u8)
+						);
+						visited += 1;
+						Ok(())
+					},
+				)
+				.assert_ok();
 			assert_eq!(visited, section.count);
 		}
 		let exact_bytes = layout.page_count * PAGE_SIZE as u64;
 		let mut capped = layout.header;
 		capped.max_bytes = exact_bytes;
-		ReachabilityLayout::new(capped)?;
+		ReachabilityLayout::new(capped).assert_ok();
 		capped.max_bytes -= 1;
 		assert!(ReachabilityLayout::new(capped).is_err());
 	}
-	Ok(())
 }
 
+/// Verifies header and sections reject adversarial roots tags ordinals and
+/// reserved bytes.
 #[test]
-fn header_and_sections_reject_adversarial_roots_tags_ordinals_and_reserved_bytes()
--> FerrosGrynnResult<()> {
-	let layout = ReachabilityLayout::new(header(ReachabilityTag::Grail, 2, 0))?;
-	let mut pages = image(&layout)?;
+fn header_and_sections_reject_adversarial_roots_tags_ordinals_and_reserved_bytes() {
+	use crate::test_assertions::AssertResult as _;
+
+	let layout = ReachabilityLayout::new(header(ReachabilityTag::Grail, 2, 0)).assert_ok();
+	let mut pages = image(&layout).assert_ok();
 	let original = pages[0].as_bytes().to_vec();
 	for (at, value) in [
 		(32, 0),
@@ -344,7 +367,7 @@ fn header_and_sections_reject_adversarial_roots_tags_ordinals_and_reserved_bytes
 	] {
 		pages[0].as_bytes_mut().copy_from_slice(&original);
 		pages[0].as_bytes_mut()[at] = value;
-		pages[0].seal()?;
+		pages[0].seal().assert_ok();
 		assert!(
 			ReachabilityLayout::decode_header(&pages[0], layout.header.identity, layout.page_count)
 				.is_err(),
@@ -362,7 +385,7 @@ fn header_and_sections_reject_adversarial_roots_tags_ordinals_and_reserved_bytes
 	for (offset, value) in [(32, 0), (40, 0), (42, 1), (44, 0), (48, 1), (56, 0), (60, 1)] {
 		pages[at].as_bytes_mut().copy_from_slice(&original);
 		pages[at].as_bytes_mut()[offset] = value;
-		pages[at].seal()?;
+		pages[at].seal().assert_ok();
 		assert!(
 			section
 				.visit(
@@ -378,23 +401,25 @@ fn header_and_sections_reject_adversarial_roots_tags_ordinals_and_reserved_bytes
 			"section byte {offset}"
 		);
 	}
-	Ok(())
 }
 
+/// Verifies empty projection and budget overflow cancellation fail before
+/// publication.
 #[test]
-fn empty_projection_and_budget_overflow_cancellation_fail_before_publication()
--> FerrosGrynnResult<()> {
+fn empty_projection_and_budget_overflow_cancellation_fail_before_publication() {
+	use crate::test_assertions::AssertResult as _;
+
 	let mut empty = header(ReachabilityTag::ChainCover, 0, 0);
 	empty.node_capacity = 0;
 	empty.edge_capacity = 0;
 	empty.components = 0;
 	empty.edges = 0;
 	empty.descriptor_bytes = 1;
-	let layout = ReachabilityLayout::new(empty)?;
+	let layout = ReachabilityLayout::new(empty).assert_ok();
 	assert_eq!(layout.page_count, 3);
 	assert!(layout.sections[..3].iter().all(|section| section.root == PageNo::NULL));
 	assert_eq!(layout.sections[3].count, 1);
-	image(&layout)?;
+	image(&layout).assert_ok();
 	let mut writes = 0;
 	assert!(
 		layout
@@ -427,5 +452,4 @@ fn empty_projection_and_budget_overflow_cancellation_fail_before_publication()
 			.is_err()
 	);
 	assert_eq!(writes, 0);
-	Ok(())
 }

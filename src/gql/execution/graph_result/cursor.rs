@@ -67,7 +67,7 @@ pub(super) fn capture<Read: QueryRead>(
 		slots: slots.to_vec(),
 		source: source.to_owned(),
 		template: fingerprint::cursor_fingerprints(template, source),
-		account,
+		_account: account,
 	});
 	runtime.lock().attach_graph_context(token, context)
 }

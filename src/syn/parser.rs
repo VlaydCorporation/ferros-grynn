@@ -33,6 +33,7 @@ use crate::gql_status::{
 	TextSpan,
 };
 
+/// Parses the current state.
 pub(super) fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Program> {
 	if source.len() > u32::MAX as usize {
 		return Err(FerrosGrynnError::query_text_too_large(u64::from(u32::MAX))
@@ -45,16 +46,22 @@ pub(super) fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult
 		tokens: TokenBuffer::new(tokens),
 		in_import: false,
 	};
+	// Reblessive drives recursive parsing without using the native call stack
+	// for every level.
 	let mut stack = Stack::new();
 	stack.enter(|stk| parser.program(stk)).finish()
 }
 
+/// Token buffer state.
 pub(in crate::syn) struct TokenBuffer<const LOOKAHEAD: usize> {
+	/// Tokens associated with this token buffer.
 	tokens: Vec<Token>,
+	/// Cursor associated with this token buffer.
 	cursor: usize,
 }
 
 impl<const LOOKAHEAD: usize> TokenBuffer<LOOKAHEAD> {
+	/// Creates a new `TokenBuffer<LOOKAHEAD>` value.
 	const fn new(tokens: Vec<Token>) -> Self {
 		Self {
 			tokens,
@@ -62,12 +69,14 @@ impl<const LOOKAHEAD: usize> TokenBuffer<LOOKAHEAD> {
 		}
 	}
 
+	/// Borrows a lookahead token, clamping positions beyond input to EOF.
 	pub(in crate::syn) fn peek(&self, offset: usize) -> &Token {
 		debug_assert!(offset < LOOKAHEAD);
 		let index = self.cursor.saturating_add(offset).min(self.tokens.len() - 1);
 		&self.tokens[index]
 	}
 
+	/// Returns the current token and advances unless it is the end of input.
 	pub(in crate::syn) fn next(&mut self) -> Token {
 		let token = self.peek(0).clone();
 		if !matches!(token.kind, TokenKind::Eof) {
@@ -77,14 +86,20 @@ impl<const LOOKAHEAD: usize> TokenBuffer<LOOKAHEAD> {
 	}
 }
 
+/// Parser state.
 pub(in crate::syn) struct Parser<'a> {
+	/// Source associated with this parser.
 	pub(in crate::syn) source: &'a str,
+	/// Settings associated with this parser.
 	pub(in crate::syn) settings: ParserSettings,
+	/// Tokens associated with this parser.
 	pub(in crate::syn) tokens: TokenBuffer<4>,
+	/// In import associated with this parser.
 	pub(in crate::syn) in_import: bool,
 }
 
 impl Parser<'_> {
+	/// Parses the program syntax.
 	pub(in crate::syn) async fn program(
 		&mut self,
 		context: &mut Stk,
@@ -123,12 +138,48 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the statement syntax.
 	pub(in crate::syn) async fn statement(
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
-		let mut kind = if self.consume_keyword(keywords::EXPLAIN).is_some() {
+		let mut kind = if let Some(kind) = self.query_statement_kind(context).await? {
+			kind
+		} else if let Some(kind) = self.control_statement_kind(context).await? {
+			kind
+		} else if let Some(kind) = self.catalog_statement_kind(context).await? {
+			kind
+		} else if let Some(kind) = self.mutation_statement_kind(context).await? {
+			kind
+		} else if let Some(kind) = self.graph_statement_kind(context).await? {
+			kind
+		} else if let Some(feature) = self.unsupported_statement() {
+			return Err(self.unsupported(feature, start));
+		} else {
+			StatementKind::Expression(
+				context.run(|context| self.expression(context, 0, 1, 0)).await?,
+			)
+		};
+		let timeout = self.statement_timeout(&mut kind)?;
+		let end = self.previous_span();
+		Ok(Statement {
+			kind,
+			span: cover(start, end),
+			timeout,
+		})
+	}
+
+	/// Recognizes query or EXPLAIN statements, consuming nothing when none
+	/// matches.
+	///
+	/// # Errors
+	/// Returns the existing parsing error from the first recognized statement.
+	async fn query_statement_kind(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Option<StatementKind>> {
+		let kind = if self.consume_keyword(keywords::EXPLAIN).is_some() {
 			StatementKind::Explain(context.run(|context| self.explain_statement(context)).await?)
 		} else if self.consume_keyword(keywords::RETURN).is_some() {
 			if self.consume_keyword(keywords::GRAPH).is_some() {
@@ -138,7 +189,22 @@ impl Parser<'_> {
 			}
 		} else if self.consume_keyword(keywords::SELECT).is_some() {
 			StatementKind::Select(context.run(|context| self.select_statement(context)).await?)
-		} else if self.consume_keyword(keywords::BEGIN).is_some() {
+		} else {
+			return Ok(None);
+		};
+		Ok(Some(kind))
+	}
+
+	/// Recognizes transaction and control-flow statements, consuming nothing
+	/// when none matches.
+	///
+	/// # Errors
+	/// Returns the existing parsing error from the first recognized statement.
+	async fn control_statement_kind(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Option<StatementKind>> {
+		let kind = if self.consume_keyword(keywords::BEGIN).is_some() {
 			if self.consume_keyword(keywords::IMPORT).is_some() {
 				StatementKind::Import(context.run(|context| self.import_statement(context)).await?)
 			} else {
@@ -164,7 +230,22 @@ impl Parser<'_> {
 			StatementKind::Throw(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else if self.consume_keyword(keywords::SLEEP).is_some() {
 			StatementKind::Sleep(self.timeout_value()?)
-		} else if self.consume_keyword(keywords::ASSERT).is_some() {
+		} else {
+			return Ok(None);
+		};
+		Ok(Some(kind))
+	}
+
+	/// Recognizes catalog, maintenance and consumer commands, consuming nothing
+	/// when none matches.
+	///
+	/// # Errors
+	/// Returns the existing parsing error from the first recognized statement.
+	async fn catalog_statement_kind(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Option<StatementKind>> {
+		let kind = if self.consume_keyword(keywords::ASSERT).is_some() {
 			StatementKind::AssertInvariants(self.assert_invariants_statement()?)
 		} else if self.consume_keyword(keywords::ANALYZE).is_some() {
 			StatementKind::Maintenance(self.analyze_statement()?)
@@ -181,7 +262,22 @@ impl Parser<'_> {
 			)
 		} else if self.consume_keyword(keywords::DEFINE).is_some() {
 			context.run(|context| self.definition_statement(context)).await?
-		} else if self.consume_keyword(keywords::CREATE).is_some() {
+		} else {
+			return Ok(None);
+		};
+		Ok(Some(kind))
+	}
+
+	/// Recognizes mutation and schema-alteration commands, consuming nothing
+	/// when none matches.
+	///
+	/// # Errors
+	/// Returns the existing parsing error from the first recognized statement.
+	async fn mutation_statement_kind(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Option<StatementKind>> {
+		let kind = if self.consume_keyword(keywords::CREATE).is_some() {
 			StatementKind::Create(context.run(|context| self.create_statement(context)).await?)
 		} else if self.consume_keyword(keywords::ATTACH).is_some() {
 			StatementKind::Attach(context.run(|context| self.attach_statement(context)).await?)
@@ -215,7 +311,22 @@ impl Parser<'_> {
 			} else {
 				StatementKind::Alter(context.run(|context| self.alter_statement(context)).await?)
 			}
-		} else if self.consume_keyword(keywords::INFO).is_some() {
+		} else {
+			return Ok(None);
+		};
+		Ok(Some(kind))
+	}
+
+	/// Recognizes inspection, binding and graph-query statements, consuming
+	/// nothing when none matches.
+	///
+	/// # Errors
+	/// Returns the existing parsing error from the first recognized statement.
+	async fn graph_statement_kind(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Option<StatementKind>> {
+		let kind = if self.consume_keyword(keywords::INFO).is_some() {
 			StatementKind::Info(self.info_statement()?)
 		} else if self.consume_keyword(keywords::SHOW).is_some() {
 			StatementKind::ShowChanges(
@@ -230,20 +341,10 @@ impl Parser<'_> {
 			StatementKind::Match(context.run(|context| self.match_statement(context, false)).await?)
 		} else if self.consume_keyword(keywords::TRAVERSE).is_some() {
 			StatementKind::Traverse(context.run(|context| self.traverse_statement(context)).await?)
-		} else if let Some(feature) = self.unsupported_statement() {
-			return Err(self.unsupported(feature, start));
 		} else {
-			StatementKind::Expression(
-				context.run(|context| self.expression(context, 0, 1, 0)).await?,
-			)
+			return Ok(None);
 		};
-		let timeout = self.statement_timeout(&mut kind)?;
-		let end = self.previous_span();
-		Ok(Statement {
-			kind,
-			span: cover(start, end),
-			timeout,
-		})
+		Ok(Some(kind))
 	}
 
 	/// Resolves embedded and trailing timeout clauses after the statement body.
@@ -294,6 +395,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the timeout value syntax.
 	pub(in crate::syn) fn timeout_value(&mut self) -> FerrosGrynnResult<TimeoutValue> {
 		let token = self.tokens.next();
 		match token.kind {
@@ -333,6 +435,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the expression syntax.
 	pub(in crate::syn) async fn expression(
 		&mut self,
 		context: &mut Stk,
@@ -441,6 +544,7 @@ impl Parser<'_> {
 		Ok(left)
 	}
 
+	/// Parses the knn expression syntax.
 	async fn knn_expression(
 		&mut self,
 		context: &mut Stk,
@@ -479,6 +583,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the knn distance syntax.
 	async fn knn_distance(
 		&mut self,
 		context: &mut Stk,
@@ -511,6 +616,7 @@ impl Parser<'_> {
 		Ok(KnnDistance::Custom(Box::new(distance)))
 	}
 
+	/// Parses the prefix syntax.
 	pub(in crate::syn) async fn prefix(
 		&mut self,
 		context: &mut Stk,
@@ -520,25 +626,7 @@ impl Parser<'_> {
 		let token = self.tokens.next();
 		match token.kind {
 			TokenKind::Symbol(Symbol::Range) => {
-				let inclusive_end = self.consume_symbol(Symbol::Equal).is_some();
-				let end = if self.expression_terminator() {
-					None
-				} else {
-					Some(Box::new(
-						context
-							.run(|context| self.expression(context, 13, depth + 1, object_depth))
-							.await?,
-					))
-				};
-				let end_span = end.as_ref().map_or(token.span, |end| end.span);
-				Ok(Expr {
-					kind: ExprKind::Range {
-						start: None,
-						end,
-						inclusive_end,
-					},
-					span: cover(token.span, end_span),
-				})
+				self.prefix_range(context, token.span, depth, object_depth).await
 			}
 			TokenKind::Number(value) => Ok(Expr {
 				kind: ExprKind::Literal(Literal::Number(value)),
@@ -744,6 +832,39 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses an open-start range after its leading range token was consumed.
+	///
+	/// # Errors
+	/// Returns the existing expression or depth-limit error for the range end.
+	async fn prefix_range(
+		&mut self,
+		context: &mut Stk,
+		span: TextSpan,
+		depth: u32,
+		object_depth: u32,
+	) -> FerrosGrynnResult<Expr> {
+		let inclusive_end = self.consume_symbol(Symbol::Equal).is_some();
+		let end = if self.expression_terminator() {
+			None
+		} else {
+			Some(Box::new(
+				context
+					.run(|context| self.expression(context, 13, depth + 1, object_depth))
+					.await?,
+			))
+		};
+		let end_span = end.as_ref().map_or(span, |end| end.span);
+		Ok(Expr {
+			kind: ExprKind::Range {
+				start: None,
+				end,
+				inclusive_end,
+			},
+			span: cover(span, end_span),
+		})
+	}
+
+	/// Parses the closure syntax.
 	async fn closure(
 		&mut self,
 		context: &mut Stk,
@@ -801,6 +922,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the unary syntax.
 	pub(in crate::syn) async fn unary(
 		&mut self,
 		context: &mut Stk,
@@ -820,6 +942,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the array syntax.
 	pub(in crate::syn) async fn array(
 		&mut self,
 		context: &mut Stk,
@@ -847,6 +970,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the object syntax.
 	pub(in crate::syn) async fn object(
 		&mut self,
 		context: &mut Stk,
@@ -882,6 +1006,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the postfix syntax.
 	pub(in crate::syn) async fn postfix(
 		&mut self,
 		context: &mut Stk,
@@ -1028,6 +1153,7 @@ impl Parser<'_> {
 		}))
 	}
 
+	/// Parses the binary operator syntax.
 	pub(in crate::syn) fn binary_operator(&self) -> Option<(BinaryOperator, u8, u8, usize)> {
 		let symbol = match self.current().kind {
 			TokenKind::Symbol(symbol) => Some(symbol),
@@ -1082,6 +1208,7 @@ impl Parser<'_> {
 		Some(operator)
 	}
 
+	/// Parses the fulltext operator syntax.
 	fn fulltext_operator(
 		&self,
 		operator: &str,
@@ -1107,6 +1234,7 @@ impl Parser<'_> {
 		Ok(FulltextOperator::Slot(slot))
 	}
 
+	/// Parses the identifier syntax.
 	pub(in crate::syn) fn identifier(&mut self) -> FerrosGrynnResult<Identifier> {
 		let token = self.tokens.next();
 		match token.kind {
@@ -1127,6 +1255,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the parameter syntax.
 	pub(in crate::syn) fn parameter(&mut self) -> FerrosGrynnResult<Identifier> {
 		let token = self.tokens.next();
 		match token.kind {
@@ -1139,6 +1268,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the type name syntax.
 	pub(in crate::syn) fn type_name(&mut self) -> FerrosGrynnResult<TypeName> {
 		let identifier = self.identifier()?;
 		let mut value = identifier.value;
@@ -1155,6 +1285,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Closes parser<' >.
 	pub(in crate::syn) fn close(
 		&mut self,
 		symbol: Symbol,
@@ -1173,6 +1304,7 @@ impl Parser<'_> {
 		Err(error)
 	}
 
+	/// Parses the expect symbol syntax.
 	pub(in crate::syn) fn expect_symbol(
 		&mut self,
 		symbol: Symbol,
@@ -1181,6 +1313,7 @@ impl Parser<'_> {
 		self.consume_symbol(symbol).ok_or_else(|| self.syntax(message, self.current().span))
 	}
 
+	/// Parses the expect keyword syntax.
 	pub(in crate::syn) fn expect_keyword(
 		&mut self,
 		keyword: &str,
@@ -1189,22 +1322,27 @@ impl Parser<'_> {
 		self.consume_keyword(keyword).ok_or_else(|| self.syntax(message, self.current().span))
 	}
 
+	/// Parses the consume symbol syntax.
 	pub(in crate::syn) fn consume_symbol(&mut self, symbol: Symbol) -> Option<Token> {
 		self.at_symbol(symbol).then(|| self.tokens.next())
 	}
 
+	/// Parses the consume keyword syntax.
 	pub(in crate::syn) fn consume_keyword(&mut self, keyword: &str) -> Option<Token> {
 		self.at_keyword(keyword).then(|| self.tokens.next())
 	}
 
+	/// Returns whether the at symbol condition holds.
 	pub(in crate::syn) fn at_symbol(&self, symbol: Symbol) -> bool {
 		matches!(self.current().kind, TokenKind::Symbol(current) if current == symbol)
 	}
 
+	/// Returns whether the at keyword condition holds.
 	pub(in crate::syn) fn at_keyword(&self, keyword: &str) -> bool {
 		self.peek_keyword(0, keyword)
 	}
 
+	/// Returns whether the peek keyword condition holds.
 	pub(in crate::syn) fn peek_keyword(&self, offset: usize, keyword: &str) -> bool {
 		matches!(
 			&self.tokens.peek(offset).kind,
@@ -1212,10 +1350,12 @@ impl Parser<'_> {
 		)
 	}
 
+	/// Returns whether the at eof condition holds.
 	pub(in crate::syn) fn at_eof(&self) -> bool {
 		matches!(self.current().kind, TokenKind::Eof)
 	}
 
+	/// Returns whether the expression terminator condition holds.
 	fn expression_terminator(&self) -> bool {
 		self.at_eof()
 			|| matches!(
@@ -1235,14 +1375,17 @@ impl Parser<'_> {
 			|| self.at_keyword(keywords::WHEN)
 	}
 
+	/// Parses the current syntax.
 	pub(in crate::syn) fn current(&self) -> &Token {
 		self.tokens.peek(0)
 	}
 
+	/// Parses the previous span syntax.
 	pub(in crate::syn) fn previous_span(&self) -> TextSpan {
 		self.tokens.tokens[self.tokens.cursor.saturating_sub(1)].span
 	}
 
+	/// Ensures depth.
 	pub(in crate::syn) fn ensure_depth(&self, depth: u32) -> FerrosGrynnResult<()> {
 		if depth > self.settings.max_query_parsing_depth {
 			Err(self.nesting_error(self.settings.max_query_parsing_depth, self.current().span))
@@ -1251,10 +1394,12 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the unsupported statement syntax.
 	pub(in crate::syn) fn unsupported_statement(&self) -> Option<&'static str> {
 		keywords::UNSUPPORTED_STATEMENTS.iter().copied().find(|keyword| self.at_keyword(keyword))
 	}
 
+	/// Parses the syntax syntax.
 	pub(in crate::syn) fn syntax(&self, message: &str, span: TextSpan) -> FerrosGrynnError {
 		let error =
 			FerrosGrynnError::query_parse_error(message).with_phase(ExecutionPhase::Parsing);
@@ -1262,6 +1407,7 @@ impl Parser<'_> {
 			.map_or(error.clone(), |location| error.with_location(location))
 	}
 
+	/// Parses the unsupported syntax.
 	pub(in crate::syn) fn unsupported(&self, feature: &str, span: TextSpan) -> FerrosGrynnError {
 		let error = FerrosGrynnError::query_feature_not_supported(feature)
 			.with_phase(ExecutionPhase::Parsing);
@@ -1269,6 +1415,7 @@ impl Parser<'_> {
 			.map_or(error.clone(), |location| error.with_location(location))
 	}
 
+	/// Parses the nesting error syntax.
 	pub(in crate::syn) fn nesting_error(
 		&self,
 		maximum_depth: u32,
@@ -1282,8 +1429,11 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
+/// Regression tests for parser behavior.
 mod tests {
 	use super::parse;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		gql_status::{FerrosGrynnError, FerrosGrynnResult},
 		syn::{
@@ -1305,54 +1455,66 @@ mod tests {
 		},
 	};
 
+	/// Reads the linear pattern syntax from the parser input.
 	fn linear_pattern(pattern: &MatchPattern) -> &MatchLinearPattern {
-		let MatchPattern::Linear(pattern) = pattern else {
-			panic!("expected a linear MATCH pattern");
-		};
-		pattern
+		match pattern {
+			MatchPattern::Linear(pattern) => Some(pattern),
+			_ => None,
+		}
+		.assert_some_with("expected a linear MATCH pattern")
 	}
 
+	/// Verifies respects precedence and record adjacency.
 	#[test]
 	fn respects_precedence_and_record_adjacency() {
 		let program = parse(
 			"RETURN 1 + 2 * 3; SELECT VALUE name FROM person:alice",
 			ParserSettings::default(),
 		)
-		.expect("valid query");
-		let StatementKind::Return(statement) = &program.statements[0].kind else {
-			panic!("expected RETURN");
-		};
-		let ExprKind::Binary {
-			op: BinaryOperator::Add,
-			right,
-			..
-		} = &statement.value.kind
-		else {
-			panic!("expected addition");
-		};
+		.assert_ok_with("valid query");
+		let statement = match &program.statements[0].kind {
+			StatementKind::Return(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected RETURN");
+		let right = match &statement.value.kind {
+			ExprKind::Binary {
+				op: BinaryOperator::Add,
+				right,
+				..
+			} => Some(right),
+			_ => None,
+		}
+		.assert_some_with("expected addition");
 		assert!(matches!(right.kind, ExprKind::Binary {
 			op: BinaryOperator::Multiply,
 			..
 		}));
-		let StatementKind::Select(statement) = &program.statements[1].kind else {
-			panic!("expected SELECT");
-		};
+		let statement = match &program.statements[1].kind {
+			StatementKind::Select(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected SELECT");
 		assert!(matches!(
 			statement.source.kind,
 			crate::syn::SelectSourceKind::Atoms(crate::syn::SelectTarget::Record { .. })
 		));
 	}
 
+	/// Verifies changefeed clauses and history reads have checked statement
+	/// boundaries.
 	#[test]
-	fn changefeed_clauses_and_history_reads_have_checked_statement_boundaries()
-	-> FerrosGrynnResult<()> {
+	fn changefeed_clauses_and_history_reads_have_checked_statement_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
 		let program = parse(
 			"DEFINE CLASS item TYPE NODE CHANGEFEED 7d INCLUDE ORIGINAL FULL; DEFINE GRAPH scope \
 			 TYPE GRAPH CHANGEFEED 1h FULL; ALTER CLASS item DROP CHANGEFEED; ALTER GRAPH scope \
 			 CHANGEFEED 2d; SHOW CHANGES FOR GRAPH $graph SINCE $cursor FULL LIMIT 2; INFO FOR \
 			 CHANGEFEED $id;",
 			ParserSettings::default(),
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(program.statements.len(), 6);
 		assert!(matches!(program.statements[4].kind, StatementKind::ShowChanges(_)));
 		for query in [
@@ -1367,28 +1529,29 @@ mod tests {
 		] {
 			assert!(parse(query, ParserSettings::default()).is_err(), "{query}");
 		}
-		Ok(())
 	}
 
+	/// Verifies reports unsupported statement and unclosed delimiter.
 	#[test]
 	fn reports_unsupported_statement_and_unclosed_delimiter() {
 		let transaction = parse("BEGIN; COMMIT;", ParserSettings::default())
-			.expect("transaction statements belong to the executable stage-11 profile");
+			.assert_ok_with("transaction statements belong to the executable stage-11 profile");
 		assert!(matches!(transaction.statements[0].kind, StatementKind::Begin(_)));
 		assert!(matches!(transaction.statements[1].kind, StatementKind::Commit(_)));
 		let relate = parse(
 			"RELATE (person:alice)-[friendship:known LABEL Friend]->(person:bob) IN GRAPH social",
 			ParserSettings::default(),
 		)
-		.expect("RELATE has an exact edge identity contract");
+		.assert_ok_with("RELATE has an exact edge identity contract");
 		assert!(matches!(relate.statements[0].kind, StatementKind::Relate(_)));
 
 		let unclosed =
-			parse("RETURN [1, 2", ParserSettings::default()).expect_err("array is not closed");
+			parse("RETURN [1, 2", ParserSettings::default()).assert_err_with("array is not closed");
 		assert_eq!(unclosed.status().code().to_string(), "FG-42001");
 		assert_eq!(unclosed.status().diagnostic().related_locations().len(), 1);
 	}
 
+	/// Verifies parses transaction options and statement timeout.
 	#[test]
 	fn parses_transaction_options_and_statement_timeout() {
 		let program = parse(
@@ -1396,10 +1559,12 @@ mod tests {
 			 person TIMEOUT 25ms; COMMIT WITH VALIDATION;",
 			ParserSettings::default(),
 		)
-		.expect("stage-11 transaction syntax parses");
-		let StatementKind::Begin(begin) = &program.statements[0].kind else {
-			panic!("expected BEGIN");
-		};
+		.assert_ok_with("stage-11 transaction syntax parses");
+		let begin = match &program.statements[0].kind {
+			StatementKind::Begin(begin) => Some(begin),
+			_ => None,
+		}
+		.assert_some_with("expected BEGIN");
 		assert_eq!(begin.isolation, TransactionIsolationName::Snapshot);
 		assert!(begin.read_only);
 		assert_eq!(begin.execution_mode, ExecutionModeName::BestEffort);
@@ -1410,12 +1575,15 @@ mod tests {
 				..
 			}) if value.as_ref() == "25ms"
 		));
-		let StatementKind::Commit(commit) = &program.statements[2].kind else {
-			panic!("expected COMMIT");
-		};
+		let commit = match &program.statements[2].kind {
+			StatementKind::Commit(commit) => Some(commit),
+			_ => None,
+		}
+		.assert_some_with("expected COMMIT");
 		assert!(commit.full_validation);
 	}
 
+	/// Verifies parses control flow and assertion surface.
 	#[test]
 	fn parses_control_flow_and_assertion_surface() {
 		let program = parse(
@@ -1424,18 +1592,21 @@ mod tests {
 			 REPORT 3;",
 			ParserSettings::default(),
 		)
-		.expect("stage-12 control syntax parses");
+		.assert_ok_with("stage-12 control syntax parses");
 		assert!(matches!(program.statements[0].kind, StatementKind::If(_)));
 		assert!(matches!(program.statements[1].kind, StatementKind::For(_)));
 		assert!(matches!(program.statements[2].kind, StatementKind::While(_)));
 		assert!(matches!(program.statements[3].kind, StatementKind::Try(_)));
-		let StatementKind::AssertInvariants(assertion) = &program.statements[4].kind else {
-			panic!("expected ASSERT INVARIANTS");
-		};
+		let assertion = match &program.statements[4].kind {
+			StatementKind::AssertInvariants(assertion) => Some(assertion),
+			_ => None,
+		}
+		.assert_some_with("expected ASSERT INVARIANTS");
 		assert_eq!(assertion.graph.as_ref().map(|graph| graph.value.as_ref()), Some("social"));
 		assert_eq!(assertion.report, Some(3));
 	}
 
+	/// Verifies parses core dml and rejects unbounded upsert.
 	#[test]
 	fn parses_core_dml_and_rejects_unbounded_upsert() {
 		let program = parse(
@@ -1444,13 +1615,13 @@ mod tests {
 			 BEFORE EXPECT EXISTS",
 			ParserSettings::default(),
 		)
-		.expect("core DML parses");
+		.assert_ok_with("core DML parses");
 		assert!(matches!(program.statements[0].kind, StatementKind::Create(_)));
 		assert!(matches!(program.statements[1].kind, StatementKind::Update(_)));
 		assert!(matches!(program.statements[2].kind, StatementKind::Delete(_)));
 
 		let error = parse("UPSERT person SET active = true", ParserSettings::default())
-			.expect_err("UPSERT must be bounded by ID or WHERE");
+			.assert_err_with("UPSERT must be bounded by ID or WHERE");
 		assert_eq!(error.status().code().to_string(), "FG-42001");
 		for source in [
 			"CREATE person:alice MERGE {name: 'Alice'}",
@@ -1458,29 +1629,45 @@ mod tests {
 			"DELETE person:alice RETURN VALUE name",
 		] {
 			let error = parse(source, ParserSettings::default())
-				.expect_err("statement-specific DML grammar must be enforced");
+				.assert_err_with("statement-specific DML grammar must be enforced");
 			assert_eq!(error.status().code().to_string(), "FG-42001", "{source}");
 		}
 	}
 
+	/// Verifies parses keep levelpath only on graph local mutations.
 	#[test]
-	fn parses_keep_levelpath_only_on_graph_local_mutations() -> FerrosGrynnResult<()> {
+	fn parses_keep_levelpath_only_on_graph_local_mutations() {
+		use crate::test_assertions::AssertResult as _;
+
 		let program = parse(
 			"ATTACH person:alice TO GRAPH social KEEP LEVELPATH; UPDATE person:alice IN GRAPH \
 			 social KEEP LEVELPATH; RELATE (person:alice)-[friendship:known AS \
 			 edge]->(person:bob) IN GRAPH social KEEP LEVELPATH FOR [edge]",
 			ParserSettings::default(),
-		)?;
+		)
+		.assert_ok();
 		let StatementKind::Attach(attach) = &program.statements[0].kind else {
-			return Err(FerrosGrynnError::invalid_argument("expected ATTACH"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("expected ATTACH"));
+				test_result.assert_ok();
+			};
 		};
 		assert!(attach.keep_levelpath.is_some());
 		let StatementKind::Update(update) = &program.statements[1].kind else {
-			return Err(FerrosGrynnError::invalid_argument("expected UPDATE"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("expected UPDATE"));
+				test_result.assert_ok();
+			};
 		};
 		assert!(update.keep_levelpath.is_some());
 		let StatementKind::Relate(relate) = &program.statements[2].kind else {
-			return Err(FerrosGrynnError::invalid_argument("expected RELATE"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("expected RELATE"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(
 			relate
@@ -1501,9 +1688,9 @@ mod tests {
 			parse("TRAVERSE FROM $values |> tv::fold() KEEP LEVELPATH", ParserSettings::default())
 				.is_err()
 		);
-		Ok(())
 	}
 
+	/// Verifies parses atomic import as the only top level statement.
 	#[test]
 	fn parses_atomic_import_as_the_only_top_level_statement() {
 		let program = parse(
@@ -1513,17 +1700,21 @@ mod tests {
 			 (person:alice)-[friendship:known]->(person:bob); END IMPORT WITH VALIDATION;",
 			ParserSettings::default(),
 		)
-		.expect("stage-10 import syntax parses");
-		let StatementKind::Import(statement) = &program.statements[0].kind else {
-			panic!("expected BEGIN IMPORT");
-		};
+		.assert_ok_with("stage-10 import syntax parses");
+		let statement = match &program.statements[0].kind {
+			StatementKind::Import(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected BEGIN IMPORT");
 		assert_eq!(program.statements.len(), 1);
 		assert_eq!(statement.statements.len(), 3);
 		assert_eq!(statement.options.len(), 7);
 		assert!(statement.full_validation);
-		let StatementKind::Attach(attach) = &statement.statements[0].kind else {
-			panic!("expected ATTACH");
-		};
+		let attach = match &statement.statements[0].kind {
+			StatementKind::Attach(attach) => Some(attach),
+			_ => None,
+		}
+		.assert_some_with("expected ATTACH");
 		assert!(attach.graph.is_none());
 
 		for source in [
@@ -1536,23 +1727,26 @@ mod tests {
 		}
 	}
 
+	/// Verifies enforces query depth.
 	#[test]
 	fn enforces_query_depth() {
 		let settings = ParserSettings {
 			max_query_parsing_depth: 2,
 			..ParserSettings::default()
 		};
-		let error = parse("RETURN (((1)))", settings).expect_err("depth is limited");
+		let error = parse("RETURN (((1)))", settings).assert_err_with("depth is limited");
 		assert_eq!(error.status().code().to_string(), "FG-54F06");
 	}
 
+	/// Verifies distinguishes spaced record separator.
 	#[test]
 	fn distinguishes_spaced_record_separator() {
 		let error = parse("SELECT VALUE name FROM person :alice", ParserSettings::default())
-			.expect_err("a spaced colon is not a record ID");
+			.assert_err_with("a spaced colon is not a record ID");
 		assert_eq!(error.status().code().to_string(), "FG-42001");
 	}
 
+	/// Verifies parses standard atomwalk chains and ranges.
 	#[test]
 	fn parses_standard_atomwalk_chains_and_ranges() {
 		let standard = parse(
@@ -1562,10 +1756,12 @@ mod tests {
 			 RETURN a, path",
 			ParserSettings::default(),
 		)
-		.expect("valid StandardPath MATCH");
-		let StatementKind::Match(statement) = &standard.statements[0].kind else {
-			panic!("expected MATCH");
-		};
+		.assert_ok_with("valid StandardPath MATCH");
+		let statement = match &standard.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
 		let patterns = statement.patterns.iter().map(linear_pattern).collect::<Vec<_>>();
 		assert_eq!(statement.patterns.len(), 5);
 		assert_eq!(patterns[0].steps.len(), 2);
@@ -1602,10 +1798,12 @@ mod tests {
 			 y)> IN GRAPH social RETURN v, e, w",
 			ParserSettings::default(),
 		)
-		.expect("valid AtomWalk MATCH");
-		let StatementKind::Match(statement) = &atom.statements[0].kind else {
-			panic!("expected MATCH ATOM");
-		};
+		.assert_ok_with("valid AtomWalk MATCH");
+		let statement = match &atom.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH ATOM");
 		assert!(statement.atom);
 		let pattern = linear_pattern(&statement.patterns[0]);
 		assert_eq!(pattern.steps.iter().map(|step| step.direction).collect::<Vec<_>>(), [
@@ -1616,14 +1814,17 @@ mod tests {
 		]);
 	}
 
+	/// Verifies parses open match range for maxdepth normalization.
 	#[test]
 	fn parses_open_match_range_for_maxdepth_normalization() {
 		let source = "MATCH (* AS a)-[E*1..]->(* AS b) IN GRAPH social RETURN b";
 		let program =
-			parse(source, ParserSettings::default()).expect("open path range is canonical");
-		let StatementKind::Match(statement) = &program.statements[0].kind else {
-			panic!("expected MATCH");
-		};
+			parse(source, ParserSettings::default()).assert_ok_with("open path range is canonical");
+		let statement = match &program.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
 		let pattern = linear_pattern(&statement.patterns[0]);
 		assert_eq!(
 			pattern.steps[0].edge.length.map(|length| (length.min, length.max)),
@@ -1631,15 +1832,19 @@ mod tests {
 		);
 	}
 
+	/// Verifies parses global match cost before predicates and preserves
+	/// unicode span.
 	#[test]
 	fn parses_global_match_cost_before_predicates_and_preserves_unicode_span() {
 		let source = "MATCH path = (person AS a)-[link*1..3 WEIGHTED SHORTEST]->(person AS b) IN \
 		              GRAPH routes WITH COST fn::`тариф` WHERE b.active RETURN path;";
-		let program = parse(source, ParserSettings::default()).unwrap();
-		let StatementKind::Match(statement) = &program.statements[0].kind else {
-			panic!("expected MATCH");
-		};
-		let function = statement.custom_cost.as_ref().unwrap();
+		let program = parse(source, ParserSettings::default()).assert_ok();
+		let statement = match &program.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
+		let function = statement.custom_cost.as_ref().assert_some();
 		assert_eq!(function.name.value.as_ref(), "тариф");
 		assert!(source.is_char_boundary(function.name.span.offset as usize));
 		assert!(
@@ -1664,15 +1869,18 @@ mod tests {
 		}
 	}
 
+	/// Verifies parses global traverse cost and unicode span.
 	#[test]
 	fn parses_global_traverse_cost_and_unicode_span() {
 		let source = "TRAVERSE ATOM FROM [person:a] IN GRAPH routes WITH COST fn::`тариф` |> \
 		              tv::weightedShortestPath(person:b);";
-		let program = parse(source, ParserSettings::default()).unwrap();
-		let StatementKind::Traverse(statement) = &program.statements[0].kind else {
-			panic!("expected TRAVERSE");
-		};
-		let function = statement.custom_cost.as_ref().unwrap();
+		let program = parse(source, ParserSettings::default()).assert_ok();
+		let statement = match &program.statements[0].kind {
+			StatementKind::Traverse(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected TRAVERSE");
+		let function = statement.custom_cost.as_ref().assert_some();
 		assert_eq!(function.name.value.as_ref(), "тариф");
 		assert_eq!(
 			&source[function.name.span.offset as usize
@@ -1689,6 +1897,7 @@ mod tests {
 		}
 	}
 
+	/// Verifies parses full match and graph first surface.
 	#[test]
 	fn parses_full_match_and_graph_first_surface() {
 		let standard = parse(
@@ -1698,13 +1907,15 @@ mod tests {
 			 BY person DESC NULLS FIRST",
 			ParserSettings::default(),
 		)
-		.expect("full StandardPath surface parses");
-		let StatementKind::Match(statement) = &standard.statements[0].kind else {
-			panic!("expected MATCH");
-		};
+		.assert_ok_with("full StandardPath surface parses");
+		let statement = match &standard.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
 		assert!(statement.optional);
-		assert!(statement.binding_distinct);
-		assert!(statement.projection_distinct);
+		assert!(statement.distinctness.bindings);
+		assert!(statement.distinctness.projection);
 		assert_eq!(statement.order.len(), 1);
 		assert!(matches!(statement.source.kind, ExprKind::Parameter(_)));
 
@@ -1713,30 +1924,36 @@ mod tests {
 			 [(document AS d)] IN GRAPH knowledge RETURN e, a, b, d",
 			ParserSettings::default(),
 		)
-		.expect("hyper endpoint assignments parse");
-		let StatementKind::Match(statement) = &hyper.statements[0].kind else {
-			panic!("expected HYPER MATCH");
-		};
+		.assert_ok_with("hyper endpoint assignments parse");
+		let statement = match &hyper.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected HYPER MATCH");
 		assert!(matches!(statement.patterns[0], MatchPattern::Hyper(_)));
 
 		let within = parse(
 			"MATCH (child AS c) WITHIN*[1..4] <(module AS m)> IN GRAPH knowledge RETURN c, m",
 			ParserSettings::default(),
 		)
-		.expect("transitive containment parses");
-		let StatementKind::Match(statement) = &within.statements[0].kind else {
-			panic!("expected WITHIN MATCH");
-		};
+		.assert_ok_with("transitive containment parses");
+		let statement = match &within.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected WITHIN MATCH");
 		assert!(matches!(statement.patterns[0], MatchPattern::Within(_)));
 
 		let returned = parse(
 			"MATCH (* AS a) IN GRAPH social RETURN GRAPH <DAG SIMPLE> { nodes: a, edges: [] }",
 			ParserSettings::default(),
 		)
-		.expect("terminal RETURN GRAPH parses");
-		let StatementKind::Match(statement) = &returned.statements[0].kind else {
-			panic!("expected MATCH");
-		};
+		.assert_ok_with("terminal RETURN GRAPH parses");
+		let statement = match &returned.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
 		assert!(statement.return_graph.is_some());
 
 		let built = parse(
@@ -1744,38 +1961,43 @@ mod tests {
 			 person) ROOT person:root LIMIT NODES 10 LIMIT EDGES 9",
 			ParserSettings::default(),
 		)
-		.expect("named BUILD GRAPH parses");
+		.assert_ok_with("named BUILD GRAPH parses");
 		assert!(matches!(built.statements[0].kind, StatementKind::BuildGraph(_)));
 		parse("BUILD GRAPH <GRAPH DAG> FROM []", ParserSettings::default())
-			.expect_err("one graph contract cannot contain two families");
+			.assert_err_with("one graph contract cannot contain two families");
 		parse("BUILD GRAPH <SIMPLE SIMPLE> FROM []", ParserSettings::default())
-			.expect_err("one graph contract cannot repeat a validator");
+			.assert_err_with("one graph contract cannot repeat a validator");
 
 		parse(
 			"MATCH CONSTRAINTS <TRAIL WALK> (* AS a)-[*]->(* AS b) IN GRAPH social RETURN b",
 			ParserSettings::default(),
 		)
-		.expect_err("one constraint scope cannot contain two path modes");
+		.assert_err_with("one constraint scope cannot contain two path modes");
 		parse(
 			"MATCH CONSTRAINTS <SHORTEST WEIGHTED SHORTEST> (* AS a)-[*]->(* AS b) IN GRAPH \
 			 social RETURN b",
 			ParserSettings::default(),
 		)
-		.expect_err("one constraint scope cannot contain two objectives");
+		.assert_err_with("one constraint scope cannot contain two objectives");
 	}
 
+	/// Verifies atomwalk path bounds share grammar and preserve unicode spans.
 	#[test]
 	fn atomwalk_path_bounds_share_grammar_and_preserve_unicode_spans() {
+		/// Unicode AtomWalk fixture used to check shared path grammar and UTF-8
+		/// byte spans.
 		const SOURCE: &str = "MATCH ATOM путь = <(person AS а)>~[link*0..3 TRAIL \
 		                      SHORTEST]~><[link AS е]> IN GRAPH routes RETURN путь;";
 		let bounded = parse(SOURCE, ParserSettings::default())
-			.expect("bounded AtomWalk uses the shared path grammar");
-		let StatementKind::Match(statement) = &bounded.statements[0].kind else {
-			panic!("expected MATCH");
-		};
+			.assert_ok_with("bounded AtomWalk uses the shared path grammar");
+		let statement = match &bounded.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
 		let step = &linear_pattern(&statement.patterns[0]).steps[0];
-		assert_eq!(step.edge.length.unwrap().min, 0);
-		assert_eq!(step.edge.length.unwrap().max, Some(3));
+		assert_eq!(step.edge.length.assert_some().min, 0);
+		assert_eq!(step.edge.length.assert_some().max, Some(3));
 		assert!(SOURCE.is_char_boundary(step.edge.span.offset as usize));
 		assert!(SOURCE.is_char_boundary((step.edge.span.offset + step.edge.span.len) as usize));
 		for query in [
@@ -1786,22 +2008,27 @@ mod tests {
 		}
 	}
 
+	/// Verifies rejects legacy match source and treats colon as record id.
 	#[test]
 	fn rejects_legacy_match_source_and_treats_colon_as_record_id() {
 		let program =
 			parse("MATCH (person:alice) IN GRAPH social RETURN person", ParserSettings::default())
-				.expect("adjacent colon is the normative exact RecordId selector");
-		let StatementKind::Match(statement) = &program.statements[0].kind else {
-			panic!("expected MATCH");
-		};
+				.assert_ok_with("adjacent colon is the normative exact RecordId selector");
+		let statement = match &program.statements[0].kind {
+			StatementKind::Match(statement) => Some(statement),
+			_ => None,
+		}
+		.assert_some_with("expected MATCH");
 		let pattern = linear_pattern(&statement.patterns[0]);
 		assert!(matches!(pattern.start.selector, MatchSelector::Record { .. }));
 		assert!(pattern.start.alias.is_none());
 
 		parse("MATCH (Person AS a) FROM social RETURN a", ParserSettings::default())
-			.expect_err("legacy FROM source syntax must not remain available");
+			.assert_err_with("legacy FROM source syntax must not remain available");
 	}
 
+	/// Verifies parses class schema statements and requires explicit index
+	/// scope.
 	#[test]
 	fn parses_class_schema_statements_and_requires_explicit_index_scope() {
 		let program = parse(
@@ -1813,7 +2040,7 @@ mod tests {
 			 REMOVE FIELD email ON CLASS user; REMOVE CLASS user; REMOVE GRAPH social",
 			ParserSettings::default(),
 		)
-		.expect("core schema syntax");
+		.assert_ok_with("core schema syntax");
 		assert_eq!(program.statements.len(), 14);
 		assert!(matches!(program.statements[0].kind, StatementKind::DefineGraph(_)));
 		assert!(matches!(program.statements[3].kind, StatementKind::DefineIndex(_)));
@@ -1830,26 +2057,32 @@ mod tests {
 			 CONCURRENTLY",
 			ParserSettings::default(),
 		)
-		.expect("specialized index definitions");
-		let StatementKind::DefineIndex(fulltext) = &specialized.statements[0].kind else {
-			panic!("expected Fulltext definition");
-		};
+		.assert_ok_with("specialized index definitions");
+		let fulltext = match &specialized.statements[0].kind {
+			StatementKind::DefineIndex(fulltext) => Some(fulltext),
+			_ => None,
+		}
+		.assert_some_with("expected Fulltext definition");
 		assert!(matches!(fulltext.definition, BasicIndexDefinition::Fulltext { .. }));
-		let StatementKind::DefineIndex(hnsw) = &specialized.statements[1].kind else {
-			panic!("expected HNSW definition");
-		};
+		let hnsw = match &specialized.statements[1].kind {
+			StatementKind::DefineIndex(hnsw) => Some(hnsw),
+			_ => None,
+		}
+		.assert_some_with("expected HNSW definition");
 		assert!(matches!(hnsw.definition, BasicIndexDefinition::Hnsw { .. }));
-		let StatementKind::DefineIndex(disk_ann) = &specialized.statements[2].kind else {
-			panic!("expected DiskANN definition");
-		};
+		let disk_ann = match &specialized.statements[2].kind {
+			StatementKind::DefineIndex(disk_ann) => Some(disk_ann),
+			_ => None,
+		}
+		.assert_some_with("expected DiskANN definition");
 		assert!(matches!(disk_ann.definition, BasicIndexDefinition::DiskAnn { .. }));
 		parse(
 			"DEFINE INDEX embedding ON CLASS user FIELDS vector HNSW SCOPE BASE",
 			ParserSettings::default(),
 		)
-		.expect_err("HNSW requires a dimension");
+		.assert_err_with("HNSW requires a dimension");
 		let alter_graph = parse("ALTER GRAPH social", ParserSettings::default())
-			.expect_err("ALTER GRAPH requires a capture action");
+			.assert_err_with("ALTER GRAPH requires a capture action");
 		assert_eq!(alter_graph.status().code().to_string(), "FG-42001");
 		assert!(parse("ALTER GRAPH social CHANGEFEED 7d FULL", ParserSettings::default()).is_ok());
 		assert!(parse("DEFINE TABLE user TYPE NODE", ParserSettings::default()).is_err());
@@ -1865,10 +2098,11 @@ mod tests {
 			 social",
 			ParserSettings::default(),
 		)
-		.expect("effective scope");
+		.assert_ok_with("effective scope");
 		assert!(matches!(effective.statements[0].kind, StatementKind::DefineIndex(_)));
 	}
 
+	/// Verifies parses analyzer schema statements and inline mapper.
 	#[test]
 	fn parses_analyzer_schema_statements_and_inline_mapper() {
 		let program = parse(
@@ -1878,7 +2112,7 @@ mod tests {
 			 ANALYZER english; REMOVE ANALYZER IF EXISTS english;",
 			ParserSettings::default(),
 		)
-		.expect("analyzer DDL parses");
+		.assert_ok_with("analyzer DDL parses");
 		assert!(matches!(program.statements[0].kind, StatementKind::DefineAnalyzer(_)));
 		assert!(matches!(program.statements[1].kind, StatementKind::Alter(_)));
 		assert!(matches!(program.statements[2].kind, StatementKind::Info(_)));
@@ -1888,14 +2122,15 @@ mod tests {
 			"DEFINE ANALYZER invalid FUNCTION fn::tokens TOKENIZERS blank;",
 			ParserSettings::default(),
 		)
-		.expect_err("FUNCTION and TOKENIZERS are mutually exclusive");
+		.assert_err_with("FUNCTION and TOKENIZERS are mutually exclusive");
 		parse(
 			"DEFINE ANALYZER invalid FILTERS mapper('dictionary.txt');",
 			ParserSettings::default(),
 		)
-		.expect("mapper type is rejected during semantic analysis");
+		.assert_ok_with("mapper type is rejected during semantic analysis");
 	}
 
+	/// Verifies parses fulltext and knn expression operators.
 	#[test]
 	fn parses_fulltext_and_knn_expression_operators() {
 		let program = parse(
@@ -1906,18 +2141,22 @@ mod tests {
 			 32 |> $query;",
 			ParserSettings::default(),
 		)
-		.expect("stage-22/23 search operators parse");
-		let StatementKind::Select(select) = &program.statements[0].kind else {
-			panic!("expected SELECT");
-		};
-		let ExprKind::Binary {
-			left,
-			op: BinaryOperator::And,
-			right,
-		} = &select.filter.as_ref().expect("WHERE expression").kind
-		else {
-			panic!("expected conjunction");
-		};
+		.assert_ok_with("stage-22/23 search operators parse");
+		let select = match &program.statements[0].kind {
+			StatementKind::Select(select) => Some(select),
+			_ => None,
+		}
+		.assert_some_with("expected SELECT");
+		let (left, right) = match &select.filter.as_ref().assert_some_with("WHERE expression").kind
+		{
+			ExprKind::Binary {
+				left,
+				op: BinaryOperator::And,
+				right,
+			} => Some((left, right)),
+			_ => None,
+		}
+		.assert_some_with("expected conjunction");
 		assert!(matches!(left.kind, ExprKind::Fulltext {
 			op: FulltextOperator::Slot(7),
 			..
@@ -1926,9 +2165,11 @@ mod tests {
 			search: Some(KnnSearchArgument::Distance(KnnDistance::Minkowski(_))),
 			..
 		}));
-		let StatementKind::Select(ef) = &program.statements[4].kind else {
-			panic!("expected EF SELECT");
-		};
+		let ef = match &program.statements[4].kind {
+			StatementKind::Select(ef) => Some(ef),
+			_ => None,
+		}
+		.assert_some_with("expected EF SELECT");
 		assert!(matches!(
 			ef.filter.as_ref().map(|filter| &filter.kind),
 			Some(ExprKind::Knn {
@@ -1937,9 +2178,10 @@ mod tests {
 			})
 		));
 		parse("SELECT title FROM document WHERE title @0@ 'rust';", ParserSettings::default())
-			.expect_err("Fulltext slot zero is reserved");
+			.assert_err_with("Fulltext slot zero is reserved");
 	}
 
+	/// Verifies parses graph content and property updates.
 	#[test]
 	fn parses_graph_content_and_property_updates() {
 		let program = parse(
@@ -1948,10 +2190,12 @@ mod tests {
 			 AFTER; UPDATE GRAPH sales UNSET properties.region RETURN DIFF",
 			ParserSettings::default(),
 		)
-		.expect("stage-13 graph property syntax");
-		let StatementKind::DefineGraph(definition) = &program.statements[0].kind else {
-			panic!("expected DEFINE GRAPH");
-		};
+		.assert_ok_with("stage-13 graph property syntax");
+		let definition = match &program.statements[0].kind {
+			StatementKind::DefineGraph(definition) => Some(definition),
+			_ => None,
+		}
+		.assert_some_with("expected DEFINE GRAPH");
 		assert!(definition.content.is_some());
 		assert!(matches!(program.statements[1].kind, StatementKind::UpdateGraph(_)));
 		assert!(matches!(program.statements[2].kind, StatementKind::UpdateGraph(_)));
@@ -1960,17 +2204,24 @@ mod tests {
 		);
 	}
 
+	/// Verifies duration explain normalizes timeout.
 	#[test]
-	fn duration_explain_normalizes_timeout() -> FerrosGrynnResult<()> {
+	fn duration_explain_normalizes_timeout() {
+		use crate::test_assertions::AssertResult as _;
+
 		for source in [
 			"EXPLAIN SELECT id FROM person TIMEOUT $limit;",
 			"EXPLAIN FULL CREATE person:planned TIMEOUT 1s;",
 			"EXPLAIN ANALYZE MATCH (* AS n) IN GRAPH social TIMEOUT $limit RETURN n;",
 		] {
-			let program = parse(source, ParserSettings::default())?;
+			let program = parse(source, ParserSettings::default()).assert_ok();
 			let statement = &program.statements[0];
 			let StatementKind::Explain(explain) = &statement.kind else {
-				return Err(FerrosGrynnError::invalid_argument("test EXPLAIN missing"));
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("test EXPLAIN missing"));
+					test_result.assert_ok();
+				};
 			};
 			assert!(statement.timeout.is_some(), "{source}");
 			assert!(explain.statement.timeout.is_none(), "{source}");
@@ -1982,9 +2233,9 @@ mod tests {
 		] {
 			assert!(parse(source, ParserSettings::default()).is_err(), "{source}");
 		}
-		Ok(())
 	}
 
+	/// Verifies parses optimizer hints and prefix explain only.
 	#[test]
 	fn parses_optimizer_hints_and_prefix_explain_only() {
 		let program = parse(
@@ -1993,12 +2244,14 @@ mod tests {
 			 EXPLAIN ANALYZE CREATE person:alice; SELECT id FROM person WITH NOINDEX;",
 			ParserSettings::default(),
 		)
-		.expect("stage-14 optimizer syntax parses");
+		.assert_ok_with("stage-14 optimizer syntax parses");
 		assert!(matches!(program.statements[0].kind, StatementKind::Explain(_)));
 		assert!(matches!(program.statements[1].kind, StatementKind::Explain(_)));
-		let StatementKind::Select(select) = &program.statements[2].kind else {
-			panic!("expected SELECT");
-		};
+		let select = match &program.statements[2].kind {
+			StatementKind::Select(select) => Some(select),
+			_ => None,
+		}
+		.assert_some_with("expected SELECT");
 		assert!(matches!(select.access, Some(crate::syn::SelectAccessHint::NoIndex(_))));
 		for source in [
 			"EXPLAIN EXPLAIN SELECT id FROM person;",

@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use super::{arena::GraphArena, builders::*};
+use super::{
+	arena::GraphArena,
+	builders::{OverflowBuilder, QualifiedOverflowBuilder, inline_refs},
+};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeEndpoint, EdgeTopology},
@@ -11,31 +14,48 @@ use crate::{
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
+/// Node adjacency state.
 pub(super) struct NodeAdjacency {
+	/// Outgoing associated with this node adjacency.
 	pub(super) outgoing: Vec<DiskAtomRef>,
+	/// Incoming associated with this node adjacency.
 	pub(super) incoming: Vec<DiskAtomRef>,
+	/// Undirected associated with this node adjacency.
 	pub(super) undirected: Vec<DiskAtomRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Encoded endpoint state.
 pub(super) struct EncodedEndpoint {
+	/// Graph slot associated with this encoded endpoint.
 	pub(super) graph_slot: u32,
+	/// Atom associated with this encoded endpoint.
 	pub(super) atom: DiskAtomRef,
 }
 
+/// Encoded topology state.
 pub(super) struct EncodedTopology {
+	/// Code associated with this encoded topology.
 	pub(super) code: EdgeTopologyCode,
+	/// Source associated with this encoded topology.
 	pub(super) source: Vec<EncodedEndpoint>,
+	/// Target associated with this encoded topology.
 	pub(super) target: Vec<EncodedEndpoint>,
 }
 
+/// Encoded hot side state.
 pub(super) struct EncodedHotSide {
+	/// Inline associated with this encoded hot side.
 	pub(super) inline: [Option<DiskAtomRef>; 2],
+	/// Local overflow associated with this encoded hot side.
 	pub(super) local_overflow: Option<PageNo>,
+	/// Graph slot associated with this encoded hot side.
 	pub(super) graph_slot: Option<u32>,
+	/// Graph overflow associated with this encoded hot side.
 	pub(super) graph_overflow: Option<PageNo>,
 }
 
+/// Encodes topology.
 pub(super) fn encode_topology(
 	topology: &EdgeTopology,
 	locals: &BTreeMap<AtomId, DiskAtomRef>,
@@ -95,6 +115,7 @@ pub(super) fn encode_topology(
 	}
 }
 
+/// Encodes endpoints.
 fn encode_endpoints(
 	endpoints: &[EdgeEndpoint],
 	locals: &BTreeMap<AtomId, DiskAtomRef>,
@@ -121,6 +142,7 @@ fn encode_endpoints(
 		.collect()
 }
 
+/// Encodes hot side.
 pub(super) fn encode_hot_side(
 	entries: &[EncodedEndpoint],
 	side: EndpointSide,
@@ -158,6 +180,7 @@ pub(super) fn encode_hot_side(
 	})
 }
 
+/// Records node adjacency.
 pub(super) fn record_node_adjacency(
 	topology: &EdgeTopology,
 	edge: DiskAtomRef,
@@ -219,6 +242,7 @@ pub(super) fn record_node_adjacency(
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

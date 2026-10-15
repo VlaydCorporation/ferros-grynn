@@ -3,6 +3,12 @@ name = "ferros-grynn-macros"
 authors = ["Vlayd Detect"]
 edition = "2024"
 version = "0.1.0"
+description = "Procedural macros for Ferros-Grynn values and typed statuses"
+license = "Apache-2.0"
+repository = "https://github.com/VlaydCorporation/ferros-grynn"
+readme = "../../README.md"
+keywords = ["database", "macros", "gql"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

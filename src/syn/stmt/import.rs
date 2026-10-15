@@ -10,24 +10,40 @@ use super::*;
 #[non_exhaustive]
 pub enum ImportGraphRef {
 	/// Case-sensitive graph name.
-	Name(Identifier),
+	Name(
+		/// Case-sensitive graph name.
+		Identifier,
+	),
 	/// Runtime parameter containing a graph reference or graph name.
-	Parameter(Identifier),
+	Parameter(
+		/// Runtime parameter containing a graph reference or graph name.
+		Identifier,
+	),
 }
 
 /// Canonical import option name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum ImportOptionName {
+	/// Select the index-maintenance policy for imported rows.
 	Indexes,
+	/// Select the constraint-validation policy.
 	Constraints,
+	/// Select how constraint violations are handled.
 	OnViolation,
+	/// Set the maximum accepted rejected-row count.
 	RejectLimit,
+	/// Set the target import segment size.
 	SegmentSize,
+	/// Select event handling during import.
 	Events,
+	/// Select changefeed handling during import.
 	Changefeed,
+	/// Set the target page fill factor.
 	FillFactor,
+	/// Set the temporary sorting-memory budget.
 	SortMem,
+	/// Set the import worker limit.
 	Parallelism,
 }
 
@@ -35,9 +51,17 @@ pub enum ImportOptionName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ImportOptionValue {
-	Word(Identifier),
+	/// Named policy value supplied to an import option.
+	Word(
+		/// Named policy value supplied to an import option.
+		Identifier,
+	),
+	/// Numeric value supplied to an import option.
 	Number {
+		/// Payload retained for the operation or its expected result.
 		value: Box<str>,
+		/// Source byte range used to report diagnostics for this syntax
+		/// element.
 		span: TextSpan,
 	},
 }
@@ -46,8 +70,11 @@ pub enum ImportOptionValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ImportOption {
+	/// Declared name used when resolving or displaying this element.
 	pub name: ImportOptionName,
+	/// Payload retained for the operation or its expected result.
 	pub value: ImportOptionValue,
+	/// Source byte range used to report diagnostics for this syntax element.
 	pub span: TextSpan,
 }
 
@@ -55,9 +82,13 @@ pub struct ImportOption {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ImportStatement {
+	/// Owned graph reference identifying the operation scope.
 	pub graph: Option<ImportGraphRef>,
+	/// Configuration or policy clauses supplied to the selected operation.
 	pub options: Vec<ImportOption>,
+	/// Statements retained in source execution order.
 	pub statements: Vec<Statement>,
+	/// Whether the import requests complete constraint validation.
 	pub full_validation: bool,
 }
 

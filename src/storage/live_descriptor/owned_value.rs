@@ -102,8 +102,9 @@ pub(super) fn decode(
 }
 
 #[cfg(test)]
+/// Regression tests for owned value behavior.
 mod tests {
-	use super::{super::*, decode, encode, *};
+	use super::{super::*, decode, encode};
 	use crate::graph::{
 		AtomKind,
 		AtomOccurrenceRef,
@@ -114,20 +115,25 @@ mod tests {
 		GraphStorageMode,
 	};
 
+	/// Verifies graph result qualified literals and frozen parameters
+	/// roundtrip.
 	#[test]
-	fn graph_result_qualified_literals_and_frozen_parameters_roundtrip() -> FerrosGrynnResult<()> {
+	fn graph_result_qualified_literals_and_frozen_parameters_roundtrip() {
+		use crate::test_assertions::AssertResult as _;
+
 		let graph = GraphRef::new(
-			GraphId::new(7).ok_or_else(|| invalid("fixture graph ID"))?,
+			GraphId::new(7).ok_or_else(|| invalid("fixture graph ID")).assert_ok(),
 			"source",
 			GraphKind::Graph,
 			GraphStorageMode::InMemory,
-		)?;
+		)
+		.assert_ok();
 		let value = Value::from(AtomOccurrenceRef::new(
-			AtomRef::new(AtomKind::Node, "person:one".parse()?),
+			AtomRef::new(AtomKind::Node, "person:one".parse().assert_ok()),
 			std::sync::Arc::new(graph),
 		));
 		let query = LiveQuery::new(LiveSource::Class(
-			ClassId::new(1).ok_or_else(|| invalid("fixture class ID"))?,
+			ClassId::new(1).ok_or_else(|| invalid("fixture class ID")).assert_ok(),
 		))
 		.with_parameters(Object::from_iter([("picked", Value::Array(vec![value.clone()].into()))]))
 		.with_graph_result(crate::live::LiveGraphResult::new(
@@ -135,22 +141,28 @@ mod tests {
 			LiveExpr::Array(Vec::new()),
 		));
 		let descriptor = LiveDescriptor::Query(query);
-		let bytes = super::super::encode(&descriptor, 1 << 20)?;
-		assert_eq!(super::super::decode(&bytes, 1 << 20)?, descriptor);
+		let bytes = super::super::encode(&descriptor, 1 << 20).assert_ok();
+		assert_eq!(super::super::decode(&bytes, 1 << 20).assert_ok(), descriptor);
 		let mut context = EncodeContext::default();
-		let mut budget = CodecBudget::new(1 << 20, 0)?;
+		let mut budget = CodecBudget::new(1 << 20, 0).assert_ok();
 		let LiveDescriptor::Query(query) = descriptor else {
-			return Err(invalid("fixture query"));
+			return {
+				let test_result: FerrosGrynnResult<()> = Err(invalid("fixture query"));
+				test_result.assert_ok();
+			};
 		};
-		let value = query.parameters().get("picked").ok_or_else(|| invalid("fixture parameter"))?;
-		let good = encode(value, &mut context, &mut budget, None)?;
+		let value = query
+			.parameters()
+			.get("picked")
+			.ok_or_else(|| invalid("fixture parameter"))
+			.assert_ok();
+		let good = encode(value, &mut context, &mut budget, None).assert_ok();
 		assert_eq!(&good[..8], b"FGLV\x01\x00\x00\x00");
 		for offset in [4, 6, 8] {
 			let mut bad = good.clone();
 			bad[offset] = 255;
-			assert!(decode(&bad, &context, &mut CodecBudget::new(1 << 20, 0)?).is_err());
+			assert!(decode(&bad, &context, &mut CodecBudget::new(1 << 20, 0).assert_ok()).is_err());
 		}
-		assert!(decode(&good, &context, &mut CodecBudget::new(1, 0)?).is_err());
-		Ok(())
+		assert!(decode(&good, &context, &mut CodecBudget::new(1, 0).assert_ok()).is_err());
 	}
 }

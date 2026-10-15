@@ -6,6 +6,8 @@ use ferros_grynn::{
 
 use crate::support::{execute, record};
 
+/// Verifies sdk catalog definitions are private until commit and keep stable
+/// identities.
 #[test]
 fn sdk_catalog_definitions_are_private_until_commit_and_keep_stable_identities() {
 	let db = database();
@@ -33,6 +35,8 @@ fn sdk_catalog_definitions_are_private_until_commit_and_keep_stable_identities()
 	});
 }
 
+/// Verifies schemafull rejects wrong types and unknown fields without partial
+/// data.
 #[test]
 fn schemafull_rejects_wrong_types_and_unknown_fields_without_partial_data() {
 	let db = database();
@@ -56,6 +60,7 @@ fn schemafull_rejects_wrong_types_and_unknown_fields_without_partial_data() {
 	});
 }
 
+/// Verifies dropping uncommitted schema leaves no class or graph.
 #[test]
 fn dropping_uncommitted_schema_leaves_no_class_or_graph() {
 	let db = database();

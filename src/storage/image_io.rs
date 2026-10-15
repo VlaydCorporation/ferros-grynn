@@ -15,6 +15,7 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 };
 
+/// Returns the stage pages result.
 pub(super) fn stage_pages(
 	tx: &mut TxHandle,
 	space: DataSpaceId,
@@ -30,6 +31,7 @@ pub(super) fn stage_pages(
 	Ok(())
 }
 
+/// Reads pages.
 pub(super) fn read_pages(
 	wal: &FrameWal,
 	registry: &FileRegistry,
@@ -210,6 +212,7 @@ pub(super) fn backfill_pages(
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

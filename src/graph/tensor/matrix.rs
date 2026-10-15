@@ -44,6 +44,8 @@ impl<T> CsrMatrix<T> {
 	{
 		let mut check = || Ok(());
 		let mut control = Control::new(limits, &mut check)?;
+		// Retained spare capacity consumes the budget even when the logical CSR
+		// lengths are small.
 		let offset_bytes =
 			offsets.capacity().checked_mul(size_of::<usize>()).ok_or_else(overflow)?;
 		let column_bytes =

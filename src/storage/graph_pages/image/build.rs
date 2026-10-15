@@ -16,7 +16,7 @@ use super::{
 	topology::{NodeAdjacency, encode_hot_side, encode_topology, record_node_adjacency},
 };
 use crate::{
-	datastore::{DatabaseRoot, GraphRoot, OccurrenceState},
+	datastore::{DatabaseRoot, GraphRoot, OccurrenceStateRef},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, GraphId},
 	storage::{
@@ -69,6 +69,7 @@ pub(in crate::storage) fn build_import_graph_image(
 	})
 }
 
+/// Builds graph image with membership.
 fn build_graph_image_with_membership<Membership>(
 	database: &DatabaseRoot,
 	graph_id: GraphId,
@@ -103,10 +104,10 @@ fn build_graph_image_with_membership<Membership>(
 		}
 	}
 	for occurrence in graph.occurrences() {
-		if let OccurrenceState::Edge {
+		if let OccurrenceStateRef::Edge {
 			topology,
 			..
-		} = occurrence.state()
+		} = occurrence.state().view()
 		{
 			record_node_adjacency(topology, disk_ref(occurrence.local_id())?, &mut node_adjacency)?;
 		}
@@ -148,8 +149,8 @@ fn build_graph_image_with_membership<Membership>(
 					.ok_or_else(|| invalid("graph label is absent from its dictionary"))
 			})
 			.transpose()?;
-		match occurrence.state() {
-			OccurrenceState::Node {
+		match occurrence.state().view() {
+			OccurrenceStateRef::Node {
 				nested_graph,
 			} => {
 				let local = occurrence.local_id();
@@ -190,7 +191,7 @@ fn build_graph_image_with_membership<Membership>(
 					undirected_inline: inline_refs(&incident.undirected),
 				})?;
 			}
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology,
 				weight,
 				transition_graph,
@@ -304,6 +305,7 @@ fn build_graph_image_with_membership<Membership>(
 	})
 }
 
+/// Writes tombstone generations.
 fn write_tombstone_generations(
 	graph: &crate::datastore::GraphRoot,
 	nodes: &mut [crate::storage::page::AlignedPage],
@@ -325,6 +327,7 @@ fn write_tombstone_generations(
 	Ok(())
 }
 
+/// Writes node.
 fn write_node(
 	pages: &mut [crate::storage::page::AlignedPage],
 	id: AtomId,
@@ -335,6 +338,7 @@ fn write_node(
 	write_node_hot_slot(&mut pages[index], slot, value)
 }
 
+/// Writes edge.
 fn write_edge(
 	pages: &mut [crate::storage::page::AlignedPage],
 	id: AtomId,
@@ -345,6 +349,7 @@ fn write_edge(
 	write_edge_hot_slot(&mut pages[index], slot, value)
 }
 
+/// Returns the seal all result.
 fn seal_all(pages: &mut [crate::storage::page::AlignedPage]) -> FerrosGrynnResult<()> {
 	for page in pages {
 		page.seal()?;
@@ -352,6 +357,7 @@ fn seal_all(pages: &mut [crate::storage::page::AlignedPage]) -> FerrosGrynnResul
 	Ok(())
 }
 
+/// Returns the label kind result.
 fn label_kind(id: AtomId) -> LabelKind {
 	match id.kind() {
 		Some(AtomKind::Node) => LabelKind::Node,
@@ -359,22 +365,27 @@ fn label_kind(id: AtomId) -> LabelKind {
 	}
 }
 
+/// Returns the occurrence kind result.
 fn occurrence_kind(id: AtomId) -> FerrosGrynnResult<AtomKind> {
 	id.kind().ok_or_else(|| invalid("graph occurrence uses null identity"))
 }
 
+/// Returns the disk ref result.
 fn disk_ref(id: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	DiskAtomRef::from_parts(occurrence_kind(id)?, id.slot())
 }
 
+/// Returns the u32 len result.
 fn u32_len(value: usize, field: &str) -> FerrosGrynnResult<u32> {
 	u32::try_from(value).map_err(|_error| invalid(format!("{field} exceeds u32")))
 }
 
+/// Returns the usize u64 result.
 fn usize_u64(value: usize, field: &str) -> FerrosGrynnResult<u64> {
 	u64::try_from(value).map_err(|_error| invalid(format!("{field} exceeds u64")))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

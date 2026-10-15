@@ -20,11 +20,22 @@ use crate::{
 #[non_exhaustive]
 pub enum ChangefeedSince {
 	/// Selects commits strictly after this exact position.
-	Versionstamp(Versionstamp),
+	Versionstamp(
+		/// Selects commits strictly after this exact position.
+		Versionstamp,
+	),
 	/// Selects commits at or after this UTC instant, ordered by versionstamp.
-	Timestamp(DateTime),
+	Timestamp(
+		/// Selects commits at or after this UTC instant, ordered by
+		/// versionstamp.
+		DateTime,
+	),
 	/// Resumes after a whole commit with database, source and mode validation.
-	Cursor(ChangefeedCursor),
+	Cursor(
+		/// Resumes after a whole commit with database, source and mode
+		/// validation.
+		ChangefeedCursor,
+	),
 }
 
 /// Validated selection and bounded scratch/work for one snapshot reader.
@@ -86,6 +97,7 @@ impl ChangefeedReadOptions {
 }
 
 impl Default for ChangefeedReadOptions {
+	/// Constructs the default initial state of `ChangefeedReadOptions`.
 	fn default() -> Self {
 		Self::new(ChangefeedSince::Versionstamp(Versionstamp::new(0)))
 	}
@@ -170,6 +182,7 @@ impl<'transaction> ChangefeedReader<'transaction> {
 }
 
 impl fmt::Debug for ChangefeedReader<'_> {
+	/// Formats `ChangefeedReader<'_>` using the requested formatter.
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("ChangefeedReader").field("cursor", &self.cursor()).finish_non_exhaustive()
 	}

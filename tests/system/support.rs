@@ -13,9 +13,12 @@ use ferros_grynn::{
 /// Owns the datastore before its temporary directory, including during
 /// unwinding.
 pub struct Database {
+	/// Datastore retained by the fixture or operation.
 	store: Datastore,
+	/// Directory retaining the local files used by the scenario.
 	#[cfg(windows)]
 	directory: Option<Directory>,
+	/// Configuration or policy clauses supplied to the selected operation.
 	#[cfg(windows)]
 	options: LocalOptions,
 }
@@ -23,6 +26,7 @@ pub struct Database {
 impl Deref for Database {
 	type Target = Datastore;
 
+	/// Borrows the underlying value represented by this `Database`.
 	fn deref(&self) -> &Self::Target {
 		&self.store
 	}
@@ -73,7 +77,7 @@ fn local_with(io_mode: IoMode) -> Database {
 impl Database {
 	/// Checks committed state; local repeats the check after WAL and checkpoint
 	/// recovery.
-	pub fn assert_committed(self, check: impl Fn(&Datastore)) {
+	pub fn assert_committed<CheckArg: Fn(&Datastore)>(self, check: CheckArg) {
 		check(&self.store);
 		#[cfg(windows)]
 		if let Some(directory) = self.directory {
@@ -103,10 +107,14 @@ impl Database {
 
 #[cfg(windows)]
 /// Deletes only the unique directory owned by this fixture.
-struct Directory(PathBuf);
+struct Directory(
+	/// Deletes only the unique directory owned by this fixture.
+	PathBuf,
+);
 
 #[cfg(windows)]
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		if let Err(error) = std::fs::remove_dir_all(&self.0) {
 			eprintln!("could not remove test database {}: {error}", self.0.display());

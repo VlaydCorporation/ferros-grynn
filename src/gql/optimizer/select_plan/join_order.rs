@@ -9,12 +9,18 @@ use crate::{
 };
 
 #[derive(Clone)]
+/// Candidate source order with the cardinality and cost used during join
+/// enumeration.
 struct JoinOrderState {
+	/// Order associated with this join order state.
 	order: Vec<usize>,
+	/// Cardinality associated with this join order state.
 	cardinality: Cardinality,
+	/// Cost associated with this join order state.
 	cost: PlanCost,
 }
 
+/// Returns the enumerate join order result.
 pub(super) fn enumerate_join_order(
 	logical: &LogicalSelect,
 	cards: &[Cardinality],
@@ -63,6 +69,7 @@ fn reorderable_sources(logical: &LogicalSelect) -> usize {
 	clippy::too_many_arguments,
 	reason = "bounded DP needs the source estimates and fixed resource model"
 )]
+/// Returns the dp join order result.
 fn dp_join_order(
 	logical: &LogicalSelect,
 	cards: &[Cardinality],
@@ -129,6 +136,7 @@ fn dp_join_order(
 	clippy::too_many_arguments,
 	reason = "deterministic greedy planning shares the bounded cost inputs"
 )]
+/// Returns the greedy join order result.
 fn greedy_join_order(
 	logical: &LogicalSelect,
 	cards: &[Cardinality],
@@ -166,6 +174,7 @@ fn greedy_join_order(
 	order
 }
 
+/// Returns whether the source connects to mask condition holds.
 fn source_connects_to_mask(
 	logical: &LogicalSelect,
 	offsets: &[usize],
@@ -186,6 +195,7 @@ fn source_connects_to_mask(
 	})
 }
 
+/// Returns the ready join predicates result.
 pub(super) fn ready_join_predicates(
 	logical: &LogicalSelect,
 	joined: &BTreeSet<usize>,
@@ -217,6 +227,7 @@ pub(super) fn ready_join_predicates(
 	ready
 }
 
+/// Joins keys across.
 pub(super) fn join_keys_across(
 	logical: &LogicalSelect,
 	predicates: &[usize],
@@ -242,6 +253,7 @@ pub(super) fn join_keys_across(
 	(!keys.is_empty()).then_some(keys)
 }
 
+/// Returns the equality column pairs result.
 fn equality_column_pairs(expression: &TypedExpr) -> Option<Vec<(usize, usize)>> {
 	match &expression.kind {
 		TypedExprKind::Binary {
@@ -267,6 +279,7 @@ fn equality_column_pairs(expression: &TypedExpr) -> Option<Vec<(usize, usize)>> 
 	}
 }
 
+/// Returns the expression sources result.
 fn expression_sources(
 	logical: &LogicalSelect,
 	offsets: &[usize],
@@ -299,6 +312,7 @@ fn expression_sources(
 	}
 }
 
+/// Returns the source for column result.
 fn source_for_column(logical: &LogicalSelect, offsets: &[usize], column: usize) -> Option<usize> {
 	let sources =
 		std::iter::once(&logical.source).chain(logical.joins.iter().map(|join| &join.source));
@@ -309,6 +323,7 @@ fn source_for_column(logical: &LogicalSelect, offsets: &[usize], column: usize) 
 	})
 }
 
+/// Joins cardinality.
 pub(super) fn join_cardinality(
 	left: Cardinality,
 	right: Cardinality,
@@ -336,6 +351,7 @@ pub(super) fn join_cardinality(
 	Cardinality::new(lower, expected.max(lower), product_upper.max(lower))
 }
 
+/// Returns the estimated row width result.
 pub(super) fn estimated_row_width(source: &LogicalSelectSource) -> u64 {
 	u64::try_from(source.schema.columns.len()).unwrap_or(u64::MAX).saturating_mul(32).max(64)
 }

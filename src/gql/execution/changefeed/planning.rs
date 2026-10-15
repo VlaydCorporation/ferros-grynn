@@ -27,7 +27,10 @@ use crate::{
 /// Counts a conservative canonical buffer ceiling before the allocating hash
 /// pass.
 #[derive(Default)]
-pub(in crate::gql::execution) struct HashBytes(usize);
+pub(in crate::gql::execution) struct HashBytes(
+	/// Saturating allocation ceiling accumulated from canonical hash writes.
+	usize,
+);
 
 impl HashBytes {
 	/// Returns the conservative allocation ceiling for the canonical writer.
@@ -37,10 +40,12 @@ impl HashBytes {
 }
 
 impl Hasher for HashBytes {
+	/// Performs the finish operation for `HashBytes`.
 	fn finish(&self) -> u64 {
 		0
 	}
 
+	/// Performs the write operation for `HashBytes`.
 	fn write(&mut self, bytes: &[u8]) {
 		self.0 = self.0.saturating_add(bytes.len()).saturating_add(16);
 	}

@@ -64,6 +64,7 @@ struct HistoryWalk {
 }
 
 impl Default for HistoryWalk {
+	/// Constructs the default initial state of `HistoryWalk`.
 	fn default() -> Self {
 		Self {
 			last: 0,
@@ -78,7 +79,11 @@ impl Default for HistoryWalk {
 /// A metadata-bearing whole commit or an unavailable trusted segment.
 enum HistoryItem {
 	/// RAM images are already immutable; copies retain their owned image Arcs.
-	Memory(Arc<CapturedCommit>),
+	Memory(
+		/// RAM images are already immutable; copies retain their owned image
+		/// Arcs.
+		Arc<CapturedCommit>,
+	),
 	/// Local images remain lazy until selection accepts this commit.
 	Local {
 		/// Catalog ordinal, retained after metadata advances to a later
@@ -92,7 +97,10 @@ enum HistoryItem {
 		info: ChangefeedGroupInfo,
 	},
 	/// Complete unavailable interval, without guessing any images.
-	Lost(HistorySegment),
+	Lost(
+		/// Complete unavailable interval, without guessing any images.
+		HistorySegment,
+	),
 }
 
 /// Fixed-root history adapter shared by public reading and LIVE preparation.
@@ -686,6 +694,7 @@ impl HistoryWalk {
 }
 
 impl ReadBatches for SourceReader<'_> {
+	/// Yields the next batch for `SourceReader<'_>`.
 	fn next_batch(
 		&mut self,
 		memory_limit: Option<usize>,
@@ -711,14 +720,17 @@ impl ReadBatches for SourceReader<'_> {
 		result
 	}
 
+	/// Returns cursor for `SourceReader<'_>`.
 	fn cursor(&self) -> Option<ChangefeedCursor> {
 		self.cursor.clone()
 	}
 
+	/// Returns binding for `SourceReader<'_>`.
 	fn binding(&self) -> Option<crate::changefeed::ChangefeedReadBinding> {
 		self.definition.as_ref().map(|definition| definition.read_binding(&self.root))
 	}
 
+	/// Returns statistics for `SourceReader<'_>`.
 	fn statistics(&self) -> ChangefeedReadStatistics {
 		let mut statistics = self.statistics;
 		statistics.work = self.work.used;

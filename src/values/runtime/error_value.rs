@@ -3,16 +3,24 @@ use crate::gql_status::FerrosGrynnError;
 /// Runtime-only, storage-rejected projection exposed to a GrynnQL `CATCH`.
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct ErrorValue {
+	/// Code associated with this error value.
 	code: String,
+	/// Message associated with this error value.
 	message: String,
+	/// Condition associated with this error value.
 	condition: String,
+	/// Classification associated with this error value.
 	classification: String,
+	/// Category associated with this error value.
 	category: String,
+	/// Domain associated with this error value.
 	domain: String,
+	/// Causes associated with this error value.
 	causes: Vec<ErrorValue>,
 }
 
 impl ErrorValue {
+	/// Creates from error.
 	pub(crate) fn from_error(error: &FerrosGrynnError) -> Self {
 		let status = error.status();
 		Self {

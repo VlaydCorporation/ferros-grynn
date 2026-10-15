@@ -1,8 +1,14 @@
+/// Owned syntax-tree expressions and common nodes.
 mod ast;
+/// Depth configuration shared by GrynnQL parser entry points.
 pub mod config;
+/// UTF-8 token scanning and literal recognition.
 mod lexer;
+/// Parser state, precedence and depth limits.
 mod parser;
+/// Statement syntax nodes and parsing.
 mod stmt;
+/// Token kinds and UTF-8 source spans.
 mod token;
 
 pub use ast::{
@@ -107,6 +113,7 @@ pub use stmt::{
 	MatchConstraints,
 	MatchContains,
 	MatchDirection,
+	MatchDistinctness,
 	MatchEdge,
 	MatchEndpoint,
 	MatchEndpointKind,
@@ -167,20 +174,25 @@ pub use stmt::{
 	WhileStatement,
 };
 
+/// Configured depth limits for parsing one GrynnQL source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ParserSettings {
+	/// Maximum nesting depth accepted while parsing object values.
 	pub max_object_parsing_depth: u32,
+	/// Maximum expression or statement nesting depth accepted by the parser.
 	pub max_query_parsing_depth: u32,
 }
 
 impl Default for ParserSettings {
+	/// Constructs the default initial state of `ParserSettings`.
 	fn default() -> Self {
 		Self::from(&GQLConfig::default())
 	}
 }
 
 impl From<&GQLConfig> for ParserSettings {
+	/// Converts `&GQLConfig` into `ParserSettings`.
 	fn from(config: &GQLConfig) -> Self {
 		Self {
 			max_object_parsing_depth: config.max_object_parsing_depth,
@@ -189,6 +201,11 @@ impl From<&GQLConfig> for ParserSettings {
 	}
 }
 
+/// Parses and validates the input syntax for this type.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Program> {
 	parser::parse(source, settings)
 }
@@ -200,15 +217,17 @@ pub(crate) fn has_bridge_clause(source: &str) -> FerrosGrynnResult<bool> {
 }
 
 #[cfg(test)]
+/// Regression tests for syn behavior.
 mod property_tests {
 	use proptest::prelude::*;
 
 	use super::{ParserSettings, parse};
 
 	proptest! {
+		/// Verifies parser never panics.
 		#[test]
 		fn parser_never_panics(source in ".{0,512}") {
-			let _ = parse(&source, ParserSettings::default());
+			drop(parse(&source, ParserSettings::default()));
 		}
 	}
 }

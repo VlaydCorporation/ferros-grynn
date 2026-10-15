@@ -142,11 +142,7 @@ impl TensorArtifact {
 				control,
 			)
 		};
-		let plane = if sort_root.is_some() {
-			Some(&mut sorted as &mut PlaneBuilder<'_>)
-		} else {
-			None
-		};
+		let plane = sort_root.is_some().then_some(&mut sorted as &mut PlaneBuilder<'_>);
 		let tensor = capture_tensor(
 			reference,
 			TensorOptions {
@@ -282,7 +278,7 @@ impl TensorArtifact {
 			.checked_sub(control.bytes)
 			.filter(|bytes| *bytes > 0)
 			.ok_or_else(|| resource("tensor restore bytes", scratch_bytes as u64))?;
-		// ponytail: reopen rescans the exact incidence oracle to validate
+		// shortcut: reopen rescans the exact incidence oracle to validate
 		// metadata; decode dictionaries directly only if measured
 		// reopen latency requires it.
 		let build_limits = GraphAlgorithmLimits {
@@ -414,7 +410,7 @@ fn sorted_plane(
 	control.sort(count)?;
 	let remaining = control.limits.memory_bytes.checked_sub(control.bytes).ok_or_else(overflow)?;
 	let run_budget =
-		(remaining / 16).min(crate::storage::external_sort_run_budget()).min(8 << 20).max(40);
+		(remaining / 16).min(crate::storage::external_sort_run_budget()).clamp(40, 8 << 20);
 	let record_bytes = count.checked_mul(40).ok_or_else(overflow)?;
 	let workspace = count
 		.checked_mul(128)

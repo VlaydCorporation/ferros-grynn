@@ -50,7 +50,10 @@ impl SourceIdentity {
 /// Exact immutable epoch of one prototype page source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg(test)]
-struct SourceEpoch(PageCacheVersion);
+struct SourceEpoch(
+	/// Exact immutable epoch of one prototype page source.
+	PageCacheVersion,
+);
 
 #[cfg(test)]
 impl SourceEpoch {

@@ -9,7 +9,7 @@ use crate::{
 	changefeed::ChangeIdentity,
 	datastore::ClassId,
 	gql_status::FerrosGrynnResult,
-	graph::{AtomKind, AtomRef, EdgeDirection, GraphId, GraphKind, GraphTopologyConstraints},
+	graph::{AtomKind, EdgeDirection, GraphId, GraphKind, GraphTopologyConstraints},
 	live::{
 		LiveGraphAtomId,
 		LiveGraphEdge,
@@ -382,8 +382,8 @@ pub fn encode(image: &LiveGraphImage, maximum: usize) -> FerrosGrynnResult<Vec<u
 /// Shares aggregate scratch and work with its enclosing history envelope.
 pub(in crate::storage) fn encode_bounded(
 	image: &LiveGraphImage,
-	mut budget: &mut CodecBudget,
-	mut work: &mut Work,
+	budget: &mut CodecBudget,
+	work: &mut Work,
 ) -> FerrosGrynnResult<Vec<u8>> {
 	budget.admit(image.estimated_heap_bytes()?)?;
 	let mut context = EncodeContext::default();
@@ -397,47 +397,47 @@ pub(in crate::storage) fn encode_bounded(
 		)
 	})?;
 	let mut body = Vec::new();
-	append(&mut body, &[family(image.family)], &mut budget)?;
-	append(&mut body, &image.validators.bits().to_le_bytes(), &mut budget)?;
-	append(&mut body, &[u8::from(image.root.is_some())], &mut budget)?;
+	append(&mut body, &[family(image.family)], budget)?;
+	append(&mut body, &image.validators.bits().to_le_bytes(), budget)?;
+	append(&mut body, &[u8::from(image.root.is_some())], budget)?;
 	if let Some(root) = &image.root {
-		qualified::encode_atom(&mut body, root, &mut context, &mut budget)?;
+		qualified::encode_atom(&mut body, root, &mut context, budget)?;
 	}
-	values::write_count(&mut body, image.property_keys.len(), &mut budget)?;
+	values::write_count(&mut body, image.property_keys.len(), budget)?;
 	for (name, key) in &image.property_keys {
 		work.take(0, 1)?;
-		values::append_text(&mut body, name, &mut budget)?;
-		append(&mut body, &key.get().to_le_bytes(), &mut budget)?;
+		values::append_text(&mut body, name, budget)?;
+		append(&mut body, &key.get().to_le_bytes(), budget)?;
 	}
-	values::write_count(&mut body, image.scopes.len(), &mut budget)?;
+	values::write_count(&mut body, image.scopes.len(), budget)?;
 	for (key, graph) in &image.scopes {
-		scope(&mut body, key, &mut context, &mut budget, &mut work)?;
+		scope(&mut body, key, &mut context, budget, work)?;
 		let slot = graph
 			.source
 			.as_ref()
-			.map(|graph| values::graph_slot(&mut context, graph, &mut budget))
+			.map(|graph| values::graph_slot(&mut context, graph, budget))
 			.transpose()?
 			.unwrap_or(0);
-		append(&mut body, &slot.to_le_bytes(), &mut budget)?;
-		append(&mut body, &graph.validators.bits().to_le_bytes(), &mut budget)?;
-		object(&mut body, &graph.properties, &mut context, &mut budget, &mut work)?;
-		values::write_count(&mut body, graph.nodes.len(), &mut budget)?;
+		append(&mut body, &slot.to_le_bytes(), budget)?;
+		append(&mut body, &graph.validators.bits().to_le_bytes(), budget)?;
+		object(&mut body, &graph.properties, &mut context, budget, work)?;
+		values::write_count(&mut body, graph.nodes.len(), budget)?;
 		for (atom, node) in &graph.nodes {
 			work.take(0, 1)?;
-			qualified::encode_atom(&mut body, atom, &mut context, &mut budget)?;
-			label(&mut body, node.label.as_ref(), &mut budget)?;
-			object(&mut body, &node.properties, &mut context, &mut budget, &mut work)?;
-			source(&mut body, node.source, &mut budget)?;
-			child(&mut body, node.child.as_ref(), &mut context, &mut budget, &mut work)?;
+			qualified::encode_atom(&mut body, atom, &mut context, budget)?;
+			label(&mut body, node.label.as_ref(), budget)?;
+			object(&mut body, &node.properties, &mut context, budget, work)?;
+			source(&mut body, node.source, budget)?;
+			child(&mut body, node.child.as_ref(), &mut context, budget, work)?;
 		}
-		values::write_count(&mut body, graph.edges.len(), &mut budget)?;
+		values::write_count(&mut body, graph.edges.len(), budget)?;
 		for (atom, edge) in &graph.edges {
 			work.take(0, 1)?;
-			qualified::encode_atom(&mut body, atom, &mut context, &mut budget)?;
-			label(&mut body, edge.label.as_ref(), &mut budget)?;
-			object(&mut body, &edge.properties, &mut context, &mut budget, &mut work)?;
-			source(&mut body, edge.source, &mut budget)?;
-			child(&mut body, edge.child.as_ref(), &mut context, &mut budget, &mut work)?;
+			qualified::encode_atom(&mut body, atom, &mut context, budget)?;
+			label(&mut body, edge.label.as_ref(), budget)?;
+			object(&mut body, &edge.properties, &mut context, budget, work)?;
+			source(&mut body, edge.source, budget)?;
+			child(&mut body, edge.child.as_ref(), &mut context, budget, work)?;
 			append(
 				&mut body,
 				&[
@@ -448,29 +448,29 @@ pub(in crate::storage) fn encode_bounded(
 					},
 					u8::from(edge.weight.is_some()),
 				],
-				&mut budget,
+				budget,
 			)?;
 			if let Some(weight) = edge.weight {
-				let bytes = values::encode(&Value::from(weight), &mut context, &mut budget)?;
-				append_blob(&mut body, &bytes, &mut budget)?;
+				let bytes = values::encode(&Value::from(weight), &mut context, budget)?;
+				append_blob(&mut body, &bytes, budget)?;
 			}
-			endpoints(&mut body, &edge.inputs, &mut context, &mut budget, &mut work)?;
-			endpoints(&mut body, &edge.outputs, &mut context, &mut budget, &mut work)?;
+			endpoints(&mut body, &edge.inputs, &mut context, budget, work)?;
+			endpoints(&mut body, &edge.outputs, &mut context, budget, work)?;
 		}
 	}
-	let dictionary = values::encode_dictionary(&context, &mut budget)?;
+	let dictionary = values::encode_dictionary(&context, budget)?;
 	let length = HEADER
 		.checked_add(dictionary.len())
 		.and_then(|size| size.checked_add(body.len()))
 		.ok_or_else(|| invalid("graph checkpoint size overflows"))?;
 	checked_payload(length as u64)?;
 	let mut output = Vec::new();
-	append(&mut output, b"FGLG\x01\x00\x00\x00", &mut budget)?;
-	append(&mut output, &(dictionary.len() as u64).to_le_bytes(), &mut budget)?;
-	append(&mut output, &(body.len() as u64).to_le_bytes(), &mut budget)?;
-	append(&mut output, &0u64.to_le_bytes(), &mut budget)?;
-	append(&mut output, &dictionary, &mut budget)?;
-	append(&mut output, &body, &mut budget)?;
+	append(&mut output, b"FGLG\x01\x00\x00\x00", budget)?;
+	append(&mut output, &(dictionary.len() as u64).to_le_bytes(), budget)?;
+	append(&mut output, &(body.len() as u64).to_le_bytes(), budget)?;
+	append(&mut output, &0u64.to_le_bytes(), budget)?;
+	append(&mut output, &dictionary, budget)?;
+	append(&mut output, &body, budget)?;
 	let checksum = rapidhash_v3(&output);
 	output[24..32].copy_from_slice(&checksum.to_le_bytes());
 	Ok(output)
@@ -478,6 +478,7 @@ pub(in crate::storage) fn encode_bounded(
 
 /// Validates framing and checksums before allocating dictionaries or graph
 /// content.
+#[cfg(test)]
 pub fn decode(bytes: &[u8], maximum: usize) -> FerrosGrynnResult<LiveGraphImage> {
 	let mut budget = CodecBudget::new(maximum, bytes.len())?;
 	let mut work = Work {
@@ -489,8 +490,8 @@ pub fn decode(bytes: &[u8], maximum: usize) -> FerrosGrynnResult<LiveGraphImage>
 /// Shares aggregate allocation and work limits across all checkpoint images.
 pub(in crate::storage) fn decode_bounded(
 	bytes: &[u8],
-	mut budget: &mut CodecBudget,
-	mut work: &mut Work,
+	budget: &mut CodecBudget,
+	work: &mut Work,
 ) -> FerrosGrynnResult<LiveGraphImage> {
 	checked_payload(bytes.len() as u64)?;
 	let mut input = Decoder::new(bytes);
@@ -515,12 +516,12 @@ pub(in crate::storage) fn decode_bounded(
 		return Err(invalid("graph checkpoint checksum mismatch"));
 	}
 	drop(checked);
-	let context = values::decode_dictionary(input.take(dictionary)?, &mut budget)?;
+	let context = values::decode_dictionary(input.take(dictionary)?, budget)?;
 	let mut data = Decoder::new(input.take(body)?);
 	let family = read_family(&mut data)?;
 	let validators = constraints(&mut data)?;
 	let root = if flag(&mut data)? {
-		Some(qualified::decode_atom(&mut data, &context, &mut budget)?)
+		Some(qualified::decode_atom(&mut data, &context, budget)?)
 	} else {
 		None
 	};
@@ -530,7 +531,7 @@ pub(in crate::storage) fn decode_bounded(
 	let mut property_ids = BTreeSet::new();
 	for _ in 0..count {
 		budget.admit(384)?;
-		let name = values::text(&mut data, &mut budget)?;
+		let name = values::text(&mut data, budget)?;
 		let key = PropertyKeyId::new(data.u32()?);
 		if property_keys.last_key_value().is_some_and(|(last, _)| last >= &name)
 			|| !property_ids.insert(key)
@@ -544,7 +545,7 @@ pub(in crate::storage) fn decode_bounded(
 	let mut scopes = BTreeMap::new();
 	for _ in 0..count {
 		budget.admit(256 + std::mem::size_of::<LiveGraphScope>())?;
-		let key = read_scope(&mut data, &context, &mut budget, &mut work)?;
+		let key = read_scope(&mut data, &context, budget, work)?;
 		if scopes.last_key_value().is_some_and(|(last, _)| last >= &key) {
 			return Err(invalid("graph scopes are not canonical"));
 		}
@@ -552,25 +553,25 @@ pub(in crate::storage) fn decode_bounded(
 		let source = if slot == 0 {
 			None
 		} else {
-			Some(values::graph(&context, slot, &mut budget)?)
+			Some(values::graph(&context, slot, budget)?)
 		};
 		let scope_validators = constraints(&mut data)?;
-		let properties = read_object(&mut data, &context, &mut budget, &mut work)?;
+		let properties = read_object(&mut data, &context, budget, work)?;
 		let count = values::count(&mut data, 24)?;
 		work.take(0, count)?;
 		let mut nodes = BTreeMap::new();
 		for _ in 0..count {
 			budget.admit(256 + std::mem::size_of::<LiveGraphNode>())?;
-			let atom = qualified::decode_atom(&mut data, &context, &mut budget)?;
+			let atom = qualified::decode_atom(&mut data, &context, budget)?;
 			if atom.kind() != AtomKind::Node
 				|| nodes.last_key_value().is_some_and(|(last, _)| last >= &atom)
 			{
 				return Err(invalid("graph node identities are not canonical"));
 			}
-			let label = read_label(&mut data, &mut budget)?;
-			let properties = read_object(&mut data, &context, &mut budget, &mut work)?;
+			let label = read_label(&mut data, budget)?;
+			let properties = read_object(&mut data, &context, budget, work)?;
 			let source = read_source(&mut data)?;
-			let child = read_child(&mut data, &context, &mut budget, &mut work)?;
+			let child = read_child(&mut data, &context, budget, work)?;
 			nodes.insert(atom, LiveGraphNode {
 				label,
 				properties,
@@ -583,16 +584,16 @@ pub(in crate::storage) fn decode_bounded(
 		let mut edges = BTreeMap::new();
 		for _ in 0..count {
 			budget.admit(256 + std::mem::size_of::<LiveGraphEdge>())?;
-			let atom = qualified::decode_atom(&mut data, &context, &mut budget)?;
+			let atom = qualified::decode_atom(&mut data, &context, budget)?;
 			if atom.kind() != AtomKind::Edge
 				|| edges.last_key_value().is_some_and(|(last, _)| last >= &atom)
 			{
 				return Err(invalid("graph edge identities are not canonical"));
 			}
-			let label = read_label(&mut data, &mut budget)?;
-			let properties = read_object(&mut data, &context, &mut budget, &mut work)?;
+			let label = read_label(&mut data, budget)?;
+			let properties = read_object(&mut data, &context, budget, work)?;
 			let source = read_source(&mut data)?;
-			let child = read_child(&mut data, &context, &mut budget, &mut work)?;
+			let child = read_child(&mut data, &context, budget, work)?;
 			let direction = match data.u8()? {
 				0 => EdgeDirection::Directed,
 				1 => EdgeDirection::Bidirectional,
@@ -600,15 +601,15 @@ pub(in crate::storage) fn decode_bounded(
 				_ => return Err(invalid("graph edge direction is unknown")),
 			};
 			let weight = if flag(&mut data)? {
-				match values::decode(data.blob()?, &context, &mut budget)? {
+				match values::decode(data.blob()?, &context, budget)? {
 					Value::Number(weight) => Some(weight),
 					_ => return Err(invalid("graph weight is not numeric")),
 				}
 			} else {
 				None
 			};
-			let inputs = read_endpoints(&mut data, &context, &mut budget, &mut work)?;
-			let outputs = read_endpoints(&mut data, &context, &mut budget, &mut work)?;
+			let inputs = read_endpoints(&mut data, &context, budget, work)?;
+			let outputs = read_endpoints(&mut data, &context, budget, work)?;
 			edges.insert(atom, LiveGraphEdge {
 				label,
 				properties,

@@ -126,9 +126,15 @@ enum CombinationCandidate {
 	/// same rotation.
 	ValidatedDirect,
 	/// Atomic arena under one explicit admission policy.
-	AtomicPolicy(ReadPolicy),
+	AtomicPolicy(
+		/// Atomic arena under one explicit admission policy.
+		ReadPolicy,
+	),
 	/// Fixed-address VM cache under one explicit admission policy.
-	VmPolicy(ReadPolicy),
+	VmPolicy(
+		/// Fixed-address VM cache under one explicit admission policy.
+		ReadPolicy,
+	),
 	/// Rocks-like non-admitting scatter scan with bounded look-ahead.
 	BypassScatter {
 		/// Requested extent look-ahead depth.
@@ -171,6 +177,7 @@ impl CombinationCandidate {
 // Reusable scatter request state owned by one prefetch worker thread.
 #[cfg(all(windows, feature = "native-async-io"))]
 std::thread_local! {
+	/// Scatter request state reused by one prefetch worker without sharing mutable buffers across threads.
 	static PREFETCH_SCATTER: RefCell<Option<ScatterReader>> = const { RefCell::new(None) };
 }
 
@@ -232,6 +239,7 @@ impl<Buffer> ReusableBufferPool<Buffer> {
 }
 
 impl<Buffer> Clone for ReusableBufferPool<Buffer> {
+	/// Returns an owned clone of this `ReusableBufferPool<Buffer>`.
 	fn clone(&self) -> Self {
 		Self {
 			shared: Arc::clone(&self.shared),
@@ -264,6 +272,8 @@ impl<Buffer> ReusableBufferLease<Buffer> {
 }
 
 impl<Buffer> Drop for ReusableBufferLease<Buffer> {
+	/// Runs cleanup for this `ReusableBufferLease<Buffer>` before its fields
+	/// are released.
 	fn drop(&mut self) {
 		if let Some(buffer) = self.buffer.take() {
 			self.pool.shared.available.lock().push(buffer);
@@ -3547,6 +3557,7 @@ fn storage_engine_prototype_mixed_finalist_probe() -> Result<(), Box<dyn Error>>
 #[test]
 #[ignore = "fixed-hot production benchmark; run explicitly with --profile profiling"]
 fn storage_engine_prototype_fixed_hot_scan_probe() -> Result<(), Box<dyn Error>> {
+	/// Exact candidate names accepted by the fixed-hot process probe.
 	const CANDIDATES: [&str; 3] =
 		["T0_raw_fixed_hot", "H11_production_r8_hot+scatter_p1", "R0_mmap_fixed_hot"];
 
@@ -4621,7 +4632,7 @@ fn measure_direct_prefetch(
 			measure_validated_direct_scan(&file, extents, &mut pages, scan_pages)?;
 		let rss_after = process_rss()?;
 		measurement.rss_delta = rss_after.saturating_sub(rss_before);
-		return Ok(measurement);
+		Ok(measurement)
 	} else {
 		let set_count = depth
 			.checked_add(1)
@@ -4650,12 +4661,12 @@ fn measure_direct_prefetch(
 		let timing = timer.finish()?;
 		pool.ensure_all_returned()?;
 		let rss_after = process_rss()?;
-		return Ok(aggregate_measurement(
+		Ok(aggregate_measurement(
 			timing,
 			extents.len() as u64,
 			scan_pages as u64 * PAGE_SIZE as u64,
 			rss_after.saturating_sub(rss_before),
-		));
+		))
 	}
 }
 
@@ -4962,12 +4973,12 @@ fn measure_scatter_prefetch(
 		}
 		let timing = timer.finish()?;
 		let rss_after = process_rss()?;
-		return Ok(aggregate_measurement(
+		Ok(aggregate_measurement(
 			timing,
 			extents.len() as u64,
 			scan_pages as u64 * PAGE_SIZE as u64,
 			rss_after.saturating_sub(rss_before),
-		));
+		))
 	} else {
 		let set_count = depth
 			.checked_add(1)
@@ -5015,12 +5026,12 @@ fn measure_scatter_prefetch(
 		let timing = timer.finish()?;
 		pool.ensure_all_returned()?;
 		let rss_after = process_rss()?;
-		return Ok(aggregate_measurement(
+		Ok(aggregate_measurement(
 			timing,
 			extents.len() as u64,
 			scan_pages as u64 * PAGE_SIZE as u64,
 			rss_after.saturating_sub(rss_before),
-		));
+		))
 	}
 }
 
@@ -5028,22 +5039,42 @@ fn measure_scatter_prefetch(
 #[derive(Clone, Copy)]
 enum ConcurrentResidentCandidate<'fixture> {
 	/// Fully resident read-only mapping.
-	Mmap(&'fixture MmapControl),
+	Mmap(
+		/// Fully resident read-only mapping.
+		&'fixture MmapControl,
+	),
 	/// Production Clock-Pro pool.
-	ClockPro(&'fixture BufferPool),
+	ClockPro(
+		/// Production Clock-Pro pool.
+		&'fixture BufferPool,
+	),
 	/// Atomic arena with directory lookup.
-	Atomic(&'fixture AtomicArenaBufferPool),
+	Atomic(
+		/// Atomic arena with directory lookup.
+		&'fixture AtomicArenaBufferPool,
+	),
 	/// Atomic arena with pre-resolved locators.
 	AtomicResolved(
+		/// Preloaded atomic arena whose frames serve this worker.
 		&'fixture AtomicArenaBufferPool,
+		/// Exact arena locators prepared in logical page order before timing.
 		&'fixture [super::atomic_arena::ResolvedFrameHandle],
 	),
 	/// Fixed-address VM cache with source lookup.
 	#[cfg(windows)]
-	Vm(&'fixture VmCache),
+	Vm(
+		/// Fixed-address VM cache with source lookup.
+		&'fixture VmCache,
+	),
 	/// Fixed-address VM cache with pre-resolved addresses.
 	#[cfg(windows)]
-	VmResolved(&'fixture VmCache, &'fixture [VmResolvedHandle]),
+	VmResolved(
+		/// Preloaded fixed-address VM cache serving this worker.
+		&'fixture VmCache,
+		/// Exact VM page addresses prepared in logical page order before
+		/// timing.
+		&'fixture [VmResolvedHandle],
+	),
 }
 
 impl ConcurrentResidentCandidate<'_> {
@@ -5643,6 +5674,7 @@ fn measure_atomic_accesses(
 
 /// Builds the contiguous per-source hot set required by the retained page
 /// table candidate.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn contiguous_hot_preload(hot_pages: usize) -> Vec<WorkloadAccess> {
 	(0..hot_pages)
 		.map(|page| WorkloadAccess {
@@ -5655,6 +5687,7 @@ fn contiguous_hot_preload(hot_pages: usize) -> Vec<WorkloadAccess> {
 
 /// Builds a graph-like stream with seven hot frontier reads followed by one
 /// unique cold transition.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn mixed_hot_cold_accesses(
 	operations: usize,
 	hot_pages: usize,
@@ -5681,6 +5714,7 @@ fn mixed_hot_cold_accesses(
 }
 
 /// Builds short property runs interrupted by unique overflow-page reads.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn mixed_property_accesses(
 	operations: usize,
 	hot_pages: usize,
@@ -5709,7 +5743,10 @@ fn mixed_property_accesses(
 }
 
 /// Permutes one bounded cold range without repeats or sequential read-ahead.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn permuted_cold_page(first: usize, ordinal: usize, page_count: usize) -> PageNo {
+	/// Prime stride larger than the bounded cold range, so the modular walk
+	/// visits every page once.
 	const STRIDE_PRIME: u64 = 15_485_863;
 	debug_assert!(page_count > 0 && (page_count as u64) < STRIDE_PRIME);
 	let count = page_count as u64;
@@ -5718,6 +5755,7 @@ fn permuted_cold_page(first: usize, ordinal: usize, page_count: usize) -> PageNo
 
 /// Records R2, retained R8, and mmap against one identical access stream.
 #[allow(clippy::too_many_arguments, reason = "mixed benchmark dimensions remain explicit")]
+#[cfg(all(windows, feature = "native-async-io"))]
 fn record_mixed_access_pair(
 	artifacts: &mut Artifacts,
 	config: HarnessConfig,
@@ -5812,6 +5850,7 @@ fn record_mixed_access_pair(
 
 /// Measures R8 with one cursor-owned hot page table and non-admitting Direct
 /// reads for sparse cold transitions.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn measure_epoch_hot_bypass_accesses(
 	datasets: &[Dataset],
 	directs: &[DirectFile],
@@ -5919,6 +5958,8 @@ fn measure_epoch_hot_ioring_accesses(
 	accesses: &[WorkloadAccess],
 	latency_batch: usize,
 ) -> Result<(Measurement, f64), Box<dyn Error>> {
+	/// Requested number of outstanding page reads in the mixed IoRing
+	/// measurement.
 	const REQUESTED_QD: usize = 32;
 	if datasets.len() != 1
 		|| directs.len() != 1
@@ -5972,7 +6013,7 @@ fn measure_epoch_hot_ioring_accesses(
 		PAGE_SIZE as u64,
 		|operation| {
 			let operation = operation as usize;
-			if operation % cursor_window == 0 {
+			if operation.is_multiple_of(cursor_window) {
 				let reads = &cold_reads_by_window[operation / cursor_window];
 				cold_batch = if reads.is_empty() {
 					None
@@ -6007,6 +6048,7 @@ fn measure_epoch_hot_ioring_accesses(
 
 /// Measures mmap with only the declared hot pages prefaulted and validated;
 /// every cold access keeps checksum work inside the measured path.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn measure_mmap_hot_cold_accesses(
 	datasets: &[Dataset],
 	preload: &[WorkloadAccess],
@@ -6050,6 +6092,7 @@ fn measure_mmap_hot_cold_accesses(
 
 /// Measures conventional pinned R2 roots plus non-admitting one-page Direct
 /// reads for a disjoint leaf range.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn measure_btree_sync_bypass(
 	dataset: &Dataset,
 	direct: &DirectFile,
@@ -6178,6 +6221,7 @@ fn measure_btree_hybrid_scatter(
 
 /// Measures mmap with hot roots prefaulted and every leaf checksum retained
 /// inside the timed disjoint scan.
+#[cfg(all(windows, feature = "native-async-io"))]
 fn measure_btree_mmap(
 	dataset: &Dataset,
 	root_pages: usize,
@@ -6208,13 +6252,17 @@ fn measure_btree_mmap(
 	finish_fixture_rss(measurement, rss_before)
 }
 
+/// One scan extent: first page, page count and membership in the hot set.
+#[cfg(all(windows, feature = "native-async-io"))]
+type FixedHotRun = (PageNo, usize, bool);
+
 /// Builds four contiguous cold extents followed by one rotating hot extent.
 #[cfg(all(windows, feature = "native-async-io"))]
 fn fixed_hot_scan_runs(
 	page_count: usize,
 	hot_pages: usize,
 	extent_pages: usize,
-) -> Result<Vec<(PageNo, usize, bool)>, Box<dyn Error>> {
+) -> Result<Vec<FixedHotRun>, Box<dyn Error>> {
 	if extent_pages == 0
 		|| hot_pages == 0
 		|| !hot_pages.is_multiple_of(extent_pages)
@@ -6243,7 +6291,7 @@ fn fixed_hot_scan_runs(
 /// Times variable-sized physical runs while reporting latency per logical page.
 #[cfg(all(windows, feature = "native-async-io"))]
 fn measure_fixed_hot_runs<Consume>(
-	runs: &[(PageNo, usize, bool)],
+	runs: &[FixedHotRun],
 	rss_before: u64,
 	mut consume: Consume,
 ) -> Result<Measurement, Box<dyn Error>>
@@ -6276,7 +6324,7 @@ where
 #[cfg(all(windows, feature = "native-async-io"))]
 fn measure_fixed_hot_raw(
 	dataset: &Dataset,
-	runs: &[(PageNo, usize, bool)],
+	runs: &[FixedHotRun],
 	extent_pages: usize,
 ) -> Result<Measurement, Box<dyn Error>> {
 	let rss_before = process_rss()?;
@@ -6303,7 +6351,7 @@ fn measure_fixed_hot_raw(
 #[cfg(all(windows, feature = "native-async-io"))]
 fn measure_fixed_hot_hybrid(
 	dataset: &Dataset,
-	runs: &[(PageNo, usize, bool)],
+	runs: &[FixedHotRun],
 	hot_pages: usize,
 	pool_pages: usize,
 	extent_pages: usize,
@@ -6382,7 +6430,7 @@ fn measure_fixed_hot_hybrid(
 #[cfg(all(windows, feature = "native-async-io"))]
 fn measure_fixed_hot_mmap(
 	dataset: &Dataset,
-	runs: &[(PageNo, usize, bool)],
+	runs: &[FixedHotRun],
 	hot_pages: usize,
 ) -> Result<Measurement, Box<dyn Error>> {
 	let rss_before = process_rss()?;
@@ -6677,29 +6725,31 @@ fn measure_production_resident_windows(
 			if !use_complete_hot_table {
 				scope.update_resolved_table_owned(table, &mut window_handles)?;
 			}
-			let window = scope.get_resolved_window(table, runs_in_window)?.ok_or_else(|| {
-				FerrosGrynnError::storage_io_failure("production window page became stale")
-			})?;
-			for offset in 0..runs_in_window {
-				let page_index = if use_complete_hot_table {
-					let run = completed_runs + sample_offset + offset as u64;
-					resident_page(run, hot_pages).get() as usize
-				} else {
-					offset
-				};
-				let page = window.page(page_index).ok_or_else(|| {
-					FerrosGrynnError::storage_io_failure(
-						"production window lost its prepared frame",
-					)
-				})?;
-				let remaining = logical_operations - completed_operations;
-				let logical_count = remaining.min(run_length as u64);
-				for logical in 0..logical_count as usize {
-					black_box(page.as_bytes()[resident_marker_offset(logical)]);
+			{
+				let window =
+					scope.get_resolved_window(table, runs_in_window)?.ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("production window page became stale")
+					})?;
+				for offset in 0..runs_in_window {
+					let page_index = if use_complete_hot_table {
+						let run = completed_runs + sample_offset + offset as u64;
+						resident_page(run, hot_pages).get() as usize
+					} else {
+						offset
+					};
+					let page = window.page(page_index).ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure(
+							"production window lost its prepared frame",
+						)
+					})?;
+					let remaining = logical_operations - completed_operations;
+					let logical_count = remaining.min(run_length as u64);
+					for logical in 0..logical_count as usize {
+						black_box(page.as_bytes()[resident_marker_offset(logical)]);
+					}
+					completed_operations += logical_count;
 				}
-				completed_operations += logical_count;
 			}
-			drop(window);
 			sample_offset += runs_in_window as u64;
 		}
 		let sample_operations = completed_operations - sample_operations_before;
@@ -6850,21 +6900,24 @@ fn consume_production_resident_operations(
 			}
 			scope.update_resolved_table_owned(table, &mut window_handles)?;
 		}
-		let window = scope.get_resolved_window(table, window_len)?.ok_or_else(|| {
-			FerrosGrynnError::storage_io_failure("concurrent production window became stale")
-		})?;
-		for offset in 0..window_len {
-			let page_index = if use_complete_hot_table {
-				resident_page(start + completed + offset as u64, hot_pages).get() as usize
-			} else {
-				offset
-			};
-			let page = window.page(page_index).ok_or_else(|| {
-				FerrosGrynnError::storage_io_failure("concurrent production window lost its frame")
+		{
+			let window = scope.get_resolved_window(table, window_len)?.ok_or_else(|| {
+				FerrosGrynnError::storage_io_failure("concurrent production window became stale")
 			})?;
-			black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			for offset in 0..window_len {
+				let page_index = if use_complete_hot_table {
+					resident_page(start + completed + offset as u64, hot_pages).get() as usize
+				} else {
+					offset
+				};
+				let page = window.page(page_index).ok_or_else(|| {
+					FerrosGrynnError::storage_io_failure(
+						"concurrent production window lost its frame",
+					)
+				})?;
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			}
 		}
-		drop(window);
 		completed += window_len as u64;
 	}
 	Ok(())
@@ -7078,9 +7131,11 @@ fn filetime_ticks(value: FILETIME) -> u64 {
 /// Reads cumulative process page faults and current working-set bytes.
 #[cfg(windows)]
 pub(super) fn process_memory_snapshot() -> io::Result<ProcessMemorySnapshot> {
-	let mut counters = PROCESS_MEMORY_COUNTERS::default();
-	counters.cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
-		.map_err(|_error| io::Error::other("process memory counter size exceeds u32"))?;
+	let mut counters = PROCESS_MEMORY_COUNTERS {
+		cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
+			.map_err(|_error| io::Error::other("process memory counter size exceeds u32"))?,
+		..Default::default()
+	};
 	// SAFETY: `GetCurrentProcess` returns the documented non-owning
 	// pseudo-handle.
 	let process = unsafe { GetCurrentProcess() };
@@ -7263,6 +7318,8 @@ struct ThreadAffinityRestore {
 
 #[cfg(windows)]
 impl Drop for ThreadAffinityRestore {
+	/// Runs cleanup for this `ThreadAffinityRestore` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		use windows::Win32::System::Threading::SetThreadAffinityMask;
 
@@ -7306,6 +7363,7 @@ fn tsc_resolved_probe(
 ) -> Result<bool, Box<dyn Error>> {
 	use std::arch::x86_64::{__cpuid, __rdtscp, _mm_lfence};
 
+	/// Returns fenced tsc for this module.
 	#[inline(always)]
 	fn fenced_tsc(aux: &mut u32) -> u64 {
 		let aux = std::ptr::from_mut(aux);
@@ -7363,6 +7421,7 @@ fn tsc_resolved_probe(
 }
 
 #[cfg(test)]
+/// Regression tests for harness behavior.
 mod harness_contract_tests {
 	use super::*;
 
@@ -7376,6 +7435,8 @@ mod harness_contract_tests {
 	}
 
 	impl Drop for ScopedDropToken {
+		/// Runs cleanup for this `ScopedDropToken` before its fields are
+		/// released.
 		fn drop(&mut self) {
 			self.dropped.fetch_add(1, Ordering::Relaxed);
 		}
@@ -7718,6 +7779,7 @@ mod harness_contract_tests {
 	/// enough for calibration without asserting cache-policy outcomes.
 	#[test]
 	fn resident_page_distribution_is_decorrelated_and_complete() -> Result<(), Box<dyn Error>> {
+		/// Number of generated resident-page selections per histogram bucket.
 		const SAMPLES_PER_BUCKET: usize = 128;
 		for hot_pages in [5_462_usize, 8_192] {
 			let mut buckets = vec![0_usize; hot_pages];
@@ -7747,6 +7809,7 @@ mod harness_contract_tests {
 	/// barrier permits workers to advance into the timed phase.
 	#[test]
 	fn concurrency_start_uses_distinct_readiness_and_timed_release() {
+		/// Worker count used to verify the two-phase benchmark start barrier.
 		const WORKERS: usize = 2;
 
 		let readiness = Barrier::new(WORKERS + 1);

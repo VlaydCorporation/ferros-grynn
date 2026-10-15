@@ -2,20 +2,39 @@
 
 use std::collections::BTreeMap;
 
-use super::{checked_page_no, codec::*};
+use super::{
+	checked_page_no,
+	codec::{
+		invalid_page,
+		read_optional_page,
+		read_u32,
+		read_u64,
+		validate_zero,
+		write_optional_page,
+		write_u32,
+		write_u64,
+	},
+};
 use crate::{
 	datastore::ClassId,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::page::{AlignedPage, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
 };
 
+/// Configured next page value.
 const NEXT_PAGE: usize = 32;
+/// Configured count value.
 const COUNT: usize = 40;
+/// Configured reserved value.
 const RESERVED: usize = 44;
+/// Configured entries value.
 const ENTRIES: usize = 48;
+/// Configured entry bytes value.
 const ENTRY_BYTES: usize = 16;
+/// Configured per page value.
 const PER_PAGE: usize = (PAGE_SIZE - ENTRIES) / ENTRY_BYTES;
 
+/// Encodes class statistics.
 pub(in crate::storage) fn encode_class_statistics(
 	classes: &BTreeMap<ClassId, u64>,
 	first_page: u64,
@@ -36,6 +55,7 @@ pub(in crate::storage) fn encode_class_statistics(
 	Ok(pages)
 }
 
+/// Decodes class statistics.
 pub(in crate::storage) fn decode_class_statistics<ReadPage>(
 	read_page: ReadPage,
 	layout: super::StatisticsLayout,
@@ -46,6 +66,7 @@ where
 	decode_class_statistics_range(read_page, layout.class_first, layout.class_pages)
 }
 
+/// Decodes class statistics range.
 pub(in crate::storage) fn decode_class_statistics_range<ReadPage>(
 	mut read_page: ReadPage,
 	first: Option<PageNo>,
@@ -89,6 +110,7 @@ where
 	Ok(result)
 }
 
+/// Encodes page.
 fn encode_page(
 	page_no: PageNo,
 	next: Option<PageNo>,
@@ -113,6 +135,7 @@ fn encode_page(
 	Ok(page)
 }
 
+/// Decodes page.
 fn decode_page(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -146,6 +169,7 @@ fn decode_page(
 	Ok(result)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

@@ -1,5 +1,9 @@
 use std::num::NonZeroUsize;
 
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{ClassSchema, Datastore},
 	gql::{QueryExecutionOptions, QueryStatementKind},
@@ -7,29 +11,30 @@ use crate::{
 	values::{Number, Object, RecordId, Value},
 };
 
+/// Returns traverse for this module.
 fn traverse(source: &str) -> Value {
 	let store = Datastore::in_memory();
-	let result = store.execute(source, &Object::new()).unwrap();
-	let statement = result.last().unwrap();
+	let result = store.execute(source, &Object::new()).assert_ok();
+	let statement = result.last().assert_some();
 	assert_eq!(statement.kind, QueryStatementKind::Traverse);
-	statement.result.as_ref().unwrap().value().clone()
+	statement.result.as_ref().assert_ok().value().clone()
 }
 
 /// Creates a directed chain used by both estimate bindings and exact traversal.
 fn estimate_store() -> Datastore {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("road", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("routes", GraphKind::Graph).unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("road", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("routes", GraphKind::Graph).assert_ok();
 	let records = ["person:a", "person:b", "person:c", "road:ab", "road:bc"]
-		.map(|value| value.parse::<RecordId>().unwrap());
+		.map(|value| value.parse::<RecordId>().assert_ok());
 	for record in &records {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
 	let nodes = records[..3]
 		.iter()
-		.map(|record| seed.attach_node(graph.id(), record, None, None).unwrap())
+		.map(|record| seed.attach_node(graph.id(), record, None, None).assert_ok())
 		.collect::<Vec<_>>();
 	for (ordinal, pair) in nodes.windows(2).enumerate() {
 		seed.attach_edge(
@@ -40,9 +45,9 @@ fn estimate_store() -> Datastore {
 			None,
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
-	seed.commit().unwrap();
+	seed.commit().assert_ok();
 	store
 }
 
@@ -50,16 +55,18 @@ fn estimate_store() -> Datastore {
 fn estimate_value(store: &Datastore, query: &str) -> Value {
 	store
 		.execute(query, &Object::new())
-		.unwrap()
+		.assert_ok()
 		.last()
-		.unwrap()
+		.assert_some()
 		.result
 		.as_ref()
-		.unwrap()
+		.assert_ok()
 		.value()
 		.clone()
 }
 
+/// Verifies k hop estimate selects only compatible sketches and keeps exact
+/// enumeration.
 #[test]
 fn k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration() {
 	let store = estimate_store();
@@ -70,11 +77,11 @@ fn k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration()
 	assert_eq!(
 		before
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("neighbourhood_fallbacks"),
 		Some(&Value::from(1_u64))
 	);
@@ -94,17 +101,17 @@ fn k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration()
 	}
 	let incompatible = explain(query);
 	assert_eq!(
-		incompatible.as_object().unwrap().get("plan_hash"),
-		before.as_object().unwrap().get("plan_hash")
+		incompatible.as_object().assert_some().get("plan_hash"),
+		before.as_object().assert_some().get("plan_hash")
 	);
 	assert_eq!(
 		incompatible
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("neighbourhood_sketch_reads"),
 		Some(&Value::from(0_u64))
 	);
@@ -119,41 +126,42 @@ fn k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration()
 		);
 	}
 	let ready = explain(query);
-	let ready = ready.as_object().unwrap();
-	assert_ne!(ready.get("plan_hash"), before.as_object().unwrap().get("plan_hash"));
+	let ready = ready.as_object().assert_some();
+	assert_ne!(ready.get("plan_hash"), before.as_object().assert_some().get("plan_hash"));
 	let node = ready
 		.get("nodes")
-		.unwrap()
+		.assert_some()
 		.as_array()
-		.unwrap()
+		.assert_some()
 		.iter()
 		.filter_map(Value::as_object)
 		.find(|node| node.get("operator") == Some(&Value::from("NeighbourhoodSketch")))
-		.unwrap();
+		.assert_some();
 	assert_eq!(node.get("precision"), Some(&Value::from(12_u64)));
-	let metrics = ready.get("analyze").unwrap().as_object().unwrap();
+	let metrics = ready.get("analyze").assert_some().as_object().assert_some();
 	assert_eq!(metrics.get("neighbourhood_sketch_reads"), Some(&Value::from(1_u64)));
 	assert_eq!(metrics.get("neighbourhood_fallbacks"), Some(&Value::from(0_u64)));
 	assert_eq!(metrics.get("neighbourhood_exact_work"), Some(&Value::from(0_u64)));
 	assert_ne!(metrics.get("graph_artifact_bytes"), Some(&Value::from(0_u64)));
 	let exact = "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHop(2);";
 	let rows = estimate_value(&store, exact);
-	let members = rows.as_array().unwrap().iter().next().unwrap().as_array().unwrap();
+	let members =
+		rows.as_array().assert_some().iter().next().assert_some().as_array().assert_some();
 	assert_eq!(
 		members
 			.iter()
-			.map(|value| value.as_atom_occurrence().unwrap().atom().id().to_string())
+			.map(|value| value.as_atom_occurrence().assert_some().atom().id().to_string())
 			.collect::<Vec<_>>(),
 		["person:a", "person:b", "person:c"]
 	);
 	assert_eq!(
 		explain(exact)
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("neighbourhood_sketch_reads"),
 		Some(&Value::from(0_u64))
 	);
@@ -188,15 +196,16 @@ fn k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration()
 	);
 }
 
+/// Verifies k hop estimate rejects invalid radii and enforces exact resource
+/// budgets.
 #[test]
 fn k_hop_estimate_rejects_invalid_radii_and_enforces_exact_resource_budgets() {
 	let store = estimate_store();
 	for radius in ["-1", "1.5", "'two'", "4294967296"] {
 		let query =
 			format!("TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate({radius});");
-		match store.execute(&query, &Object::new()) {
-			Ok(results) => assert!(results[0].result.is_err(), "{radius}"),
-			Err(_) => {}
+		if let Ok(results) = store.execute(&query, &Object::new()) {
+			assert!(results[0].result.is_err(), "{radius}");
 		}
 	}
 	let query = "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate(2);";
@@ -204,12 +213,14 @@ fn k_hop_estimate_rejects_invalid_radii_and_enforces_exact_resource_budgets() {
 		max_path_expansions: 1,
 		..Default::default()
 	};
-	assert!(store.execute_with_options(query, &Object::new(), limited).unwrap()[0].result.is_err());
+	assert!(
+		store.execute_with_options(query, &Object::new(), limited).assert_ok()[0].result.is_err()
+	);
 	let tiny = QueryExecutionOptions {
-		barrier_memory_bytes: NonZeroUsize::new(2048).unwrap(),
+		barrier_memory_bytes: NonZeroUsize::new(2048).assert_some(),
 		..Default::default()
 	};
-	assert!(store.execute_with_options(query, &Object::new(), tiny).unwrap()[0].result.is_err());
+	assert!(store.execute_with_options(query, &Object::new(), tiny).assert_ok()[0].result.is_err());
 	let cancel = crate::gql::QueryCancellation::default();
 	cancel.cancel();
 	let cancelled = QueryExecutionOptions {
@@ -217,21 +228,21 @@ fn k_hop_estimate_rejects_invalid_radii_and_enforces_exact_resource_budgets() {
 		..Default::default()
 	};
 	assert!(
-		store.execute_with_options(query, &Object::new(), cancelled).unwrap()[0].result.is_err()
+		store.execute_with_options(query, &Object::new(), cancelled).assert_ok()[0].result.is_err()
 	);
 	let full = estimate_value(&store, &format!("EXPLAIN ANALYZE FORMAT JSON {query}"));
 	let work = full
 		.as_object()
-		.unwrap()
+		.assert_some()
 		.get("analyze")
-		.unwrap()
+		.assert_some()
 		.as_object()
-		.unwrap()
+		.assert_some()
 		.get("neighbourhood_exact_work")
-		.unwrap()
+		.assert_some()
 		.as_number()
 		.and_then(|value| u64::try_from(value).ok())
-		.unwrap();
+		.assert_some();
 	assert!(work > 1);
 	let shared = QueryExecutionOptions {
 		max_path_expansions: work,
@@ -244,12 +255,13 @@ fn k_hop_estimate_rejects_invalid_radii_and_enforces_exact_resource_budgets() {
 				&Object::new(),
 				shared
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
 }
 
+/// Verifies k hop estimate private invalidation old snapshot and ssi.
 #[test]
 fn k_hop_estimate_private_invalidation_old_snapshot_and_ssi() {
 	let store = estimate_store();
@@ -263,51 +275,66 @@ fn k_hop_estimate_private_invalidation_old_snapshot_and_ssi() {
 	let hits = |value: &Value| {
 		value
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("neighbourhood_sketch_reads")
 			.cloned()
 	};
-	let graph = store.schema_catalog().named_graph("routes").unwrap().id();
-	let edge = "road:ab".parse::<RecordId>().unwrap();
+	let graph = store.schema_catalog().named_graph("routes").assert_some().id();
+	let edge = "road:ab".parse::<RecordId>().assert_ok();
 	let mut old = store.begin();
 	let mut reader = store.begin();
 	assert_eq!(
-		hits(reader.execute(query, &Object::new()).unwrap()[0].result.as_ref().unwrap().value()),
+		hits(
+			reader.execute(query, &Object::new()).assert_ok()[0]
+				.result
+				.as_ref()
+				.assert_ok()
+				.value()
+		),
 		Some(Value::from(1_u64))
 	);
 	let mut private = store.begin();
-	private.set_occurrence_label(graph, &edge, Some("private".into())).unwrap();
+	private.set_occurrence_label(graph, &edge, Some("private".into())).assert_ok();
 	assert_eq!(
-		hits(private.execute(query, &Object::new()).unwrap()[0].result.as_ref().unwrap().value()),
+		hits(
+			private.execute(query, &Object::new()).assert_ok()[0]
+				.result
+				.as_ref()
+				.assert_ok()
+				.value()
+		),
 		Some(Value::from(0_u64))
 	);
 	drop(private);
 	assert_eq!(hits(&estimate_value(&store, query)), Some(Value::from(1_u64)));
 	let mut property = store.begin();
-	let key = property.intern_property("info").unwrap();
-	property.set_base_property(&edge, key, Value::from(7_i64)).unwrap();
-	property.commit().unwrap();
+	let key = property.intern_property("info").assert_ok();
+	property.set_base_property(&edge, key, Value::from(7_i64)).assert_ok();
+	property.commit().assert_ok();
 	assert_eq!(hits(&estimate_value(&store, query)), Some(Value::from(1_u64)));
 	let mut writer = store.begin();
-	writer.detach_occurrence(graph, &edge, false).unwrap();
-	writer.commit().unwrap();
+	writer.detach_occurrence(graph, &edge, false).assert_ok();
+	writer.commit().assert_ok();
 	assert_eq!(hits(&estimate_value(&store, query)), Some(Value::from(0_u64)));
 	assert_eq!(
 		estimate_value(&store, "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate(2);"),
 		Value::Array(vec![1_u64].into())
 	);
 	assert_eq!(
-		hits(old.execute(query, &Object::new()).unwrap()[0].result.as_ref().unwrap().value()),
+		hits(old.execute(query, &Object::new()).assert_ok()[0].result.as_ref().assert_ok().value()),
 		Some(Value::from(1_u64))
 	);
-	reader.create_atom("person:reader".parse().unwrap(), Default::default()).unwrap();
-	assert_eq!(reader.commit().unwrap_err().status().code().to_string(), "FG-40001");
+	reader
+		.create_atom("person:reader".parse().assert_ok(), crate::values::PropertyMap::default())
+		.assert_ok();
+	assert_eq!(reader.commit().assert_err().status().code().to_string(), "FG-40001");
 }
 
+/// Verifies traverses collection with language closures.
 #[test]
 fn traverses_collection_with_language_closures() {
 	assert_eq!(
@@ -323,6 +350,7 @@ fn traverses_collection_with_language_closures() {
 	);
 }
 
+/// Verifies named algorithm receives current and flat maps collections.
 #[test]
 fn named_algorithm_receives_current_and_flat_maps_collections() {
 	let store = Datastore::in_memory();
@@ -334,7 +362,7 @@ fn named_algorithm_receives_current_and_flat_maps_collections() {
 			 RETURN $value; };",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(
 		defined.iter().all(|result| result.result.is_ok()),
 		"function definition failed: {defined:?}"
@@ -343,27 +371,29 @@ fn named_algorithm_receives_current_and_flat_maps_collections() {
 	assert_eq!(
 		store
 			.execute("TRAVERSE FROM [1, 2, 3] |> tv::algo(fn::offset, 2);", &Object::new(),)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.as_ref()
-			.unwrap()
+			.assert_ok()
 			.value(),
 		&Value::Array(vec![3_i64, 4, 5].into())
 	);
 	assert_eq!(
-		store.execute("TRAVERSE FROM [1, 2] |> tv::algo(fn::spread);", &Object::new(),).unwrap()[0]
-			.result
-			.as_ref()
-			.unwrap()
-			.value(),
+		store.execute("TRAVERSE FROM [1, 2] |> tv::algo(fn::spread);", &Object::new(),).assert_ok()
+			[0]
+		.result
+		.as_ref()
+		.assert_ok()
+		.value(),
 		&Value::Array(vec![1_i64, 11, 2, 12].into())
 	);
 	let impure = store
 		.execute("TRAVERSE FROM [1] |> tv::algo(fn::impure_identity);", &Object::new())
-		.unwrap();
+		.assert_ok();
 	assert!(impure[0].result.is_err());
 }
 
+/// Verifies collection steps cover the public traversal adapters.
 #[test]
 fn collection_steps_cover_the_public_traversal_adapters() {
 	assert_eq!(
@@ -426,14 +456,15 @@ fn collection_steps_cover_the_public_traversal_adapters() {
 	}
 }
 
+/// Verifies generic pipeline and block closure use the query runtime.
 #[test]
 fn generic_pipeline_and_block_closure_use_the_query_runtime() {
 	let store = Datastore::in_memory();
 	let pipeline = store
 		.execute("[1, 2, 3] |> tv::map(|$value| $value * 2) |> tv::fold();", &Object::new())
-		.unwrap();
+		.assert_ok();
 	assert_eq!(
-		pipeline[0].result.as_ref().unwrap().value(),
+		pipeline[0].result.as_ref().assert_ok().value(),
 		&Value::Array(vec![Value::Array(vec![2_i64, 4, 6].into())].into())
 	);
 	let closure = store
@@ -442,32 +473,38 @@ fn generic_pipeline_and_block_closure_use_the_query_runtime() {
 			 $increment(41);",
 			&Object::new(),
 		)
-		.unwrap();
-	assert_eq!(closure.last().unwrap().result.as_ref().unwrap().value(), &Value::from(42_i64));
+		.assert_ok();
+	assert_eq!(
+		closure.last().assert_some().result.as_ref().assert_ok().value(),
+		&Value::from(42_i64)
+	);
 }
 
+/// Verifies persistent session owns closures and transient execute rejects
+/// escape.
 #[test]
 fn persistent_session_owns_closures_and_transient_execute_rejects_escape() {
 	let store = Datastore::in_memory();
 	let mut session = store.session();
 	session
 		.execute("LET $factor = 2; LET $twice = |$value| $value * $factor;", &Object::new())
-		.unwrap();
-	let result = session.execute("$twice(21);", &Object::new()).unwrap();
-	assert_eq!(result[0].result.as_ref().unwrap().value(), &Value::from(42_i64));
+		.assert_ok();
+	let result = session.execute("$twice(21);", &Object::new()).assert_ok();
+	assert_eq!(result[0].result.as_ref().assert_ok().value(), &Value::from(42_i64));
 
-	let returned = session.execute("$twice;", &Object::new()).unwrap();
-	let closure = returned[0].result.as_ref().unwrap().value().clone();
+	let returned = session.execute("$twice;", &Object::new()).assert_ok();
+	let closure = returned[0].result.as_ref().assert_ok().value().clone();
 	let mut other = store.session();
 	let mut variables = Object::new();
 	variables.insert("foreign", closure);
-	let mismatch = other.execute("$foreign(1);", &variables).unwrap();
+	let mismatch = other.execute("$foreign(1);", &variables).assert_ok();
 	assert!(mismatch[0].result.is_err());
 
-	let transient = store.execute("[|$value| $value];", &Object::new()).unwrap();
+	let transient = store.execute("[|$value| $value];", &Object::new()).assert_ok();
 	assert!(transient[0].result.is_err());
 }
 
+/// Verifies persistent session releases statement local closures.
 #[test]
 fn persistent_session_releases_statement_local_closures() {
 	let store = Datastore::in_memory();
@@ -475,12 +512,13 @@ fn persistent_session_releases_statement_local_closures() {
 	for _ in 0..32 {
 		let result = session
 			.execute("TRAVERSE FROM [1, 2] |> tv::map(|$value| $value + 1);", &Object::new())
-			.unwrap();
+			.assert_ok();
 		assert!(result[0].result.is_ok());
 		assert_eq!(session.retained_closure_bytes(), 0);
 	}
 }
 
+/// Verifies traversal bulks and splits limit without changing values.
 #[test]
 fn traversal_bulks_and_splits_limit_without_changing_values() {
 	assert_eq!(
@@ -493,6 +531,7 @@ fn traversal_bulks_and_splits_limit_without_changing_values() {
 	);
 }
 
+/// Verifies sacks receive previous state before current value.
 #[test]
 fn sacks_receive_previous_state_before_current_value() {
 	assert_eq!(
@@ -512,31 +551,33 @@ fn sacks_receive_previous_state_before_current_value() {
 	assert!(
 		Datastore::in_memory()
 			.execute("TRAVERSE FROM [2] |> tv::get_named_sack('missing');", &Object::new())
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
 }
 
+/// Verifies atom source requires snapshot visible graph membership.
 #[test]
 fn atom_source_requires_snapshot_visible_graph_membership() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	let graph = seed.define_graph("social", GraphKind::Graph).unwrap();
-	seed.commit().unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("social", GraphKind::Graph).assert_ok();
+	seed.commit().assert_ok();
 	let mut variables = Object::new();
 	variables.insert("graph", Value::GraphRef(Box::new(graph)));
 	variables.insert(
 		"missing",
-		Value::Atom(Box::new(AtomRef::new(AtomKind::Node, "person:missing".parse().unwrap()))),
+		Value::Atom(Box::new(AtomRef::new(AtomKind::Node, "person:missing".parse().assert_ok()))),
 	);
 	let result = store
 		.execute("TRAVERSE FROM $missing IN GRAPH $graph |> tv::limit(1);", &variables)
-		.unwrap();
+		.assert_ok();
 	assert!(result[0].result.is_err());
 }
 
+/// Verifies fast traversal preserves multiplicity and impure source order.
 #[test]
 fn fast_traversal_preserves_multiplicity_and_impure_source_order() {
 	let store = Datastore::in_memory();
@@ -547,15 +588,16 @@ fn fast_traversal_preserves_multiplicity_and_impure_source_order() {
 			 $acc * 10 + $x; }) |> tv::select('seen'); COMMIT;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let traversal =
-		results.iter().find(|result| result.kind == QueryStatementKind::Traverse).unwrap();
+		results.iter().find(|result| result.kind == QueryStatementKind::Traverse).assert_some();
 	assert_eq!(
-		traversal.result.as_ref().unwrap().value(),
+		traversal.result.as_ref().assert_ok().value(),
 		&Value::Array(vec![1_i64, 12, 121].into())
 	);
 }
 
+/// Verifies traversal return reads named bindings and side effect state.
 #[test]
 fn traversal_return_reads_named_bindings_and_side_effect_state() {
 	assert_eq!(
@@ -580,6 +622,7 @@ fn traversal_return_reads_named_bindings_and_side_effect_state() {
 	);
 }
 
+/// Verifies mutating side effect is visible to downstream steps.
 #[test]
 fn mutating_side_effect_is_visible_to_downstream_steps() {
 	let store = Datastore::in_memory();
@@ -590,9 +633,9 @@ fn mutating_side_effect_is_visible_to_downstream_steps() {
 			 GRAPH social;",
 			&Object::new(),
 		)
-		.unwrap();
-	let graph = store.schema_catalog().named_graph("social").unwrap().reference().clone();
-	let alice = "person:alice".parse::<RecordId>().unwrap();
+		.assert_ok();
+	let graph = store.schema_catalog().named_graph("social").assert_some().reference().clone();
+	let alice = "person:alice".parse::<RecordId>().assert_ok();
 	let mut variables = Object::new();
 	variables.insert("graph", Value::GraphRef(Box::new(graph)));
 	variables.insert("alice", Value::Record(Box::new(alice)));
@@ -604,20 +647,21 @@ fn mutating_side_effect_is_visible_to_downstream_steps() {
 			 tv::values('score'); COMMIT;",
 			&variables,
 		)
-		.unwrap();
+		.assert_ok();
 	let traversal =
-		results.iter().find(|result| result.kind == QueryStatementKind::Traverse).unwrap();
-	assert_eq!(traversal.result.as_ref().unwrap().value(), &Value::Array(vec![7_i64].into()));
+		results.iter().find(|result| result.kind == QueryStatementKind::Traverse).assert_some();
+	assert_eq!(traversal.result.as_ref().assert_ok().value(), &Value::Array(vec![7_i64].into()));
 	assert_eq!(
-		store.execute("SELECT VALUE score FROM person:alice;", &Object::new()).unwrap()[0]
+		store.execute("SELECT VALUE score FROM person:alice;", &Object::new()).assert_ok()[0]
 			.result
 			.as_ref()
-			.unwrap()
+			.assert_ok()
 			.value(),
 		&Value::Array(vec![7_i64].into())
 	);
 }
 
+/// Verifies failed language closure restores its transaction savepoint.
 #[test]
 fn failed_language_closure_restores_its_transaction_savepoint() {
 	let store = Datastore::in_memory();
@@ -627,7 +671,7 @@ fn failed_language_closure_restores_its_transaction_savepoint() {
 			 int; CREATE person:alice SET score = 1;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	let results = store
 		.execute(
 			"BEGIN; LET $mutate = |$value| { UPDATE person:alice SET score = 9; THROW 'rollback'; \
@@ -635,11 +679,13 @@ fn failed_language_closure_restores_its_transaction_savepoint() {
 			 person:alice; COMMIT;",
 			&Object::new(),
 		)
-		.unwrap();
-	let selected = results.iter().find(|result| result.kind == QueryStatementKind::Select).unwrap();
-	assert_eq!(selected.result.as_ref().unwrap().value(), &Value::Array(vec![1_i64].into()));
+		.assert_ok();
+	let selected =
+		results.iter().find(|result| result.kind == QueryStatementKind::Select).assert_some();
+	assert_eq!(selected.result.as_ref().assert_ok().value(), &Value::Array(vec![1_i64].into()));
 }
 
+/// Verifies traversal order and dedup spill through shared query runs.
 #[test]
 fn traversal_order_and_dedup_spill_through_shared_query_runs() {
 	let store = Datastore::in_memory();
@@ -655,19 +701,20 @@ fn traversal_order_and_dedup_spill_through_shared_query_runs() {
 				..QueryExecutionOptions::default()
 			},
 		)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(
-		results[0].result.as_ref().unwrap().value(),
+		results[0].result.as_ref().assert_ok().value(),
 		&Value::Array(vec![1_i64, 2, 3].into())
 	);
 	let query_root = root.join("tmp").join("query");
 	assert!(
-		!query_root.exists() || std::fs::read_dir(&query_root).unwrap().next().is_none(),
+		!query_root.exists() || std::fs::read_dir(&query_root).assert_ok().next().is_none(),
 		"completed traversal must remove transient query-run sessions"
 	);
 	drop(std::fs::remove_dir_all(root));
 }
 
+/// Verifies traversal frontier obeys the shared memory budget.
 #[test]
 fn traversal_frontier_obeys_the_shared_memory_budget() {
 	let results = Datastore::in_memory()
@@ -679,32 +726,38 @@ fn traversal_frontier_obeys_the_shared_memory_budget() {
 				..QueryExecutionOptions::default()
 			},
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(results[0].result.is_err());
 }
 
+/// Verifies traversal group accepts a composite field key.
 #[test]
 fn traversal_group_accepts_a_composite_field_key() {
 	let result = traverse(
 		"TRAVERSE FROM [{ region: 'eu', tier: 1 }, { region: 'eu', tier: 2 }, { region: 'eu', \
 		 tier: 1 }] |> tv::group('region', 'tier');",
 	);
-	let Value::Array(groups) = result else {
-		panic!("group traversal must return an array")
-	};
+	let groups = match result {
+		Value::Array(groups) => Some(groups),
+		_ => None,
+	}
+	.assert_some_with("group traversal must return an array");
 	assert_eq!(groups.len(), 2);
 	let counts = groups
 		.iter()
 		.map(|group| {
-			let Value::Object(group) = group else {
-				panic!("group traversal must return objects")
-			};
+			let group = match group {
+				Value::Object(group) => Some(group),
+				_ => None,
+			}
+			.assert_some_with("group traversal must return objects");
 			group.get("count").cloned().unwrap_or(Value::None)
 		})
 		.collect::<Vec<_>>();
 	assert_eq!(counts, vec![Value::from(2_i64), Value::from(1_i64)]);
 }
 
+/// Verifies repeat propagates until errors.
 #[test]
 fn repeat_propagates_until_errors() {
 	let store = Datastore::in_memory();
@@ -713,34 +766,37 @@ fn repeat_propagates_until_errors() {
 			"TRAVERSE FROM [1] |> tv::repeat(|$x| $x + 1).until(|$x| math::sqrt(-1));",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(results[0].result.is_err());
 }
 
+/// Verifies traversal uses the common statement timeout.
 #[test]
 fn traversal_uses_the_common_statement_timeout() {
 	let store = Datastore::in_memory();
 	let results = store
 		.execute("TRAVERSE FROM [1] |> tv::map(|$value| $value) TIMEOUT 0ms;", &Object::new())
-		.unwrap();
+		.assert_ok();
 	assert!(results[0].result.is_err());
 }
 
+/// Verifies navigates occurrences and resolves fields inside closures.
 #[test]
 fn navigates_occurrences_and_resolves_fields_inside_closures() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("knows", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("social", GraphKind::Graph).unwrap();
-	let alice = "person:alice".parse::<RecordId>().unwrap();
-	let bob = "person:bob".parse::<RecordId>().unwrap();
-	let knows = "knows:alice-bob".parse::<RecordId>().unwrap();
-	seed.create_atom(alice.clone(), Default::default()).unwrap();
-	seed.create_atom(bob.clone(), Default::default()).unwrap();
-	seed.create_atom(knows.clone(), Default::default()).unwrap();
-	let alice_local = seed.attach_node(graph.id(), &alice, Some("Employee".into()), None).unwrap();
-	let bob_local = seed.attach_node(graph.id(), &bob, Some("Employee".into()), None).unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("knows", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("social", GraphKind::Graph).assert_ok();
+	let alice = "person:alice".parse::<RecordId>().assert_ok();
+	let bob = "person:bob".parse::<RecordId>().assert_ok();
+	let knows = "knows:alice-bob".parse::<RecordId>().assert_ok();
+	seed.create_atom(alice.clone(), crate::values::PropertyMap::default()).assert_ok();
+	seed.create_atom(bob.clone(), crate::values::PropertyMap::default()).assert_ok();
+	seed.create_atom(knows.clone(), crate::values::PropertyMap::default()).assert_ok();
+	let alice_local =
+		seed.attach_node(graph.id(), &alice, Some("Employee".into()), None).assert_ok();
+	let bob_local = seed.attach_node(graph.id(), &bob, Some("Employee".into()), None).assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&knows,
@@ -749,8 +805,8 @@ fn navigates_occurrences_and_resolves_fields_inside_closures() {
 		None,
 		None,
 	)
-	.unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.commit().assert_ok();
 
 	let mut variables = Object::new();
 	variables.insert("graph", Value::GraphRef(Box::new(graph)));
@@ -761,9 +817,9 @@ fn navigates_occurrences_and_resolves_fields_inside_closures() {
 			 tv::out() |> tv::values('id');",
 			&variables,
 		)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(
-		result[0].result.as_ref().unwrap().value(),
+		result[0].result.as_ref().assert_ok().value(),
 		&Value::Array(vec![Value::Record(Box::new(bob.clone()))].into())
 	);
 
@@ -772,13 +828,17 @@ fn navigates_occurrences_and_resolves_fields_inside_closures() {
 			"TRAVERSE FROM $alice IN GRAPH $graph |> tv::outE() |> tv::inV() |> tv::path();",
 			&variables,
 		)
-		.unwrap();
-	let Value::Array(paths) = path[0].result.as_ref().unwrap().value() else {
-		panic!("path traversal must return an array")
-	};
-	let Some(Value::Path(path)) = paths.iter().next() else {
-		panic!("path traversal must return one path")
-	};
+		.assert_ok();
+	let paths = match path[0].result.as_ref().assert_ok().value() {
+		Value::Array(paths) => Some(paths),
+		_ => None,
+	}
+	.assert_some_with("path traversal must return an array");
+	let path = match paths.iter().next() {
+		Some(Value::Path(path)) => Some(path),
+		_ => None,
+	}
+	.assert_some_with("path traversal must return one path");
 	assert_eq!(path.steps().len(), 2);
 	assert_eq!(path.steps()[0].atom().atom().id(), &alice);
 	assert_eq!(path.steps()[1].atom().atom().id(), &bob);
@@ -790,29 +850,30 @@ fn navigates_occurrences_and_resolves_fields_inside_closures() {
 			 tv::values('id');",
 			&variables,
 		)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(
-		matched[0].result.as_ref().unwrap().value(),
+		matched[0].result.as_ref().assert_ok().value(),
 		&Value::Array(vec![Value::Record(Box::new(bob))].into())
 	);
 }
 
+/// Verifies traversal algorithms reuse exact graph core.
 #[test]
 fn traversal_algorithms_reuse_exact_graph_core() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("road", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("routes", GraphKind::Graph).unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("road", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("routes", GraphKind::Graph).assert_ok();
 	let records =
-		["person:a", "person:b", "person:c"].map(|value| value.parse::<RecordId>().unwrap());
-	let edges = ["road:a-b", "road:b-c"].map(|value| value.parse::<RecordId>().unwrap());
+		["person:a", "person:b", "person:c"].map(|value| value.parse::<RecordId>().assert_ok());
+	let edges = ["road:a-b", "road:b-c"].map(|value| value.parse::<RecordId>().assert_ok());
 	for record in records.iter().chain(edges.iter()) {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
-	let a = seed.attach_node(graph.id(), &records[0], None, None).unwrap();
-	let b = seed.attach_node(graph.id(), &records[1], None, None).unwrap();
-	let c = seed.attach_node(graph.id(), &records[2], None, None).unwrap();
+	let a = seed.attach_node(graph.id(), &records[0], None, None).assert_ok();
+	let b = seed.attach_node(graph.id(), &records[1], None, None).assert_ok();
+	let c = seed.attach_node(graph.id(), &records[2], None, None).assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&edges[0],
@@ -821,7 +882,7 @@ fn traversal_algorithms_reuse_exact_graph_core() {
 		Some(Number::Int(2)),
 		None,
 	)
-	.unwrap();
+	.assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&edges[1],
@@ -830,8 +891,8 @@ fn traversal_algorithms_reuse_exact_graph_core() {
 		Some(Number::Int(3)),
 		None,
 	)
-	.unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.commit().assert_ok();
 
 	let mut variables = Object::new();
 	variables.insert("graph", Value::GraphRef(Box::new(graph)));
@@ -840,21 +901,25 @@ fn traversal_algorithms_reuse_exact_graph_core() {
 		.insert("target", Value::Atom(Box::new(AtomRef::new(AtomKind::Node, records[2].clone()))));
 	let result = store
 		.execute("TRAVERSE FROM $source IN GRAPH $graph |> tv::distanceTo($target);", &variables)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(
-		result[0].result.as_ref().unwrap().value(),
+		result[0].result.as_ref().assert_ok().value(),
 		&Value::Array(vec![Value::Number(Number::Int(5))].into())
 	);
 
 	let result = store
 		.execute("TRAVERSE FROM $graph |> tv::V() |> tv::topologicalSort();", &variables)
-		.unwrap();
-	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
-		panic!("topological traversal must return an array")
-	};
-	let Some(Value::Array(order)) = rows.iter().next() else {
-		panic!("topological traversal must return one ordered array")
-	};
+		.assert_ok();
+	let rows = match result[0].result.as_ref().assert_ok().value() {
+		Value::Array(rows) => Some(rows),
+		_ => None,
+	}
+	.assert_some_with("topological traversal must return an array");
+	let order = match rows.iter().next() {
+		Some(Value::Array(order)) => Some(order),
+		_ => None,
+	}
+	.assert_some_with("topological traversal must return one ordered array");
 	assert_eq!(order.len(), 3);
 
 	let result = store
@@ -862,13 +927,17 @@ fn traversal_algorithms_reuse_exact_graph_core() {
 			"TRAVERSE FROM $graph |> tv::V() |> tv::stronglyConnectedComponents();",
 			&variables,
 		)
-		.unwrap();
-	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
-		panic!("SCC traversal must return an array")
-	};
-	let Some(Value::Array(components)) = rows.iter().next() else {
-		panic!("SCC traversal must return one component array")
-	};
+		.assert_ok();
+	let rows = match result[0].result.as_ref().assert_ok().value() {
+		Value::Array(rows) => Some(rows),
+		_ => None,
+	}
+	.assert_some_with("SCC traversal must return an array");
+	let components = match rows.iter().next() {
+		Some(Value::Array(components)) => Some(components),
+		_ => None,
+	}
+	.assert_some_with("SCC traversal must return one component array");
 	assert_eq!(components.len(), 3);
 
 	for query in [
@@ -883,7 +952,7 @@ fn traversal_algorithms_reuse_exact_graph_core() {
 		"TRAVERSE FROM $graph |> tv::V() |> tv::findCuts();",
 		"TRAVERSE FROM $graph |> tv::V() |> tv::hasCycle();",
 	] {
-		let results = store.execute(query, &variables).unwrap();
+		let results = store.execute(query, &variables).assert_ok();
 		assert!(results[0].result.is_ok(), "traversal adapter failed: {query}");
 	}
 }

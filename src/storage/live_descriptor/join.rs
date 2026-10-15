@@ -92,6 +92,7 @@ pub(super) fn decode(
 }
 
 #[cfg(test)]
+/// Regression tests for join behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -104,28 +105,34 @@ mod tests {
 	/// Default bytes remain stable while JOIN shape, order and limits are
 	/// checked.
 	#[test]
-	fn live_join_descriptor_tail_and_dependencies() -> FerrosGrynnResult<()> {
-		let class = ClassId::from_storage(1)?;
+	fn live_join_descriptor_tail_and_dependencies() {
+		use crate::test_assertions::AssertResult as _;
+
+		let class = ClassId::from_storage(1).assert_ok();
 		let base = LiveQuery::new(LiveSource::Class(class));
 		let join = LiveJoin::new(
-			LiveSource::Class(ClassId::from_storage(2)?),
+			LiveSource::Class(ClassId::from_storage(2).assert_ok()),
 			"r",
 			LiveJoinKind::Cross,
 			None,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(join.alias().as_str(), "r");
 		assert_eq!(join.kind(), LiveJoinKind::Cross);
 		assert!(join.predicate().is_none());
 		let descriptor = LiveDescriptor::Query(base.clone().with_joins(vec![join]));
-		let frame = super::super::encode(&descriptor, 1 << 20)?;
+		let frame = super::super::encode(&descriptor, 1 << 20).assert_ok();
 		assert_eq!(frame.len(), 90);
 		assert_eq!(frame[66], 32);
 		assert_eq!(&frame[67..71], &1_u32.to_le_bytes());
 		assert_eq!(&frame[71..75], &[2, 0, 0, 0]);
 		assert_eq!(&frame[75..83], &1_u64.to_le_bytes());
 		assert_eq!(&frame[83..90], &[b'r', 0, 2, 0, 0, 0, 0]);
-		assert_eq!(super::super::decode(&frame, 1 << 20)?, descriptor);
-		assert_eq!(super::super::encode(&LiveDescriptor::Query(base.clone()), 1 << 20)?.len(), 67);
+		assert_eq!(super::super::decode(&frame, 1 << 20).assert_ok(), descriptor);
+		assert_eq!(
+			super::super::encode(&LiveDescriptor::Query(base.clone()), 1 << 20).assert_ok().len(),
+			67
+		);
 		for (offset, byte) in [(66, 64), (71, 3), (72, 1), (83, 0), (83, 255), (89, 2)] {
 			let mut bad = frame.clone();
 			bad[offset] = byte;
@@ -155,24 +162,26 @@ mod tests {
 				LiveJoin::new(LiveSource::Class(class), alias, LiveJoinKind::Cross, None).is_err()
 			);
 		}
-		let scope = LiveBindingId::from_uuid(Uuid::now_v7())?;
-		let predicate = LiveBindingId::from_uuid(Uuid::now_v7())?;
-		let query = base.with_alias("l")?.with_joins(vec![
+		let scope = LiveBindingId::from_uuid(Uuid::now_v7()).assert_ok();
+		let predicate = LiveBindingId::from_uuid(Uuid::now_v7()).assert_ok();
+		let query = base.with_alias("l").assert_ok().with_joins(vec![
 			LiveJoin::new(
 				LiveSource::GraphRecordExpr {
 					graph: Box::new(LiveExpr::Binding(scope)),
-					record: "other:a".parse()?,
+					record: "other:a".parse().assert_ok(),
 				},
 				"r",
 				LiveJoinKind::Left,
 				Some(LiveExpr::Binding(predicate)),
-			)?,
+			)
+			.assert_ok(),
 			LiveJoin::new(
 				LiveSource::GraphExpr(Box::new(LiveExpr::Binding(scope))),
 				"all",
 				LiveJoinKind::Cross,
 				None,
-			)?,
+			)
+			.assert_ok(),
 		]);
 		let mut expected = vec![scope, predicate];
 		expected.sort_unstable();
@@ -181,21 +190,22 @@ mod tests {
 			crate::live::dependencies::query_dependencies(
 				&query,
 				&mut crate::live::dependencies::BindingAdmission::new(&options)
-			)?,
+			)
+			.assert_ok(),
 			expected
 		);
 		assert_eq!(
 			crate::live::dependencies::query_record_names(
 				&query,
 				&mut crate::live::dependencies::BindingAdmission::new(&options)
-			)?,
+			)
+			.assert_ok(),
 			vec![crate::values::Text::from("other")]
 		);
 		let descriptor = LiveDescriptor::Query(query);
-		let frame = super::super::encode(&descriptor, 1 << 20)?;
-		assert_eq!(super::super::decode(&frame, 1 << 20)?, descriptor);
+		let frame = super::super::encode(&descriptor, 1 << 20).assert_ok();
+		assert_eq!(super::super::decode(&frame, 1 << 20).assert_ok(), descriptor);
 		assert!(super::super::encode(&descriptor, 64).is_err());
 		assert!(super::super::decode(&frame, frame.len()).is_err());
-		Ok(())
 	}
 }

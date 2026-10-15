@@ -2,22 +2,28 @@
 
 use super::*;
 
+/// Scan cursor state.
 pub(in crate::gql::execution) struct ScanCursor<'a> {
+	/// Inner associated with this scan cursor.
 	pub(in crate::gql::execution) inner: Box<dyn RowCursor + 'a>,
 }
 
 impl RowCursor for ScanCursor<'_> {
+	/// Advances this `ScanCursor<'_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		control.check()?;
 		self.inner.next(control)
 	}
 }
 
+/// One row cursor state.
 pub(in crate::gql::execution) struct OneRowCursor {
+	/// Row associated with this one row cursor.
 	pub(in crate::gql::execution) row: Option<Row>,
 }
 
 impl RowCursor for OneRowCursor {
+	/// Advances this `OneRowCursor` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		control.check()?;
 		Ok(self.row.take())
@@ -119,6 +125,8 @@ pub(in crate::gql) struct TransientAdmission<'a> {
 }
 
 impl Drop for TransientAdmission<'_> {
+	/// Runs cleanup for this `TransientAdmission<'_>` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		*self.active.borrow_mut() = self.previous.take();
 	}
@@ -193,12 +201,14 @@ impl RootFields<'_> {
 }
 
 impl AtomFieldRead for RootFields<'_> {
+	/// Returns live binding for `RootFields<'_>`.
 	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
 		self.control.check()?;
 		self.observe(crate::datastore::ConflictKey::LiveBinding(id));
 		self.root.live_catalog().binding_value(id)
 	}
 
+	/// Returns live binding value for `RootFields<'_>`.
 	fn live_binding_value(
 		&self,
 		id: crate::live::LiveBindingId,
@@ -207,14 +217,17 @@ impl AtomFieldRead for RootFields<'_> {
 		self.copy_value(self.live_binding(id)?)
 	}
 
+	/// Returns observe for `RootFields<'_>`.
 	fn observe(&self, key: crate::datastore::ConflictKey) {
 		(self.read)(key);
 	}
 
+	/// Reports whether the bounded condition holds for `RootFields<'_>`.
 	fn bounded(&self) -> bool {
 		true
 	}
 
+	/// Admits value for `RootFields<'_>`.
 	fn admit_value(&self, value: &Value) -> FerrosGrynnResult<()> {
 		crate::gql::value_admission::admit_value(
 			value,
@@ -224,6 +237,7 @@ impl AtomFieldRead for RootFields<'_> {
 		)
 	}
 
+	/// Returns admit for `RootFields<'_>`.
 	fn admit(&self, bytes: usize) -> FerrosGrynnResult<()> {
 		if let Some(account) = self.transient.borrow_mut().as_mut() {
 			if !account.reserve(bytes) {
@@ -239,6 +253,7 @@ impl AtomFieldRead for RootFields<'_> {
 		self.admit_retained(bytes)
 	}
 
+	/// Admits retained for `RootFields<'_>`.
 	fn admit_retained(&self, bytes: usize) -> FerrosGrynnResult<()> {
 		if !self.account.borrow_mut().reserve(bytes) {
 			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
@@ -249,6 +264,7 @@ impl AtomFieldRead for RootFields<'_> {
 		Ok(())
 	}
 
+	/// Returns transient scope for `RootFields<'_>`.
 	fn transient_scope(&self) -> Option<TransientAdmission<'_>> {
 		let previous = self.transient.replace(Some(self.control.barrier_account()));
 		Some(TransientAdmission {
@@ -257,10 +273,12 @@ impl AtomFieldRead for RootFields<'_> {
 		})
 	}
 
+	/// Returns work for `RootFields<'_>`.
 	fn work(&self, operations: u64) -> FerrosGrynnResult<()> {
 		(self.work)(operations)
 	}
 
+	/// Returns field for `RootFields<'_>`.
 	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value> {
 		let bound = atom;
 		(self.read)(crate::datastore::ConflictKey::GraphIncidence(bound.graph, bound.atom));
@@ -348,6 +366,7 @@ impl AtomFieldRead for RootFields<'_> {
 		}
 	}
 
+	/// Returns occurrence field for `RootFields<'_>`.
 	fn occurrence_field(
 		&self,
 		occurrence: &AtomOccurrenceRef,
@@ -356,17 +375,18 @@ impl AtomFieldRead for RootFields<'_> {
 		self.field(self.bound(occurrence)?, field)
 	}
 
+	/// Returns inner graph for `RootFields<'_>`.
 	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		let bound = self.bound(occurrence)?;
 		(self.read)(crate::datastore::ConflictKey::GraphIncidence(bound.graph, bound.atom));
 		let current = self.root.occurrence(bound.graph, bound.atom).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("PURE owner occurrence is absent")
 		})?;
-		let nested = match current.state() {
-			crate::datastore::OccurrenceState::Node {
+		let nested = match current.state().view() {
+			crate::datastore::OccurrenceStateRef::Node {
 				nested_graph,
 			} => *nested_graph,
-			crate::datastore::OccurrenceState::Edge {
+			crate::datastore::OccurrenceStateRef::Edge {
 				transition_graph,
 				..
 			} => *transition_graph,
@@ -385,6 +405,7 @@ impl AtomFieldRead for RootFields<'_> {
 		}
 	}
 
+	/// Returns level path for `RootFields<'_>`.
 	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		let bound = self.bound(occurrence)?;
 		(self.read)(crate::datastore::ConflictKey::GraphCatalogRange);
@@ -402,6 +423,7 @@ impl AtomFieldRead for RootFields<'_> {
 		})
 	}
 
+	/// Records field for `RootFields<'_>`.
 	fn record_field(
 		&self,
 		record: &RecordId,
@@ -490,16 +512,21 @@ fn validate_query_path<Read: QueryRead>(
 
 /// Record-reference resolver bound to one statement snapshot and graph scope.
 pub(in crate::gql::execution) struct RecordFields<'a, Read> {
+	/// Read associated with this record fields.
 	pub(in crate::gql::execution) read: &'a Read,
+	/// Snapshot associated with this record fields.
 	pub(in crate::gql::execution) snapshot: Snapshot,
+	/// Graph associated with this record fields.
 	pub(in crate::gql::execution) graph: Option<&'a GraphRef>,
 }
 
 impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
+	/// Returns live binding for `RecordFields<'_, Read>`.
 	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
 		self.read.live_binding_value(self.snapshot, id)
 	}
 
+	/// Returns live binding value for `RecordFields<'_, Read>`.
 	fn live_binding_value(
 		&self,
 		id: crate::live::LiveBindingId,
@@ -511,36 +538,45 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		control.copy_reactive_value(self.live_binding(id)?)
 	}
 
+	/// Returns observe for `RecordFields<'_, Read>`.
 	fn observe(&self, key: crate::datastore::ConflictKey) {
 		if let Some(fields) = self.read.bounded_fields() {
 			fields.observe(key);
 		}
 	}
 
+	/// Reports whether the bounded condition holds for `RecordFields<'_,
+	/// Read>`.
 	fn bounded(&self) -> bool {
 		self.read.bounded_fields().is_some()
 	}
 
+	/// Admits value for `RecordFields<'_, Read>`.
 	fn admit_value(&self, value: &Value) -> FerrosGrynnResult<()> {
 		self.read.bounded_fields().map_or(Ok(()), |fields| fields.admit_value(value))
 	}
 
+	/// Returns admit for `RecordFields<'_, Read>`.
 	fn admit(&self, bytes: usize) -> FerrosGrynnResult<()> {
 		self.read.bounded_fields().map_or(Ok(()), |fields| fields.admit(bytes))
 	}
 
+	/// Admits retained for `RecordFields<'_, Read>`.
 	fn admit_retained(&self, bytes: usize) -> FerrosGrynnResult<()> {
 		self.read.bounded_fields().map_or(Ok(()), |fields| fields.admit_retained(bytes))
 	}
 
+	/// Returns transient scope for `RecordFields<'_, Read>`.
 	fn transient_scope(&self) -> Option<TransientAdmission<'_>> {
 		self.read.bounded_fields().and_then(|fields| fields.transient_scope())
 	}
 
+	/// Returns work for `RecordFields<'_, Read>`.
 	fn work(&self, operations: u64) -> FerrosGrynnResult<()> {
 		self.read.bounded_fields().map_or(Ok(()), |fields| fields.work(operations))
 	}
 
+	/// Returns field for `RecordFields<'_, Read>`.
 	fn field(&self, atom: BoundAtom, _field: &str) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::invalid_argument(format!(
 			"SELECT row has no graph-local atom binding for {}.",
@@ -548,6 +584,7 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		)))
 	}
 
+	/// Returns occurrence field for `RecordFields<'_, Read>`.
 	fn occurrence_field(
 		&self,
 		occurrence: &AtomOccurrenceRef,
@@ -566,16 +603,19 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		fields.occurrence_field(occurrence, field)
 	}
 
+	/// Returns inner graph for `RecordFields<'_, Read>`.
 	fn inner_graph(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::invalid_argument("graph::inner requires a MATCH atom occurrence"))
 	}
 
+	/// Returns level path for `RecordFields<'_, Read>`.
 	fn level_path(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::invalid_argument(
 			"graph::level_path requires a MATCH atom occurrence",
 		))
 	}
 
+	/// Records field for `RecordFields<'_, Read>`.
 	fn record_field(
 		&self,
 		record: &RecordId,
@@ -585,6 +625,7 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		self.read.record_field(self.snapshot, record, self.graph, field, control)
 	}
 
+	/// Validates path for `RecordFields<'_, Read>`.
 	fn validate_path(
 		&self,
 		path: &crate::graph::Path,
@@ -596,14 +637,18 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 
 /// Atom field resolver with a lazy cache of snapshot-visible graph references.
 pub(in crate::gql::execution) struct MatchGraphFields<'a, Read> {
+	/// Read associated with this match graph fields.
 	pub(in crate::gql::execution) read: &'a Read,
+	/// Snapshot associated with this match graph fields.
 	pub(in crate::gql::execution) snapshot: Snapshot,
 	/// Snapshot property dictionary.
 	pub(in crate::gql::execution) dictionary: Arc<PropertyDictionary>,
+	/// References associated with this match graph fields.
 	references: RefCell<std::collections::BTreeMap<crate::graph::GraphId, Arc<GraphRef>>>,
 }
 
 impl<'a, Read: QueryRead> MatchGraphFields<'a, Read> {
+	/// Creates a new `MatchGraphFields<'a, Read>` value.
 	pub(in crate::gql::execution) fn new(
 		read: &'a Read,
 		snapshot: Snapshot,
@@ -619,6 +664,7 @@ impl<'a, Read: QueryRead> MatchGraphFields<'a, Read> {
 		}
 	}
 
+	/// Registers match graph fields<'a, read>.
 	pub(in crate::gql::execution) fn register(&self, reference: GraphRef) -> Arc<GraphRef> {
 		let graph = reference.id();
 		if let Some(reference) = self.references.borrow().get(&graph) {
@@ -629,6 +675,7 @@ impl<'a, Read: QueryRead> MatchGraphFields<'a, Read> {
 		reference
 	}
 
+	/// Returns the reference result.
 	pub(in crate::gql::execution) fn reference(
 		&self,
 		graph: crate::graph::GraphId,
@@ -641,10 +688,12 @@ impl<'a, Read: QueryRead> MatchGraphFields<'a, Read> {
 }
 
 impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
+	/// Returns live binding for `MatchGraphFields<'_, Read>`.
 	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
 		self.read.live_binding_value(self.snapshot, id)
 	}
 
+	/// Returns live binding value for `MatchGraphFields<'_, Read>`.
 	fn live_binding_value(
 		&self,
 		id: crate::live::LiveBindingId,
@@ -658,6 +707,7 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		.live_binding_value(id, control)
 	}
 
+	/// Returns field for `MatchGraphFields<'_, Read>`.
 	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value> {
 		let reference = self.reference(atom.graph)?;
 		if field == "graph" {
@@ -719,6 +769,7 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		}
 	}
 
+	/// Returns occurrence field for `MatchGraphFields<'_, Read>`.
 	fn occurrence_field(
 		&self,
 		occurrence: &AtomOccurrenceRef,
@@ -735,6 +786,7 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		self.field(BoundAtom::new(occurrence.graph().id(), atom), field)
 	}
 
+	/// Returns inner graph for `MatchGraphFields<'_, Read>`.
 	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		let owner = self.register(occurrence.graph().clone());
 		let graph = self.read.graph(self.snapshot, &owner)?;
@@ -763,10 +815,12 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		}))
 	}
 
+	/// Returns level path for `MatchGraphFields<'_, Read>`.
 	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		self.read.level_path(self.snapshot, occurrence)
 	}
 
+	/// Records field for `MatchGraphFields<'_, Read>`.
 	fn record_field(
 		&self,
 		record: &RecordId,
@@ -776,6 +830,7 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		self.read.record_field(self.snapshot, record, None, field, control)
 	}
 
+	/// Validates path for `MatchGraphFields<'_, Read>`.
 	fn validate_path(
 		&self,
 		path: &crate::graph::Path,
@@ -785,6 +840,7 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 	}
 }
 
+/// Returns the properties object result.
 pub(in crate::gql::execution) fn properties_object(
 	properties: &crate::values::PropertyMap,
 	dictionary: &PropertyDictionary,
@@ -801,16 +857,22 @@ pub(in crate::gql::execution) fn properties_object(
 		.collect()
 }
 
+/// Filter cursor state.
 pub(in crate::gql::execution) struct FilterCursor<'a> {
+	/// Input associated with this filter cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Predicate associated with this filter cursor.
 	pub(in crate::gql::execution) predicate: &'a TypedExpr,
+	/// Slots associated with this filter cursor.
 	pub(in crate::gql::execution) slots: &'a [Value],
+	/// Source associated with this filter cursor.
 	pub(in crate::gql::execution) source: &'a str,
 	/// Optional MATCH atom-field resolver.
 	pub(in crate::gql::execution) fields: Option<&'a dyn AtomFieldRead>,
 }
 
 impl RowCursor for FilterCursor<'_> {
+	/// Advances this `FilterCursor<'_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		while let Some(row) = self.input.next(control)? {
 			if eval(
@@ -830,16 +892,22 @@ impl RowCursor for FilterCursor<'_> {
 	}
 }
 
+/// Project cursor state.
 pub(in crate::gql::execution) struct ProjectCursor<'a> {
+	/// Input associated with this project cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Expressions associated with this project cursor.
 	pub(in crate::gql::execution) expressions: &'a [TypedExpr],
+	/// Slots associated with this project cursor.
 	pub(in crate::gql::execution) slots: &'a [Value],
+	/// Source associated with this project cursor.
 	pub(in crate::gql::execution) source: &'a str,
 	/// Optional MATCH atom-field resolver.
 	pub(in crate::gql::execution) fields: Option<&'a dyn AtomFieldRead>,
 }
 
 impl RowCursor for ProjectCursor<'_> {
+	/// Advances this `ProjectCursor<'_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		let Some(row) = self.input.next(control)? else {
 			return Ok(None);
@@ -855,13 +923,18 @@ impl RowCursor for ProjectCursor<'_> {
 	}
 }
 
+/// Limit cursor state.
 pub(in crate::gql::execution) struct LimitCursor<'a> {
+	/// Input associated with this limit cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Number of elements that have not yet been consumed.
 	pub(in crate::gql::execution) remaining: Option<usize>,
+	/// Skip associated with this limit cursor.
 	pub(in crate::gql::execution) skip: usize,
 }
 
 impl RowCursor for LimitCursor<'_> {
+	/// Advances this `LimitCursor<'_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		while self.skip > 0 {
 			if self.input.next(control)?.is_none() {

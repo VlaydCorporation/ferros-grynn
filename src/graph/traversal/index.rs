@@ -19,14 +19,19 @@ use crate::{
 	values::Uuid,
 };
 
+/// Choice of outgoing, incoming or both incidence directions during traversal.
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub enum TraversalDirection {
+	/// Follow outgoing directed incidences.
 	Forward,
+	/// Follow incoming directed incidences.
 	Backward,
+	/// Follow both incoming and outgoing incidences.
 	Both,
 }
 
+/// Whether traversal visits only nodes or treats every atom as traversable.
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub enum TraversalSemantics {
@@ -36,32 +41,44 @@ pub enum TraversalSemantics {
 	Atom,
 }
 
+/// Indexed incidence linking a target endpoint with its traversed edge and
+/// roles.
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct TraversalStep {
+	/// Target associated with this traversal step.
 	pub(super) target: EdgeEndpoint,
+	/// Via edge associated with this traversal step.
 	pub(super) via_edge: AtomId,
+	/// Topology associated with this traversal step.
 	pub(super) topology: EdgeDirection,
+	/// Direction associated with this traversal step.
 	pub(super) direction: PathDirection,
+	/// Role associated with this traversal step.
 	pub(super) role: EndpointRole,
 }
 
 impl TraversalStep {
+	/// Borrows the stored target of this `TraversalStep`.
 	pub const fn target(&self) -> &EdgeEndpoint {
 		&self.target
 	}
 
+	/// Returns the stored via edge of this `TraversalStep`.
 	pub const fn via_edge(&self) -> AtomId {
 		self.via_edge
 	}
 
+	/// Returns the stored topology of this `TraversalStep`.
 	pub const fn topology(&self) -> EdgeDirection {
 		self.topology
 	}
 
+	/// Returns the stored direction of this `TraversalStep`.
 	pub const fn direction(&self) -> PathDirection {
 		self.direction
 	}
 
+	/// Returns the stored role of this `TraversalStep`.
 	pub const fn role(&self) -> EndpointRole {
 		self.role
 	}
@@ -74,19 +91,32 @@ impl TraversalStep {
 /// additionally permits V-E, E-V and E-E endpoint transitions.
 #[derive(Debug, Clone)]
 pub struct TraversalIndex {
+	/// Identity associated with this traversal index.
 	identity: Uuid,
+	/// Revision identifying this version of the data.
 	revision: u64,
+	/// Semantics associated with this traversal index.
 	semantics: TraversalSemantics,
+	/// Has nested endpoints associated with this traversal index.
 	has_nested_endpoints: bool,
+	/// Forward associated with this traversal index.
 	forward: RapidHashMap<EdgeEndpoint, Vec<TraversalStep>>,
+	/// Backward associated with this traversal index.
 	backward: RapidHashMap<EdgeEndpoint, Vec<TraversalStep>>,
 }
 
 impl TraversalIndex {
+	/// Constructs `TraversalIndex` from the supplied initial state.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn new<R: GraphRead>(graph: &R, semantics: TraversalSemantics) -> FerrosGrynnResult<Self> {
 		Self::build(graph, semantics, true, &mut || Ok(()))
 	}
 
+	/// Returns the new for expansion result.
 	pub(crate) fn new_for_expansion<R: GraphRead>(
 		graph: &R,
 		semantics: TraversalSemantics,
@@ -222,6 +252,7 @@ impl TraversalIndex {
 		Ok(Some(index))
 	}
 
+	/// Returns the new with check result.
 	pub(super) fn new_with_check<R: GraphRead, Check>(
 		graph: &R,
 		semantics: TraversalSemantics,
@@ -233,6 +264,7 @@ impl TraversalIndex {
 		Self::build(graph, semantics, true, check)
 	}
 
+	/// Builds traversal index.
 	fn build<R: GraphRead, Check>(
 		graph: &R,
 		semantics: TraversalSemantics,
@@ -279,26 +311,32 @@ impl TraversalIndex {
 		Ok(index)
 	}
 
+	/// Returns the stored identity of this `TraversalIndex`.
 	pub const fn identity(&self) -> Uuid {
 		self.identity
 	}
 
+	/// Returns the stored revision of this `TraversalIndex`.
 	pub const fn revision(&self) -> u64 {
 		self.revision
 	}
 
+	/// Returns the stored semantics of this `TraversalIndex`.
 	pub const fn semantics(&self) -> TraversalSemantics {
 		self.semantics
 	}
 
+	/// Returns whether this value has nested endpoints.
 	pub(crate) const fn has_nested_endpoints(&self) -> bool {
 		self.has_nested_endpoints
 	}
 
+	/// Reports whether the contains condition holds for `TraversalIndex`.
 	pub fn contains(&self, endpoint: &EdgeEndpoint) -> bool {
 		self.forward.contains_key(endpoint)
 	}
 
+	/// Returns steps for `TraversalIndex`.
 	pub fn steps<'index>(
 		&'index self,
 		endpoint: &EdgeEndpoint,
@@ -315,6 +353,12 @@ impl TraversalIndex {
 		deduplicated_steps(first, second)
 	}
 
+	/// Returns breadth first for `TraversalIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn breadth_first(
 		&self,
 		root: EdgeEndpoint,
@@ -379,6 +423,11 @@ impl TraversalIndex {
 		Ok(order)
 	}
 
+	/// Returns depth first for `TraversalIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn depth_first(
 		&self,
 		root: EdgeEndpoint,
@@ -407,6 +456,7 @@ impl TraversalIndex {
 		Ok(order)
 	}
 
+	/// Registers topology.
 	fn register_topology(&mut self, edge: AtomId, topology: &EdgeTopology) {
 		match topology {
 			EdgeTopology::Directed {
@@ -448,6 +498,7 @@ impl TraversalIndex {
 		}
 	}
 
+	/// Performs the connect sets operation.
 	fn connect_sets(
 		&mut self,
 		edge: AtomId,
@@ -487,6 +538,7 @@ impl TraversalIndex {
 		clippy::too_many_arguments,
 		reason = "forward and reverse path metadata form one incidence pair"
 	)]
+	/// Performs the connect operation.
 	fn connect(
 		&mut self,
 		edge: AtomId,
@@ -519,17 +571,20 @@ impl TraversalIndex {
 		});
 	}
 
+	/// Returns whether the accepts condition holds.
 	fn accepts(&self, endpoint: &EdgeEndpoint) -> bool {
 		self.semantics == TraversalSemantics::Atom
 			|| endpoint_kind(endpoint) == Some(AtomKind::Node)
 	}
 
+	/// Registers endpoint.
 	fn register_endpoint(&mut self, endpoint: EdgeEndpoint) {
 		self.has_nested_endpoints |= matches!(endpoint, EdgeEndpoint::Nested(_));
 		self.forward.entry(endpoint.clone()).or_default();
 		self.backward.entry(endpoint).or_default();
 	}
 
+	/// Ensures endpoint.
 	fn ensure_endpoint(&self, endpoint: &EdgeEndpoint) -> FerrosGrynnResult<()> {
 		if self.contains(endpoint) {
 			return Ok(());
@@ -543,13 +598,13 @@ impl TraversalIndex {
 
 /// Visits one endpoint's exact incidence without constructing the other
 /// endpoint pairs.
-pub fn visit_endpoint_steps(
+pub fn visit_endpoint_steps<VisitArg: FnMut(TraversalStep) -> FerrosGrynnResult<()>>(
 	edge: AtomId,
 	topology: &EdgeTopology,
 	endpoint: &EdgeEndpoint,
 	semantics: TraversalSemantics,
 	direction: TraversalDirection,
-	mut visit: impl FnMut(TraversalStep) -> FerrosGrynnResult<()>,
+	mut visit: VisitArg,
 ) -> FerrosGrynnResult<()> {
 	if semantics == TraversalSemantics::Node && endpoint_kind(endpoint) != Some(AtomKind::Node) {
 		return Ok(());
@@ -581,13 +636,16 @@ pub fn visit_endpoint_steps(
 	clippy::redundant_pub_crate,
 	reason = "Re-exported at crate scope for exact tensor projection"
 )]
-pub(crate) fn visit_incidence_targets<T: Eq>(
+pub fn visit_incidence_targets<
+	T: Eq,
+	EmitArg: FnMut(&T, PathDirection, EndpointRole) -> FerrosGrynnResult<()>,
+>(
 	topology: EdgeDirection,
 	source: &[T],
 	target: &[T],
 	endpoint: &T,
 	direction: TraversalDirection,
-	mut emit: impl FnMut(&T, PathDirection, EndpointRole) -> FerrosGrynnResult<()>,
+	mut emit: EmitArg,
 ) -> FerrosGrynnResult<()> {
 	if topology == EdgeDirection::Undirected {
 		let occurrences = source.iter().filter(|candidate| *candidate == endpoint).count();
@@ -624,6 +682,7 @@ pub(crate) fn visit_incidence_targets<T: Eq>(
 	Ok(())
 }
 
+/// Returns the endpoint kind result.
 const fn endpoint_kind(endpoint: &EdgeEndpoint) -> Option<AtomKind> {
 	match endpoint {
 		EdgeEndpoint::Local(id) => id.kind(),
@@ -631,6 +690,7 @@ const fn endpoint_kind(endpoint: &EdgeEndpoint) -> Option<AtomKind> {
 	}
 }
 
+/// Returns the local steps result.
 pub(super) fn local_steps(
 	index: &TraversalIndex,
 	node: AtomId,
@@ -648,6 +708,7 @@ pub(super) fn local_steps(
 	deduplicated_steps(first, second)
 }
 
+/// Returns the deduplicated steps result.
 fn deduplicated_steps<'index>(
 	first: &'index [TraversalStep],
 	second: &'index [TraversalStep],
@@ -656,15 +717,20 @@ fn deduplicated_steps<'index>(
 }
 
 #[cfg(test)]
+/// Regression tests for index behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies endpoint kernel matches full incidence for every direction and
+	/// mode.
 	#[test]
 	fn endpoint_kernel_matches_full_incidence_for_every_direction_and_mode() {
-		let node = AtomId::from_parts(AtomKind::Node, 1, 1).unwrap();
-		let edge = AtomId::from_parts(AtomKind::Edge, 1, 1).unwrap();
-		let other = AtomId::from_parts(AtomKind::Edge, 2, 1).unwrap();
-		let nested = crate::graph::QualifiedAtomId::new(vec![node], edge).unwrap();
+		let node = AtomId::from_parts(AtomKind::Node, 1, 1).assert_ok();
+		let edge = AtomId::from_parts(AtomKind::Edge, 1, 1).assert_ok();
+		let other = AtomId::from_parts(AtomKind::Edge, 2, 1).assert_ok();
+		let nested = crate::graph::QualifiedAtomId::new(vec![node], edge).assert_ok();
 		let sources = [EdgeEndpoint::Local(node), EdgeEndpoint::Local(edge)];
 		let targets = [EdgeEndpoint::Local(other), EdgeEndpoint::Nested(nested)];
 		for topology in [
@@ -703,7 +769,7 @@ mod tests {
 								Ok(())
 							},
 						)
-						.unwrap();
+						.assert_ok();
 						assert_eq!(
 							actual, expected,
 							"{topology:?} {endpoint:?} {semantics:?} {direction:?}"

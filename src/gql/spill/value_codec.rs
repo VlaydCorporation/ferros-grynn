@@ -21,16 +21,26 @@ use crate::{
 	},
 };
 
+/// Configured magic value.
 const MAGIC: &[u8; 5] = b"FGQV\x01";
+/// Configured tag canonical value.
 const TAG_CANONICAL: u8 = 0;
+/// Configured tag occurrence value.
 const TAG_OCCURRENCE: u8 = 1;
+/// Configured tag path value.
 const TAG_PATH: u8 = 2;
+/// Configured tag array value.
 const TAG_ARRAY: u8 = 3;
+/// Configured tag set value.
 const TAG_SET: u8 = 4;
+/// Configured tag object value.
 const TAG_OBJECT: u8 = 5;
+/// Configured tag range value.
 const TAG_RANGE: u8 = 6;
+/// Configured max depth value.
 const MAX_DEPTH: usize = 64;
 
+/// Encodes query value.
 pub(super) fn encode_query_value(
 	value: Value,
 	context: &mut EncodeContext,
@@ -41,6 +51,7 @@ pub(super) fn encode_query_value(
 	Ok(output)
 }
 
+/// Decodes query value.
 pub(super) fn decode_query_value(
 	bytes: &[u8],
 	context: &EncodeContext,
@@ -61,6 +72,7 @@ pub(super) fn decode_query_value(
 	Ok(value)
 }
 
+/// Encodes value.
 fn encode_value(
 	output: &mut Vec<u8>,
 	value: Value,
@@ -124,6 +136,7 @@ fn encode_value(
 	}
 }
 
+/// Encodes occurrence.
 fn encode_occurrence(
 	output: &mut Vec<u8>,
 	occurrence: AtomOccurrenceRef,
@@ -135,6 +148,7 @@ fn encode_occurrence(
 	encode_value(output, Value::GraphRef(Box::new(graph.as_ref().clone())), context, depth)
 }
 
+/// Encodes path.
 fn encode_path(
 	output: &mut Vec<u8>,
 	path: &Path,
@@ -172,6 +186,7 @@ fn encode_path(
 	Ok(())
 }
 
+/// Encodes bound.
 fn encode_bound(
 	output: &mut Vec<u8>,
 	bound: Bound<Value>,
@@ -192,6 +207,7 @@ fn encode_bound(
 	Ok(())
 }
 
+/// Pushes len.
 fn push_len(output: &mut Vec<u8>, length: usize) -> FerrosGrynnResult<()> {
 	let length =
 		u32::try_from(length).map_err(|_error| invalid_run("query-run collection exceeds u32"))?;
@@ -199,12 +215,14 @@ fn push_len(output: &mut Vec<u8>, length: usize) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Pushes bytes.
 fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> FerrosGrynnResult<()> {
 	push_len(output, bytes.len())?;
 	output.extend_from_slice(bytes);
 	Ok(())
 }
 
+/// Returns the direction tag result.
 const fn direction_tag(direction: PathDirection) -> u8 {
 	match direction {
 		PathDirection::Forward => 0,
@@ -213,6 +231,7 @@ const fn direction_tag(direction: PathDirection) -> u8 {
 	}
 }
 
+/// Returns the role tag result.
 const fn role_tag(role: EndpointRole) -> u8 {
 	match role {
 		EndpointRole::Source => 0,
@@ -221,14 +240,20 @@ const fn role_tag(role: EndpointRole) -> u8 {
 	}
 }
 
+/// Decoder state.
 struct Decoder<'a> {
+	/// Bytes associated with this decoder.
 	bytes: &'a [u8],
+	/// Position associated with this decoder.
 	position: usize,
+	/// Allocation associated with this decoder.
 	allocation: usize,
+	/// Limits associated with this decoder.
 	limits: DecodeLimits,
 }
 
 impl Decoder<'_> {
+	/// Decodes value.
 	fn decode_value(&mut self, context: &EncodeContext, depth: usize) -> FerrosGrynnResult<Value> {
 		if depth > self.limits.max_depth {
 			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -283,12 +308,14 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes canonical.
 	fn decode_canonical(&mut self, context: &EncodeContext) -> FerrosGrynnResult<Value> {
 		let limits = self.limits;
 		let bytes = self.bytes()?;
 		CanonicalCodec::decode(bytes, limits)?.into_runtime(&context.decoder())
 	}
 
+	/// Decodes occurrence.
 	fn decode_occurrence(
 		&mut self,
 		context: &EncodeContext,
@@ -303,6 +330,7 @@ impl Decoder<'_> {
 		Ok(AtomOccurrenceRef::new(*atom, Arc::new(*graph)))
 	}
 
+	/// Decodes path.
 	fn decode_path(&mut self, context: &EncodeContext, depth: usize) -> FerrosGrynnResult<Path> {
 		let Value::Uuid(origin) = self.decode_value(context, depth)? else {
 			return Err(invalid_run("query-run path origin is invalid"));
@@ -351,6 +379,7 @@ impl Decoder<'_> {
 		Ok(Path::new(origin, snapshot, steps, cost))
 	}
 
+	/// Decodes bound.
 	fn decode_bound(
 		&mut self,
 		context: &EncodeContext,
@@ -364,6 +393,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Returns the collection len result.
 	fn collection_len(&mut self) -> FerrosGrynnResult<usize> {
 		let length = self.u32()? as usize;
 		if length > self.limits.max_collection_len {
@@ -377,6 +407,7 @@ impl Decoder<'_> {
 		Ok(length)
 	}
 
+	/// Returns the string result.
 	fn string(&mut self) -> FerrosGrynnResult<String> {
 		let length = self.u32()? as usize;
 		if length > self.limits.max_string_bytes {
@@ -392,6 +423,7 @@ impl Decoder<'_> {
 			.map_err(|_error| invalid_run("query-run object field is not UTF-8"))
 	}
 
+	/// Returns the bytes result.
 	fn bytes(&mut self) -> FerrosGrynnResult<&[u8]> {
 		let length = self.u32()? as usize;
 		if length > self.limits.max_blob_bytes {
@@ -404,6 +436,7 @@ impl Decoder<'_> {
 		self.take(length)
 	}
 
+	/// Returns the account result.
 	fn account(&mut self, bytes: usize) -> FerrosGrynnResult<()> {
 		self.allocation = self
 			.allocation
@@ -419,15 +452,18 @@ impl Decoder<'_> {
 		Ok(())
 	}
 
+	/// Returns the byte result.
 	fn byte(&mut self) -> FerrosGrynnResult<u8> {
 		Ok(self.take(1)?[0])
 	}
 
+	/// Returns the u32 result.
 	fn u32(&mut self) -> FerrosGrynnResult<u32> {
 		let bytes = self.take(4)?;
 		Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 	}
 
+	/// Returns the u64 result.
 	fn u64(&mut self) -> FerrosGrynnResult<u64> {
 		let bytes = self.take(8)?;
 		Ok(u64::from_le_bytes([
@@ -435,6 +471,7 @@ impl Decoder<'_> {
 		]))
 	}
 
+	/// Takes decoder<' >.
 	fn take(&mut self, length: usize) -> FerrosGrynnResult<&[u8]> {
 		let end = self
 			.position

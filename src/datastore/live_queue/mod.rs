@@ -147,7 +147,10 @@ pub(super) struct Queue {
 /// Admission is distinct from an empty delivery queue.
 pub(super) enum PreparedQueue {
 	/// Complete successor, installable without allocation or evaluation.
-	Ready(Queue),
+	Ready(
+		/// Complete successor, installable without allocation or evaluation.
+		Queue,
+	),
 	/// A BLOCK subscriber requires capacity before the source commit.
 	Blocked,
 	/// This batch cannot fit even in an empty queue; publication must pause it.

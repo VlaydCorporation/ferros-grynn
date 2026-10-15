@@ -9,10 +9,12 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) struct CommitOutcome {
 	/// Database-wide transaction identity.
+	#[cfg(test)]
 	pub(in crate::storage::wal) tx_id: TxId,
 	/// Logical commit clock after this operation.
 	pub(in crate::storage::wal) commit_ts: CommitTs,
 	/// Durable WAL boundary after this operation.
+	#[cfg(test)]
 	pub(in crate::storage::wal) commit_lsn: Lsn,
 }
 
@@ -39,6 +41,7 @@ pub(in crate::storage) struct RecoverySeed {
 
 impl RecoverySeed {
 	/// Empty database seed used by creation and legacy component tests.
+	#[cfg(test)]
 	pub(in crate::storage::wal) const EMPTY: Self = Self {
 		generation: CheckpointGeneration::ZERO,
 		checkpoint_lsn: Lsn::ZERO,
@@ -101,13 +104,9 @@ pub(in crate::storage) struct CheckpointTicket {
 
 impl CheckpointTicket {
 	/// Returns the assigned generation.
+	#[cfg(test)]
 	pub(in crate::storage) const fn generation(&self) -> CheckpointGeneration {
 		self.generation
-	}
-
-	/// Returns the reader-safe backfill boundary.
-	pub(in crate::storage) const fn target(&self) -> Lsn {
-		self.target
 	}
 
 	/// Returns the immutable page-frame plan.
@@ -152,6 +151,7 @@ impl CheckpointCommit {
 
 impl CommitOutcome {
 	/// Returns the committed transaction identity.
+	#[cfg(test)]
 	pub(in crate::storage) const fn tx_id(self) -> TxId {
 		self.tx_id
 	}
@@ -162,6 +162,7 @@ impl CommitOutcome {
 	}
 
 	/// Returns the published commit-marker LSN.
+	#[cfg(test)]
 	pub(in crate::storage) const fn commit_lsn(self) -> Lsn {
 		self.commit_lsn
 	}
@@ -246,11 +247,6 @@ impl ResolvedFrame {
 	pub(in crate::storage) const fn frame_lsn(self) -> Lsn {
 		self.version.frame_lsn
 	}
-
-	/// Returns the commit marker controlling visibility.
-	pub(in crate::storage) const fn commit_lsn(self) -> Lsn {
-		self.version.commit_lsn
-	}
 }
 
 /// One page image staged privately by a transaction.
@@ -291,6 +287,7 @@ pub(in crate::storage) struct TxHandle {
 
 impl TxHandle {
 	/// Returns this transaction's stable identity.
+	#[cfg(test)]
 	pub(in crate::storage) const fn id(&self) -> TxId {
 		self.id
 	}
@@ -352,21 +349,9 @@ impl TxHandle {
 	}
 
 	/// Returns a staged image for read-your-writes without copying it.
+	#[cfg(test)]
 	pub(in crate::storage) fn staged_page(&self, key: PageKey) -> Option<&AlignedPage> {
 		self.staged.get(&key).map(|staged| staged.page.as_ref())
-	}
-
-	/// Returns the exclusive high-water page staged for one physical file.
-	pub(in crate::storage) fn staged_file_page_count(
-		&self,
-		space_id: DataSpaceId,
-		file_id: DataFileId,
-	) -> Option<u64> {
-		self.staged
-			.keys()
-			.filter(|key| key.space_id() == space_id && key.file_id() == file_id)
-			.filter_map(|key| key.page_no().get().checked_add(1))
-			.max()
 	}
 
 	/// Releases the active snapshot registration exactly once.

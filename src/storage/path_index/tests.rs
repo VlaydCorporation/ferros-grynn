@@ -1,6 +1,8 @@
 //! Multi-page layout, admission, ownership and corrupt section checks.
 
 use super::*;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 
 /// Complete test shape for one supported directed cost model.
 fn header(cost_kind: u8, vertices: u64) -> LandmarkPathHeader {
@@ -34,7 +36,7 @@ fn header(cost_kind: u8, vertices: u64) -> LandmarkPathHeader {
 }
 
 /// Encodes reproducible values without depending on shortest path kernels.
-fn element(kind: SectionKind, ordinal: u64, bytes: &mut [u8]) -> FerrosGrynnResult<()> {
+fn element(kind: SectionKind, ordinal: u64, bytes: &mut [u8]) {
 	if kind == SectionKind::DefinitionDescriptor {
 		bytes[0] = ordinal as u8;
 	} else {
@@ -43,7 +45,6 @@ fn element(kind: SectionKind, ordinal: u64, bytes: &mut [u8]) -> FerrosGrynnResu
 			bytes[8..].copy_from_slice(&ordinal.to_le_bytes());
 		}
 	}
-	Ok(())
 }
 
 /// Preallocates final aligned slots before copying any sealed pages.
@@ -53,7 +54,10 @@ fn pages(layout: &LandmarkPathLayout) -> Vec<AlignedPage> {
 	let mut next = 0;
 	layout
 		.stream(
-			element,
+			|kind, ordinal, bytes| {
+				element(kind, ordinal, bytes);
+				Ok(())
+			},
 			|at, page| {
 				assert_eq!(at.get(), next);
 				next += 1;
@@ -62,16 +66,17 @@ fn pages(layout: &LandmarkPathLayout) -> Vec<AlignedPage> {
 			},
 			&mut || Ok(()),
 		)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(next, layout.page_count);
 	pages
 }
 
+/// Verifies landmark path roundtrip empty and multiple pages all costs.
 #[test]
 fn landmark_path_roundtrip_empty_and_multiple_pages_all_costs() {
 	for cost in 1..=3 {
 		for vertices in [0, 1, 2500] {
-			let layout = LandmarkPathLayout::new(header(cost, vertices)).unwrap();
+			let layout = LandmarkPathLayout::new(header(cost, vertices)).assert_ok();
 			let pages = pages(&layout);
 			assert_eq!(&pages[0].as_bytes()[..8], &[0x46, 0x49, 0x50, 1, 0x30, 0, 0, 0]);
 			assert_eq!(
@@ -80,7 +85,7 @@ fn landmark_path_roundtrip_empty_and_multiple_pages_all_costs() {
 					layout.header.identity,
 					layout.page_count
 				)
-				.unwrap(),
+				.assert_ok(),
 				layout
 			);
 			let data = layout
@@ -92,12 +97,12 @@ fn landmark_path_roundtrip_empty_and_multiple_pages_all_costs() {
 					},
 					&mut || Ok(()),
 				)
-				.unwrap();
+				.assert_ok();
 			for (section, data) in layout.sections.iter().zip(data) {
 				assert_eq!(data.len() as u64, section.count * u64::from(section.width));
 				for (ordinal, bytes) in data.chunks_exact(usize::from(section.width)).enumerate() {
 					let mut expected = vec![0; bytes.len()];
-					element(section.kind, ordinal as u64, &mut expected).unwrap();
+					element(section.kind, ordinal as u64, &mut expected);
 					assert_eq!(bytes, expected);
 				}
 			}
@@ -120,9 +125,10 @@ fn landmark_path_roundtrip_empty_and_multiple_pages_all_costs() {
 	}
 }
 
+/// Verifies landmark path corrupt header sections admission and cancellation.
 #[test]
 fn landmark_path_corrupt_header_sections_admission_and_cancellation() {
-	let layout = LandmarkPathLayout::new(header(1, 2500)).unwrap();
+	let layout = LandmarkPathLayout::new(header(1, 2500)).assert_ok();
 	let mut pages = pages(&layout);
 	let valid = pages[0].as_bytes().to_vec();
 	for (at, value) in [
@@ -153,7 +159,7 @@ fn landmark_path_corrupt_header_sections_admission_and_cancellation() {
 	] {
 		pages[0].as_bytes_mut().copy_from_slice(&valid);
 		pages[0].as_bytes_mut()[at] = value;
-		pages[0].seal().unwrap();
+		pages[0].seal().assert_ok();
 		assert!(
 			LandmarkPathLayout::decode_header(&pages[0], layout.header.identity, layout.page_count)
 				.is_err(),
@@ -214,7 +220,10 @@ fn landmark_path_corrupt_header_sections_admission_and_cancellation() {
 	assert!(
 		forged
 			.stream(
-				element,
+				|kind, ordinal, bytes| {
+					element(kind, ordinal, bytes);
+					Ok(())
+				},
 				|_, _| {
 					writes += 1;
 					Ok(())
@@ -231,7 +240,7 @@ fn landmark_path_corrupt_header_sections_admission_and_cancellation() {
 	{
 		pages[at].as_bytes_mut().copy_from_slice(&valid_section);
 		pages[at].as_bytes_mut()[offset] = byte;
-		pages[at].seal().unwrap();
+		pages[at].seal().assert_ok();
 		assert!(
 			layout
 				.load_sections(

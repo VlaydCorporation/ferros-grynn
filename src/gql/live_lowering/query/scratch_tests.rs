@@ -38,33 +38,36 @@ fn streaming_fixture(rows: usize, key_bytes: usize) -> FerrosGrynnResult<(Datast
 
 /// Discarded WHERE rows must release their transient copy reservations.
 #[test]
-fn live_streaming_discarded_rows_charge_peak_scratch() -> FerrosGrynnResult<()> {
-	let (store, class) = streaming_fixture(4096, 0)?;
+fn live_streaming_discarded_rows_charge_peak_scratch() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, class) = streaming_fixture(4096, 0).assert_ok();
 	let query = LiveQuery::new(LiveSource::Class(class))
-		.with_filter(LiveExpr::field("keep")?)
-		.with_projection(LiveProjection::Value(LiveExpr::field("score")?));
+		.with_filter(LiveExpr::field("keep").assert_ok())
+		.with_projection(LiveProjection::Value(LiveExpr::field("score").assert_ok()));
 	let result = evaluate_query(
 		&store.inner.current_root(),
 		&query,
 		&|_id| Err(FerrosGrynnError::invalid_argument("unexpected binding")),
-		&LiveOptions::default().with_budgets(1 << 20, 1_000_000)?,
+		&LiveOptions::default().with_budgets(1 << 20, 1_000_000).assert_ok(),
 		std::env::temp_dir(),
 		&|_| {},
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(result.rows.len(), 4);
 	for ordinal in 0..4 {
-		let identity = LiveIdentity::Record(format!("item:r{ordinal}").parse()?);
+		let identity = LiveIdentity::Record(format!("item:r{ordinal}").parse().assert_ok());
 		assert_eq!(result.rows.get(&identity), Some(&Value::from(ordinal)));
 	}
 	let last = store
 		.inner
 		.current_root()
-		.atom_by_record(&"item:r4095".parse()?)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture record missing"))?
+		.atom_by_record(&"item:r4095".parse().assert_ok())
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture record missing"))
+		.assert_ok()
 		.id();
 	assert!(result.reads.contains(&ConflictKey::BaseClassRange(class)));
 	assert!(!result.reads.contains(&ConflictKey::BaseAtom(last)));
-	Ok(())
 }
 
 /// Resource rejection never returns a successful partial result map.
@@ -181,7 +184,9 @@ fn live_streaming_nested_outputs_remain_bounded() -> FerrosGrynnResult<()> {
 /// Nested scopes restore reservations; failed reservations do not consume
 /// bytes.
 #[test]
-fn live_streaming_scope_restore_and_failure_cleanup() -> FerrosGrynnResult<()> {
+fn live_streaming_scope_restore_and_failure_cleanup() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let root = store.inner.current_root();
 	let observe = |_| {};
@@ -192,22 +197,24 @@ fn live_streaming_scope_restore_and_failure_cleanup() -> FerrosGrynnResult<()> {
 	let fields = read.fields();
 	let maximum = control.barrier_memory_limit();
 	let quarter = maximum / 4;
-	fields.admit_retained(quarter)?;
+	fields.admit_retained(quarter).assert_ok();
 	{
 		let _outer = fields
 			.transient_scope()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("scope missing"))?;
-		fields.admit(2 * quarter)?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("scope missing"))
+			.assert_ok();
+		fields.admit(2 * quarter).assert_ok();
 		{
 			let _inner = fields
 				.transient_scope()
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("scope missing"))?;
-			fields.admit(quarter)?;
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("scope missing"))
+				.assert_ok();
+			fields.admit(quarter).assert_ok();
 			assert!(fields.admit(1).is_err());
 		}
-		fields.admit(quarter)?;
+		fields.admit(quarter).assert_ok();
 	}
-	fields.admit_retained(maximum - quarter)?;
+	fields.admit_retained(maximum - quarter).assert_ok();
 	assert!(fields.admit_retained(1).is_err());
 	for cancel in [false, true] {
 		let cancellation = crate::gql::QueryCancellation::default();
@@ -230,7 +237,6 @@ fn live_streaming_scope_restore_and_failure_cleanup() -> FerrosGrynnResult<()> {
 			Err(FerrosGrynnError::invalid_argument("failed callback"))
 		})();
 		assert!(outcome.is_err());
-		fields.admit_retained(control.barrier_memory_limit())?;
+		fields.admit_retained(control.barrier_memory_limit()).assert_ok();
 	}
-	Ok(())
 }

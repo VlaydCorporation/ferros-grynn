@@ -2,75 +2,9 @@
 //!
 //! All kernels consume the same incidence projection as tensor views. Results
 //! own public identities; cancellation, overflow and nonconvergence are errors.
-//!
-//! ```
-//! use ferros_grynn::graph::{Graph, Mutable, analytics, tensor::*};
-//! # fn main() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
-//! let graph = Graph::<Mutable>::new();
-//! let tensor = EndpointTensor::from_graph(&graph, TensorOptions::default())?;
-//! let projection = tensor.project(ProjectionOptions::default())?;
-//! let mut check = || Ok(());
-//! analytics::degree(&projection, GraphAlgorithmLimits::default(), &mut check)?;
-//! analytics::page_rank(&projection, analytics::PageRankOptions::default(), &mut check)?;
-//! analytics::harmonic_closeness(
-//! 	&projection,
-//! 	analytics::CentralityOptions::default(),
-//! 	&mut check,
-//! )?;
-//! analytics::betweenness(&projection, analytics::CentralityOptions::default(), &mut check)?;
-//! analytics::eigenvector(&projection, analytics::SpectralOptions::default(), &mut check)?;
-//! analytics::katz(&projection, analytics::KatzOptions::default(), &mut check)?;
-//! analytics::triangles(&projection, analytics::TriangleOptions::default(), &mut check)?;
-//! analytics::clustering(&projection, analytics::ClusteringOptions::default(), &mut check)?;
-//! analytics::label_propagation(
-//! 	&projection,
-//! 	analytics::LabelPropagationOptions::default(),
-//! 	&mut check,
-//! )?;
-//! analytics::louvain(&projection, analytics::LouvainOptions::default(), &mut check)?;
-//! # Ok(())
-//! # }
-//! ```
-//!
+#![doc = include_str!("../../../docs/rustdoc/graph-analytics-example-01.md")]
 //! All-shortest owns complete logical paths; callbacks receive exact prefixes.
-//!
-//! ```
-//! use ferros_grynn::{
-//! 	graph::{EdgeTopology, Graph, Mutable, analytics::*, tensor::*},
-//! 	values::PropertyMap,
-//! };
-//! # fn main() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
-//! let mut graph = Graph::<Mutable>::new();
-//! let a = graph.add_node_with_id("node:a".parse()?, None, PropertyMap::new())?;
-//! let b = graph.add_node_with_id("node:b".parse()?, None, PropertyMap::new())?;
-//! graph.add_edge(EdgeTopology::directed([a], [b]), None, PropertyMap::new())?;
-//! let tensor = EndpointTensor::from_graph(&graph, TensorOptions::default())?;
-//! let axes: Vec<_> = tensor
-//! 	.domain_atoms()
-//! 	.filter(|a| a.atom().kind() == ferros_grynn::graph::AtomKind::Node)
-//! 	.collect();
-//! let complete = tensor
-//! 	.all_shortest_paths(
-//! 		axes[0],
-//! 		axes[1],
-//! 		ProjectionOptions::default(),
-//! 		AllShortestOptions::default(),
-//! 	)?
-//! 	.collect_all()?;
-//! assert_eq!(complete.len(), 1);
-//! let mut options = AllShortestOptions::default();
-//! options.cost = PathCost::Custom;
-//! let result = tensor.all_shortest_paths_with_cost(
-//! 	axes[0],
-//! 	axes[1],
-//! 	ProjectionOptions::default(),
-//! 	options,
-//! 	&mut |context| Ok(context.prefix),
-//! 	&mut || Ok(()),
-//! )?;
-//! assert_eq!(result.enumerate().count(), 1);
-//! # Ok(()) }
-//! ```
+#![doc = include_str!("../../../docs/rustdoc/graph-analytics-example-02.md")]
 
 mod all_shortest;
 mod community;
@@ -117,6 +51,7 @@ pub struct IterationOptions {
 }
 
 impl Default for IterationOptions {
+	/// Constructs the default initial state of `IterationOptions`.
 	fn default() -> Self {
 		Self {
 			tolerance: 1.0e-10,
@@ -204,6 +139,7 @@ pub struct PageRankOptions {
 	pub limits: GraphAlgorithmLimits,
 }
 impl Default for PageRankOptions {
+	/// Constructs the default initial state of `PageRankOptions`.
 	fn default() -> Self {
 		Self {
 			damping: 0.85,
@@ -228,6 +164,7 @@ pub struct CentralityOptions {
 	pub limits: GraphAlgorithmLimits,
 }
 impl Default for CentralityOptions {
+	/// Constructs the default initial state of `CentralityOptions`.
 	fn default() -> Self {
 		Self {
 			weights: WeightSelection::Unweighted,
@@ -261,6 +198,7 @@ pub struct KatzOptions {
 	pub spectral: SpectralOptions,
 }
 impl Default for KatzOptions {
+	/// Constructs the default initial state of `KatzOptions`.
 	fn default() -> Self {
 		Self {
 			alpha: None,
@@ -352,6 +290,7 @@ pub struct LabelPropagationOptions {
 }
 
 impl Default for LabelPropagationOptions {
+	/// Constructs the default initial state of `LabelPropagationOptions`.
 	fn default() -> Self {
 		Self {
 			votes: crate::graph::TraversalDirection::Both,
@@ -381,6 +320,7 @@ pub struct LouvainOptions {
 }
 
 impl Default for LouvainOptions {
+	/// Constructs the default initial state of `LouvainOptions`.
 	fn default() -> Self {
 		Self {
 			orientation: AnalyticsOrientation::Undirected,

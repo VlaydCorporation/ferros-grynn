@@ -50,6 +50,7 @@ pub struct CommitStatement {
 }
 
 impl Parser<'_> {
+	/// Begins statement.
 	pub(in crate::syn) fn begin_statement(&mut self) -> FerrosGrynnResult<BeginStatement> {
 		let isolation = if self.consume_keyword(keywords::ISOLATION).is_some() {
 			self.expect_keyword(keywords::LEVEL, "Expected `LEVEL` after `ISOLATION`.")?;
@@ -100,6 +101,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Commits statement.
 	pub(in crate::syn) fn commit_statement(&mut self) -> FerrosGrynnResult<CommitStatement> {
 		let full_validation = if self.consume_keyword(keywords::WITH).is_some() {
 			self.expect_keyword(keywords::VALIDATION, "Expected `VALIDATION` after `WITH`.")?;

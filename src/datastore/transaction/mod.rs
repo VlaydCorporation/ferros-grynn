@@ -28,6 +28,7 @@ use super::{
 	MaintenanceJobInfo,
 	MaintenanceTarget,
 	OccurrenceState,
+	OccurrenceStateRef,
 	SchemaAnalyzer,
 	SchemaFunction,
 	SchemaId,
@@ -63,6 +64,7 @@ mod changefeed_import;
 mod changefeed_journal;
 /// Snapshot-bound public history selection, preflight and pull reading.
 mod changefeed_reader;
+/// Conflict validation, mutation replay and commit publication.
 mod commit;
 /// Versioned event registration and transaction-visible metadata.
 mod event;
@@ -73,7 +75,9 @@ mod event_dispatch;
 mod event_import;
 /// Durable invocation admission and atomic lifecycle transitions.
 mod event_outbox;
+/// Graph membership, topology and occurrence mutations.
 mod graph;
+/// Transaction-backed graph readers and materialization.
 mod graph_view;
 mod import;
 /// Transaction-private reactive registration, replacement and close.
@@ -98,16 +102,20 @@ mod operation;
 mod operation_image;
 /// Logical qualified endpoint selections retained across private mutations.
 mod qualified_incidence;
+/// Snapshot-bound query reads, indexes and predicate tracking.
 mod query;
 /// Logical endpoint references and explicit owner routes for RELATE.
 mod relate;
+/// Transactional schema definitions and validation.
 mod schema;
 mod tensor;
+/// Explicit write-back of changed materialized graphs.
 mod writeback;
 
 #[cfg(test)]
 mod read_tracking_tests;
 #[cfg(test)]
+/// Regression tests for transaction behavior.
 mod tests;
 
 pub use graph_view::TransactionGraphView;
@@ -116,8 +124,11 @@ pub use graph_view::TransactionGraphView;
 	reason = "Tensor metadata crosses the datastore query adapter"
 )]
 pub(crate) use query::QueryTensorCache;
-pub(crate) use query::{
+pub use query::{
 	QueryGeometryIndexRead,
+	QueryLandmarkPath,
+	QueryNeighbourhoodEstimate,
+	QueryNeighbourhoodSketch,
 	QuerySnapshot,
 	QueryStatisticsDemand,
 	QueryStorageCursor,
@@ -126,7 +137,6 @@ pub(crate) use query::{
 	ScalarIndexConstraint,
 	ScalarIndexWindow,
 };
-pub use query::{QueryLandmarkPath, QueryNeighbourhoodEstimate, QueryNeighbourhoodSketch};
 pub use tensor::capture_tensor;
 
 /// Durable result coverage selected by the publication path.
@@ -174,6 +184,7 @@ pub(super) fn prepare_live_publication(
 /// Owned database-global atom value returned by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomSnapshot {
+	/// Atom associated with this atom snapshot.
 	atom: Arc<super::BaseAtom>,
 }
 
@@ -202,7 +213,9 @@ impl AtomSnapshot {
 /// Timestamp published by a successful transaction commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitResult {
+	/// Transaction associated with this commit result.
 	transaction: u64,
+	/// Commit ts associated with this commit result.
 	commit_ts: u64,
 }
 
@@ -224,11 +237,18 @@ impl CommitResult {
 }
 
 #[derive(Debug, Clone)]
+/// Mutation alternatives.
 enum Mutation {
 	/// Durable non-secret database identity and correspondence rules.
-	RegisterBridgeDatabase(Arc<crate::bridge::BridgeDatabase>),
+	RegisterBridgeDatabase(
+		/// Durable non-secret database identity and correspondence rules.
+		Arc<crate::bridge::BridgeDatabase>,
+	),
 	/// One authoritative row reserving both uniqueness directions.
-	RegisterBridgeMapping(Arc<crate::bridge::BridgeMapping>),
+	RegisterBridgeMapping(
+		/// One authoritative row reserving both uniqueness directions.
+		Arc<crate::bridge::BridgeMapping>,
+	),
 	/// Checked confirmation or diagnostic tombstone of an existing row.
 	TransitionBridgeMapping {
 		/// Stable reference to the row being transitioned.
@@ -237,7 +257,10 @@ enum Mutation {
 		state: crate::bridge::BridgeMappingState,
 	},
 	/// New stable reactive identity and its frozen logical recipe.
-	DefineLiveBinding(Arc<super::LiveBindingDefinition>),
+	DefineLiveBinding(
+		/// New stable reactive identity and its frozen logical recipe.
+		Arc<super::LiveBindingDefinition>,
+	),
 	/// Checked expression replacement retaining the same stable identity.
 	ReplaceLiveBinding {
 		/// Private validated replacement recipe and captures.
@@ -246,13 +269,25 @@ enum Mutation {
 		expected: crate::live::LiveVersion,
 	},
 	/// Explicit removal after checking all reactive dependents.
-	RemoveLiveBinding(crate::live::LiveBindingId),
+	RemoveLiveBinding(
+		/// Explicit removal after checking all reactive dependents.
+		crate::live::LiveBindingId,
+	),
 	/// Immutable private recipe; publication activates its final lifecycle.
-	RegisterLive(Arc<super::LiveDefinition>),
+	RegisterLive(
+		/// Immutable private recipe; publication activates its final lifecycle.
+		Arc<super::LiveDefinition>,
+	),
 	/// Explicit stop, retaining historical identity.
-	CloseLive(crate::live::LiveId),
+	CloseLive(
+		/// Explicit stop, retaining historical identity.
+		crate::live::LiveId,
+	),
 	/// Whole-commit confirmation validated by an attached issuing consumer.
-	AcknowledgeLive(crate::live::LiveCursor),
+	AcknowledgeLive(
+		/// Whole-commit confirmation validated by an attached issuing consumer.
+		crate::live::LiveCursor,
+	),
 	/// Final capture configuration of a retained class or graph feed.
 	ConfigureChangefeed {
 		/// Stable owning class or graph identity.
@@ -264,32 +299,103 @@ enum Mutation {
 		/// Validated policy, or None to stop capture.
 		config: Option<crate::changefeed::ChangefeedConfig>,
 	},
+	/// Intern property case of mutation.
 	InternProperty {
+		/// Key associated with this mutation.
 		key: PropertyKeyId,
+		/// Name associated with this mutation.
 		name: Text,
 	},
-	DefineClass(ClassSchema),
-	DefineParameter(SchemaParameter),
-	DefineFunction(SchemaFunction),
+	/// Define class case of mutation.
+	DefineClass(
+		/// Define class case of mutation.
+		ClassSchema,
+	),
+	/// Define parameter case of mutation.
+	DefineParameter(
+		/// Define parameter case of mutation.
+		SchemaParameter,
+	),
+	/// Define function case of mutation.
+	DefineFunction(
+		/// Define function case of mutation.
+		SchemaFunction,
+	),
 	/// A new event definition with a stable schema identity.
-	DefineEvent(EventDefinition),
-	DefineAnalyzer(SchemaAnalyzer),
-	DefineGraph(GraphSchema),
-	ReplaceClass(ClassSchema),
-	ReplaceParameter(SchemaParameter),
-	ReplaceFunction(SchemaFunction),
+	DefineEvent(
+		/// A new event definition with a stable schema identity.
+		EventDefinition,
+	),
+	/// Define analyzer case of mutation.
+	DefineAnalyzer(
+		/// Define analyzer case of mutation.
+		SchemaAnalyzer,
+	),
+	/// Define graph case of mutation.
+	DefineGraph(
+		/// Define graph case of mutation.
+		GraphSchema,
+	),
+	/// Replace class case of mutation.
+	ReplaceClass(
+		/// Replace class case of mutation.
+		ClassSchema,
+	),
+	/// Replace parameter case of mutation.
+	ReplaceParameter(
+		/// Replace parameter case of mutation.
+		SchemaParameter,
+	),
+	/// Replace function case of mutation.
+	ReplaceFunction(
+		/// Replace function case of mutation.
+		SchemaFunction,
+	),
 	/// Definition replacement, preserving target and event identity.
-	ReplaceEvent(EventDefinition),
-	ReplaceAnalyzer(SchemaAnalyzer),
-	ReplaceGraph(GraphSchema),
-	InstallBuiltGraphTree(build_graph::InstallBuiltGraphTree),
-	RemoveClass(ClassId),
-	RemoveParameter(SchemaId),
-	RemoveFunction(FunctionId),
+	ReplaceEvent(
+		/// Definition replacement, preserving target and event identity.
+		EventDefinition,
+	),
+	/// Replace analyzer case of mutation.
+	ReplaceAnalyzer(
+		/// Replace analyzer case of mutation.
+		SchemaAnalyzer,
+	),
+	/// Replace graph case of mutation.
+	ReplaceGraph(
+		/// Replace graph case of mutation.
+		GraphSchema,
+	),
+	/// Install built graph tree case of mutation.
+	InstallBuiltGraphTree(
+		/// Install built graph tree case of mutation.
+		build_graph::InstallBuiltGraphTree,
+	),
+	/// Remove class case of mutation.
+	RemoveClass(
+		/// Remove class case of mutation.
+		ClassId,
+	),
+	/// Remove parameter case of mutation.
+	RemoveParameter(
+		/// Remove parameter case of mutation.
+		SchemaId,
+	),
+	/// Remove function case of mutation.
+	RemoveFunction(
+		/// Remove function case of mutation.
+		FunctionId,
+	),
 	/// Event removal affects future dispatch, not accepted invocations.
-	RemoveEvent(EventId),
+	RemoveEvent(
+		/// Event removal affects future dispatch, not accepted invocations.
+		EventId,
+	),
 	/// Accepted immutable payload; replay never evaluates its source.
-	EnqueueEvent(Arc<super::EventInvocation>),
+	EnqueueEvent(
+		/// Accepted immutable payload; replay never evaluates its source.
+		Arc<super::EventInvocation>,
+	),
 	/// Checked attempt/cancellation/completion publication.
 	TransitionEvent {
 		/// Stable accepted identity.
@@ -303,70 +409,130 @@ enum Mutation {
 		/// Bounded failure or cancellation explanation.
 		diagnostic: Option<Text>,
 	},
-	RemoveAnalyzer(AnalyzerId),
-	RemoveGraph(GraphId),
+	/// Remove analyzer case of mutation.
+	RemoveAnalyzer(
+		/// Remove analyzer case of mutation.
+		AnalyzerId,
+	),
+	/// Remove graph case of mutation.
+	RemoveGraph(
+		/// Remove graph case of mutation.
+		GraphId,
+	),
+	/// Create atom case of mutation.
 	CreateAtom {
+		/// Identifier used to locate this value within its owning subsystem.
 		id: GlobalAtomId,
+		/// Identifier of the schema class.
 		class_id: ClassId,
+		/// Stable record identifier of the associated atom.
 		record_id: RecordId,
+		/// Properties associated with this mutation.
 		properties: PropertyMap,
 	},
+	/// Set base property case of mutation.
 	SetBaseProperty {
+		/// Global associated with this mutation.
 		global: GlobalAtomId,
+		/// Key associated with this mutation.
 		key: PropertyKeyId,
+		/// Value associated with this mutation.
 		value: Value,
 	},
+	/// Remove base property case of mutation.
 	RemoveBaseProperty {
+		/// Global associated with this mutation.
 		global: GlobalAtomId,
+		/// Key associated with this mutation.
 		key: PropertyKeyId,
 	},
+	/// Delete atom case of mutation.
 	DeleteAtom {
+		/// Global associated with this mutation.
 		global: GlobalAtomId,
 	},
+	/// Attach node case of mutation.
 	AttachNode {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// Global associated with this mutation.
 		global: GlobalAtomId,
+		/// Label associated with this mutation.
 		label: Option<Text>,
+		/// Nested graph associated with this mutation.
 		nested_graph: Option<GraphId>,
 	},
+	/// Attach edge case of mutation.
 	AttachEdge {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// Global associated with this mutation.
 		global: GlobalAtomId,
+		/// Label associated with this mutation.
 		label: Option<Text>,
+		/// Topology associated with this mutation.
 		topology: EdgeTopology,
+		/// Weight associated with this mutation.
 		weight: Option<Number>,
+		/// Transition graph associated with this mutation.
 		transition_graph: Option<GraphId>,
 	},
+	/// Detach case of mutation.
 	Detach {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Global associated with this mutation.
 		global: GlobalAtomId,
 	},
+	/// Set overlay case of mutation.
 	SetOverlay {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// Key associated with this mutation.
 		key: PropertyKeyId,
+		/// Value associated with this mutation.
 		value: Value,
 	},
+	/// Hide property case of mutation.
 	HideProperty {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// Key associated with this mutation.
 		key: PropertyKeyId,
 	},
+	/// Reset property case of mutation.
 	ResetProperty {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// Key associated with this mutation.
 		key: PropertyKeyId,
 	},
+	/// Set occurrence label case of mutation.
 	SetOccurrenceLabel {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// Label associated with this mutation.
 		label: Option<Text>,
 	},
+	/// Replace occurrence state case of mutation.
 	ReplaceOccurrenceState {
+		/// Graph associated with this mutation.
 		graph: GraphId,
+		/// Local associated with this mutation.
 		local: AtomId,
+		/// State associated with this mutation.
 		state: OccurrenceState,
 	},
 }
@@ -374,10 +540,15 @@ enum Mutation {
 /// Transaction-private normalized root with FCW and conservative SSI
 /// validation.
 pub struct Transaction {
+	/// Store associated with this transaction.
 	store: Datastore,
+	/// Identifier used to locate this value within its owning subsystem.
 	id: u64,
+	/// Started associated with this transaction.
 	started: Instant,
+	/// Options associated with this transaction.
 	options: TransactionOptions,
+	/// Snapshot associated with this transaction.
 	snapshot: Arc<DatabaseRoot>,
 	/// Retains physical generations already captured by this immutable MVCC
 	/// root.
@@ -387,17 +558,27 @@ pub struct Transaction {
 	/// bindings.
 	changefeed_snapshot:
 		Option<(u64, FerrosGrynnResult<Option<crate::storage::LocalChangefeedSnapshot>>)>,
+	/// Working associated with this transaction.
 	working: DatabaseRoot,
+	/// Reads associated with this transaction.
 	reads: Mutex<RapidHashMap<ConflictKey, u64>>,
+	/// Missing records associated with this transaction.
 	missing_records: Mutex<BTreeSet<RecordId>>,
-	// ponytail: one-key cache avoids the steady repeated-read lock; replace it
+	// shortcut: one-key cache avoids the steady repeated-read lock; replace it
 	// with a bounded set only if alternating point-read profiles justify it.
+	/// Last base read associated with this transaction.
 	last_base_read: Option<GlobalAtomId>,
+	/// Range writes associated with this transaction.
 	range_writes: BTreeSet<ConflictKey>,
+	/// Writes associated with this transaction.
 	writes: BTreeMap<ConflictKey, u64>,
+	/// Requirements associated with this transaction.
 	requirements: BTreeMap<ConflictKey, u64>,
+	/// Fanout reservations associated with this transaction.
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
+	/// Write bytes associated with this transaction.
 	write_bytes: usize,
+	/// Mutations associated with this transaction.
 	mutations: Vec<Mutation>,
 	/// Bounded operation ranges and targets, without captured images.
 	change_journal: changefeed_journal::ChangeJournal,
@@ -408,9 +589,13 @@ pub struct Transaction {
 	import_events: Option<Box<event_import::ImportEventSpool>>,
 	/// Ordinary local-only mutations allocate no logical anchor journal.
 	qualified_incidence: Option<Box<qualified_incidence::Journal>>,
+	/// Import constraints associated with this transaction.
 	import_constraints: Option<ImportConstraintMode>,
+	/// Import graph scope associated with this transaction.
 	import_graph_scope: Option<GraphId>,
+	/// Rollback mutation errors associated with this transaction.
 	rollback_mutation_errors: bool,
+	/// Atomic mutation depth associated with this transaction.
 	atomic_mutation_depth: usize,
 	/// Scoped caller control is retained only while a logical mutation runs.
 	event_control: Option<Box<crate::gql::ExecutionControl>>,
@@ -420,8 +605,11 @@ pub struct Transaction {
 	event_depth: u32,
 	/// Accepted ancestry persists across sync handlers and async attempts.
 	event_cause: Option<super::EventCause>,
+	/// Gql statement depth associated with this transaction.
 	gql_statement_depth: usize,
+	/// Gql aborted associated with this transaction.
 	gql_aborted: bool,
+	/// Gql bindings associated with this transaction.
 	gql_bindings: crate::values::Object,
 	/// Own lexical declarations and immutable outer session metadata.
 	gql_binding_types: crate::gql::bindings::BindingTypes,
@@ -435,20 +623,31 @@ pub struct Transaction {
 	gql_live_acks: Vec<GqlLiveAck>,
 }
 
-pub(crate) struct TransactionSavepoint {
+/// Transaction savepoint state.
+pub struct TransactionSavepoint {
 	/// Historical accepted ancestry restored with the private operation state.
 	event_cause: Option<super::EventCause>,
 	/// Independent event recursion frame restored with transaction state.
 	event_depth: u32,
+	/// Working associated with this transaction savepoint.
 	working: DatabaseRoot,
+	/// Reads associated with this transaction savepoint.
 	reads: RapidHashMap<ConflictKey, u64>,
+	/// Missing records associated with this transaction savepoint.
 	missing_records: BTreeSet<RecordId>,
+	/// Last base read associated with this transaction savepoint.
 	last_base_read: Option<GlobalAtomId>,
+	/// Range writes associated with this transaction savepoint.
 	range_writes: BTreeSet<ConflictKey>,
+	/// Writes associated with this transaction savepoint.
 	writes: BTreeMap<ConflictKey, u64>,
+	/// Requirements associated with this transaction savepoint.
 	requirements: BTreeMap<ConflictKey, u64>,
+	/// Fanout reservations associated with this transaction savepoint.
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
+	/// Write bytes associated with this transaction savepoint.
 	write_bytes: usize,
+	/// Mutation len associated with this transaction savepoint.
 	mutation_len: usize,
 	/// Capture journal rollback, including checked ordinals and reservations.
 	change_journal: changefeed_journal::JournalCheckpoint,
@@ -458,6 +657,7 @@ pub(crate) struct TransactionSavepoint {
 	import_events: Option<event_import::EventSpoolCheckpoint>,
 	/// Restores accepted qualified routes together with item/TRY effects.
 	qualified_incidence: Option<qualified_incidence::Checkpoint>,
+	/// Gql bindings associated with this transaction savepoint.
 	gql_bindings: crate::values::Object,
 	/// Immutable lexical contracts restored together with their values.
 	gql_binding_types: crate::gql::bindings::BindingTypes,
@@ -469,6 +669,7 @@ pub(crate) struct TransactionSavepoint {
 }
 
 impl Transaction {
+	/// Creates a new `Transaction` value.
 	pub(crate) fn new(
 		store: Datastore,
 		id: u64,
@@ -527,19 +728,25 @@ impl Transaction {
 		}
 	}
 
+	/// Returns the new import result.
 	pub(crate) fn new_import(
 		store: Datastore,
 		id: u64,
 		options: TransactionOptions,
 		snapshot: Arc<DatabaseRoot>,
-		indexes: ImportIndexMode,
-		constraints: ImportConstraintMode,
-		on_violation: ImportViolationPolicy,
+		import: super::ImportOptions,
 		graph_scope: Option<GraphId>,
-		changefeed: super::ImportChangefeedMode,
-		events: super::ImportEventsMode,
 		commit_ts: u64,
 	) -> Self {
+		let super::ImportOptions {
+			indexes,
+			constraints,
+			on_violation,
+			changefeed,
+			events,
+			..
+		} = import;
+
 		let mut transaction = Self::new(store, id, options, snapshot);
 		if indexes == ImportIndexMode::Deferred {
 			transaction
@@ -606,6 +813,7 @@ impl Transaction {
 		}
 	}
 
+	/// Returns the active maintenance job result.
 	pub(crate) fn active_maintenance_job(
 		&self,
 		target: MaintenanceTarget,
@@ -613,6 +821,7 @@ impl Transaction {
 		self.store.inner.maintenance.active_job_for(target)
 	}
 
+	/// Returns the mutation count result.
 	pub(crate) const fn mutation_count(&self) -> usize {
 		self.mutations.len()
 	}
@@ -659,6 +868,7 @@ impl Transaction {
 		crate::gql::execute_transaction_with_options(self, source, variables, options)
 	}
 
+	/// Returns the run gql statement result.
 	pub(crate) fn run_gql_statement<T>(
 		&mut self,
 		execute: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
@@ -674,14 +884,17 @@ impl Transaction {
 		result
 	}
 
+	/// Performs the abort gql operation.
 	pub(crate) fn abort_gql(&mut self) {
 		self.gql_aborted = true;
 	}
 
+	/// Returns the gql bindings result.
 	pub(crate) const fn gql_bindings(&self) -> &crate::values::Object {
 		&self.gql_bindings
 	}
 
+	/// Replaces gql bindings.
 	pub(crate) fn replace_gql_bindings(&mut self, bindings: crate::values::Object) {
 		self.gql_bindings = bindings;
 	}
@@ -744,6 +957,7 @@ impl Transaction {
 		self.gql_binding_types.overlay(&self.gql_outer_binding_types, control)
 	}
 
+	/// Returns the gql savepoint result.
 	pub(crate) fn gql_savepoint(&self) -> TransactionSavepoint {
 		TransactionSavepoint {
 			event_cause: self.event_cause,
@@ -772,6 +986,7 @@ impl Transaction {
 		}
 	}
 
+	/// Restores gql savepoint.
 	pub(crate) fn restore_gql_savepoint(&mut self, savepoint: TransactionSavepoint) {
 		self.event_cause = savepoint.event_cause;
 		self.event_depth = savepoint.event_depth;
@@ -802,6 +1017,7 @@ impl Transaction {
 		self.gql_live_acks.truncate(savepoint.gql_live_ack_len);
 	}
 
+	/// Returns the assert invariants result.
 	pub(crate) fn assert_invariants(
 		&mut self,
 		graph: Option<&GraphRef>,
@@ -899,6 +1115,7 @@ impl Transaction {
 		self.define_graph_with_properties(name, kind, PropertyMap::new())
 	}
 
+	/// Returns the define graph with properties result.
 	pub(crate) fn define_graph_with_properties<IntoText: Into<Text>>(
 		&mut self,
 		name: IntoText,
@@ -915,6 +1132,7 @@ impl Transaction {
 		)
 	}
 
+	/// Returns the define graph with contract result.
 	pub(crate) fn define_graph_with_contract<IntoText: Into<Text>>(
 		&mut self,
 		name: IntoText,
@@ -958,6 +1176,7 @@ impl Transaction {
 		Ok(reference)
 	}
 
+	/// Returns the allocate graph schema result.
 	fn allocate_graph_schema(
 		&self,
 		name: Text,
@@ -1052,6 +1271,7 @@ impl Transaction {
 		}
 	}
 
+	/// Returns the intern record id keys result.
 	fn intern_record_id_keys(&mut self, id: &RecordIdPart) -> FerrosGrynnResult<()> {
 		match id {
 			RecordIdPart::Array(values) => {
@@ -1087,6 +1307,7 @@ impl Transaction {
 		})
 	}
 
+	/// Creates atom inner.
 	fn create_atom_inner(
 		&mut self,
 		record_id: RecordId,
@@ -1189,13 +1410,15 @@ impl Transaction {
 		let previous = self.working.set_base_property(global, key, value.clone())?;
 		self.insert_write(write, BASE_ATOM_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
-		for graph in self
+		// Snapshot memberships before mutating the transaction's range
+		// tracking.
+		let graph_memberships = self
 			.working
 			.memberships(global)
 			.into_iter()
 			.flat_map(|memberships| memberships.keys().copied())
-			.collect::<Vec<_>>()
-		{
+			.collect::<Vec<_>>();
+		for &graph in &graph_memberships {
 			self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		}
 		for graph in fanout {
@@ -1260,13 +1483,15 @@ impl Transaction {
 		let previous = self.working.remove_base_property(global, key)?;
 		self.insert_write(write, BASE_ATOM_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
-		for graph in self
+		// Snapshot memberships before mutating the transaction's range
+		// tracking.
+		let graph_memberships = self
 			.working
 			.memberships(global)
 			.into_iter()
 			.flat_map(|memberships| memberships.keys().copied())
-			.collect::<Vec<_>>()
-		{
+			.collect::<Vec<_>>();
+		for &graph in &graph_memberships {
 			self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		}
 		for graph in fanout {
@@ -1306,6 +1531,7 @@ impl Transaction {
 		self.atomic_mutation(|transaction| transaction.delete_atom_inner(record_id, cascade))
 	}
 
+	/// Deletes atom inner.
 	fn delete_atom_inner(&mut self, record_id: &RecordId, cascade: bool) -> FerrosGrynnResult<()> {
 		self.admit_bridge_tombstones(&crate::bridge::BridgeMappingSubject::Atom(
 			record_id.clone(),
@@ -1317,11 +1543,10 @@ impl Transaction {
 		if !self.writes.contains_key(&write) {
 			self.ensure_capacity(BASE_ATOM_WRITE_BYTES)?;
 		}
-		let memberships = self
-			.working
-			.memberships(global)
-			.map(|memberships| memberships.keys().copied().collect::<Vec<_>>())
-			.unwrap_or_else(Vec::new);
+		let memberships = match self.working.memberships(global) {
+			Some(memberships) => memberships.keys().copied().collect::<Vec<_>>(),
+			None => Vec::new(),
+		};
 		if cascade
 			&& let Some(scope) = self.import_graph_scope
 			&& memberships.iter().any(|graph| *graph != scope)
@@ -1349,6 +1574,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Prepares read.
 	fn prepare_read(&mut self) -> FerrosGrynnResult<()> {
 		self.ensure_live()?;
 		if self.gql_statement_depth == 0 {
@@ -1357,10 +1583,12 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Prepares mutation.
 	fn prepare_mutation(&mut self) -> FerrosGrynnResult<()> {
 		self.prepare_write(true)
 	}
 
+	/// Prepares write.
 	fn prepare_write(&mut self, defer_indexes: bool) -> FerrosGrynnResult<()> {
 		self.ensure_live()?;
 		self.store.inner.ensure_write_allowed(self.id)?;
@@ -1380,6 +1608,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Prepares schema mutation.
 	fn prepare_schema_mutation(&mut self) -> FerrosGrynnResult<()> {
 		if self.import_constraints.is_some() {
 			return Err(FerrosGrynnError::query_feature_not_supported(
@@ -1435,6 +1664,7 @@ impl Transaction {
 		}
 	}
 
+	/// Ensures live.
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {
 		if self.gql_aborted {
 			return Err(FerrosGrynnError::transaction_aborted(self.id));
@@ -1452,6 +1682,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Refreshes read committed.
 	fn refresh_read_committed(&mut self) -> FerrosGrynnResult<()> {
 		if self.options.isolation != IsolationLevel::ReadCommitted {
 			return Ok(());
@@ -1502,12 +1733,14 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Returns the require atom result.
 	fn require_atom(&self, record_id: &RecordId) -> FerrosGrynnResult<GlobalAtomId> {
 		self.working
 			.resolve_atom(record_id)
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", record_id.to_string()))
 	}
 
+	/// Returns the atom snapshot result.
 	fn atom_snapshot(&self, global: GlobalAtomId) -> FerrosGrynnResult<AtomSnapshot> {
 		let atom = self
 			.working
@@ -1518,6 +1751,7 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the atom domain result.
 	fn atom_domain(&self, global: GlobalAtomId) -> FerrosGrynnResult<(ClassId, AtomKind)> {
 		let atom = self
 			.working
@@ -1526,6 +1760,7 @@ impl Transaction {
 		Ok((atom.class_id(), atom.kind()))
 	}
 
+	/// Returns the inherited memberships result.
 	fn inherited_memberships(&self, global: GlobalAtomId, key: PropertyKeyId) -> Vec<GraphId> {
 		self.working
 			.memberships(global)
@@ -1535,6 +1770,7 @@ impl Transaction {
 			.collect()
 	}
 
+	/// Records read.
 	fn record_read(&self, key: ConflictKey) {
 		self.record_reads([key]);
 	}
@@ -1544,6 +1780,7 @@ impl Transaction {
 		Self::record_revisions(&self.snapshot, self.reads.get_mut(), [key]);
 	}
 
+	/// Records reads.
 	fn record_reads<const COUNT: usize>(&self, keys: [ConflictKey; COUNT]) {
 		let mut reads = self.reads.lock();
 		Self::record_revisions(&self.snapshot, &mut reads, keys);
@@ -1560,18 +1797,22 @@ impl Transaction {
 		}
 	}
 
+	/// Records missing.
 	fn record_missing(&self, record: &RecordId) {
 		self.missing_records.lock().insert(record.clone());
 	}
 
+	/// Marks range change.
 	fn mark_range_change(&mut self, key: ConflictKey) {
 		self.range_writes.insert(key);
 	}
 
+	/// Records requirement.
 	fn record_requirement(&mut self, key: ConflictKey) {
 		self.requirements.entry(key).or_insert_with(|| self.snapshot.version(key));
 	}
 
+	/// Inserts write.
 	fn insert_write(&mut self, key: ConflictKey, cost: usize) {
 		if self.writes.contains_key(&key) {
 			return;
@@ -1580,6 +1821,7 @@ impl Transaction {
 		self.write_bytes += cost;
 	}
 
+	/// Ensures capacity.
 	fn ensure_capacity(&self, additional: usize) -> FerrosGrynnResult<()> {
 		let actual = self.write_set_bytes().saturating_add(additional);
 		let maximum = self.store.inner.transaction_limits().max_write_set_bytes;
@@ -1600,6 +1842,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Returns the limit error result.
 	fn limit_error(&self, actual: usize) -> FerrosGrynnError {
 		let limit = self.store.inner.transaction_limits().max_write_set_bytes;
 		FerrosGrynnError::transaction_write_set_limit_exceeded(
@@ -1610,6 +1853,7 @@ impl Transaction {
 	}
 }
 
+/// Returns the invariant assertion error result.
 fn invariant_assertion_error(report: &InvariantViolationReport) -> FerrosGrynnError {
 	let totals = report
 		.totals()

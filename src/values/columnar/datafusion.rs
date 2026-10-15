@@ -10,6 +10,7 @@ use ::datafusion::{catalog::TableProvider, datasource::MemTable, prelude::Sessio
 use super::PropertyBatch;
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
+/// Configured presence metadata value.
 const PRESENCE_METADATA: &str = "ferros_grynn.presence_for_property";
 
 impl PropertyBatch {
@@ -17,6 +18,10 @@ impl PropertyBatch {
 	///
 	/// Hidden presence columns let the query planner lower `IS NONE` separately
 	/// from Arrow's ordinary `IS NULL` semantics.
+	///
+	/// # Errors
+	///
+	/// Returns `arrow_property_batch_failure` diagnostics.
 	pub fn datafusion_record_batch(&self) -> FerrosGrynnResult<RecordBatch> {
 		let mut fields = self.record_batch.schema().fields().iter().cloned().collect::<Vec<_>>();
 		let mut columns = self.record_batch.columns().to_vec();
@@ -38,6 +43,12 @@ impl PropertyBatch {
 		})
 	}
 
+	/// Returns datafusion table for `PropertyBatch`.
+	///
+	/// # Errors
+	///
+	/// Returns `data_fusion_property_batch_failure` diagnostics and propagates
+	/// failures from called operations.
 	pub fn datafusion_table(&self) -> FerrosGrynnResult<Arc<MemTable>> {
 		let batch = self.datafusion_record_batch()?;
 		MemTable::try_new(batch.schema(), vec![vec![batch]]).map(Arc::new).map_err(|source| {
@@ -46,6 +57,12 @@ impl PropertyBatch {
 		})
 	}
 
+	/// Registers datafusion table for `PropertyBatch`.
+	///
+	/// # Errors
+	///
+	/// Returns `data_fusion_property_batch_failure` diagnostics and propagates
+	/// failures from called operations.
 	pub fn register_datafusion_table<IntoStr: Into<String>>(
 		&self,
 		context: &SessionContext,
@@ -58,35 +75,40 @@ impl PropertyBatch {
 		})
 	}
 
+	/// Returns presence field name for `PropertyBatch`.
 	pub fn presence_field_name(key: crate::values::runtime::PropertyKeyId) -> String {
 		format!("__fg_presence_{}", key.get())
 	}
 }
 
 #[cfg(test)]
+/// Regression tests for datafusion behavior.
 mod tests {
 	use ::datafusion::prelude::SessionContext;
 
 	use super::PropertyBatch;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::values::runtime::{PropertyDictionary, PropertyMap, Value};
 
+	/// Verifies registers only after arrow batch preserves sentinels.
 	#[tokio::test]
 	async fn registers_only_after_arrow_batch_preserves_sentinels() {
 		let mut dictionary = PropertyDictionary::new();
-		let score = dictionary.intern("score").unwrap();
+		let score = dictionary.intern("score").assert_ok();
 		let mut rows = vec![PropertyMap::new(); 3];
 		rows[0].insert(score, 10_i64);
 		rows[1].insert(score, Value::Null);
 
-		let batch = PropertyBatch::from_rows(&rows, &dictionary).unwrap();
-		assert_eq!(batch.to_rows().unwrap(), rows);
+		let batch = PropertyBatch::from_rows(&rows, &dictionary).assert_ok();
+		assert_eq!(batch.to_rows().assert_ok(), rows);
 
 		let context = SessionContext::new();
-		batch.register_datafusion_table(&context, "properties").unwrap();
-		assert!(context.table_exist("properties").unwrap());
-		let error = batch.register_datafusion_table(&context, "properties").unwrap_err();
+		batch.register_datafusion_table(&context, "properties").assert_ok();
+		assert!(context.table_exist("properties").assert_ok());
+		let error = batch.register_datafusion_table(&context, "properties").assert_err();
 		assert_eq!(error.status().code().to_string(), "FG-50F02");
-		let frame = context.table("properties").await.unwrap();
+		let frame = context.table("properties").await.assert_ok();
 		let schema = frame.schema();
 		assert!(schema.field_with_unqualified_name("score").is_ok());
 		assert!(

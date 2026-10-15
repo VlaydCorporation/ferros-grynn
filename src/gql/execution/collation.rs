@@ -16,8 +16,11 @@ use crate::{
 	values::{Bytes, Value},
 };
 
+/// Shared primary value.
 static PRIMARY: OnceLock<Option<CollatorBorrowed<'static>>> = OnceLock::new();
+/// Shared numeric value.
 static NUMERIC: OnceLock<Option<CollatorBorrowed<'static>>> = OnceLock::new();
+/// Shared primary numeric value.
 static PRIMARY_NUMERIC: OnceLock<Option<CollatorBorrowed<'static>>> = OnceLock::new();
 
 /// Converts a runtime string into a byte-comparable ICU4X key while retaining
@@ -45,6 +48,7 @@ pub(super) fn order_key(value: Value, order: &LogicalOrder) -> FerrosGrynnResult
 	Ok(Value::Array(vec![Value::Bytes(Bytes::from(key)), Value::String(text)].into()))
 }
 
+/// Returns the collator result.
 fn collator(primary: bool, numeric: bool) -> FerrosGrynnResult<&'static CollatorBorrowed<'static>> {
 	let slot = match (primary, numeric) {
 		(true, true) => &PRIMARY_NUMERIC,
@@ -61,6 +65,7 @@ fn collator(primary: bool, numeric: bool) -> FerrosGrynnResult<&'static Collator
 	})
 }
 
+/// Builds collator.
 fn build_collator(primary: bool, numeric: bool) -> Option<CollatorBorrowed<'static>> {
 	let mut preferences = CollatorPreferences::default();
 	if numeric {

@@ -23,7 +23,10 @@ use crate::{
 /// Stable identity of one schema-catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct SchemaId(NonZeroU32);
+pub struct SchemaId(
+	/// Positive identity allocated in the datastore's shared schema namespace.
+	NonZeroU32,
+);
 
 impl SchemaId {
 	/// Creates an identity from its durable representation.
@@ -42,6 +45,7 @@ impl SchemaId {
 		self.0.get()
 	}
 
+	/// Creates from storage.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("schema identity is reserved"))
@@ -49,15 +53,19 @@ impl SchemaId {
 }
 
 impl Display for SchemaId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.get(), formatter)
+	/// Formats `SchemaId` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), f)
 	}
 }
 
 /// Stable identity of one atom class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct ClassId(SchemaId);
+pub struct ClassId(
+	/// Schema-namespace identity assigned to this class definition.
+	SchemaId,
+);
 
 impl ClassId {
 	/// Creates a class identity from its durable representation.
@@ -73,10 +81,12 @@ impl ClassId {
 		self.0.get()
 	}
 
+	/// Creates from schema id.
 	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
 		Self(value)
 	}
 
+	/// Creates from storage.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("class identity is reserved"))
@@ -84,21 +94,26 @@ impl ClassId {
 }
 
 impl From<ClassId> for SchemaId {
+	/// Converts `ClassId` into `SchemaId`.
 	fn from(value: ClassId) -> Self {
 		value.0
 	}
 }
 
 impl Display for ClassId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.get(), formatter)
+	/// Formats `ClassId` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), f)
 	}
 }
 
 /// Stable identity of one index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct IndexId(SchemaId);
+pub struct IndexId(
+	/// Schema-namespace identity assigned to this index definition.
+	SchemaId,
+);
 
 impl IndexId {
 	/// Creates an index identity from its durable representation.
@@ -114,10 +129,12 @@ impl IndexId {
 		self.0.get()
 	}
 
+	/// Creates from schema id.
 	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
 		Self(value)
 	}
 
+	/// Creates from storage.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("index identity is reserved"))
@@ -125,21 +142,26 @@ impl IndexId {
 }
 
 impl From<IndexId> for SchemaId {
+	/// Converts `IndexId` into `SchemaId`.
 	fn from(value: IndexId) -> Self {
 		value.0
 	}
 }
 
 impl Display for IndexId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.get(), formatter)
+	/// Formats `IndexId` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), f)
 	}
 }
 
 /// Stable identity of one named function overload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct FunctionId(SchemaId);
+pub struct FunctionId(
+	/// Schema-namespace identity assigned to this stored function definition.
+	SchemaId,
+);
 
 impl FunctionId {
 	/// Creates a function identity from its durable representation.
@@ -155,10 +177,12 @@ impl FunctionId {
 		self.0.get()
 	}
 
+	/// Creates from schema id.
 	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
 		Self(value)
 	}
 
+	/// Creates from storage.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("function identity is reserved"))
@@ -166,21 +190,27 @@ impl FunctionId {
 }
 
 impl From<FunctionId> for SchemaId {
+	/// Converts `FunctionId` into `SchemaId`.
 	fn from(value: FunctionId) -> Self {
 		value.0
 	}
 }
 
 impl Display for FunctionId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.get(), formatter)
+	/// Formats `FunctionId` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), f)
 	}
 }
 
 /// Monotonic semantic version of one schema-catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct SchemaVersion(NonZeroU32);
+pub struct SchemaVersion(
+	/// Positive version distinguishing successive definitions of one schema
+	/// object.
+	NonZeroU32,
+);
 
 impl SchemaVersion {
 	/// Initial version assigned when a definition is first published.
@@ -199,6 +229,7 @@ impl SchemaVersion {
 		self.0.get()
 	}
 
+	/// Returns the next schema version.
 	pub(crate) fn next(self) -> FerrosGrynnResult<Self> {
 		self.get()
 			.checked_add(1)
@@ -206,6 +237,7 @@ impl SchemaVersion {
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("schema version is exhausted"))
 	}
 
+	/// Creates from storage.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("schema version zero is reserved")
@@ -214,8 +246,9 @@ impl SchemaVersion {
 }
 
 impl Display for SchemaVersion {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.get(), formatter)
+	/// Formats `SchemaVersion` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), f)
 	}
 }
 
@@ -234,12 +267,16 @@ pub enum SystemIndexKind {
 /// One engine-owned index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemIndex {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: IndexId,
+	/// Version associated with this system index.
 	version: SchemaVersion,
+	/// Kind associated with this system index.
 	kind: SystemIndexKind,
 }
 
 impl SystemIndex {
+	/// Creates a new `SystemIndex` value.
 	pub(crate) const fn new(id: IndexId, kind: SystemIndexKind) -> Self {
 		Self {
 			id,
@@ -248,6 +285,7 @@ impl SystemIndex {
 		}
 	}
 
+	/// Creates from storage.
 	pub(crate) const fn from_storage(
 		id: IndexId,
 		version: SchemaVersion,
@@ -279,19 +317,28 @@ impl SystemIndex {
 /// Published schema definition of one named graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphSchema {
+	/// Version associated with this graph schema.
 	version: SchemaVersion,
+	/// Reference associated with this graph schema.
 	reference: GraphRef,
+	/// System indexes associated with this graph schema.
 	system_indexes: Vec<SystemIndex>,
 	/// User definitions in stable identity order.
 	pub(crate) indexes: Vec<GraphIndex>,
+	/// Properties associated with this graph schema.
 	properties: PropertyMap,
+	/// Topology constraints associated with this graph schema.
 	topology_constraints: GraphTopologyConstraints,
+	/// Root associated with this graph schema.
 	root: Option<RecordId>,
+	/// Owner root associated with this graph schema.
 	owner_root: Option<GraphId>,
+	/// Published at associated with this graph schema.
 	pub(crate) published_at: u64,
 }
 
 impl GraphSchema {
+	/// Creates a new `GraphSchema` value.
 	pub(crate) fn new(
 		version: SchemaVersion,
 		reference: GraphRef,
@@ -351,14 +398,17 @@ impl GraphSchema {
 		self.root.as_ref()
 	}
 
+	/// Returns the owner root result.
 	pub(crate) const fn owner_root(&self) -> Option<GraphId> {
 		self.owner_root
 	}
 
+	/// Returns whether this value is internal.
 	pub(crate) const fn is_internal(&self) -> bool {
 		self.owner_root.is_some()
 	}
 
+	/// Replaces properties.
 	pub(crate) fn replace_properties(&self, properties: PropertyMap) -> FerrosGrynnResult<Self> {
 		let mut replacement = self.clone();
 		replacement.version = replacement.version.next()?;
@@ -366,6 +416,7 @@ impl GraphSchema {
 		Ok(replacement)
 	}
 
+	/// Replaces definition.
 	pub(crate) fn replace_definition(
 		&self,
 		properties: Option<PropertyMap>,
@@ -427,11 +478,17 @@ impl GraphSchema {
 /// Durable global database parameter definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaParameter {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(crate) id: Option<SchemaId>,
+	/// Version associated with this schema parameter.
 	pub(crate) version: SchemaVersion,
+	/// Name associated with this schema parameter.
 	pub(crate) name: Text,
+	/// Value associated with this schema parameter.
 	pub(crate) value: Value,
+	/// Comment associated with this schema parameter.
 	pub(crate) comment: Option<Text>,
+	/// Published at associated with this schema parameter.
 	pub(crate) published_at: u64,
 }
 
@@ -450,12 +507,18 @@ pub enum FunctionEffect {
 /// One named parameter in a durable function signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaFunctionParameter {
+	/// Name associated with this schema function parameter.
 	pub(crate) name: Text,
+	/// Value type associated with this schema function parameter.
 	pub(crate) value_type: crate::values::Type,
 }
 
 impl SchemaFunctionParameter {
 	/// Creates one parameter after validating its catalog name.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn new<IntoText: Into<Text>>(
 		name: IntoText,
 		value_type: crate::values::Type,
@@ -482,17 +545,29 @@ impl SchemaFunctionParameter {
 /// Immutable durable definition of one named function overload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaFunction {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(crate) id: Option<FunctionId>,
+	/// Version associated with this schema function.
 	pub(crate) version: SchemaVersion,
+	/// Namespace associated with this schema function.
 	pub(crate) namespace: Text,
+	/// Name associated with this schema function.
 	pub(crate) name: Text,
+	/// Parameters associated with this schema function.
 	pub(crate) parameters: Vec<SchemaFunctionParameter>,
+	/// Result associated with this schema function.
 	pub(crate) result: crate::values::Type,
+	/// Effect associated with this schema function.
 	pub(crate) effect: FunctionEffect,
+	/// Cost associated with this schema function.
 	pub(crate) cost: bool,
+	/// Max depth associated with this schema function.
 	pub(crate) max_depth: Option<u8>,
+	/// Body associated with this schema function.
 	pub(crate) body: Text,
+	/// Comment associated with this schema function.
 	pub(crate) comment: Option<Text>,
+	/// Published at associated with this schema function.
 	pub(crate) published_at: u64,
 }
 
@@ -623,6 +698,7 @@ impl SchemaFunction {
 		self.comment.as_ref()
 	}
 
+	/// Returns the signature result.
 	pub(crate) fn signature(&self) -> (String, String, Vec<crate::values::Type>) {
 		(
 			self.namespace.to_string(),
@@ -692,22 +768,38 @@ impl SchemaParameter {
 /// Immutable MVCC snapshot of currently visible schema definitions.
 #[derive(Clone)]
 pub struct SchemaCatalog {
+	/// Next schema id associated with this schema catalog.
 	pub(crate) next_schema_id: u64,
+	/// Next graph id associated with this schema catalog.
 	pub(crate) next_graph_id: u64,
+	/// Graphs associated with this schema catalog.
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphSchema>>,
+	/// Graph names associated with this schema catalog.
 	pub(crate) graph_names: BTreeMap<String, GraphId>,
+	/// Graph versions associated with this schema catalog.
 	pub(crate) graph_versions: BTreeMap<GraphId, u64>,
+	/// Classes associated with this schema catalog.
 	pub(crate) classes: BTreeMap<ClassId, Arc<ClassSchema>>,
+	/// Class names associated with this schema catalog.
 	pub(crate) class_names: BTreeMap<String, ClassId>,
+	/// Class versions associated with this schema catalog.
 	pub(crate) class_versions: BTreeMap<ClassId, u64>,
+	/// Parameters associated with this schema catalog.
 	pub(crate) parameters: BTreeMap<String, Arc<SchemaParameter>>,
+	/// Parameter versions associated with this schema catalog.
 	pub(crate) parameter_versions: BTreeMap<String, u64>,
+	/// Functions associated with this schema catalog.
 	pub(crate) functions: BTreeMap<FunctionId, Arc<SchemaFunction>>,
+	/// Function signatures associated with this schema catalog.
 	pub(crate) function_signatures:
 		BTreeMap<(String, String, Vec<crate::values::Type>), FunctionId>,
+	/// Function versions associated with this schema catalog.
 	pub(crate) function_versions: BTreeMap<FunctionId, u64>,
+	/// Analyzers associated with this schema catalog.
 	pub(crate) analyzers: BTreeMap<AnalyzerId, Arc<SchemaAnalyzer>>,
+	/// Analyzer names associated with this schema catalog.
 	pub(crate) analyzer_names: BTreeMap<String, AnalyzerId>,
+	/// Analyzer versions associated with this schema catalog.
 	pub(crate) analyzer_versions: BTreeMap<AnalyzerId, u64>,
 	/// Source-owned event definitions in stable dispatch order.
 	pub(crate) events: BTreeMap<EventId, Arc<EventDefinition>>,
@@ -716,6 +808,7 @@ pub struct SchemaCatalog {
 }
 
 impl Default for SchemaCatalog {
+	/// Constructs the default initial state of `SchemaCatalog`.
 	fn default() -> Self {
 		Self {
 			next_schema_id: 1,
@@ -789,6 +882,7 @@ impl SchemaCatalog {
 		self.graphs.values().filter(|graph| !graph.is_internal())
 	}
 
+	/// Returns the all graphs result.
 	pub(crate) fn all_graphs(&self) -> impl ExactSizeIterator<Item = &Arc<GraphSchema>> {
 		self.graphs.values()
 	}
@@ -845,6 +939,7 @@ impl SchemaCatalog {
 	}
 }
 
+/// Validates catalog name.
 pub(super) fn validate_catalog_name(name: &str, subject: &str) -> FerrosGrynnResult<()> {
 	if name.is_empty() || name.contains('\0') {
 		return Err(FerrosGrynnError::invalid_argument(format!(
@@ -855,26 +950,30 @@ pub(super) fn validate_catalog_name(name: &str, subject: &str) -> FerrosGrynnRes
 }
 
 #[cfg(test)]
+/// Regression tests for catalog behavior.
 mod tests {
 	use std::sync::Arc;
 
 	use super::{ClassId, SchemaCatalog, SchemaId};
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::ClassSchema,
 		values::runtime::{AtomKind, Text},
 	};
 
+	/// Verifies class identity is not an untyped schema identity.
 	#[test]
 	fn class_identity_is_not_an_untyped_schema_identity() {
-		let schema_id = SchemaId::new(7).unwrap();
+		let schema_id = SchemaId::new(7).assert_some();
 		let class_id = ClassId::from_schema_id(schema_id);
-		let mut class = ClassSchema::new("person", AtomKind::Node, []).unwrap();
+		let mut class = ClassSchema::new("person", AtomKind::Node, []).assert_ok();
 		class.id = Some(class_id);
 		let mut catalog = SchemaCatalog::default();
 		catalog.classes.insert(class_id, Arc::new(class));
 		catalog.class_names.insert(Text::from("person").to_string(), class_id);
 
-		assert_eq!(catalog.class("person").unwrap().id(), Some(class_id));
+		assert_eq!(catalog.class("person").assert_some().id(), Some(class_id));
 		assert_eq!(SchemaId::from(class_id), schema_id);
 	}
 }

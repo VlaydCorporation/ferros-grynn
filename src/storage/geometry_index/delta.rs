@@ -142,8 +142,6 @@ pub(crate) struct GeometryDeltaRecord {
 /// Checked replacement generation; records are ordered by stable row identity.
 #[derive(Debug)]
 pub(crate) struct DecodedGeometryDelta {
-	/// MVCC revision of this replacement set.
-	pub(crate) revision: u64,
 	/// Exact records in stable identity order.
 	pub(crate) records: Vec<GeometryDeltaRecord>,
 }
@@ -251,7 +249,7 @@ pub(crate) fn decode_geometry_delta(
 		{
 			return Err(invalid("invalid geometry delta record page"));
 		}
-		for bytes in bytes[40..40 + count * WIDTH].chunks_exact(WIDTH) {
+		for bytes in bytes[40..40 + count * WIDTH].as_chunks::<WIDTH>().0 {
 			let entry = decode_entry(&bytes[..40])?;
 			let atom = DiskAtomRef::from_raw(entry.identity)?;
 			if records.last().is_some_and(|previous: &GeometryDeltaRecord| previous.atom >= atom)
@@ -260,7 +258,7 @@ pub(crate) fn decode_geometry_delta(
 				return Err(invalid("geometry delta identities or reserved bytes are invalid"));
 			}
 			let mbr = match bytes[40] {
-				0 if entry.mbr == [0.0; 4] => None,
+				0 if entry.mbr.iter().all(num_traits::Zero::is_zero) => None,
 				1 => Some(entry.mbr),
 				_ => return Err(invalid("invalid geometry delta action")),
 			};
@@ -271,7 +269,6 @@ pub(crate) fn decode_geometry_delta(
 		}
 	}
 	Ok(DecodedGeometryDelta {
-		revision,
 		records,
 	})
 }

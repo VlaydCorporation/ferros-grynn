@@ -87,13 +87,15 @@ impl AnalyticsOptions {
 			"ROOTED" => TensorScope::Rooted,
 			_ => return Err(invalid("analytical scope must be LOCAL or ROOTED")),
 		};
-		let mut projection = ProjectionOptions::default();
-		projection.mode = if atom {
-			TraversalSemantics::Atom
-		} else {
-			TraversalSemantics::Node
+		let mut projection = ProjectionOptions {
+			mode: if atom {
+				TraversalSemantics::Atom
+			} else {
+				TraversalSemantics::Node
+			},
+			direction: direction_option(object, "direction", TraversalDirection::Forward)?,
+			..Default::default()
 		};
-		projection.direction = direction_option(object, "direction", TraversalDirection::Forward)?;
 		if let Some(labels) = object.get("labels") {
 			let Value::Array(labels) = labels else {
 				return Err(invalid("labels must be an array"));

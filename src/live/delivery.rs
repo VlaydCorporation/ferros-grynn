@@ -267,12 +267,22 @@ impl LiveGap {
 #[non_exhaustive]
 pub enum LivePayload {
 	/// All net changes of one commit.
-	Batch(LiveBatch),
+	Batch(
+		/// All net changes of one commit.
+		LiveBatch,
+	),
 	/// Complete graph revision using qualified logical identities.
-	Graph(Arc<LiveGraphBatch>),
+	Graph(
+		/// Complete graph revision using qualified logical identities.
+		Arc<LiveGraphBatch>,
+	),
 	/// Explicit unavailable interval, followed by available tail where
 	/// possible.
-	Gap(LiveGap),
+	Gap(
+		/// Explicit unavailable interval, followed by available tail where
+		/// possible.
+		LiveGap,
+	),
 	/// Evaluation fault and the unavailable result interval it caused.
 	Fault {
 		/// Exact typed evaluator/resource diagnosis.
@@ -310,12 +320,16 @@ pub enum LiveNext {
 	/// No currently queued item; the subscription remains attached and active.
 	Idle,
 	/// Complete delivery, repeated by next until acknowledged.
-	Delivery(LiveDelivery),
+	Delivery(
+		/// Complete delivery, repeated by next until acknowledged.
+		LiveDelivery,
+	),
 	/// Subscription stopped or consumer disconnected.
 	Closed,
 }
 
 #[cfg(test)]
+/// Regression tests for delivery behavior.
 mod tests {
 	use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -336,18 +350,21 @@ mod tests {
 	/// Catalog presentation changes cannot turn the same qualified row into
 	/// an exit followed by an entry.
 	#[test]
-	fn live_occurrence_identity_survives_graph_rename() -> FerrosGrynnResult<()> {
-		let id =
-			GraphId::new(1).ok_or_else(|| FerrosGrynnError::invalid_argument("fixture graph"))?;
-		let atom = AtomRef::new(AtomKind::Node, "person:a".parse()?);
+	fn live_occurrence_identity_survives_graph_rename() {
+		use crate::test_assertions::AssertResult as _;
+
+		let id = GraphId::new(1)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture graph"))
+			.assert_ok();
+		let atom = AtomRef::new(AtomKind::Node, "person:a".parse().assert_ok());
 		let identity = |name| -> FerrosGrynnResult<_> {
 			Ok(LiveIdentity::Occurrence(AtomOccurrenceRef::new(
 				atom.clone(),
 				Arc::new(GraphRef::new(id, name, GraphKind::Graph, GraphStorageMode::InMemory)?),
 			)))
 		};
-		let first = identity("before")?;
-		let renamed = identity("after")?;
+		let first = identity("before").assert_ok();
+		let renamed = identity("after").assert_ok();
 		assert_eq!(first, renamed);
 		let hash = |value: &LiveIdentity| {
 			let mut hasher = DefaultHasher::new();
@@ -355,6 +372,5 @@ mod tests {
 			hasher.finish()
 		};
 		assert_eq!(hash(&first), hash(&renamed));
-		Ok(())
 	}
 }

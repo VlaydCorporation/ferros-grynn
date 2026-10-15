@@ -1,16 +1,19 @@
 //! Checkpoint backfill and metadata COW for graph data spaces.
 
 use super::GraphFileSet;
+#[cfg(test)]
+use crate::storage::{
+	image_io::backfill_pages,
+	page::{AlignedPage, PageNo},
+	wal::{CheckpointTicket, FrameWal},
+};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
 		file_registry::FileRegistry,
 		graph_superblock::GraphSuperblock,
-		image_io::backfill_pages,
 		metadata_cow::write_checkpoint_page,
-		page::{AlignedPage, PageNo},
 		types::{CheckpointGeneration, Lsn},
-		wal::{CheckpointTicket, FrameWal},
 	},
 };
 
@@ -27,6 +30,7 @@ pub(in crate::storage) struct GraphCheckpointAuthority {
 
 impl GraphCheckpointAuthority {
 	/// Authority before the first durable database checkpoint.
+	#[cfg(test)]
 	pub(super) const EMPTY: Self = Self {
 		generation: CheckpointGeneration::ZERO,
 		backfilled_lsn: Lsn::ZERO,
@@ -60,6 +64,7 @@ impl GraphCheckpointAuthority {
 }
 
 /// Backfills graph data pages and returns the selected logical superblock.
+#[cfg(test)]
 pub(in crate::storage) fn backfill_graph_checkpoint(
 	wal: &FrameWal,
 	registry: &FileRegistry,
@@ -80,7 +85,6 @@ pub(in crate::storage) fn backfill_graph_checkpoint(
 			let mut page = AlignedPage::zeroed();
 			wal.frame_read_scope().read_frame(*frame, &mut page)?;
 			logical_superblock = Some(GraphSuperblock::decode(&page)?);
-			continue;
 		}
 	}
 	backfill_pages(wal, registry, files.space(), &regular_files, ticket)?;
@@ -107,6 +111,7 @@ pub(in crate::storage) fn write_graph_checkpoint_page(
 	Ok(checkpointed)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

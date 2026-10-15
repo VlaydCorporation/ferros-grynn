@@ -419,6 +419,7 @@ impl Transaction {
 }
 
 #[cfg(test)]
+/// Regression tests for live binding behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -438,28 +439,35 @@ mod tests {
 	/// Metadata clones stay charged while their dependency output is being
 	/// projected into an independent row.
 	#[test]
-	fn live_binding_info_retains_vector_admission() -> FerrosGrynnResult<()> {
+	fn live_binding_info_retains_vector_admission() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let id = tx.define_live_binding(
-			LiveExpr::Literal(1.into()),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
+		let id = tx
+			.define_live_binding(
+				LiveExpr::Literal(1.into()),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
 		let mut definition = tx
 			.working
 			.live_catalog()
 			.bindings
 			.get(&id)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture binding missing"))?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture binding missing"))
+			.assert_ok()
 			.as_ref()
 			.clone();
 		definition.dependencies = vec![id; 256];
 		definition.functions = vec![
 			(
-				crate::datastore::FunctionId::new(1).ok_or_else(|| {
-					FerrosGrynnError::invalid_argument("fixture function id is zero")
-				})?,
+				crate::datastore::FunctionId::new(1)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("fixture function id is zero")
+					})
+					.assert_ok(),
 				crate::datastore::SchemaVersion::INITIAL,
 			);
 			4096
@@ -467,78 +475,89 @@ mod tests {
 		let control = crate::gql::ExecutionControl::new(
 			&crate::gql::QueryExecutionOptions {
 				barrier_memory_bytes: std::num::NonZeroUsize::new(64 * 1024)
-					.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture budget is zero"))?,
+					.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture budget is zero"))
+					.assert_ok(),
 				..crate::gql::QueryExecutionOptions::default()
 			},
 			None,
 		);
-		let (info, account) = definition.info_controlled(&control)?;
+		let (info, account) = definition.info_controlled(&control).assert_ok();
 		let mut projection = control.barrier_account();
 		let bytes = info.dependencies().len() * 128;
 		assert!(!projection.reserve(bytes));
 		drop(info);
 		drop(account);
 		assert!(projection.reserve(bytes));
-		Ok(())
 	}
 
 	/// All callbacks, views and maintenance use owned public types without GQL
 	/// text.
 	#[test]
-	fn live_binding_frozen_inputs_replacements_savepoints_and_old_snapshots()
-	-> FerrosGrynnResult<()> {
+	fn live_binding_frozen_inputs_replacements_savepoints_and_old_snapshots() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
 		let mut parameters = Object::new();
 		parameters.insert("fixed", Value::from(18_i64));
-		let first = tx.define_live_binding(
-			LiveExpr::Parameter("fixed".into()),
-			parameters.clone(),
-			LiveBindingOptions::default(),
-		)?;
+		let first = tx
+			.define_live_binding(
+				LiveExpr::Parameter("fixed".into()),
+				parameters.clone(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
 		parameters.insert("fixed", Value::from(99_i64));
-		let second = tx.define_live_binding(
-			LiveExpr::Binding(first)
-				.binary(LiveBinaryOperator::Add, LiveExpr::Literal(Value::from(2_i64))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		assert_eq!(tx.live_binding_value(first)?, Value::from(18_i64));
+		let second = tx
+			.define_live_binding(
+				LiveExpr::Binding(first)
+					.binary(LiveBinaryOperator::Add, LiveExpr::Literal(Value::from(2_i64))),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		assert_eq!(tx.live_binding_value(first).assert_ok(), Value::from(18_i64));
 		let savepoint = tx.gql_savepoint();
-		tx.replace_live_binding_value(first, Value::from(21_i64))?;
-		assert!(tx.live_binding_info(first)?.parameters().is_empty());
+		tx.replace_live_binding_value(first, Value::from(21_i64)).assert_ok();
+		assert!(tx.live_binding_info(first).assert_ok().parameters().is_empty());
 		tx.restore_gql_savepoint(savepoint);
-		assert_eq!(tx.live_binding_value(first)?, Value::from(18_i64));
-		tx.commit()?;
+		assert_eq!(tx.live_binding_value(first).assert_ok(), Value::from(18_i64));
+		tx.commit().assert_ok();
 		let mut old = store.begin();
 		let mut tx = store.begin();
-		tx.replace_live_binding_value(first, Value::from(25_i64))?;
-		let stamp = tx.commit()?.versionstamp();
+		tx.replace_live_binding_value(first, Value::from(25_i64)).assert_ok();
+		let stamp = tx.commit().assert_ok().versionstamp();
 		let mut current = store.begin();
-		assert_eq!(current.live_binding_value(second)?, Value::from(27_i64));
-		assert_eq!(current.live_binding_info(second)?.revision().value(), stamp);
-		assert_eq!(old.live_binding_value(second)?, Value::from(20_i64));
-		assert_eq!(current.live_binding_info(first)?.revision().definition().get(), 2);
-		Ok(())
+		assert_eq!(current.live_binding_value(second).assert_ok(), Value::from(27_i64));
+		assert_eq!(current.live_binding_info(second).assert_ok().revision().value(), stamp);
+		assert_eq!(old.live_binding_value(second).assert_ok(), Value::from(20_i64));
+		assert_eq!(current.live_binding_info(first).assert_ok().revision().definition().get(), 2);
 	}
 
 	/// Failed DAG edits leave the old recipe and all transaction mutations
 	/// intact.
 	#[test]
-	fn live_binding_cycles_and_dependent_removal_are_atomic() -> FerrosGrynnResult<()> {
+	fn live_binding_cycles_and_dependent_removal_are_atomic() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let first = tx.define_live_binding(
-			LiveExpr::Literal(Value::from(1_i64)),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		let second = tx.define_live_binding(
-			LiveExpr::Binding(first),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let first = tx
+			.define_live_binding(
+				LiveExpr::Literal(Value::from(1_i64)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		let second = tx
+			.define_live_binding(
+				LiveExpr::Binding(first),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
 		let mutations = tx.mutation_count();
 		assert!(
 			tx.replace_live_binding_expression(
@@ -550,129 +569,154 @@ mod tests {
 			.is_err()
 		);
 		assert_eq!(tx.mutation_count(), mutations);
-		assert!(tx.live_binding_info(first)?.dependencies().is_empty());
+		assert!(tx.live_binding_info(first).assert_ok().dependencies().is_empty());
 		assert!(tx.remove_live_binding(first).is_err());
-		let live = tx.register_live(
-			LiveQuery::new(LiveSource::Class(class))
-				.with_projection(LiveProjection::Value(LiveExpr::Binding(first))),
-			LiveOptions::default(),
-		)?;
-		tx.remove_live_binding(second)?;
+		let live = tx
+			.register_live(
+				LiveQuery::new(LiveSource::Class(class))
+					.with_projection(LiveProjection::Value(LiveExpr::Binding(first))),
+				LiveOptions::default(),
+			)
+			.assert_ok();
+		tx.remove_live_binding(second).assert_ok();
 		assert!(tx.remove_live_binding(first).is_err());
-		tx.close_live(live)?;
-		tx.remove_live_binding(first)?;
-		tx.commit()?;
+		tx.close_live(live).assert_ok();
+		tx.remove_live_binding(first).assert_ok();
+		tx.commit().assert_ok();
 		let mut current = store.begin();
-		assert_eq!(current.live_binding_info(first)?.state(), LiveState::Closed);
+		assert_eq!(current.live_binding_info(first).assert_ok().state(), LiveState::Closed);
 		assert!(current.live_binding_value(first).is_err());
-		assert_eq!(current.live_info(live)?.bindings().len(), 1);
-		Ok(())
+		assert_eq!(current.live_info(live).assert_ok().bindings().len(), 1);
 	}
 
 	/// Data and reactive parameter edits observe one final replay image.
 	#[test]
-	fn live_binding_select_uses_final_data_and_parameter_values() -> FerrosGrynnResult<()> {
+	fn live_binding_select_uses_final_data_and_parameter_values() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let count = tx.define_live_binding(
-			LiveExpr::Select(Box::new(LiveQuery::new(LiveSource::Class(class)).with_projection(
-				LiveProjection::Value(LiveExpr::Call {
-					name: "count".into(),
-					arguments: Vec::new(),
-				}),
-			))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		let threshold = tx.define_live_binding(
-			LiveExpr::Literal(Value::from(10_i64)),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		let allowed = tx.define_live_binding(
-			LiveExpr::Binding(count)
-				.binary(LiveBinaryOperator::Greater, LiveExpr::Binding(threshold)),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		tx.create_atom("person:a".parse()?, PropertyMap::new())?;
-		tx.create_atom("person:b".parse()?, PropertyMap::new())?;
-		tx.replace_live_binding_value(threshold, Value::from(1_i64))?;
-		let stamp = tx.commit()?.versionstamp();
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let count = tx
+			.define_live_binding(
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(LiveSource::Class(class)).with_projection(
+						LiveProjection::Value(LiveExpr::Call {
+							name: "count".into(),
+							arguments: Vec::new(),
+						}),
+					),
+				)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		let threshold = tx
+			.define_live_binding(
+				LiveExpr::Literal(Value::from(10_i64)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		let allowed = tx
+			.define_live_binding(
+				LiveExpr::Binding(count)
+					.binary(LiveBinaryOperator::Greater, LiveExpr::Binding(threshold)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		tx.create_atom("person:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		tx.create_atom("person:b".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		tx.replace_live_binding_value(threshold, Value::from(1_i64)).assert_ok();
+		let stamp = tx.commit().assert_ok().versionstamp();
 		let mut current = store.begin();
-		assert_eq!(current.live_binding_value(count)?, Value::from(2_i64));
-		assert_eq!(current.live_binding_value(allowed)?, Value::Bool(true));
-		assert_eq!(current.live_binding_info(allowed)?.revision().value(), stamp);
-		Ok(())
+		assert_eq!(current.live_binding_value(count).assert_ok(), Value::from(2_i64));
+		assert_eq!(current.live_binding_value(allowed).assert_ok(), Value::Bool(true));
+		assert_eq!(current.live_binding_info(allowed).assert_ok().revision().value(), stamp);
 	}
 
 	/// Active evaluation faults pause affected identities while committing
 	/// source DML.
 	#[test]
-	fn live_binding_fault_commits_primary_and_requires_explicit_replacement()
-	-> FerrosGrynnResult<()> {
+	fn live_binding_fault_commits_primary_and_requires_explicit_replacement() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let record: crate::values::RecordId = "person:a".parse()?;
-		tx.create_atom(record.clone(), PropertyMap::new())?;
-		let count = tx.define_live_binding(
-			LiveExpr::Select(Box::new(LiveQuery::new(LiveSource::Class(class)).with_projection(
-				LiveProjection::Value(LiveExpr::Call {
-					name: "count".into(),
-					arguments: Vec::new(),
-				}),
-			))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		let inverse = tx.define_live_binding(
-			LiveExpr::Literal(Value::from(10_i64))
-				.binary(LiveBinaryOperator::Divide, LiveExpr::Binding(count)),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		let parent = tx.define_live_binding(
-			LiveExpr::Binding(inverse)
-				.binary(LiveBinaryOperator::Multiply, LiveExpr::Literal(Value::from(2_i64))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		tx.commit()?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let record: crate::values::RecordId = "person:a".parse().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		let count = tx
+			.define_live_binding(
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(LiveSource::Class(class)).with_projection(
+						LiveProjection::Value(LiveExpr::Call {
+							name: "count".into(),
+							arguments: Vec::new(),
+						}),
+					),
+				)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		let inverse = tx
+			.define_live_binding(
+				LiveExpr::Literal(Value::from(10_i64))
+					.binary(LiveBinaryOperator::Divide, LiveExpr::Binding(count)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		let parent = tx
+			.define_live_binding(
+				LiveExpr::Binding(inverse)
+					.binary(LiveBinaryOperator::Multiply, LiveExpr::Literal(Value::from(2_i64))),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		tx.commit().assert_ok();
 		let mut old = store.begin();
 		let mut tx = store.begin();
-		tx.delete_atom(&record)?;
-		tx.commit()?;
+		tx.delete_atom(&record).assert_ok();
+		tx.commit().assert_ok();
 		let mut current = store.begin();
-		assert!(current.atom(&record)?.is_none());
-		assert_eq!(current.live_binding_info(inverse)?.state(), LiveState::Paused);
-		assert_eq!(current.live_binding_info(parent)?.state(), LiveState::Paused);
+		assert!(current.atom(&record).assert_ok().is_none());
+		assert_eq!(current.live_binding_info(inverse).assert_ok().state(), LiveState::Paused);
+		assert_eq!(current.live_binding_info(parent).assert_ok().state(), LiveState::Paused);
 		let diagnostic = current
 			.live_binding_value(inverse)
 			.err()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("test expected a binding fault"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("test expected a binding fault"))
+			.assert_ok();
 		assert_eq!(diagnostic.status().code().to_string(), "FG-G1F09");
 		assert!(diagnostic.cause().is_some());
-		assert_eq!(old.live_binding_value(inverse)?, Value::from(10_i64));
-		current.replace_live_binding_value(inverse, Value::from(3_i64))?;
-		current.replace_live_binding_expression(
-			parent,
-			LiveExpr::Binding(inverse)
-				.binary(LiveBinaryOperator::Multiply, LiveExpr::Literal(Value::from(2_i64))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		current.commit()?;
+		assert_eq!(old.live_binding_value(inverse).assert_ok(), Value::from(10_i64));
+		current.replace_live_binding_value(inverse, Value::from(3_i64)).assert_ok();
+		current
+			.replace_live_binding_expression(
+				parent,
+				LiveExpr::Binding(inverse)
+					.binary(LiveBinaryOperator::Multiply, LiveExpr::Literal(Value::from(2_i64))),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		current.commit().assert_ok();
 		let mut current = store.begin();
-		assert_eq!(current.live_binding_value(parent)?, Value::from(6_i64));
-		Ok(())
+		assert_eq!(current.live_binding_value(parent).assert_ok(), Value::from(6_i64));
 	}
 
 	/// Concrete named-function versions cannot silently change active
 	/// expressions.
 	#[test]
-	fn live_recipe_call_pure_versions_pause_until_recaptured() -> FerrosGrynnResult<()> {
+	fn live_recipe_call_pure_versions_pause_until_recaptured() {
+		use crate::test_assertions::AssertResult as _;
+
 		for named in [false, true] {
 			let store = Datastore::in_memory();
 			let mut tx = store.begin();
@@ -688,7 +732,7 @@ mod tests {
 					"{ RETURN $value; }",
 				)
 			};
-			tx.define_function(function()?)?;
+			tx.define_function(function().assert_ok()).assert_ok();
 			let expression = if named {
 				LiveExpr::CallWithOptions {
 					name: "fn::identity".into(),
@@ -705,90 +749,111 @@ mod tests {
 					arguments: vec![LiveExpr::Literal(Value::from(9_007_199_254_740_993_i64))],
 				}
 			};
-			let id = tx.define_live_binding(
-				expression.clone(),
-				Object::new(),
-				LiveBindingOptions::default(),
-			)?;
-			tx.commit()?;
+			let id = tx
+				.define_live_binding(
+					expression.clone(),
+					Object::new(),
+					LiveBindingOptions::default(),
+				)
+				.assert_ok();
+			tx.commit().assert_ok();
 			let mut tx = store.begin();
-			assert_eq!(tx.live_binding_info(id)?.function_dependencies().len(), 1);
-			let function_id = tx.live_binding_info(id)?.function_dependencies()[0].0;
+			assert_eq!(tx.live_binding_info(id).assert_ok().function_dependencies().len(), 1);
+			let function_id = tx.live_binding_info(id).assert_ok().function_dependencies()[0].0;
 			let published = tx
-				.function_by_id(function_id)?
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("test function is absent"))?;
-			tx.replace_function(published.as_ref().clone())?;
-			tx.commit()?;
+				.function_by_id(function_id)
+				.assert_ok()
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("test function is absent"))
+				.assert_ok();
+			tx.replace_function(published.as_ref().clone()).assert_ok();
+			tx.commit().assert_ok();
 			let mut tx = store.begin();
-			assert_eq!(tx.live_binding_info(id)?.state(), LiveState::Paused);
+			assert_eq!(tx.live_binding_info(id).assert_ok().state(), LiveState::Paused);
 			tx.replace_live_binding_expression(
 				id,
 				expression,
 				Object::new(),
 				LiveBindingOptions::default(),
-			)?;
-			tx.commit()?;
+			)
+			.assert_ok();
+			tx.commit().assert_ok();
 			let mut tx = store.begin();
-			assert_eq!(tx.live_binding_value(id)?, Value::from(9_007_199_254_740_993_i64));
-			assert_eq!(tx.live_binding_info(id)?.function_dependencies()[0].1.get(), 2);
+			assert_eq!(
+				tx.live_binding_value(id).assert_ok(),
+				Value::from(9_007_199_254_740_993_i64)
+			);
+			assert_eq!(tx.live_binding_info(id).assert_ok().function_dependencies()[0].1.get(), 2);
 		}
-		Ok(())
 	}
 
 	/// Exhausting an active evaluation cap preserves source DML atomically.
 	#[test]
-	fn live_binding_active_work_limit_pauses_after_successful_source_commit()
-	-> FerrosGrynnResult<()> {
+	fn live_binding_active_work_limit_pauses_after_successful_source_commit() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let id = tx.define_live_binding(
-			LiveExpr::Select(Box::new(
-				LiveQuery::new(LiveSource::Class(class))
-					.with_filter(
-						LiveExpr::field("id")?
-							.binary(LiveBinaryOperator::NotEqual, LiveExpr::Literal(Value::Null)),
-					)
-					.with_projection(LiveProjection::Value(LiveExpr::Call {
-						name: "count".into(),
-						arguments: Vec::new(),
-					})),
-			)),
-			Object::new(),
-			LiveBindingOptions::default().with_budgets(256 * 1024 * 1024, 500)?,
-		)?;
-		tx.commit()?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let id = tx
+			.define_live_binding(
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(LiveSource::Class(class))
+						.with_filter(
+							LiveExpr::field("id").assert_ok().binary(
+								LiveBinaryOperator::NotEqual,
+								LiveExpr::Literal(Value::Null),
+							),
+						)
+						.with_projection(LiveProjection::Value(LiveExpr::Call {
+							name: "count".into(),
+							arguments: Vec::new(),
+						})),
+				)),
+				Object::new(),
+				LiveBindingOptions::default().with_budgets(256 * 1024 * 1024, 500).assert_ok(),
+			)
+			.assert_ok();
+		tx.commit().assert_ok();
 		let mut tx = store.begin();
 		for ordinal in 0..1024 {
-			tx.create_atom(format!("person:{ordinal}").parse()?, PropertyMap::new())?;
+			tx.create_atom(format!("person:{ordinal}").parse().assert_ok(), PropertyMap::new())
+				.assert_ok();
 		}
-		tx.commit()?;
+		tx.commit().assert_ok();
 		let mut current = store.begin();
-		assert!(current.atom(&"person:1023".parse()?)?.is_some());
-		assert_eq!(current.live_binding_info(id)?.state(), LiveState::Paused);
-		assert_eq!(current.live_binding_info(id)?.value(), &Value::from(0_i64));
+		assert!(current.atom(&"person:1023".parse().assert_ok()).assert_ok().is_some());
+		assert_eq!(current.live_binding_info(id).assert_ok().state(), LiveState::Paused);
+		assert_eq!(current.live_binding_info(id).assert_ok().value(), &Value::from(0_i64));
 		assert!(current.live_binding_value(id).err().is_some_and(|error| error.cause().is_some()));
-		Ok(())
 	}
 
 	/// Concurrent independent writers replay/evaluate against the winning root.
 	#[test]
-	fn live_binding_concurrent_writers_rebase_final_values() -> FerrosGrynnResult<()> {
-		use crate::datastore::{IsolationLevel, TransactionAccess, TransactionOptions};
+	fn live_binding_concurrent_writers_rebase_final_values() {
+		use crate::{
+			datastore::{IsolationLevel, TransactionAccess, TransactionOptions},
+			test_assertions::AssertResult as _,
+		};
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let id = tx.define_live_binding(
-			LiveExpr::Select(Box::new(LiveQuery::new(LiveSource::Class(class)).with_projection(
-				LiveProjection::Value(LiveExpr::Call {
-					name: "count".into(),
-					arguments: Vec::new(),
-				}),
-			))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		tx.commit()?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let id = tx
+			.define_live_binding(
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(LiveSource::Class(class)).with_projection(
+						LiveProjection::Value(LiveExpr::Call {
+							name: "count".into(),
+							arguments: Vec::new(),
+						}),
+					),
+				)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		tx.commit().assert_ok();
 		let start = Arc::new(std::sync::Barrier::new(4));
 		let mut handles = Vec::new();
 		for ordinal in 0..4 {
@@ -808,77 +873,90 @@ mod tests {
 		for handle in handles {
 			handle
 				.join()
-				.map_err(|_panic| FerrosGrynnError::invalid_argument("test writer panicked"))??;
+				.map_err(|_panic| FerrosGrynnError::invalid_argument("test writer panicked"))
+				.assert_ok()
+				.assert_ok();
 		}
-		assert_eq!(store.begin().live_binding_value(id)?, Value::from(4_i64));
+		assert_eq!(store.begin().live_binding_value(id).assert_ok(), Value::from(4_i64));
 		for ordinal in 0..4 {
-			assert!(store.begin().atom(&format!("person:{ordinal}").parse()?)?.is_some());
+			assert!(
+				store
+					.begin()
+					.atom(&format!("person:{ordinal}").parse().assert_ok())
+					.assert_ok()
+					.is_some()
+			);
 		}
-		Ok(())
 	}
 
 	/// Failed admission and failed final activation leave no published
 	/// identity/data.
 	#[test]
-	fn live_binding_record_source_does_not_rebind_to_recreated_class() -> FerrosGrynnResult<()> {
+	fn live_binding_record_source_does_not_rebind_to_recreated_class() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+		tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
 		let expression = LiveExpr::Select(Box::new(
-			LiveQuery::new(LiveSource::Record("person:a".parse()?)).with_projection(
+			LiveQuery::new(LiveSource::Record("person:a".parse().assert_ok())).with_projection(
 				LiveProjection::Value(LiveExpr::Call {
 					name: "count".into(),
 					arguments: Vec::new(),
 				}),
 			),
 		));
-		let id = tx.define_live_binding(
-			expression.clone(),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		tx.commit()?;
+		let id = tx
+			.define_live_binding(expression.clone(), Object::new(), LiveBindingOptions::default())
+			.assert_ok();
+		tx.commit().assert_ok();
 		let mut tx = store.begin();
-		tx.remove_class("person")?;
-		tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		tx.create_atom("person:a".parse()?, PropertyMap::new())?;
-		tx.commit()?;
+		tx.remove_class("person").assert_ok();
+		tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		tx.create_atom("person:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		tx.commit().assert_ok();
 		let mut current = store.begin();
-		assert_eq!(current.live_binding_info(id)?.state(), LiveState::Paused);
-		assert_eq!(current.live_binding_info(id)?.value(), &Value::from(0_i64));
-		current.replace_live_binding_expression(
-			id,
-			expression,
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		current.commit()?;
-		assert_eq!(store.begin().live_binding_value(id)?, Value::from(1_i64));
-		Ok(())
+		assert_eq!(current.live_binding_info(id).assert_ok().state(), LiveState::Paused);
+		assert_eq!(current.live_binding_info(id).assert_ok().value(), &Value::from(0_i64));
+		current
+			.replace_live_binding_expression(
+				id,
+				expression,
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		current.commit().assert_ok();
+		assert_eq!(store.begin().live_binding_value(id).assert_ok(), Value::from(1_i64));
 	}
 
 	/// Pending registrations retain their registration-time source incarnation.
 	#[test]
-	fn live_binding_pending_registration_cannot_recapture_recreated_source() -> FerrosGrynnResult<()>
-	{
+	fn live_binding_pending_registration_cannot_recapture_recreated_source() {
+		use crate::test_assertions::AssertResult as _;
+
 		for replace in [false, true] {
 			let store = Datastore::in_memory();
 			let mut setup = store.begin();
-			setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+			setup
+				.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+				.assert_ok();
 			let expression = LiveExpr::Select(Box::new(
-				LiveQuery::new(LiveSource::Record("person:a".parse()?)).with_projection(
+				LiveQuery::new(LiveSource::Record("person:a".parse().assert_ok())).with_projection(
 					LiveProjection::Value(LiveExpr::Call {
 						name: "count".into(),
 						arguments: Vec::new(),
 					}),
 				),
 			));
-			let id = setup.define_live_binding(
-				expression.clone(),
-				Object::new(),
-				LiveBindingOptions::default(),
-			)?;
-			setup.commit()?;
+			let id = setup
+				.define_live_binding(
+					expression.clone(),
+					Object::new(),
+					LiveBindingOptions::default(),
+				)
+				.assert_ok();
+			setup.commit().assert_ok();
 			let mut tx = store.begin();
 			let pending = if replace {
 				tx.replace_live_binding_expression(
@@ -886,113 +964,130 @@ mod tests {
 					expression,
 					Object::new(),
 					LiveBindingOptions::default(),
-				)?;
+				)
+				.assert_ok();
 				id
 			} else {
-				tx.define_live_binding(expression, Object::new(), LiveBindingOptions::default())?
+				tx.define_live_binding(expression, Object::new(), LiveBindingOptions::default())
+					.assert_ok()
 			};
-			tx.remove_class("person")?;
-			tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-			tx.create_atom("person:a".parse()?, PropertyMap::new())?;
+			tx.remove_class("person").assert_ok();
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+			tx.create_atom("person:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
 			assert!(tx.commit().is_err());
-			assert!(store.begin().atom(&"person:a".parse()?)?.is_none());
+			assert!(store.begin().atom(&"person:a".parse().assert_ok()).assert_ok().is_none());
 			if !replace {
 				assert!(store.begin().live_binding_info(pending).is_err());
 			}
-			assert_eq!(store.begin().live_binding_value(id)?, Value::from(0_i64));
+			assert_eq!(store.begin().live_binding_value(id).assert_ok(), Value::from(0_i64));
 		}
-		Ok(())
 	}
 
 	/// Binding revisions reported through subscription metadata participate in
 	/// SSI.
 	#[test]
-	fn live_binding_info_reads_prevent_stale_serializable_writes() -> FerrosGrynnResult<()> {
-		use crate::datastore::{IsolationLevel, TransactionAccess, TransactionOptions};
+	fn live_binding_info_reads_prevent_stale_serializable_writes() {
+		use crate::{
+			datastore::{IsolationLevel, TransactionAccess, TransactionOptions},
+			test_assertions::AssertResult as _,
+		};
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let count = setup.define_live_binding(
-			LiveExpr::Select(Box::new(LiveQuery::new(LiveSource::Class(class)).with_projection(
-				LiveProjection::Value(LiveExpr::Call {
-					name: "count".into(),
-					arguments: Vec::new(),
-				}),
-			))),
-			Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		let id = setup.register_live(
-			LiveQuery::new(LiveSource::Class(class))
-				.with_projection(LiveProjection::Value(LiveExpr::Binding(count))),
-			LiveOptions::default(),
-		)?;
-		setup.commit()?;
+		let class = setup
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let count = setup
+			.define_live_binding(
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(LiveSource::Class(class)).with_projection(
+						LiveProjection::Value(LiveExpr::Call {
+							name: "count".into(),
+							arguments: Vec::new(),
+						}),
+					),
+				)),
+				Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		let id = setup
+			.register_live(
+				LiveQuery::new(LiveSource::Class(class))
+					.with_projection(LiveProjection::Value(LiveExpr::Binding(count))),
+				LiveOptions::default(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
 		for explicit in [false, true] {
 			let mut reader = store.begin_with(TransactionOptions::new(
 				IsolationLevel::Serializable,
 				TransactionAccess::ReadWrite,
 			));
-			let before = reader.live_info(id)?.bindings()[0].value();
+			let before = reader.live_info(id).assert_ok().bindings()[0].value();
 			let mut writer = store.begin();
 			if explicit {
-				writer.replace_live_binding_value(count, Value::from(7_i64))?;
+				writer.replace_live_binding_value(count, Value::from(7_i64)).assert_ok();
 			} else {
-				writer.create_atom("person:a".parse()?, PropertyMap::new())?;
+				writer.create_atom("person:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
 			}
-			let stamp = writer.commit()?.versionstamp();
+			let stamp = writer.commit().assert_ok().versionstamp();
 			assert!(stamp > before);
-			reader.create_atom(
-				if explicit {
-					"person:explicit"
-				} else {
-					"person:automatic"
-				}
-				.parse()?,
-				PropertyMap::new(),
-			)?;
+			reader
+				.create_atom(
+					if explicit {
+						"person:explicit"
+					} else {
+						"person:automatic"
+					}
+					.parse()
+					.assert_ok(),
+					PropertyMap::new(),
+				)
+				.assert_ok();
 			assert!(reader.commit().is_err());
 		}
-		Ok(())
 	}
 
 	/// Failed admission and failed final activation leave no published
 	/// identity/data.
 	#[test]
-	fn live_binding_resource_and_final_registration_faults_publish_nothing() -> FerrosGrynnResult<()>
-	{
+	fn live_binding_resource_and_final_registration_faults_publish_nothing() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
 		assert!(
 			tx.define_live_binding(
 				LiveExpr::Literal(Value::from(1_i64)),
 				Object::new(),
-				LiveBindingOptions::default().with_budgets(16, 1)?
+				LiveBindingOptions::default().with_budgets(16, 1).assert_ok()
 			)
 			.is_err()
 		);
 		assert!(tx.working.live_catalog().bindings.is_empty());
-		tx.define_class(ClassSchema::new("person", AtomKind::Node, [ClassField::new(
-			"age",
-			Type::Int,
-		)])?)?;
-		let age = tx.intern_property("age")?;
-		let record: crate::values::RecordId = "person:a".parse()?;
-		tx.create_atom(record.clone(), PropertyMap::from_iter([(age, Value::from(1_i64))]))?;
+		tx.define_class(
+			ClassSchema::new("person", AtomKind::Node, [ClassField::new("age", Type::Int)])
+				.assert_ok(),
+		)
+		.assert_ok();
+		let age = tx.intern_property("age").assert_ok();
+		let record: crate::values::RecordId = "person:a".parse().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::from_iter([(age, Value::from(1_i64))]))
+			.assert_ok();
 		let age_value = LiveExpr::Select(Box::new(
 			LiveQuery::new(LiveSource::Record(record.clone()))
-				.with_projection(LiveProjection::Value(LiveExpr::field("age")?)),
+				.with_projection(LiveProjection::Value(LiveExpr::field("age").assert_ok())),
 		));
 		tx.define_live_binding(
 			LiveExpr::Literal(Value::from(1_i64)).binary(LiveBinaryOperator::Divide, age_value),
 			Object::new(),
 			LiveBindingOptions::default(),
-		)?;
-		tx.set_base_property(&record, age, Value::from(0_i64))?;
+		)
+		.assert_ok();
+		tx.set_base_property(&record, age, Value::from(0_i64)).assert_ok();
 		assert!(tx.commit().is_err());
 		let mut current = store.begin();
-		assert!(current.atom(&record)?.is_none());
+		assert!(current.atom(&record).assert_ok().is_none());
 		assert!(current.working.live_catalog().bindings.is_empty());
-		Ok(())
 	}
 }

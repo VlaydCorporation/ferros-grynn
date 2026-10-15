@@ -1,15 +1,23 @@
 //! User-selected synchronous or native queued page transport.
 
+#[cfg(any(
+	test,
+	all(windows, feature = "native-async-io", feature = "storage-engine-prototype-api")
+))]
 use std::{ops::Range, sync::Arc};
 
-use super::{
-	direct::{DirectFile, DirectFileOpenMode},
-	page::{AlignedPage, PageHeader, PageNo},
-};
+use super::direct::DirectFileOpenMode;
+#[cfg(any(test, all(windows, feature = "native-async-io")))]
+use super::page::AlignedPage;
+#[cfg(any(
+	test,
+	all(windows, feature = "native-async-io", feature = "storage-engine-prototype-api")
+))]
+use super::{direct::DirectFile, page::PageNo};
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 /// Unix native-mode availability boundary.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "storage-engine-prototype-api"))]
 mod page_io_unix;
 /// Windows IoRing transport.
 #[cfg(all(windows, feature = "native-async-io"))]
@@ -29,14 +37,23 @@ const WINDOWS_IORING_QUEUE_DEPTH: u32 = 128;
 
 /// Physical page transport selected when opening a local database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PageIoMode {
 	/// Synchronous positional Direct I/O.
 	Sync,
 	/// Windows IoRing Direct I/O.
+	#[cfg(any(
+		feature = "storage-engine-prototype-api",
+		all(windows, feature = "native-async-io")
+	))]
 	NativeAsync,
 }
 
 /// One file extent and its location inside a shared aligned page buffer.
+#[cfg(any(
+	test,
+	all(windows, feature = "native-async-io", feature = "storage-engine-prototype-api")
+))]
 pub struct FilePageExtent {
 	/// File retained until every native completion has been drained.
 	file: Arc<DirectFile>,
@@ -48,6 +65,10 @@ pub struct FilePageExtent {
 	page_count: usize,
 }
 
+#[cfg(any(
+	test,
+	all(windows, feature = "native-async-io", feature = "storage-engine-prototype-api")
+))]
 impl FilePageExtent {
 	/// Describes one non-empty contiguous file extent.
 	pub fn new(
@@ -85,9 +106,14 @@ pub(super) enum PageIo {
 	Sync,
 	/// One serialized Windows IoRing submission queue.
 	#[cfg(all(windows, feature = "native-async-io"))]
-	// ponytail: keep one ring and mutex until profiles show cross-batch queue
+	// shortcut: keep one ring and mutex until profiles show cross-batch queue
 	// contention; then shard rings by storage worker.
-	NativeAsync(parking_lot::Mutex<WindowsIoRing>),
+	NativeAsync {
+		/// Owns the checked ring until this transport is dropped, including
+		/// builds whose production callers observe only the selected
+		/// mode and file flags.
+		_ring: parking_lot::Mutex<WindowsIoRing>,
+	},
 }
 
 impl PageIo {
@@ -96,9 +122,104 @@ impl PageIo {
 		match self {
 			Self::Sync => PageIoMode::Sync,
 			#[cfg(all(windows, feature = "native-async-io"))]
-			Self::NativeAsync(_) => PageIoMode::NativeAsync,
+			Self::NativeAsync {
+				..
+			} => PageIoMode::NativeAsync,
 		}
 	}
+
+	/// Returns the handle flags required for registered data files.
+	pub(super) const fn file_open_mode(&self) -> DirectFileOpenMode {
+		match self {
+			Self::Sync => {
+				#[cfg(windows)]
+				{
+					// Keep a queued companion handle available beside the
+					// synchronous scalar handle.
+					DirectFileOpenMode::Overlapped
+				}
+				#[cfg(not(windows))]
+				{
+					DirectFileOpenMode::Synchronous
+				}
+			}
+			#[cfg(all(windows, feature = "native-async-io"))]
+			Self::NativeAsync {
+				..
+			} => DirectFileOpenMode::Overlapped,
+		}
+	}
+
+	/// Reads independent file extents, preserving their caller-assigned buffer
+	/// positions.
+	///
+	/// # Errors
+	///
+	/// Returns an error for invalid or overlapping ranges, file bounds, short
+	/// I/O, or a native queue failure.
+	#[cfg(test)]
+	pub(super) fn read_extents(
+		&self,
+		extents: &[FilePageExtent],
+		pages: &mut [AlignedPage],
+	) -> FerrosGrynnResult<()> {
+		validate_extent_layout(extents, pages.len())?;
+		match self {
+			Self::Sync => {
+				for extent in extents {
+					let range = extent.buffer_range(pages.len())?;
+					extent.file.read_pages_raw(extent.first_page, &mut pages[range])?;
+				}
+				Ok(())
+			}
+			#[cfg(all(windows, feature = "native-async-io"))]
+			Self::NativeAsync {
+				..
+			} if extents.len() == 1 => {
+				let extent = &extents[0];
+				let range = extent.buffer_range(pages.len())?;
+				extent.file.read_pages_raw(extent.first_page, &mut pages[range])
+			}
+			#[cfg(all(windows, feature = "native-async-io"))]
+			Self::NativeAsync {
+				_ring: ring,
+			} => ring.lock().read_extents(extents, pages),
+		}
+	}
+
+	/// Writes independent validated file extents through the selected
+	/// transport. Durability remains the caller's explicit `sync_data` barrier.
+	///
+	/// # Errors
+	///
+	/// Returns an error for invalid or overlapping ranges, file gaps, malformed
+	/// pages, short I/O, or a native queue failure.
+	#[cfg(test)]
+	pub(super) fn write_extents(
+		&self,
+		extents: &[FilePageExtent],
+		pages: &[AlignedPage],
+	) -> FerrosGrynnResult<()> {
+		validate_extent_layout(extents, pages.len())?;
+		match self {
+			Self::Sync => {
+				for extent in extents {
+					let range = extent.buffer_range(pages.len())?;
+					extent.file.write_pages(extent.first_page, &pages[range])?;
+				}
+				Ok(())
+			}
+			#[cfg(all(windows, feature = "native-async-io"))]
+			Self::NativeAsync {
+				_ring: ring,
+			} => ring.lock().write_extents(extents, pages),
+		}
+	}
+}
+
+impl TryFrom<PageIoMode> for PageIo {
+	/// Failure to initialize or support the requested transport.
+	type Error = FerrosGrynnError;
 
 	/// Creates the selected transport and performs its runtime capability
 	/// check.
@@ -107,13 +228,19 @@ impl PageIo {
 	///
 	/// Returns `IoModeUnavailable` when the build, target, or current Windows
 	/// kernel cannot provide the explicitly requested native mode.
-	pub(super) fn new(mode: PageIoMode) -> FerrosGrynnResult<Self> {
+	fn try_from(mode: PageIoMode) -> FerrosGrynnResult<Self> {
 		match mode {
 			PageIoMode::Sync => Ok(Self::Sync),
+			#[cfg(any(
+				feature = "storage-engine-prototype-api",
+				all(windows, feature = "native-async-io")
+			))]
 			PageIoMode::NativeAsync => {
 				#[cfg(all(windows, feature = "native-async-io"))]
 				{
-					WindowsIoRing::new().map(parking_lot::Mutex::new).map(Self::NativeAsync)
+					WindowsIoRing::new().map(|ring| Self::NativeAsync {
+						_ring: parking_lot::Mutex::new(ring),
+					})
 				}
 				#[cfg(not(windows))]
 				{
@@ -130,116 +257,13 @@ impl PageIo {
 			}
 		}
 	}
-
-	/// Returns the handle flags required for registered data files.
-	pub(super) const fn file_open_mode(&self) -> DirectFileOpenMode {
-		match self {
-			Self::Sync => {
-				#[cfg(windows)]
-				{
-					DirectFileOpenMode::Overlapped
-				}
-				#[cfg(not(windows))]
-				{
-					DirectFileOpenMode::Synchronous
-				}
-			}
-			#[cfg(all(windows, feature = "native-async-io"))]
-			Self::NativeAsync(_) => DirectFileOpenMode::Overlapped,
-		}
-	}
-
-	/// Reads and validates one page through the selected transport.
-	///
-	/// # Errors
-	///
-	/// Returns a native transport, range, header, or checksum error.
-	pub(super) fn read_page(
-		&self,
-		file: &Arc<DirectFile>,
-		page_no: PageNo,
-		page: &mut AlignedPage,
-	) -> FerrosGrynnResult<PageHeader> {
-		let extent = FilePageExtent::new(Arc::clone(file), page_no, 0, 1);
-		self.read_extents(std::slice::from_ref(&extent), std::slice::from_mut(page))?;
-		page.validate(page_no)
-	}
-
-	/// Reads independent file extents, preserving their caller-assigned buffer
-	/// positions.
-	///
-	/// # Errors
-	///
-	/// Returns an error for invalid or overlapping ranges, file bounds, short
-	/// I/O, or a native queue failure.
-	pub(super) fn read_extents(
-		&self,
-		extents: &[FilePageExtent],
-		pages: &mut [AlignedPage],
-	) -> FerrosGrynnResult<()> {
-		validate_extent_layout(extents, pages.len())?;
-		match self {
-			Self::Sync => {
-				for extent in extents {
-					let range = extent.buffer_range(pages.len())?;
-					extent.file.read_pages_raw(extent.first_page, &mut pages[range])?;
-				}
-				Ok(())
-			}
-			#[cfg(all(windows, feature = "native-async-io"))]
-			Self::NativeAsync(_) if extents.len() == 1 => {
-				let extent = &extents[0];
-				let range = extent.buffer_range(pages.len())?;
-				extent.file.read_pages_raw(extent.first_page, &mut pages[range])
-			}
-			#[cfg(all(windows, feature = "native-async-io"))]
-			Self::NativeAsync(ring) => ring.lock().read_extents(extents, pages),
-		}
-	}
-
-	/// Writes independent validated file extents through the selected
-	/// transport. Durability remains the caller's explicit `sync_data` barrier.
-	///
-	/// # Errors
-	///
-	/// Returns an error for invalid or overlapping ranges, file gaps, malformed
-	/// pages, short I/O, or a native queue failure.
-	pub(super) fn write_extents(
-		&self,
-		extents: &[FilePageExtent],
-		pages: &[AlignedPage],
-	) -> FerrosGrynnResult<()> {
-		validate_extent_layout(extents, pages.len())?;
-		match self {
-			Self::Sync => {
-				for extent in extents {
-					let range = extent.buffer_range(pages.len())?;
-					extent.file.write_pages(extent.first_page, &pages[range])?;
-				}
-				Ok(())
-			}
-			#[cfg(all(windows, feature = "native-async-io"))]
-			Self::NativeAsync(ring) => ring.lock().write_extents(extents, pages),
-		}
-	}
-
-	/// Writes one page during recovery through the selected transport.
-	///
-	/// # Errors
-	///
-	/// Returns the same errors as [`Self::write_extents`].
-	pub(super) fn write_page(
-		&self,
-		file: &Arc<DirectFile>,
-		page_no: PageNo,
-		page: &AlignedPage,
-	) -> FerrosGrynnResult<()> {
-		let extent = FilePageExtent::new(Arc::clone(file), page_no, 0, 1);
-		self.write_extents(std::slice::from_ref(&extent), std::slice::from_ref(page))
-	}
 }
 
 /// Ensures concurrent native reads never receive overlapping mutable buffers.
+#[cfg(any(
+	test,
+	all(windows, feature = "native-async-io", feature = "storage-engine-prototype-api")
+))]
 fn validate_extent_layout(
 	extents: &[FilePageExtent],
 	buffer_pages: usize,
@@ -258,13 +282,17 @@ fn validate_extent_layout(
 }
 
 #[cfg(test)]
+/// Regression tests for page io behavior.
 mod tests {
 	use std::path::{Path, PathBuf};
 
 	use super::*;
 
 	/// Unique workspace-local file removed after one native test.
-	struct TestPath(PathBuf);
+	struct TestPath(
+		/// Unique workspace-local file removed after one native test.
+		PathBuf,
+	);
 
 	impl TestPath {
 		/// Creates a collision-resistant path without opening it.
@@ -283,6 +311,7 @@ mod tests {
 	}
 
 	impl Drop for TestPath {
+		/// Runs cleanup for this `TestPath` before its fields are released.
 		fn drop(&mut self) {
 			let _ignored = std::fs::remove_file(&self.0);
 		}
@@ -291,108 +320,121 @@ mod tests {
 	/// Overlap rejection protects the safe mutable-buffer boundary before any
 	/// native call.
 	#[test]
-	fn overlapping_buffer_extents_are_rejected() -> FerrosGrynnResult<()> {
-		let path = TestPath::new()?;
-		let file = Arc::new(DirectFile::create_new(path.as_path())?);
+	fn overlapping_buffer_extents_are_rejected() {
+		use crate::test_assertions::AssertResult as _;
+
+		let path = TestPath::new().assert_ok();
+		let file = Arc::new(DirectFile::create_new(path.as_path()).assert_ok());
 		let extents = [
 			FilePageExtent::new(Arc::clone(&file), PageNo::new(0), 0, 2),
 			FilePageExtent::new(file, PageNo::new(2), 1, 1),
 		];
 		let result = validate_extent_layout(&extents, 2);
 		assert!(result.is_err());
-		Ok(())
+
+		// Both safe entry points must reject overlap before accessing the file.
+		let page_io = PageIo::try_from(PageIoMode::Sync).assert_ok();
+		let mut pages = vec![AlignedPage::zeroed(), AlignedPage::zeroed()];
+		assert!(page_io.read_extents(&extents, &mut pages).is_err());
+		assert!(page_io.write_extents(&extents, &pages).is_err());
 	}
 
 	/// One queue submission must preserve sparse extent placement for both
 	/// reads and writes.
 	#[cfg(all(windows, feature = "native-async-io"))]
 	#[test]
-	fn windows_ioring_reads_and_writes_sparse_extents() -> FerrosGrynnResult<()> {
-		use crate::storage::page::PAGE_HEADER_SIZE;
+	fn windows_ioring_reads_and_writes_sparse_extents() {
+		use crate::{storage::page::PAGE_HEADER_SIZE, test_assertions::AssertResult as _};
 
-		let path = TestPath::new()?;
+		let path = TestPath::new().assert_ok();
 		let page_count = 8_u64;
 		{
-			let writer = DirectFile::create_new(path.as_path())?;
-			writer.resize_pages(page_count)?;
+			let writer = DirectFile::create_new(path.as_path()).assert_ok();
+			writer.resize_pages(page_count).assert_ok();
 			let mut pages = Vec::with_capacity(page_count as usize);
 			for raw_page_no in 0..page_count {
-				pages.push(test_page(raw_page_no, raw_page_no as u8)?);
+				pages.push(test_page(raw_page_no, raw_page_no as u8).assert_ok());
 			}
-			writer.write_pages(PageNo::new(0), &pages)?;
-			writer.sync_data()?;
+			writer.write_pages(PageNo::new(0), &pages).assert_ok();
+			writer.sync_data().assert_ok();
 		}
 
-		let file = Arc::new(DirectFile::open_read_write_with_mode(
-			path.as_path(),
-			DirectFileOpenMode::Overlapped,
-		)?);
-		let page_io = PageIo::new(PageIoMode::NativeAsync)?;
+		let file = Arc::new(
+			DirectFile::open_read_write_with_mode(path.as_path(), DirectFileOpenMode::Overlapped)
+				.assert_ok(),
+		);
+		let page_io = PageIo::try_from(PageIoMode::NativeAsync).assert_ok();
 		let mut loaded = (0..4).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 		let read_extents = [
 			FilePageExtent::new(Arc::clone(&file), PageNo::new(0), 0, 1),
 			FilePageExtent::new(Arc::clone(&file), PageNo::new(3), 1, 2),
 			FilePageExtent::new(Arc::clone(&file), PageNo::new(7), 3, 1),
 		];
-		page_io.read_extents(&read_extents, &mut loaded)?;
+		page_io.read_extents(&read_extents, &mut loaded).assert_ok();
 		for (page, raw_page_no) in loaded.iter_mut().zip([0_u64, 3, 4, 7]) {
-			page.validate(PageNo::new(raw_page_no))?;
+			page.validate(PageNo::new(raw_page_no)).assert_ok();
 			assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], raw_page_no as u8);
 		}
 
-		let replacements = [test_page(1, 101)?, test_page(5, 105)?, test_page(6, 106)?];
+		let replacements = [(1, 101), (5, 105), (6, 106)]
+			.into_iter()
+			.map(|(raw_page_no, marker)| test_page(raw_page_no, marker).assert_ok())
+			.collect::<Vec<_>>();
 		let write_extents = [
 			FilePageExtent::new(Arc::clone(&file), PageNo::new(1), 0, 1),
 			FilePageExtent::new(Arc::clone(&file), PageNo::new(5), 1, 2),
 		];
-		page_io.write_extents(&write_extents, &replacements)?;
-		file.sync_data()?;
+		page_io.write_extents(&write_extents, &replacements).assert_ok();
+		file.sync_data().assert_ok();
 		let mut verified = (0..3).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
-		page_io.read_extents(&write_extents, &mut verified)?;
+		page_io.read_extents(&write_extents, &mut verified).assert_ok();
 		for ((page, raw_page_no), marker) in
 			verified.iter_mut().zip([1_u64, 5, 6]).zip([101_u8, 105, 106])
 		{
-			page.validate(PageNo::new(raw_page_no))?;
+			page.validate(PageNo::new(raw_page_no)).assert_ok();
 			assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], marker);
 		}
-		Ok(())
 	}
 
 	/// Test-only frame reads report software SQE batching independently of any
 	/// device queue-depth interpretation.
 	#[cfg(all(windows, feature = "native-async-io"))]
 	#[test]
-	fn windows_ioring_reports_bounded_frame_submissions() -> FerrosGrynnResult<()> {
+	fn windows_ioring_reports_bounded_frame_submissions() {
 		use std::num::NonZeroUsize;
 
-		use crate::storage::page::PAGE_HEADER_SIZE;
+		use crate::{storage::page::PAGE_HEADER_SIZE, test_assertions::AssertResult as _};
 
+		/// Numbered pages used to check ordered IoRing reads across
+		/// submission-batch boundaries.
 		const PAGE_COUNT: usize = 9;
+		/// Submission batch limits exercised by the ordered-read fixture.
 		const SQE_BATCH_LIMITS: [usize; 4] = [1, 8, 32, 128];
 
-		let path = TestPath::new()?;
+		let path = TestPath::new().assert_ok();
 		{
-			let writer = DirectFile::create_new(path.as_path())?;
-			writer.resize_pages(PAGE_COUNT as u64)?;
+			let writer = DirectFile::create_new(path.as_path()).assert_ok();
+			writer.resize_pages(PAGE_COUNT as u64).assert_ok();
 			let mut pages = Vec::with_capacity(PAGE_COUNT);
 			for raw_page_no in 0..PAGE_COUNT as u64 {
-				pages.push(test_page(raw_page_no, raw_page_no as u8)?);
+				pages.push(test_page(raw_page_no, raw_page_no as u8).assert_ok());
 			}
-			writer.write_pages(PageNo::new(0), &pages)?;
-			writer.sync_data()?;
+			writer.write_pages(PageNo::new(0), &pages).assert_ok();
+			writer.sync_data().assert_ok();
 		}
 
-		let file = Arc::new(DirectFile::open_read_write_with_mode(
-			path.as_path(),
-			DirectFileOpenMode::Overlapped,
-		)?);
-		let mut ring = WindowsIoRing::new()?;
-		let submission_capacity =
-			usize::try_from(ring.submission_capacity()).map_err(|source| {
+		let file = Arc::new(
+			DirectFile::open_read_write_with_mode(path.as_path(), DirectFileOpenMode::Overlapped)
+				.assert_ok(),
+		);
+		let mut ring = WindowsIoRing::new().assert_ok();
+		let submission_capacity = usize::try_from(ring.submission_capacity())
+			.map_err(|source| {
 				FerrosGrynnError::storage_io_failure(format!(
 					"IoRing test submission capacity does not fit usize: {source}"
 				))
-			})?;
+			})
+			.assert_ok();
 		assert!(submission_capacity > 0);
 
 		for requested_limit in SQE_BATCH_LIMITS {
@@ -402,10 +444,12 @@ mod tests {
 				.enumerate()
 				.map(|(index, frame)| FrameRead::new(&file, PageNo::new(index as u64), frame))
 				.collect::<Vec<_>>();
-			let requested_limit = NonZeroUsize::new(requested_limit).ok_or_else(|| {
-				FerrosGrynnError::storage_io_failure("IoRing test SQE batch limit is zero")
-			})?;
-			let stats = ring.read_frames_measured(&mut reads, requested_limit)?;
+			let requested_limit = NonZeroUsize::new(requested_limit)
+				.ok_or_else(|| {
+					FerrosGrynnError::storage_io_failure("IoRing test SQE batch limit is zero")
+				})
+				.assert_ok();
+			let stats = ring.read_frames_measured(&mut reads, requested_limit).assert_ok();
 			let effective_limit = requested_limit.get().min(submission_capacity);
 			assert_eq!(stats.submission_capacity(), ring.submission_capacity());
 			assert_eq!(stats.requested_sqe_batch_limit(), requested_limit.get());
@@ -415,11 +459,10 @@ mod tests {
 			assert_eq!(stats.completed_cqes(), PAGE_COUNT);
 			drop(reads);
 			for (index, frame) in frames.iter().enumerate() {
-				frame.validate(PageNo::new(index as u64))?;
+				frame.validate(PageNo::new(index as u64)).assert_ok();
 				assert_eq!(frame.as_bytes()[PAGE_HEADER_SIZE], index as u8);
 			}
 		}
-		Ok(())
 	}
 
 	/// Builds one sealed test page with an observable payload byte.
@@ -444,43 +487,50 @@ mod tests {
 	#[cfg(all(windows, feature = "native-async-io"))]
 	#[test]
 	#[ignore = "native NVMe calibration; run explicitly on the target Windows host"]
-	fn windows_ioring_qd_gate() -> FerrosGrynnResult<()> {
+	fn windows_ioring_qd_gate() {
+		use crate::test_assertions::AssertResult as _;
+
+		/// Pages written to the calibration file before measuring synchronous
+		/// and IoRing reads.
 		const FILE_PAGES: u64 = 8_192;
+		/// Page reads in each measured queue-depth calibration sample.
 		const SAMPLE_PAGES: usize = 8_192;
+		/// Untimed page reads used to warm up the queue-depth calibration.
 		const WARMUP_PAGES: usize = 1_024;
+		/// Outstanding-read limits compared by the Windows IoRing calibration.
 		const QUEUE_DEPTHS: [usize; 4] = [1, 8, 32, 128];
 
-		let path = TestPath::new()?;
+		let path = TestPath::new().assert_ok();
 		{
-			let writer = DirectFile::create_new(path.as_path())?;
-			writer.resize_pages(FILE_PAGES)?;
+			let writer = DirectFile::create_new(path.as_path()).assert_ok();
+			writer.resize_pages(FILE_PAGES).assert_ok();
 			let batch_pages = crate::storage::direct::SYNC_BATCH_PAGES;
 			for first in (0..FILE_PAGES).step_by(batch_pages) {
-				let count = usize::try_from((FILE_PAGES - first).min(batch_pages as u64)).map_err(
-					|source| {
+				let count = usize::try_from((FILE_PAGES - first).min(batch_pages as u64))
+					.map_err(|source| {
 						FerrosGrynnError::storage_io_failure(format!(
 							"benchmark page count does not fit usize: {source}"
 						))
-					},
-				)?;
+					})
+					.assert_ok();
 				let mut pages = Vec::with_capacity(count);
 				for offset in 0..count {
 					let raw_page_no = first + offset as u64;
-					pages.push(test_page(raw_page_no, raw_page_no as u8)?);
+					pages.push(test_page(raw_page_no, raw_page_no as u8).assert_ok());
 				}
-				writer.write_pages(PageNo::new(first), &pages)?;
+				writer.write_pages(PageNo::new(first), &pages).assert_ok();
 			}
-			writer.sync_data()?;
+			writer.sync_data().assert_ok();
 		}
 
-		let file = Arc::new(DirectFile::open_read_write_with_mode(
-			path.as_path(),
-			DirectFileOpenMode::Overlapped,
-		)?);
-		let sync = PageIo::new(PageIoMode::Sync)?;
-		let native = PageIo::new(PageIoMode::NativeAsync)?;
-		profile_transport(&sync, &file, 1, FILE_PAGES, WARMUP_PAGES, 0x0d1a_0001)?;
-		profile_transport(&native, &file, 1, FILE_PAGES, WARMUP_PAGES, 0x0d1a_0002)?;
+		let file = Arc::new(
+			DirectFile::open_read_write_with_mode(path.as_path(), DirectFileOpenMode::Overlapped)
+				.assert_ok(),
+		);
+		let sync = PageIo::try_from(PageIoMode::Sync).assert_ok();
+		let native = PageIo::try_from(PageIoMode::NativeAsync).assert_ok();
+		profile_transport(&sync, &file, 1, FILE_PAGES, WARMUP_PAGES, 0x0d1a_0001).assert_ok();
+		profile_transport(&native, &file, 1, FILE_PAGES, WARMUP_PAGES, 0x0d1a_0002).assert_ok();
 		let mut high_qd_passed = false;
 		let mut qd1_passed = false;
 		for queue_depth in QUEUE_DEPTHS {
@@ -492,7 +542,8 @@ mod tests {
 				queue_depth,
 				FILE_PAGES,
 				SAMPLE_PAGES,
-			)?;
+			)
+			.assert_ok();
 			let throughput_ratio = native_sample.mib_per_second / sync_sample.mib_per_second;
 			let p99_ratio = native_sample.p99_micros / sync_sample.p99_micros;
 			println!(
@@ -511,7 +562,6 @@ mod tests {
 		}
 		assert!(high_qd_passed, "IoRing did not pass the throughput or p99 gate at QD 8/32/128");
 		assert!(qd1_passed, "IoRing QD1 regressed beyond the 5% gate");
-		Ok(())
 	}
 
 	/// Alternates backend order and returns independent five-run medians for a

@@ -43,12 +43,16 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Default)]
+/// Packed adjacency state.
 struct PackedAdjacency {
+	/// Offsets associated with this packed adjacency.
 	offsets: Vec<usize>,
+	/// Edges associated with this packed adjacency.
 	edges: Vec<AtomId>,
 }
 
 impl PackedAdjacency {
+	/// Creates from rows.
 	fn from_rows(rows: &CowVec<Vec<AtomId>>) -> Self {
 		let mut offsets = Vec::with_capacity(rows.len() + 1);
 		let mut edges = Vec::with_capacity(rows.iter().map(Vec::len).sum());
@@ -63,6 +67,7 @@ impl PackedAdjacency {
 		}
 	}
 
+	/// Returns the row result.
 	fn row(&self, slot: usize) -> &[AtomId] {
 		let Some((&start, &end)) = self.offsets.get(slot).zip(self.offsets.get(slot + 1)) else {
 			return &[];
@@ -77,18 +82,28 @@ impl PackedAdjacency {
 	          additional Vec-to-Arc<[T]> allocation"
 )]
 #[derive(Debug, Clone)]
+/// Dag storage state.
 struct DagStorage {
+	/// Nodes associated with this dag storage.
 	nodes: NodeColumns,
+	/// Edges associated with this dag storage.
 	edges: EdgeColumns,
+	/// Outgoing associated with this dag storage.
 	outgoing: CowVec<Vec<AtomId>>,
+	/// Incoming associated with this dag storage.
 	incoming: CowVec<Vec<AtomId>>,
+	/// Packed outgoing associated with this dag storage.
 	packed_outgoing: Option<Arc<PackedAdjacency>>,
+	/// Packed incoming associated with this dag storage.
 	packed_incoming: Option<Arc<PackedAdjacency>>,
+	/// Topological associated with this dag storage.
 	topological: Arc<Vec<AtomId>>,
+	/// Rank associated with this dag storage.
 	rank: CowVec<Option<usize>>,
 }
 
 impl DagStorage {
+	/// Creates a new `DagStorage` value.
 	fn new() -> Self {
 		Self {
 			nodes: NodeColumns::new(),
@@ -102,6 +117,7 @@ impl DagStorage {
 		}
 	}
 
+	/// Inserts node new.
 	fn insert_node_new(
 		&mut self,
 		record_id: RecordId,
@@ -115,6 +131,7 @@ impl DagStorage {
 		Ok(id)
 	}
 
+	/// Inserts node at.
 	fn insert_node_at(
 		&mut self,
 		id: AtomId,
@@ -128,6 +145,7 @@ impl DagStorage {
 		Ok(())
 	}
 
+	/// Inserts edge new.
 	fn insert_edge_new(
 		&mut self,
 		source: AtomId,
@@ -151,6 +169,7 @@ impl DagStorage {
 		Ok(edge)
 	}
 
+	/// Inserts edge at.
 	fn insert_edge_at(
 		&mut self,
 		id: AtomId,
@@ -169,6 +188,7 @@ impl DagStorage {
 		Ok(())
 	}
 
+	/// Validates edge.
 	fn validate_edge(&self, source: AtomId, target: AtomId) -> FerrosGrynnResult<()> {
 		for id in [source, target] {
 			if id.kind() != Some(AtomKind::Node) {
@@ -187,6 +207,7 @@ impl DagStorage {
 		Ok(())
 	}
 
+	/// Returns whether the reachable condition holds.
 	fn reachable(&self, start: AtomId, goal: AtomId) -> bool {
 		let mut pending = vec![start];
 		let mut seen = BTreeSet::new();
@@ -208,6 +229,7 @@ impl DagStorage {
 		false
 	}
 
+	/// Registers dag storage.
 	fn register(&mut self, edge: AtomId, source: AtomId, target: AtomId) {
 		self.outgoing[source.slot() as usize].push(edge);
 		self.incoming[target.slot() as usize].push(edge);
@@ -215,6 +237,7 @@ impl DagStorage {
 		self.packed_incoming = None;
 	}
 
+	/// Removes edge.
 	fn remove_edge(&mut self, id: AtomId) -> FerrosGrynnResult<bool> {
 		let Some((source, target, EdgeDirection::Directed)) =
 			self.edges.topology(id).and_then(EdgeTopology::local_binary)
@@ -230,6 +253,8 @@ impl DagStorage {
 		Ok(true)
 	}
 
+	/// Sets edge.
+	#[cfg(test)]
 	fn set_edge(&mut self, id: AtomId, source: AtomId, target: AtomId) -> FerrosGrynnResult<()> {
 		let Some((old_source, old_target, EdgeDirection::Directed)) =
 			self.edges.topology(id).and_then(EdgeTopology::local_binary)
@@ -248,6 +273,7 @@ impl DagStorage {
 		self.rebuild_topological()
 	}
 
+	/// Removes node.
 	fn remove_node(&mut self, id: AtomId) -> FerrosGrynnResult<bool> {
 		if !self.nodes.contains(id) {
 			return Ok(false);
@@ -267,6 +293,7 @@ impl DagStorage {
 		Ok(true)
 	}
 
+	/// Returns the outgoing edges result.
 	fn outgoing_edges(&self, id: AtomId) -> &[AtomId] {
 		if !self.nodes.contains(id) {
 			return &[];
@@ -277,6 +304,7 @@ impl DagStorage {
 		self.outgoing.get(id.slot() as usize).map_or(&[], Vec::as_slice)
 	}
 
+	/// Returns the incoming edges result.
 	fn incoming_edges(&self, id: AtomId) -> &[AtomId] {
 		if !self.nodes.contains(id) {
 			return &[];
@@ -287,6 +315,7 @@ impl DagStorage {
 		self.incoming.get(id.slot() as usize).map_or(&[], Vec::as_slice)
 	}
 
+	/// Rebuilds topological.
 	fn rebuild_topological(&mut self) -> FerrosGrynnResult<()> {
 		let mut indegree = vec![0_usize; self.incoming.len()];
 		let mut ready = BTreeSet::new();
@@ -324,6 +353,7 @@ impl DagStorage {
 		Ok(())
 	}
 
+	/// Performs the freeze layout operation.
 	fn freeze_layout(&mut self) {
 		self.packed_outgoing = Some(Arc::new(PackedAdjacency::from_rows(&self.outgoing)));
 		self.packed_incoming = Some(Arc::new(PackedAdjacency::from_rows(&self.incoming)));
@@ -331,6 +361,7 @@ impl DagStorage {
 		self.incoming.clear();
 	}
 
+	/// Returns the thaw layout result.
 	fn thaw_layout(&mut self) -> FerrosGrynnResult<()> {
 		if self.packed_outgoing.is_none() {
 			return Ok(());
@@ -352,6 +383,7 @@ impl DagStorage {
 		Ok(())
 	}
 
+	/// Ensures node slot.
 	fn ensure_node_slot(&mut self, id: AtomId) {
 		let slot = id.slot() as usize;
 		while self.outgoing.len() <= slot {
@@ -362,9 +394,13 @@ impl DagStorage {
 	}
 }
 
+/// Graph family whose structural mutations preserve directed acyclicity.
 pub struct Dag<State = Frozen> {
+	/// Metadata associated with this dag.
 	metadata: GraphMetadata,
+	/// Storage associated with this dag.
 	storage: DagStorage,
+	/// State associated with this dag.
 	state: PhantomData<State>,
 }
 
@@ -372,6 +408,7 @@ pub type MutableDag = Dag<Mutable>;
 pub type FrozenDag = Dag<Frozen>;
 
 impl Dag<Mutable> {
+	/// Constructs `Dag<Mutable>` from the supplied initial state.
 	pub fn new() -> Self {
 		Self {
 			metadata: GraphMetadata::new(),
@@ -380,6 +417,11 @@ impl Dag<Mutable> {
 		}
 	}
 
+	/// Returns add node for `Dag<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn add_node(
 		&mut self,
 		label: Option<Text>,
@@ -388,6 +430,7 @@ impl Dag<Mutable> {
 		self.add_node_with_id(generated_record_id(AtomKind::Node)?, label, properties)
 	}
 
+	/// Returns the add node with id result.
 	pub(crate) fn add_node_with_id(
 		&mut self,
 		record_id: RecordId,
@@ -400,6 +443,11 @@ impl Dag<Mutable> {
 		Ok(id)
 	}
 
+	/// Returns add edge for `Dag<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn add_edge(
 		&mut self,
 		source: AtomId,
@@ -416,6 +464,7 @@ impl Dag<Mutable> {
 		)
 	}
 
+	/// Returns the add edge with id result.
 	pub(crate) fn add_edge_with_id(
 		&mut self,
 		source: AtomId,
@@ -431,6 +480,8 @@ impl Dag<Mutable> {
 		Ok(id)
 	}
 
+	/// Replaces edge incidence.
+	#[cfg(test)]
 	pub(crate) fn replace_edge_incidence(
 		&mut self,
 		id: AtomId,
@@ -442,6 +493,7 @@ impl Dag<Mutable> {
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
+	/// Returns freeze for `Dag<Mutable>`.
 	pub fn freeze(mut self) -> Dag<Frozen> {
 		self.storage.freeze_layout();
 		Dag {
@@ -471,6 +523,11 @@ impl Dag<Mutable> {
 		self.metadata.clear_dirty();
 	}
 
+	/// Performs the flush operation for `Dag<Mutable>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
@@ -483,29 +540,26 @@ impl Dag<Mutable> {
 		Ok(())
 	}
 
+	/// Returns the transaction dirty result.
+	#[cfg(test)]
 	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
 		self.metadata.dirty().cloned().collect()
-	}
-
-	pub(crate) fn transaction_snapshot(&self) -> Dag<Frozen> {
-		let mut value = Dag {
-			metadata: self.metadata.clone(),
-			storage: self.storage.clone(),
-			state: PhantomData,
-		};
-		value.storage.freeze_layout();
-		value.metadata = value.metadata.into_frozen();
-		value
 	}
 }
 
 impl Default for Dag<Mutable> {
+	/// Constructs the default initial state of `Dag<Mutable>`.
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
 impl Dag<Frozen> {
+	/// Returns thaw for `Dag<Frozen>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn thaw(mut self) -> FerrosGrynnResult<Dag<Mutable>> {
 		self.storage.thaw_layout()?;
 		Ok(Dag {
@@ -517,6 +571,7 @@ impl Dag<Frozen> {
 }
 
 impl Clone for Dag<Frozen> {
+	/// Returns an owned clone of this `Dag<Frozen>`.
 	fn clone(&self) -> Self {
 		Self {
 			metadata: self.metadata.clone(),
@@ -527,18 +582,7 @@ impl Clone for Dag<Frozen> {
 }
 
 impl<State> Dag<State> {
-	pub(crate) fn restore_free_slot(
-		&mut self,
-		kind: AtomKind,
-		slot: u64,
-		generation: u32,
-	) -> FerrosGrynnResult<()> {
-		match kind {
-			AtomKind::Node => self.storage.nodes.restore_free(slot, generation),
-			AtomKind::Edge => self.storage.edges.restore_free(slot, generation),
-		}
-	}
-
+	/// Returns the slot capacity result.
 	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
 		match kind {
 			AtomKind::Node => self.storage.nodes.slot_capacity(),
@@ -546,71 +590,76 @@ impl<State> Dag<State> {
 		}
 	}
 
-	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
-		match kind {
-			AtomKind::Node => self.storage.nodes.slot_generation(slot),
-			AtomKind::Edge => self.storage.edges.slot_generation(slot),
-		}
-	}
-
+	/// Returns identity for `Dag<State>`.
 	pub const fn identity(&self) -> Uuid {
 		self.metadata.identity()
 	}
 
+	/// Returns revision for `Dag<State>`.
 	pub const fn revision(&self) -> u64 {
 		self.metadata.revision()
 	}
 
+	/// Returns properties for `Dag<State>`.
 	pub const fn properties(&self) -> &PropertyMap {
 		self.metadata.properties()
 	}
 
+	/// Returns topology constraints for `Dag<State>`.
 	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
 		self.metadata.topology_constraints()
 	}
 
+	/// Returns node count for `Dag<State>`.
 	pub const fn node_count(&self) -> usize {
 		self.storage.nodes.len()
 	}
 
+	/// Returns edge count for `Dag<State>`.
 	pub const fn edge_count(&self) -> usize {
 		self.storage.edges.len()
 	}
 
+	/// Returns node for `Dag<State>`.
 	pub fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
 		Some(NodeView::new(
 			id,
 			self.storage.nodes.record_id(id)?,
-			self.storage.nodes.label(id)?,
+			self.storage.nodes.label(id)?.as_ref(),
 			self.storage.nodes.properties(id)?,
 			None,
 		))
 	}
 
+	/// Returns edge for `Dag<State>`.
 	pub fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
 		Some(EdgeView::new(
 			id,
 			self.storage.edges.record_id(id)?,
 			self.storage.edges.topology(id)?,
-			self.storage.edges.label(id)?,
+			self.storage.edges.label(id)?.as_ref(),
 			self.storage.edges.properties(id)?,
-			self.storage.edges.weight(id)?,
+			self.storage.edges.weight(id)?.as_ref().copied(),
 			None,
 		))
 	}
 
+	/// Returns outgoing edges for `Dag<State>`.
 	pub fn outgoing_edges(&self, id: AtomId) -> &[AtomId] {
 		self.storage.outgoing_edges(id)
 	}
 
+	/// Returns incoming edges for `Dag<State>`.
 	pub fn incoming_edges(&self, id: AtomId) -> &[AtomId] {
 		self.storage.incoming_edges(id)
 	}
 
+	/// Borrows the stored storage.topological of this `Dag<State>`.
 	pub fn topological_order(&self) -> &[AtomId] {
 		&self.storage.topological
 	}
 
+	/// Returns topological rank for `Dag<State>`.
 	pub fn topological_rank(&self, id: AtomId) -> Option<usize> {
 		self.storage
 			.nodes
@@ -618,12 +667,22 @@ impl<State> Dag<State> {
 			.then(|| self.storage.rank.get(id.slot() as usize).copied().flatten())?
 	}
 
+	/// Converts this value into graph for `Dag<State>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn into_graph(self) -> FerrosGrynnResult<Graph<State>> {
 		let converted = Graph::<Mutable>::from_read_preserving(&self)?;
 		let (_, storage) = converted.into_raw();
 		Ok(Graph::from_raw(self.metadata, storage))
 	}
 
+	/// Constructs from undirected tree for `Dag<State>`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn from_undirected_tree(
 		tree: Tree<State>,
 		root: AtomId,
@@ -664,34 +723,42 @@ impl<State> GraphRead for Dag<State> {
 	where
 		Self: 'a;
 
+	/// Returns identity for `Dag<State>`.
 	fn identity(&self) -> Uuid {
 		self.identity()
 	}
 
+	/// Returns revision for `Dag<State>`.
 	fn revision(&self) -> u64 {
 		self.revision()
 	}
 
+	/// Returns kind for `Dag<State>`.
 	fn kind(&self) -> GraphKind {
 		GraphKind::Dag
 	}
 
+	/// Returns properties for `Dag<State>`.
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		Ok(Cow::Borrowed(self.properties()))
 	}
 
+	/// Returns topology constraints for `Dag<State>`.
 	fn topology_constraints(&self) -> GraphTopologyConstraints {
 		self.topology_constraints()
 	}
 
+	/// Returns node ids for `Dag<State>`.
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.nodes.ids().iter())))
 	}
 
+	/// Returns edge ids for `Dag<State>`.
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.edges.ids().iter())))
 	}
 
+	/// Returns node for `Dag<State>`.
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		let Some(record_id) = self.storage.nodes.record_id(id) else {
 			return Ok(None);
@@ -702,9 +769,10 @@ impl<State> GraphRead for Dag<State> {
 		let Some(properties) = self.storage.nodes.properties(id) else {
 			return Ok(None);
 		};
-		Ok(Some(NodeView::new(id, record_id, label, properties, None)))
+		Ok(Some(NodeView::new(id, record_id, label.as_ref(), properties, None)))
 	}
 
+	/// Returns edge for `Dag<State>`.
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		let Some(record_id) = self.storage.edges.record_id(id) else {
 			return Ok(None);
@@ -721,27 +789,40 @@ impl<State> GraphRead for Dag<State> {
 		let Some(weight) = self.storage.edges.weight(id) else {
 			return Ok(None);
 		};
-		Ok(Some(EdgeView::new(id, record_id, topology, label, properties, weight, None)))
+		Ok(Some(EdgeView::new(
+			id,
+			record_id,
+			topology,
+			label.as_ref(),
+			properties,
+			weight.as_ref().copied(),
+			None,
+		)))
 	}
 
+	/// Returns storage mode for `Dag<State>`.
 	fn storage_mode(&self) -> super::GraphStorageMode {
 		self.metadata.storage_mode()
 	}
 
+	/// Returns graph ref for `Dag<State>`.
 	fn graph_ref(&self) -> Option<&super::GraphRef> {
 		self.metadata.graph_ref()
 	}
 
+	/// Returns materialization origin for `Dag<State>`.
 	fn materialization_origin(&self) -> Option<&super::MaterializationOrigin> {
 		self.metadata.origin()
 	}
 }
 
 impl GraphMut for Dag<Mutable> {
+	/// Returns properties mut for `Dag<Mutable>`.
 	fn properties_mut(&mut self) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.metadata.properties_mut()
 	}
 
+	/// Returns node label mut for `Dag<Mutable>`.
 	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
 		if id.kind() != Some(AtomKind::Node) {
 			return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -753,6 +834,7 @@ impl GraphMut for Dag<Mutable> {
 		self.storage.nodes.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Returns node properties mut for `Dag<Mutable>`.
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		if id.kind() != Some(AtomKind::Node) {
 			return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -764,6 +846,7 @@ impl GraphMut for Dag<Mutable> {
 		self.storage.nodes.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Returns edge label mut for `Dag<Mutable>`.
 	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
 		if id.kind() != Some(AtomKind::Edge) {
 			return Err(atom_kind_mismatch(id, AtomKind::Edge));
@@ -775,6 +858,7 @@ impl GraphMut for Dag<Mutable> {
 		self.storage.edges.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Returns edge properties mut for `Dag<Mutable>`.
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		if id.kind() != Some(AtomKind::Edge) {
 			return Err(atom_kind_mismatch(id, AtomKind::Edge));
@@ -786,6 +870,7 @@ impl GraphMut for Dag<Mutable> {
 		self.storage.edges.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
+	/// Removes atom for `Dag<Mutable>`.
 	fn remove_atom(&mut self, id: AtomId) -> FerrosGrynnResult<()> {
 		self.metadata.ensure_can_bump()?;
 		let dependent_edges = if id.is_node() {
@@ -815,6 +900,8 @@ impl GraphMut for Dag<Mutable> {
 impl<State> TryFrom<Graph<State>> for Dag<State> {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Graph<State>` into `Dag<State>` after validating the
+	/// conversion.
 	fn try_from(value: Graph<State>) -> Result<Self, Self::Error> {
 		let storage = build_storage(&value)?;
 		let (metadata, _) = value.into_raw();
@@ -829,16 +916,21 @@ impl<State> TryFrom<Graph<State>> for Dag<State> {
 impl<State> TryFrom<Dag<State>> for Tree<State> {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Dag<State>` into `Tree<State>` after validating the
+	/// conversion.
 	fn try_from(value: Dag<State>) -> Result<Self, Self::Error> {
 		Tree::try_from(value.into_graph()?)
 	}
 }
 
+/// Expands the impl from forest family declarations used by this module.
 macro_rules! impl_from_forest_family {
 	($source:ident) => {
 		impl TryFrom<$source<Mutable>> for Dag<Mutable> {
 			type Error = FerrosGrynnError;
 
+			/// Checks the source variant and converts its payload to the requested
+			/// type.
 			fn try_from(value: $source<Mutable>) -> Result<Self, Self::Error> {
 				if value.orientation() == TreeOrientation::Undirected {
 					return Err(constraint(
@@ -853,6 +945,8 @@ macro_rules! impl_from_forest_family {
 		impl TryFrom<$source<Frozen>> for Dag<Frozen> {
 			type Error = FerrosGrynnError;
 
+			/// Checks the source variant and converts its payload to the requested
+			/// type.
 			fn try_from(value: $source<Frozen>) -> Result<Self, Self::Error> {
 				if value.orientation() == TreeOrientation::Undirected {
 					return Err(constraint(
@@ -871,18 +965,21 @@ impl_from_forest_family!(Tree);
 impl_from_forest_family!(RootedTree);
 
 impl QueryMaterialize for Dag<Mutable> {
+	/// Returns query from for `Dag<Mutable>`.
 	fn query_from<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		Self::try_from(Graph::<Mutable>::query_from(source)?)
 	}
 }
 
 impl QueryMaterialize for Dag<Frozen> {
+	/// Returns query from for `Dag<Frozen>`.
 	fn query_from<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		Dag::<Mutable>::query_from(source).map(Dag::freeze)
 	}
 }
 
 impl<State> Debug for Dag<State> {
+	/// Formats `Dag<State>` using the requested formatter.
 	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("Dag")
@@ -895,6 +992,7 @@ impl<State> Debug for Dag<State> {
 }
 
 impl<State> PartialEq for Dag<State> {
+	/// Compares this `Dag<State>` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		(self.identity(), self.revision()) == (other.identity(), other.revision())
 	}
@@ -903,24 +1001,29 @@ impl<State> PartialEq for Dag<State> {
 impl<State> Eq for Dag<State> {}
 
 impl<State> PartialOrd for Dag<State> {
+	/// Compares this `Dag<State>` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl<State> Ord for Dag<State> {
+	/// Compares this `Dag<State>` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		(self.identity(), self.revision()).cmp(&(other.identity(), other.revision()))
 	}
 }
 
 impl<State> Hash for Dag<State> {
+	/// Feeds this `Dag<State>` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.identity().hash(state);
 		self.revision().hash(state);
 	}
 }
 
+/// Builds storage.
 fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<DagStorage> {
 	let mut storage = DagStorage::new();
 	for id in source.node_ids()? {
@@ -961,6 +1064,7 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<DagStorage> {
 	Ok(storage)
 }
 
+/// Builds oriented tree storage.
 fn build_oriented_tree_storage<R: GraphRead>(
 	source: &R,
 	root: AtomId,
@@ -1027,68 +1131,76 @@ fn build_oriented_tree_storage<R: GraphRead>(
 	Ok(storage)
 }
 
+/// Returns the constraint result.
 fn constraint(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::graph_constraint_violation("dag", reason.into())
 }
 
 #[cfg(test)]
+/// Regression tests for dag behavior.
 mod tests {
 	use super::Dag;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::values::{
 		PropertyMap,
 		runtime::graph::{DirtyTarget, GraphMut, Mutable},
 	};
 
+	/// Verifies rejects cycles transactionally and keeps topological order.
 	#[test]
 	fn rejects_cycles_transactionally_and_keeps_topological_order() {
 		let mut dag = Dag::<Mutable>::new();
-		let first = dag.add_node(None, PropertyMap::new()).unwrap();
-		let second = dag.add_node(None, PropertyMap::new()).unwrap();
-		let third = dag.add_node(None, PropertyMap::new()).unwrap();
-		dag.add_edge(first, second, None, PropertyMap::new()).unwrap();
-		dag.add_edge(second, third, None, PropertyMap::new()).unwrap();
+		let first = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let second = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let third = dag.add_node(None, PropertyMap::new()).assert_ok();
+		dag.add_edge(first, second, None, PropertyMap::new()).assert_ok();
+		dag.add_edge(second, third, None, PropertyMap::new()).assert_ok();
 		let revision = dag.revision();
-		let error = dag.add_edge(third, first, None, PropertyMap::new()).unwrap_err();
+		let error = dag.add_edge(third, first, None, PropertyMap::new()).assert_err();
 
 		assert_eq!(error.status().code().to_string(), "FG-G2F04");
 		assert_eq!(dag.revision(), revision);
 		assert_eq!(dag.topological_order(), [first, second, third]);
 	}
 
+	/// Verifies frozen layout round trips to mutable adjacency.
 	#[test]
 	fn frozen_layout_round_trips_to_mutable_adjacency() {
 		let mut dag = Dag::<Mutable>::new();
-		let left = dag.add_node(None, PropertyMap::new()).unwrap();
-		let right = dag.add_node(None, PropertyMap::new()).unwrap();
-		let edge = dag.add_edge(left, right, None, PropertyMap::new()).unwrap();
+		let left = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let right = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let edge = dag.add_edge(left, right, None, PropertyMap::new()).assert_ok();
 		let frozen = dag.freeze();
 		assert_eq!(frozen.outgoing_edges(left), [edge]);
-		let mut dag = frozen.thaw().unwrap();
-		dag.remove_atom(edge).unwrap();
+		let mut dag = frozen.thaw().assert_ok();
+		dag.remove_atom(edge).assert_ok();
 		assert!(dag.outgoing_edges(left).is_empty());
 	}
 
+	/// Verifies parallel edges are allowed.
 	#[test]
 	fn parallel_edges_are_allowed() {
 		let mut dag = Dag::<Mutable>::new();
-		let left = dag.add_node(None, PropertyMap::new()).unwrap();
-		let right = dag.add_node(None, PropertyMap::new()).unwrap();
-		dag.add_edge(left, right, None, PropertyMap::new()).unwrap();
-		dag.add_edge(left, right, None, PropertyMap::new()).unwrap();
+		let left = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let right = dag.add_node(None, PropertyMap::new()).assert_ok();
+		dag.add_edge(left, right, None, PropertyMap::new()).assert_ok();
+		dag.add_edge(left, right, None, PropertyMap::new()).assert_ok();
 		assert_eq!(dag.edge_count(), 2);
 	}
 
+	/// Verifies node removal marks incoming and outgoing edges dirty.
 	#[test]
 	fn node_removal_marks_incoming_and_outgoing_edges_dirty() {
 		let mut dag = Dag::<Mutable>::new();
-		let first = dag.add_node(None, PropertyMap::new()).unwrap();
-		let middle = dag.add_node(None, PropertyMap::new()).unwrap();
-		let last = dag.add_node(None, PropertyMap::new()).unwrap();
-		let incoming = dag.add_edge(first, middle, None, PropertyMap::new()).unwrap();
-		let outgoing = dag.add_edge(middle, last, None, PropertyMap::new()).unwrap();
+		let first = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let middle = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let last = dag.add_node(None, PropertyMap::new()).assert_ok();
+		let incoming = dag.add_edge(first, middle, None, PropertyMap::new()).assert_ok();
+		let outgoing = dag.add_edge(middle, last, None, PropertyMap::new()).assert_ok();
 		dag.metadata.clear_dirty();
 
-		dag.remove_atom(middle).unwrap();
+		dag.remove_atom(middle).assert_ok();
 
 		let dirty = dag.metadata.dirty().cloned().collect::<Vec<_>>();
 		assert_eq!(dirty.len(), 3);

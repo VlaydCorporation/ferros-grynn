@@ -13,13 +13,17 @@ pub(in crate::storage) enum ScalarIndexMode {
 /// One sorted scalar-index key and its sorted, non-empty atom set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct ScalarIndexEntry<Address = DiskAtomRef> {
+	/// Key associated with this scalar index entry.
 	pub(in crate::storage) key: Vec<u8>,
+	/// Atoms associated with this scalar index entry.
 	pub(in crate::storage) atoms: Vec<Address>,
 }
 
 /// Complete immutable scalar B+tree generation.
 pub(in crate::storage) struct BuiltScalarIndex {
+	/// Root associated with this built scalar index.
 	pub(in crate::storage) root: PageNo,
+	/// Pages associated with this built scalar index.
 	pub(in crate::storage) pages: Vec<AlignedPage>,
 }
 
@@ -47,6 +51,7 @@ pub(in crate::storage) fn build_scalar_index<Address: PrimaryAddress + Ord>(
 	build_standard_scalar_index(entries, page_lsn, MUTABLE_STANDARD_LEAF_BYTES)
 }
 
+/// Builds standard scalar index.
 fn build_standard_scalar_index<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
 	page_lsn: PageLsn,
@@ -109,6 +114,7 @@ fn build_standard_scalar_index<Address: PrimaryAddress + Ord>(
 	})
 }
 
+/// Builds standard scalar index with fill for this module.
 #[cfg(test)]
 pub(super) fn build_standard_scalar_index_with_fill<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
@@ -123,14 +129,19 @@ pub(super) fn build_standard_scalar_index_with_fill<Address: PrimaryAddress + Or
 }
 
 /// One atom insertion or removal for a canonical scalar key.
+#[cfg(test)]
 pub(in crate::storage) struct ScalarIndexMutation<Address = DiskAtomRef> {
+	/// Key associated with this scalar index mutation.
 	pub(in crate::storage) key: Vec<u8>,
+	/// Atom associated with this scalar index mutation.
 	pub(in crate::storage) atom: Address,
+	/// Insert associated with this scalar index mutation.
 	pub(in crate::storage) insert: bool,
 }
 
 /// Re-encodes only scalar leaves whose separators and posting layout remain
 /// stable. `None` requests the existing bulk builder.
+#[cfg(test)]
 pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -217,6 +228,7 @@ pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + O
 }
 
 /// Applies removals before insertions so a valid unique-key swap is atomic.
+#[cfg(test)]
 pub(in crate::storage) fn apply_scalar_mutations<'mutation, Address>(
 	entries: &mut Vec<ScalarIndexEntry<Address>>,
 	mutations: impl IntoIterator<Item = &'mutation ScalarIndexMutation<Address>>,
@@ -275,6 +287,8 @@ pub(in crate::storage) fn scan_scalar_index<Address: PrimaryAddress + Ord>(
 	Ok(entries)
 }
 
+/// Decodes unique leaf entries.
+#[cfg(test)]
 fn decode_unique_leaf_entries<Address: PrimaryAddress>(
 	page: &AlignedPage,
 ) -> FerrosGrynnResult<Vec<ScalarIndexEntry<Address>>> {
@@ -290,6 +304,8 @@ fn decode_unique_leaf_entries<Address: PrimaryAddress>(
 		.collect()
 }
 
+/// Applies scalar mutation.
+#[cfg(test)]
 fn apply_scalar_mutation<Address: PrimaryAddress + Ord>(
 	entries: &mut Vec<ScalarIndexEntry<Address>>,
 	mutation: &ScalarIndexMutation<Address>,
@@ -341,6 +357,7 @@ fn apply_scalar_mutation<Address: PrimaryAddress + Ord>(
 }
 
 /// Looks up one exact scalar key and validates every referenced posting page.
+#[cfg(test)]
 pub(in crate::storage) fn lookup_scalar_index<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -358,6 +375,7 @@ pub(in crate::storage) fn lookup_scalar_index<Address: PrimaryAddress + Ord>(
 }
 
 /// Returns scalar-index atoms in key order for one bounded range.
+#[cfg(test)]
 pub(in crate::storage) fn range_scalar_index<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -400,6 +418,8 @@ pub(in crate::storage) fn range_scalar_index<Address: PrimaryAddress + Ord>(
 	Ok(result)
 }
 
+/// Returns the range unique index result.
+#[cfg(test)]
 fn range_unique_index<Address: PrimaryAddress>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -407,7 +427,17 @@ fn range_unique_index<Address: PrimaryAddress>(
 	upper: &Bound<&[u8]>,
 ) -> FerrosGrynnResult<Vec<Address>> {
 	let mut result = Vec::new();
-	visit_unique_range(read_page, root, PageType::IndexUniqueBtreeLeaf, lower, upper, &mut |_key, address| { result.push(address); Ok(()) })?;
+	visit_unique_range(
+		read_page,
+		root,
+		PageType::IndexUniqueBtreeLeaf,
+		lower,
+		upper,
+		&mut |_key, address| {
+			result.push(address);
+			Ok(())
+		},
+	)?;
 	Ok(result)
 }
 

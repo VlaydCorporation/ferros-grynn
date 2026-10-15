@@ -4,19 +4,29 @@ use super::*;
 
 /// One resolved HEAD, TAIL, or unqualified endpoint group.
 pub(in crate::gql::execution) struct ResolvedHyperContains {
+	/// Side associated with this resolved hyper contains.
 	pub(in crate::gql::execution) side: crate::syn::MatchHyperSide,
+	/// Endpoints associated with this resolved hyper contains.
 	pub(in crate::gql::execution) endpoints: Vec<ResolvedMatchBinding>,
 }
 
+/// Cartesian-product position used to assign candidate atoms to the bindings of
+/// a hyperedge match.
 struct AssignmentState {
+	/// Base associated with this assignment state.
 	base: Row,
+	/// Bindings associated with this assignment state.
 	bindings: Vec<ResolvedMatchBinding>,
+	/// Candidates associated with this assignment state.
 	candidates: Vec<Vec<BoundAtom>>,
+	/// Indices associated with this assignment state.
 	indices: Vec<usize>,
+	/// Done associated with this assignment state.
 	done: bool,
 }
 
 impl AssignmentState {
+	/// Creates a new `AssignmentState` value.
 	fn new(
 		base: Row,
 		bindings: Vec<ResolvedMatchBinding>,
@@ -33,6 +43,7 @@ impl AssignmentState {
 		}
 	}
 
+	/// Returns the current result.
 	fn current(&self) -> Option<Vec<BoundAtom>> {
 		(!self.done).then(|| {
 			self.candidates
@@ -43,6 +54,7 @@ impl AssignmentState {
 		})
 	}
 
+	/// Advances assignment state.
 	fn advance(&mut self) {
 		if self.candidates.is_empty() {
 			self.done = true;
@@ -62,35 +74,51 @@ impl AssignmentState {
 /// Assigns hyperedge endpoint positions without materializing the Cartesian
 /// product.
 pub(in crate::gql::execution) struct HyperContainsCursor<'a, Read: QueryRead, Graph> {
+	/// Input associated with this hyper contains cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Read associated with this hyper contains cursor.
 	read: &'a Read,
+	/// Snapshot associated with this hyper contains cursor.
 	snapshot: Snapshot,
+	/// Fields associated with this hyper contains cursor.
 	fields: &'a MatchGraphFields<'a, Read>,
+	/// Graph associated with this hyper contains cursor.
 	graph: Rc<Graph>,
+	/// Graph ref associated with this hyper contains cursor.
 	graph_ref: Arc<GraphRef>,
+	/// Edge associated with this hyper contains cursor.
 	edge: ResolvedMatchBinding,
+	/// Contains associated with this hyper contains cursor.
 	contains: Vec<ResolvedHyperContains>,
+	/// Mode associated with this hyper contains cursor.
 	mode: crate::syn::MatchMode,
+	/// Predicate associated with this hyper contains cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Edges associated with this hyper contains cursor.
 	edges: Vec<AtomId>,
+	/// Row associated with this hyper contains cursor.
 	row: Option<Row>,
+	/// Next edge associated with this hyper contains cursor.
 	next_edge: usize,
+	/// Assignment associated with this hyper contains cursor.
 	assignment: Option<AssignmentState>,
 }
 
 impl<'a, Read: QueryRead, Graph: GraphRead> HyperContainsCursor<'a, Read, Graph> {
+	/// Creates a new `HyperContainsCursor<'a, Read, Graph>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		read: &'a Read,
 		snapshot: Snapshot,
 		fields: &'a MatchGraphFields<'a, Read>,
-		graph: Rc<Graph>,
-		graph_ref: Arc<GraphRef>,
+		graph_view: (Rc<Graph>, Arc<GraphRef>),
 		edge: ResolvedMatchBinding,
 		contains: Vec<ResolvedHyperContains>,
 		mode: crate::syn::MatchMode,
 		predicate: MatchPredicateContext<'a>,
 	) -> FerrosGrynnResult<Self> {
+		let (graph, graph_ref) = graph_view;
+
 		let edges = graph.edge_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		Ok(Self {
 			input,
@@ -110,6 +138,7 @@ impl<'a, Read: QueryRead, Graph: GraphRead> HyperContainsCursor<'a, Read, Graph>
 		})
 	}
 
+	/// Returns the assignment result.
 	fn assignment(
 		&self,
 		input: &Row,
@@ -204,6 +233,8 @@ impl<'a, Read: QueryRead, Graph: GraphRead> HyperContainsCursor<'a, Read, Graph>
 }
 
 impl<Read: QueryRead, Graph: GraphRead> RowCursor for HyperContainsCursor<'_, Read, Graph> {
+	/// Advances this `HyperContainsCursor<'_, Read, Graph>` and returns its
+	/// next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;

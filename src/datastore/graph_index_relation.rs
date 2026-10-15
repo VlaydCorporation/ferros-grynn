@@ -1,6 +1,6 @@
 //! Snapshot-root adapter for the shared local incidence relation.
 
-use super::{DatabaseRoot, GraphIndex, OccurrenceState};
+use super::{DatabaseRoot, GraphIndex, OccurrenceStateRef};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::ProjectedRelation,
@@ -27,10 +27,10 @@ pub(super) fn build_graph_index_relation(
 				|| index.edge_labels().any(|label| occurrence.label() == Some(label))
 		})
 		.filter_map(|occurrence| {
-			if let OccurrenceState::Edge {
+			if let OccurrenceStateRef::Edge {
 				topology,
 				..
-			} = occurrence.state()
+			} = occurrence.state().view()
 			{
 				Some((occurrence.local_id(), topology))
 			} else {
@@ -53,28 +53,35 @@ pub(super) fn build_graph_index_relation(
 }
 
 #[cfg(test)]
+/// Regression tests for graph index relation behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::{
 		datastore::{ClassSchema, Datastore, GraphIndexDefinition, ReachabilityAlgorithm},
 		graph::{AtomKind, EdgeTopology, GraphKind, TraversalDirection, TraversalSemantics},
 		values::{PropertyMap, RecordId},
 	};
 
+	/// Verifies snapshot relation uses definition labels direction mode and
+	/// global order.
 	#[test]
 	fn snapshot_relation_uses_definition_labels_direction_mode_and_global_order() {
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-		tx.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
-		let graph = tx.define_graph("network", GraphKind::Graph).unwrap();
+		tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		tx.define_class(ClassSchema::new("relation", AtomKind::Edge, []).assert_ok()).assert_ok();
+		let graph = tx.define_graph("network", GraphKind::Graph).assert_ok();
 		let records = ["person:b", "person:a", "relation:base", "relation:connector"]
-			.map(|record| record.parse::<RecordId>().unwrap());
+			.map(|record| record.parse::<RecordId>().assert_ok());
 		for record in &records {
-			tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+			tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 		}
-		let a = tx.attach_node(graph.id(), &records[1], None, None).unwrap();
-		let b = tx.attach_node(graph.id(), &records[0], None, None).unwrap();
+		let a = tx.attach_node(graph.id(), &records[1], None, None).assert_ok();
+		let b = tx.attach_node(graph.id(), &records[0], None, None).assert_ok();
 		let base = tx
 			.attach_edge(
 				graph.id(),
@@ -84,7 +91,7 @@ mod tests {
 				None,
 				None,
 			)
-			.unwrap();
+			.assert_ok();
 		let connector = tx
 			.attach_edge(
 				graph.id(),
@@ -94,7 +101,7 @@ mod tests {
 				None,
 				None,
 			)
-			.unwrap();
+			.assert_ok();
 		let index = GraphIndex::new(
 			"relation",
 			GraphIndexDefinition::Reachability {
@@ -102,25 +109,25 @@ mod tests {
 			},
 			None,
 		)
-		.unwrap()
+		.assert_ok()
 		.with_mode(TraversalSemantics::Atom)
 		.with_direction(TraversalDirection::Backward)
 		.with_edge_labels(["keep"])
-		.unwrap();
-		tx.define_graph_index("network", index).unwrap();
-		tx.commit().unwrap();
+		.assert_ok();
+		tx.define_graph_index("network", index).assert_ok();
+		tx.commit().assert_ok();
 		let snapshot = store.inner.current_root();
-		let schema = snapshot.schema.graph(graph.id()).unwrap();
-		let index = schema.indexes().next().unwrap();
+		let schema = snapshot.schema.graph(graph.id()).assert_some();
+		let index = schema.indexes().next().assert_some();
 		let relation =
-			build_graph_index_relation(&snapshot, index, 16_384, &mut || Ok(())).unwrap();
+			build_graph_index_relation(&snapshot, index, 16_384, &mut || Ok(())).assert_ok();
 		assert_eq!(relation.vertices, [b, a, base, connector]);
 		assert_eq!(
 			relation.forward.neighbours(relation.ordinal_by_atom[&b]).collect::<Vec<_>>(),
 			[relation.ordinal_by_atom[&base]]
 		);
 		assert!(relation.forward.neighbours(relation.ordinal_by_atom[&a]).next().is_none());
-		let condensation = relation.condensation(16_384, &mut || Ok(())).unwrap();
+		let condensation = relation.condensation(16_384, &mut || Ok(())).assert_ok();
 		assert_eq!(condensation.representatives, [b, a, base, connector]);
 	}
 }

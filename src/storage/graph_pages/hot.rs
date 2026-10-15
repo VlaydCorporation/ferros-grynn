@@ -3,6 +3,7 @@ use super::hot_validation::{validate_edge_slot, validate_node_slot};
 use super::*;
 use crate::{datastore::GlobalAtomId, storage::atom_page::PropertyRef};
 
+/// Configured absent weight bits value.
 const ABSENT_WEIGHT_BITS: u64 = 0x7ff8_0000_0000_0000;
 
 /// Returns the page and within-page slot for a stable disk slot index.
@@ -87,6 +88,7 @@ pub(in crate::storage) fn read_node_hot_slot(
 	decode_node_hot_slot(page, page_no, slot)
 }
 
+/// Decodes node hot slot.
 fn decode_node_hot_slot(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -204,6 +206,7 @@ pub(in crate::storage) fn read_edge_hot_slot(
 	decode_edge_hot_slot(page, page_no, slot)
 }
 
+/// Decodes edge hot slot.
 fn decode_edge_hot_slot(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -269,6 +272,7 @@ fn decode_edge_hot_slot(
 	Ok(value)
 }
 
+/// Returns the hot slot range result.
 fn hot_slot_range(
 	page: &AlignedPage,
 	page_type: PageType,
@@ -281,6 +285,7 @@ fn hot_slot_range(
 	Ok(start..start + HOT_SLOT_BYTES)
 }
 
+/// Writes record ref.
 fn write_record_ref(
 	bytes: &mut [u8],
 	page_offset: usize,
@@ -294,15 +299,18 @@ fn write_record_ref(
 	write_u32(bytes, length_offset, length);
 }
 
+/// Writes optional u32.
 fn write_optional_u32(bytes: &mut [u8], offset: usize, value: Option<u32>) {
 	write_u32(bytes, offset, value.unwrap_or(NULL_U32));
 }
 
+/// Reads optional u32.
 fn read_optional_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 	let value = read_u32(bytes, offset);
 	(value != NULL_U32).then_some(value)
 }
 
+/// Writes disk refs.
 fn write_disk_refs<const N: usize>(
 	bytes: &mut [u8],
 	offset: usize,
@@ -313,6 +321,7 @@ fn write_disk_refs<const N: usize>(
 	}
 }
 
+/// Reads disk refs.
 fn read_disk_refs<const N: usize>(
 	bytes: &[u8],
 	offset: usize,
@@ -326,6 +335,7 @@ fn read_disk_refs<const N: usize>(
 }
 
 #[cfg(test)]
+/// Regression tests for hot behavior.
 mod tests {
 	use std::mem::align_of;
 
@@ -335,35 +345,39 @@ mod tests {
 		storage::atom_page::PropertyRef,
 	};
 
+	/// Returns verify final buffers for this module.
 	#[inline(never)]
 	fn verify_final_buffers() -> FerrosGrynnResult<[(usize, usize, usize); 2]> {
+		use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
+
 		let mut pages = (0..2).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 		let before = pages.iter().map(|page| std::ptr::from_ref(page).addr()).collect::<Vec<_>>();
-		assert!(before.iter().all(|address| address % align_of::<AlignedPage>() == 0));
+		(before.iter().all(|address| address % align_of::<AlignedPage>() == 0)).assert_true();
 		initialize_node_hot_page(&mut pages[0], PageNo::new(0), PageLsn::new(9))?;
 		initialize_edge_hot_page(&mut pages[1], PageNo::new(1), PageLsn::new(9))?;
 		let after = pages.iter().map(|page| std::ptr::from_ref(page).addr()).collect::<Vec<_>>();
-		assert_eq!(before, after);
+		(&(before), &(after)).assert_equal();
 
 		let mut observations = [(0, 0, 0); 2];
 		for (index, page) in pages.iter().enumerate() {
 			let in_loop = std::ptr::from_ref(page).addr();
-			assert_eq!(in_loop, before[index]);
-			assert_eq!(in_loop % align_of::<AlignedPage>(), 0);
+			(&(in_loop), &(before[index])).assert_equal();
+			(&(in_loop % align_of::<AlignedPage>()), &(0)).assert_equal();
 			observations[index] = (before[index], after[index], in_loop);
 		}
 
-		assert_eq!(&pages[0].as_bytes()[..4], b"FHN\x01");
-		assert_eq!(&pages[1].as_bytes()[..4], b"FHE\x01");
-		assert_eq!(pages[0].validate(PageNo::new(0))?.page_type(), PageType::NodeHot);
-		assert_eq!(pages[1].validate(PageNo::new(1))?.page_type(), PageType::EdgeHot);
+		(&(&pages[0].as_bytes()[..4]), &(b"FHN\x01")).assert_equal();
+		(&(&pages[1].as_bytes()[..4]), &(b"FHE\x01")).assert_equal();
+		(&(pages[0].validate(PageNo::new(0))?.page_type()), &(PageType::NodeHot)).assert_equal();
+		(&(pages[1].validate(PageNo::new(1))?.page_type()), &(PageType::EdgeHot)).assert_equal();
 		write_node_hot_slot(&mut pages[0], 0, &NodeHotSlot::tombstone(1))?;
 		pages[0].seal()?;
-		assert_eq!(&pages[0].as_bytes()[..4], b"FHN\x01");
-		assert_eq!(pages[0].validate(PageNo::new(0))?.page_type(), PageType::NodeHot);
+		(&(&pages[0].as_bytes()[..4]), &(b"FHN\x01")).assert_equal();
+		(&(pages[0].validate(PageNo::new(0))?.page_type()), &(PageType::NodeHot)).assert_equal();
 		Ok(observations)
 	}
 
+	/// Verifies final buffers preserve addresses alignment and headers.
 	#[test]
 	fn final_buffers_preserve_addresses_alignment_and_headers() -> FerrosGrynnResult<()> {
 		for (index, (before, after, in_loop)) in verify_final_buffers()?.into_iter().enumerate() {
@@ -376,10 +390,14 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies node occurrence uses normative global and overlay offsets.
 	#[test]
-	fn node_occurrence_uses_normative_global_and_overlay_offsets() -> FerrosGrynnResult<()> {
-		let global = GlobalAtomId::from_raw(AtomId::from_parts(AtomKind::Node, 8, 3)?.raw());
-		let edge = DiskAtomRef::from_parts(AtomKind::Edge, 7)?;
+	fn node_occurrence_uses_normative_global_and_overlay_offsets() {
+		use crate::test_assertions::AssertResult as _;
+
+		let global =
+			GlobalAtomId::from_raw(AtomId::from_parts(AtomKind::Node, 8, 3).assert_ok().raw());
+		let edge = DiskAtomRef::from_parts(AtomKind::Edge, 7).assert_ok();
 		let expected = NodeHotSlot {
 			generation: 4,
 			subgraph_slot: None,
@@ -391,29 +409,30 @@ mod tests {
 			out_overflow: None,
 			in_overflow: None,
 			undirected_overflow: None,
-			overlay: PropertyRef::inline(PageNo::new(5), 2, 19)?,
+			overlay: PropertyRef::inline(PageNo::new(5), 2, 19).assert_ok(),
 			global_atom: Some(global),
 			out_inline: [Some(edge), None, None, None],
 			in_inline: [None; 4],
 			undirected_inline: [None; 2],
 		};
-		let mut pages = vec![AlignedPage::zeroed()];
-		initialize_node_hot_page(&mut pages[0], PageNo::new(0), PageLsn::new(9))?;
-		write_node_hot_slot(&mut pages[0], 0, &expected)?;
-		pages[0].seal()?;
-		assert_eq!(read_node_hot_slot(&pages[0], PageNo::new(0), 0)?, expected);
+		let mut pages = [AlignedPage::zeroed()];
+		initialize_node_hot_page(&mut pages[0], PageNo::new(0), PageLsn::new(9)).assert_ok();
+		write_node_hot_slot(&mut pages[0], 0, &expected).assert_ok();
+		pages[0].seal().assert_ok();
+		assert_eq!(read_node_hot_slot(&pages[0], PageNo::new(0), 0).assert_ok(), expected);
 		assert_eq!(read_u32(pages[0].as_bytes(), PAGE_HEADER_SIZE + 12), 0);
 		assert_eq!(read_u64(pages[0].as_bytes(), PAGE_HEADER_SIZE + 72), global.raw());
-		Ok(())
 	}
 
+	/// Verifies reserved edge flag is rejected.
 	#[test]
-	fn reserved_edge_flag_is_rejected() -> FerrosGrynnResult<()> {
-		let mut pages = vec![AlignedPage::zeroed()];
-		initialize_edge_hot_page(&mut pages[0], PageNo::new(0), PageLsn::ZERO)?;
+	fn reserved_edge_flag_is_rejected() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut pages = [AlignedPage::zeroed()];
+		initialize_edge_hot_page(&mut pages[0], PageNo::new(0), PageLsn::ZERO).assert_ok();
 		pages[0].as_bytes_mut()[PAGE_HEADER_SIZE + EDGE_FLAGS_OFFSET] = 0x20;
-		pages[0].seal()?;
+		pages[0].seal().assert_ok();
 		assert!(read_edge_hot_slot(&pages[0], PageNo::new(0), 0).is_err());
-		Ok(())
 	}
 }

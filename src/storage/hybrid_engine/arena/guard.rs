@@ -2,41 +2,34 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{
-	AtomicArenaBufferPool,
-	LIFECYCLE_MASK,
-	Lifecycle,
-	generation,
-	lifecycle,
-	locator::{FrameLocator, ResolvedFrameHandle},
-	pins,
-};
+use super::{AtomicArenaBufferPool, Lifecycle, generation, lifecycle, locator::FrameLocator, pins};
+#[cfg(feature = "storage-engine-prototype-api")]
+use super::{LIFECYCLE_MASK, locator::ResolvedFrameHandle};
 use crate::storage::page::{AlignedPage, PAGE_SIZE};
 
 /// Cursor-scoped reclamation guard for borrowed arena page addresses.
 ///
-/// ponytail: one global reader count delays every retired frame; replace it
+/// shortcut: one global reader count delays every retired frame; replace it
 /// with generation-bucketed epochs only if measured miss-side backpressure
 /// makes that extra machinery necessary.
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct AtomicReadEpoch<'pool> {
 	/// Arena whose retired bytes remain immutable until this guard drops.
 	pub(super) pool: &'pool AtomicArenaBufferPool,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl AtomicReadEpoch<'_> {
 	/// Borrows a page through one cached locator without per-page pin/drop.
 	pub fn get_resolved<'epoch>(
 		&'epoch self,
 		handle: &ResolvedFrameHandle,
 	) -> Option<AtomicEpochPage<'epoch>> {
-		(handle.arena_id == self.pool.arena_id).then(|| self.get_locator(handle.locator)).flatten()
+		(handle.arena_id == self.pool._arena_id).then(|| self.get_locator(handle.locator)).flatten()
 	}
 
 	/// Validates one exact frame generation before exposing immutable bytes.
-	pub(super) fn get_locator<'epoch>(
-		&'epoch self,
-		locator: FrameLocator,
-	) -> Option<AtomicEpochPage<'epoch>> {
+	pub(super) fn get_locator(&self, locator: FrameLocator) -> Option<AtomicEpochPage<'_>> {
 		let meta = self.pool.metadata.get(locator.index)?;
 		let state = meta.state.load(Ordering::SeqCst);
 		if state & LIFECYCLE_MASK != Lifecycle::Resident as u64
@@ -57,6 +50,7 @@ impl AtomicReadEpoch<'_> {
 	}
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl Drop for AtomicReadEpoch<'_> {
 	/// Leaves the reclamation epoch exactly once.
 	fn drop(&mut self) {
@@ -65,11 +59,13 @@ impl Drop for AtomicReadEpoch<'_> {
 }
 
 /// Page reference whose lifetime cannot exceed its reclamation epoch.
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct AtomicEpochPage<'epoch> {
 	/// Immutable validated bytes in the stable frame arena.
 	page: &'epoch AlignedPage,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl AtomicEpochPage<'_> {
 	/// Returns the validated aligned page.
 	pub const fn as_page(&self) -> &AlignedPage {

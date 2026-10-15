@@ -10,7 +10,11 @@ use crate::{
 
 /// Compact durable database identity in one datastore's schema namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BridgeDatabaseId(NonZeroU32);
+pub struct BridgeDatabaseId(
+	/// Positive identity assigned to the external database in the local schema
+	/// namespace.
+	NonZeroU32,
+);
 
 impl BridgeDatabaseId {
 	/// Creates a positive database identity; zero is reserved.
@@ -50,7 +54,10 @@ impl BridgeDatabaseRef {
 
 /// Non-reusable mapping identity, independent of transaction-local addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BridgeMappingId(pub(crate) uuid::Uuid);
+pub struct BridgeMappingId(
+	/// Non-reusable UUID identifying one durable bridge mapping.
+	pub(crate) uuid::Uuid,
+);
 
 impl BridgeMappingId {
 	/// Returns the stable mapping UUID.
@@ -81,6 +88,7 @@ impl BridgeMappingRef {
 }
 
 impl From<BridgeMappingRef> for crate::values::Value {
+	/// Converts `BridgeMappingRef` into `crate::values::Value`.
 	fn from(reference: BridgeMappingRef) -> Self {
 		Self::Object(Object::from_iter([
 			("datastore", Self::Uuid(reference.datastore.into())),
@@ -91,6 +99,8 @@ impl From<BridgeMappingRef> for crate::values::Value {
 impl TryFrom<crate::values::Value> for BridgeMappingRef {
 	type Error = FerrosGrynnError;
 
+	/// Converts `crate::values::Value` into `BridgeMappingRef` after validating
+	/// the conversion.
 	fn try_from(value: crate::values::Value) -> FerrosGrynnResult<Self> {
 		let crate::values::Value::Object(mut fields) = value else {
 			return Err(FerrosGrynnError::bridge_mapping_error(
@@ -117,6 +127,7 @@ impl TryFrom<crate::values::Value> for BridgeMappingRef {
 
 /// Independent uniqueness domains for properties and graph-local relations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum BridgeMappingRole {
 	/// Properties attached to one global atom.
 	Atom,
@@ -126,9 +137,13 @@ pub enum BridgeMappingRole {
 
 /// Local logical subject; external records are never graph endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum BridgeMappingSubject {
 	/// Additional properties of one database-global atom.
-	Atom(RecordId),
+	Atom(
+		/// Additional properties of one database-global atom.
+		RecordId,
+	),
 	/// Relation corresponding to one local edge occurrence.
 	Relation {
 		/// Stable occurrence owner graph.
@@ -163,6 +178,7 @@ impl BridgeMappingSubject {
 
 /// External identity qualified by its registered database, not a local atom.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub struct BridgeEntityRef {
 	/// Registered external database identity.
 	pub database: BridgeDatabaseRef,
@@ -170,8 +186,19 @@ pub struct BridgeEntityRef {
 	pub record: RecordId,
 }
 
+impl BridgeEntityRef {
+	/// Qualifies an adapter-native record with its registered database.
+	pub const fn new(database: BridgeDatabaseRef, record: RecordId) -> Self {
+		Self {
+			database,
+			record,
+		}
+	}
+}
+
 /// Durable mapping lifecycle. Pending reserves both unique directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BridgeMappingState {
 	/// Both sides are reserved; the external outcome awaits confirmation.
 	Pending,
@@ -183,6 +210,7 @@ pub enum BridgeMappingState {
 
 /// Exact idempotent relation intent retained across process restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BridgeMirrorRequest {
 	/// Preallocated external relation identity.
 	pub relation: RecordId,
@@ -192,6 +220,23 @@ pub struct BridgeMirrorRequest {
 	pub target: RecordId,
 	/// Typed relation properties, independent of query source or driver state.
 	pub properties: Object,
+}
+
+impl BridgeMirrorRequest {
+	/// Retains the reserved relation identity, endpoints and typed properties.
+	pub const fn new(
+		relation: RecordId,
+		source: RecordId,
+		target: RecordId,
+		properties: Object,
+	) -> Self {
+		Self {
+			relation,
+			source,
+			target,
+			properties,
+		}
+	}
 }
 
 /// One authoritative mapping record shared by both lookup indexes.
@@ -276,11 +321,16 @@ impl BridgeDatabaseOptions {
 	/// Creates checked identity metadata without credentials or a connection.
 	/// # Errors
 	/// Rejects empty alias/provider and unbounded or NUL-containing names.
-	pub fn new(
-		alias: impl Into<Text>,
-		provider: impl Into<Text>,
-		namespace: impl Into<Text>,
-		database: impl Into<Text>,
+	pub fn new<
+		AliasArg: Into<Text>,
+		ProviderArg: Into<Text>,
+		NamespaceArg: Into<Text>,
+		DatabaseArg: Into<Text>,
+	>(
+		alias: AliasArg,
+		provider: ProviderArg,
+		namespace: NamespaceArg,
+		database: DatabaseArg,
 	) -> FerrosGrynnResult<Self> {
 		let value = Self {
 			alias: alias.into(),
@@ -306,10 +356,10 @@ impl BridgeDatabaseOptions {
 	/// Rejects invalid names, duplicate classes and non-injective table
 	/// mappings.
 	#[must_use = "registration settings are returned by value"]
-	pub fn map_class(
+	pub fn map_class<ClassArg: Into<Text>, TableArg: Into<Text>>(
 		mut self,
-		class: impl Into<Text>,
-		table: impl Into<Text>,
+		class: ClassArg,
+		table: TableArg,
 	) -> FerrosGrynnResult<Self> {
 		let class = class.into();
 		let table = table.into();
@@ -328,7 +378,11 @@ impl BridgeDatabaseOptions {
 	/// # Errors
 	/// Rejects invalid table names and ambiguous graph/table correspondences.
 	#[must_use = "registration settings are returned by value"]
-	pub fn map_graph(mut self, graph: GraphId, table: impl Into<Text>) -> FerrosGrynnResult<Self> {
+	pub fn map_graph<TableArg: Into<Text>>(
+		mut self,
+		graph: GraphId,
+		table: TableArg,
+	) -> FerrosGrynnResult<Self> {
 		let table = table.into();
 		validate_name(&table, false)?;
 		if self.graphs.contains_key(&graph) || self.graphs.values().any(|value| value == &table) {

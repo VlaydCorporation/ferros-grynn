@@ -21,6 +21,7 @@ use crate::{
 	},
 };
 
+/// Returns the checkpoint result.
 pub(super) fn checkpoint(
 	wal: &FrameWal,
 	state: &mut LocalState,

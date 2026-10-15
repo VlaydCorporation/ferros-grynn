@@ -11,12 +11,19 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GraphFamilyName {
+	/// General graph family.
 	Graph,
+	/// Connected acyclic tree family.
 	Tree,
+	/// Tree family with an explicitly selected root.
 	RootedTree,
+	/// Acyclic forest family allowing disconnected components.
 	Forest,
+	/// Directed acyclic graph family.
 	Dag,
+	/// Hypergraph family with multi-endpoint incidences.
 	Hyper,
+	/// Metagraph family retaining graph containment.
 	Meta,
 }
 
@@ -24,8 +31,11 @@ pub enum GraphFamilyName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum GraphValidatorName {
+	/// Require the SIMPLE graph validator.
 	Simple,
+	/// Require the BIPARTITE graph validator.
 	Bipartite,
+	/// Require the COMPLETE graph validator.
 	Complete,
 }
 
@@ -33,8 +43,11 @@ pub enum GraphValidatorName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GraphContract {
+	/// Optional graph family required by the graph contract.
 	pub family: Option<GraphFamilyName>,
+	/// Additional graph invariants required by the contract.
 	pub validators: Vec<GraphValidatorName>,
+	/// Source byte range used to report diagnostics for this syntax element.
 	pub span: TextSpan,
 }
 
@@ -42,11 +55,18 @@ pub struct GraphContract {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ReturnGraph {
+	/// Optional external-database bridge clause attached to this graph
+	/// operation.
 	pub bridge: Option<Box<BridgeClause>>,
+	/// Requested graph family and structural validators.
 	pub contract: Option<GraphContract>,
+	/// Optional expression selecting the root of the produced graph.
 	pub root: Option<Expr>,
+	/// Selected node identifiers or retained physical node storage.
 	pub nodes: Expr,
+	/// Selected edge identifiers or retained physical edge storage.
 	pub edges: Expr,
+	/// Source byte range used to report diagnostics for this syntax element.
 	pub span: TextSpan,
 }
 
@@ -54,30 +74,59 @@ pub struct ReturnGraph {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum BuildGraphSource {
-	Match(Box<MatchStatement>),
-	Select(Box<SelectStatement>),
-	Traverse(Box<TraverseStatement>),
-	Expression(Expr),
+	/// Use MATCH output as the graph-building source.
+	Match(
+		/// Use MATCH output as the graph-building source.
+		Box<MatchStatement>,
+	),
+	/// Use SELECT output as the graph-building source.
+	Select(
+		/// Use SELECT output as the graph-building source.
+		Box<SelectStatement>,
+	),
+	/// Use traversal output as the graph-building source.
+	Traverse(
+		/// Use traversal output as the graph-building source.
+		Box<TraverseStatement>,
+	),
+	/// Use an evaluated expression as the graph-building source.
+	Expression(
+		/// Use an evaluated expression as the graph-building source.
+		Expr,
+	),
 }
 
 /// Atomic named build or anonymous owned graph result.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct BuildGraphStatement {
+	/// Optional external-database bridge clause attached to this graph
+	/// operation.
 	pub bridge: Option<Box<BridgeClause>>,
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Requested graph family and structural validators.
 	pub contract: Option<GraphContract>,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Option<Identifier>,
+	/// Input source or initial endpoint selected by this syntax element.
 	pub source: BuildGraphSource,
+	/// Optional expression selecting the root of the produced graph.
 	pub root: Option<Expr>,
+	/// Selected node identifiers or retained physical node storage.
 	pub nodes: Option<Expr>,
+	/// Selected edge identifiers or retained physical edge storage.
 	pub edges: Option<Expr>,
+	/// Optional upper bound on nodes admitted to the built graph.
 	pub limit_nodes: Option<u64>,
+	/// Optional upper bound on edges admitted to the built graph.
 	pub limit_edges: Option<u64>,
+	/// Optional time limit attached to this operation.
 	pub timeout: Option<TimeoutValue>,
 }
 
 impl Parser<'_> {
+	/// Parses the return graph syntax.
 	pub(in crate::syn) async fn return_graph(
 		&mut self,
 		context: &mut Stk,
@@ -109,6 +158,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Builds graph statement.
 	pub(in crate::syn) async fn build_graph_statement(
 		&mut self,
 		context: &mut Stk,
@@ -204,6 +254,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Builds graph source.
 	async fn build_graph_source(
 		&mut self,
 		context: &mut Stk,
@@ -232,6 +283,7 @@ impl Parser<'_> {
 		Ok(source)
 	}
 
+	/// Parses the optional angle graph contract syntax.
 	pub(in crate::syn) fn optional_angle_graph_contract(
 		&mut self,
 	) -> FerrosGrynnResult<Option<GraphContract>> {
@@ -246,6 +298,7 @@ impl Parser<'_> {
 		}))
 	}
 
+	/// Parses the graph contract until syntax.
 	pub(in crate::syn) fn graph_contract_until(
 		&mut self,
 		terminator: Option<Symbol>,
@@ -315,6 +368,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the unsigned integer syntax.
 	fn unsigned_integer(&mut self) -> FerrosGrynnResult<u64> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {

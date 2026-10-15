@@ -54,6 +54,7 @@ impl ReadWithScope {
 }
 
 impl Drop for ReadWithScope {
+	/// Runs cleanup for this `ReadWithScope` before its fields are released.
 	fn drop(&mut self) {
 		READ_WITH_ACTIVE.with(|active| active.set(false));
 	}
@@ -139,6 +140,8 @@ impl PrototypeScanCursor {
 
 	/// Returns whether a cold hit must be promoted to the main arena.
 	fn promotes(&self, admitted_epoch: u64) -> bool {
+		// Re-reading within one scan is not evidence of reuse by an independent
+		// cursor.
 		matches!(self.intent, ReadIntent::Point | ReadIntent::IndexTraversal)
 			|| self.epoch != admitted_epoch
 	}
@@ -266,15 +269,15 @@ impl PrototypeReadCache {
 			drop(admission);
 			return consumer(guard.as_page());
 		}
-		if let Some(cold) = &self.cold {
-			if let Some(cold_guard) = cold.get_if_resident(key)? {
-				let promoted = self.hot.get_or_copy(key, cold_guard.as_page())?;
-				drop(cold_guard);
-				drop(admission);
-				cold.remove_resident(key)?;
-				self.cold_entries.lock().remove(&key);
-				return consumer(promoted.as_page());
-			}
+		if let Some(cold) = &self.cold
+			&& let Some(cold_guard) = cold.get_if_resident(key)?
+		{
+			let promoted = self.hot.get_or_copy(key, cold_guard.as_page())?;
+			drop(cold_guard);
+			drop(admission);
+			cold.remove_resident(key)?;
+			self.cold_entries.lock().remove(&key);
+			return consumer(promoted.as_page());
 		}
 		let guard = self.hot.get_or_load(key, loader)?;
 		self.cold_entries.lock().remove(&key);
@@ -297,10 +300,10 @@ impl PrototypeReadCache {
 		if let Some(guard) = self.hot.get_if_resident(key)? {
 			return consumer(guard.as_page());
 		}
-		if let Some(cold) = &self.cold {
-			if let Some(guard) = cold.get_if_resident(key)? {
-				return consumer(guard.as_page());
-			}
+		if let Some(cold) = &self.cold
+			&& let Some(guard) = cold.get_if_resident(key)?
+		{
+			return consumer(guard.as_page());
 		}
 		let mut scratch = cursor.scratch.lock();
 		let reported = loader(&mut scratch)?;
@@ -515,18 +518,18 @@ impl VmPrototypeReadCache {
 			drop(admission);
 			return consumer(guard.as_page());
 		}
-		if let Some(cold) = &self.cold {
-			if let Some(cold_guard) = cold.get_if_home_resident(key)? {
-				let promoted = self.hot.get_or_load(key, |target| {
-					target.as_bytes_mut().copy_from_slice(cold_guard.as_page().as_bytes());
-					target.validate(key.page_no())
-				})?;
-				drop(cold_guard);
-				cold.remove_home_resident(key)?;
-				self.cold_entries.lock().remove(&key);
-				drop(admission);
-				return consumer(promoted.as_page());
-			}
+		if let Some(cold) = &self.cold
+			&& let Some(cold_guard) = cold.get_if_home_resident(key)?
+		{
+			let promoted = self.hot.get_or_load(key, |target| {
+				target.as_bytes_mut().copy_from_slice(cold_guard.as_page().as_bytes());
+				target.validate(key.page_no())
+			})?;
+			drop(cold_guard);
+			cold.remove_home_resident(key)?;
+			self.cold_entries.lock().remove(&key);
+			drop(admission);
+			return consumer(promoted.as_page());
 		}
 		let guard = self.hot.get_or_load(key, loader)?;
 		self.cold_entries.lock().remove(&key);
@@ -549,10 +552,10 @@ impl VmPrototypeReadCache {
 		if let Some(guard) = self.hot.get_if_home_resident(key)? {
 			return consumer(guard.as_page());
 		}
-		if let Some(cold) = &self.cold {
-			if let Some(guard) = cold.get_if_home_resident(key)? {
-				return consumer(guard.as_page());
-			}
+		if let Some(cold) = &self.cold
+			&& let Some(guard) = cold.get_if_home_resident(key)?
+		{
+			return consumer(guard.as_page());
 		}
 		let mut scratch = cursor.scratch.lock();
 		let reported = loader(&mut scratch)?;
@@ -647,6 +650,7 @@ impl VmPrototypeReadCache {
 	clippy::panic_in_result_fn,
 	reason = "fallible tests report contract failures and one test intentionally unwinds"
 )]
+/// Regression tests for policy behavior.
 mod tests {
 	use std::{
 		error::Error,
@@ -712,6 +716,7 @@ mod tests {
 		target.validate(key.page_no())
 	}
 
+	/// Verifies intent selects the expected default policy.
 	#[test]
 	fn intent_selects_the_expected_default_policy() {
 		assert_eq!(PrototypeScanCursor::new(ReadIntent::Point).policy(), ReadPolicy::CacheAll);
@@ -743,6 +748,7 @@ mod tests {
 		);
 	}
 
+	/// Verifies nested same cursor read fails before bypass scratch relock.
 	#[test]
 	fn nested_same_cursor_read_fails_before_bypass_scratch_relock() -> Result<(), Box<dyn Error>> {
 		let cache = PrototypeReadCache::for_policy(NonZeroUsize::MIN, ReadPolicy::RocksLikeBypass);
@@ -785,6 +791,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies nested capacity one miss fails before waiting for the pinned
+	/// frame.
 	#[test]
 	fn nested_capacity_one_miss_fails_before_waiting_for_the_pinned_frame()
 	-> Result<(), Box<dyn Error>> {
@@ -834,6 +842,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies read with reentrancy marker is cleared during unwind.
 	#[test]
 	fn read_with_reentrancy_marker_is_cleared_during_unwind() -> Result<(), Box<dyn Error>> {
 		let cache = PrototypeReadCache::for_policy(NonZeroUsize::MIN, ReadPolicy::RocksLikeBypass);
@@ -864,6 +873,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies bypass preserves resident count and still hits hot pages.
 	#[test]
 	fn bypass_preserves_resident_count_and_still_hits_hot_pages() -> Result<(), Box<dyn Error>> {
 		let cache = PrototypeReadCache::for_policy(
@@ -895,6 +905,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies cold region is bounded and other cursor promotes.
 	#[test]
 	fn cold_region_is_bounded_and_other_cursor_promotes() -> Result<(), Box<dyn Error>> {
 		let cache = PrototypeReadCache::new(NonZeroUsize::new(8).ok_or("zero capacity")?);
@@ -935,6 +946,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies cold to hot promotion validates destination once.
 	#[cfg(debug_assertions)]
 	#[test]
 	fn cold_to_hot_promotion_validates_destination_once() -> Result<(), Box<dyn Error>> {
@@ -964,6 +976,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies bypass uses a page already resident in the cold region.
 	#[test]
 	fn bypass_uses_a_page_already_resident_in_the_cold_region() -> Result<(), Box<dyn Error>> {
 		let cache = PrototypeReadCache::new(NonZeroUsize::new(8).ok_or("zero capacity")?);
@@ -993,6 +1006,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies cold loading and point read coalesce without cross tier
+	/// duplicate.
 	#[test]
 	fn cold_loading_and_point_read_coalesce_without_cross_tier_duplicate()
 	-> Result<(), Box<dyn Error>> {
@@ -1060,6 +1075,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies bypass revalidates bytes after loader returns header.
 	#[test]
 	fn bypass_revalidates_bytes_after_loader_returns_header() -> Result<(), Box<dyn Error>> {
 		let cache = PrototypeReadCache::for_policy(
@@ -1083,6 +1099,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm cache all admits and reuses one exact home page.
 	#[cfg(windows)]
 	#[test]
 	fn vm_cache_all_admits_and_reuses_one_exact_home_page() -> Result<(), Box<dyn Error>> {
@@ -1119,6 +1136,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm bypass hits hot pages without polluting the vm budget.
 	#[cfg(windows)]
 	#[test]
 	fn vm_bypass_hits_hot_pages_without_polluting_the_vm_budget() -> Result<(), Box<dyn Error>> {
@@ -1156,6 +1174,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm cold region is bounded and promotes by cursor epoch or
+	/// point.
 	#[cfg(windows)]
 	#[test]
 	fn vm_cold_region_is_bounded_and_promotes_by_cursor_epoch_or_point()
@@ -1213,6 +1233,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm policy distinguishes exact home source epochs.
 	#[cfg(windows)]
 	#[test]
 	fn vm_policy_distinguishes_exact_home_source_epochs() -> Result<(), Box<dyn Error>> {

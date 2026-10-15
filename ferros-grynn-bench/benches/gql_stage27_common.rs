@@ -27,9 +27,13 @@ fn require<T>(result: FerrosGrynnResult<T>) -> T {
 
 /// Owned fixture reused only for bounded mutations and point reads.
 struct Fixture {
+	/// Datastore retained by the fixture or operation.
 	store: Datastore,
+	/// Stable record identities seeded for the scenario.
 	records: Vec<RecordId>,
+	/// Interned property-name identifier used for value lookup.
 	key: PropertyKeyId,
+	/// Payload retained for the operation or its expected result.
 	value: i64,
 }
 
@@ -40,7 +44,9 @@ fn fixture(rows: usize) -> FerrosGrynnResult<Fixture> {
 
 /// Accumulates phase wall time only for the explicit diagnostic path.
 struct PhaseClock<'a> {
+	/// Per-phase durations accumulated by the active measurement clock.
 	totals: &'a mut [Duration; 9],
+	/// Start of the most recently measured phase.
 	last: Instant,
 }
 

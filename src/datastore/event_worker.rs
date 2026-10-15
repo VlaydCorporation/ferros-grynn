@@ -326,6 +326,7 @@ fn system_time(nanoseconds: i128) -> FerrosGrynnResult<SystemTime> {
 }
 
 #[cfg(test)]
+/// Regression tests for event worker behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -376,72 +377,89 @@ mod tests {
 		}
 	}
 
+	/// Verifies event async worker success and retry exhaustion roll back
+	/// effects.
 	#[test]
-	fn event_async_worker_success_and_retry_exhaustion_roll_back_effects() -> FerrosGrynnResult<()>
-	{
+	fn event_async_worker_success_and_retry_exhaustion_roll_back_effects() {
+		use crate::test_assertions::AssertResult as _;
+
 		for retries in [0, 2] {
-			let (store, target, _value) = fast_store()?;
+			let (store, target, _value) = fast_store().assert_ok();
 			let mut define = store.begin();
-			define.define_event(
-				EventDefinition::new(
-					"fail",
-					target,
-					"true",
-					"{ CREATE audit:partial; THROW 'failure'; }",
-				)?
-				.with_execution(super::super::EventExecution::Async(
-					EventAsyncOptions::new(retries, 3)?,
-				)),
-			)?;
-			define.commit()?;
+			define
+				.define_event(
+					EventDefinition::new(
+						"fail",
+						target,
+						"true",
+						"{ CREATE audit:partial; THROW 'failure'; }",
+					)
+					.assert_ok()
+					.with_execution(super::super::EventExecution::Async(
+						EventAsyncOptions::new(retries, 3).assert_ok(),
+					)),
+				)
+				.assert_ok();
+			define.commit().assert_ok();
 			let mut source = store.begin();
-			source.create_atom("item:a".parse()?, PropertyMap::new())?;
-			source.commit()?;
-			let jobs = wait_jobs(&store, 1)?;
+			source.create_atom("item:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+			source.commit().assert_ok();
+			let jobs = wait_jobs(&store, 1).assert_ok();
 			assert_eq!(jobs[0].state(), MaintenanceJobState::Failed);
 			assert_eq!(jobs[0].event().map(EventJobInfo::attempts), Some(u16::from(retries) + 1));
 			assert_eq!(jobs[0].event().map(EventJobInfo::depth), Some(0));
 			assert!(jobs[0].diagnostic().is_some_and(|message| message.contains("failure")));
-			assert!(store.begin().atom(&"item:a".parse()?)?.is_some());
-			assert!(store.begin().atom(&"audit:partial".parse()?)?.is_none());
+			assert!(store.begin().atom(&"item:a".parse().assert_ok()).assert_ok().is_some());
+			assert!(store.begin().atom(&"audit:partial".parse().assert_ok()).assert_ok().is_none());
 			assert_eq!(store.inner.current_root().event_outbox().pending_bytes, 0);
 		}
-		let (store, target, value) = fast_store()?;
+		let (store, target, value) = fast_store().assert_ok();
 		let mut define = store.begin();
-		define.define_event(
-			EventDefinition::new(
-				"ok",
-				target,
-				"true",
-				"{ CREATE audit:done CONTENT { value: $after.value }; }",
-			)?
-			.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
-		)?;
-		define.commit()?;
+		define
+			.define_event(
+				EventDefinition::new(
+					"ok",
+					target,
+					"true",
+					"{ CREATE audit:done CONTENT { value: $after.value }; }",
+				)
+				.assert_ok()
+				.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
+			)
+			.assert_ok();
+		define.commit().assert_ok();
 		let mut source = store.begin();
-		source.create_atom("item:a".parse()?, PropertyMap::from_iter([(value, Value::from(7))]))?;
-		source.commit()?;
-		assert_eq!(wait_jobs(&store, 1)?[0].state(), MaintenanceJobState::Completed);
+		source
+			.create_atom(
+				"item:a".parse().assert_ok(),
+				PropertyMap::from_iter([(value, Value::from(7))]),
+			)
+			.assert_ok();
+		source.commit().assert_ok();
+		assert_eq!(wait_jobs(&store, 1).assert_ok()[0].state(), MaintenanceJobState::Completed);
 		assert_eq!(
 			store
 				.begin()
-				.atom(&"audit:done".parse()?)?
+				.atom(&"audit:done".parse().assert_ok())
+				.assert_ok()
 				.and_then(|atom| atom.properties().get(value).cloned()),
 			Some(Value::from(7))
 		);
-		Ok(())
 	}
 
+	/// Verifies event async atomwalk uses frozen qualified context and common
+	/// relate.
 	#[test]
-	fn event_async_atomwalk_uses_frozen_qualified_context_and_common_relate()
-	-> FerrosGrynnResult<()> {
-		let (store, _target, _value) = fast_store()?;
+	fn event_async_atomwalk_uses_frozen_qualified_context_and_common_relate() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _target, _value) = fast_store().assert_ok();
 		let mut seed = store.begin();
-		seed.define_class(ClassSchema::new("link", AtomKind::Edge, [])?)?;
-		let graph = seed.define_graph("scope", crate::graph::GraphKind::Graph)?;
+		seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+		let graph = seed.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
 		for record in ["item:a", "item:b"] {
-			seed.create_atom(record.parse()?, PropertyMap::new())?;
-			seed.attach_node(graph.id(), &record.parse()?, None, None)?;
+			seed.create_atom(record.parse().assert_ok(), PropertyMap::new()).assert_ok();
+			seed.attach_node(graph.id(), &record.parse().assert_ok(), None, None).assert_ok();
 		}
 		seed.define_event(
 			EventDefinition::new(
@@ -454,49 +472,66 @@ mod tests {
 				 <($value.endpoints.source[0])>~[link:ve]~><[$value.edge]> IN GRAPH scope; RELATE \
 				 ATOM <[$value.edge]>~[link:ev]~><($value.endpoints.target[0])> IN GRAPH scope; \
 				 RELATE ATOM <[$value.edge]>~[link:ee]~><[$value.edge]> IN GRAPH scope; }",
-			)?
+			)
+			.assert_ok()
 			.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
-		)?;
-		seed.commit()?;
+		)
+		.assert_ok();
+		seed.commit().assert_ok();
 		for result in store
-			.execute("RELATE (item:a)-[link:base]->(item:b) IN GRAPH scope;", &Object::new())?
+			.execute("RELATE (item:a)-[link:base]->(item:b) IN GRAPH scope;", &Object::new())
+			.assert_ok()
 		{
-			result.result?;
+			result.result.assert_ok();
 		}
-		let jobs = wait_jobs(&store, 1)?;
+		let jobs = wait_jobs(&store, 1).assert_ok();
 		assert_eq!(jobs[0].state(), MaintenanceJobState::Completed);
 		assert_eq!(jobs[0].event().map(EventJobInfo::attempts), Some(1));
 		for record in ["link:base", "link:vv", "link:ve", "link:ev", "link:ee"] {
-			assert!(store.begin().membership(graph.id(), &record.parse()?)?.is_some(), "{record}");
+			assert!(
+				store
+					.begin()
+					.membership(graph.id(), &record.parse().assert_ok())
+					.assert_ok()
+					.is_some(),
+				"{record}"
+			);
 		}
-		Ok(())
 	}
 
+	/// Verifies event async worker maxdepth zero three and sixteen preserve
+	/// ancestry.
 	#[test]
-	fn event_async_worker_maxdepth_zero_three_and_sixteen_preserve_ancestry()
-	-> FerrosGrynnResult<()> {
+	fn event_async_worker_maxdepth_zero_three_and_sixteen_preserve_ancestry() {
+		use crate::test_assertions::AssertResult as _;
+
 		for maximum in [0_u8, 3, 16] {
-			let (store, target, value) = fast_store()?;
+			let (store, target, value) = fast_store().assert_ok();
 			let mut define = store.begin();
-			define.define_event(
-				EventDefinition::new(
-					"chain",
-					target,
-					"$after.value < 20",
-					"{ UPDATE item:root SET value = $after.value + 1; }",
-				)?
-				.with_execution(super::super::EventExecution::Async(
-					EventAsyncOptions::new(0, maximum)?,
-				)),
-			)?;
-			define.commit()?;
+			define
+				.define_event(
+					EventDefinition::new(
+						"chain",
+						target,
+						"$after.value < 20",
+						"{ UPDATE item:root SET value = $after.value + 1; }",
+					)
+					.assert_ok()
+					.with_execution(super::super::EventExecution::Async(
+						EventAsyncOptions::new(0, maximum).assert_ok(),
+					)),
+				)
+				.assert_ok();
+			define.commit().assert_ok();
 			let mut source = store.begin();
-			source.create_atom(
-				"item:root".parse()?,
-				PropertyMap::from_iter([(value, Value::from(0))]),
-			)?;
-			source.commit()?;
-			let jobs = wait_jobs(&store, usize::from(maximum) + 1)?;
+			source
+				.create_atom(
+					"item:root".parse().assert_ok(),
+					PropertyMap::from_iter([(value, Value::from(0))]),
+				)
+				.assert_ok();
+			source.commit().assert_ok();
+			let jobs = wait_jobs(&store, usize::from(maximum) + 1).assert_ok();
 			assert_eq!(
 				jobs.iter().filter(|job| job.state() == MaintenanceJobState::Failed).count(),
 				1
@@ -509,63 +544,85 @@ mod tests {
 			assert_eq!(
 				store
 					.begin()
-					.atom(&"item:root".parse()?)?
+					.atom(&"item:root".parse().assert_ok())
+					.assert_ok()
 					.and_then(|atom| atom.properties().get(value).cloned()),
 				Some(Value::from(i64::from(maximum)))
 			);
 		}
-		Ok(())
 	}
 
+	/// Verifies event async kill pending and running keep effects unpublished.
 	#[test]
-	fn event_async_kill_pending_and_running_keep_effects_unpublished() -> FerrosGrynnResult<()> {
+	fn event_async_kill_pending_and_running_keep_effects_unpublished() {
+		use crate::test_assertions::AssertResult as _;
+
 		for running in [false, true] {
-			let (mut store, target, _value) = fast_store()?;
+			let (mut store, target, _value) = fast_store().assert_ok();
 			if !running {
 				Arc::get_mut(&mut store.inner)
-					.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture owner shared"))?
+					.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture owner shared"))
+					.assert_ok()
 					.event_processing_interval = Duration::from_secs(5);
 			}
 			let mut define = store.begin();
-			define.define_event(
-				EventDefinition::new(
-					"busy",
-					target,
-					"true",
-					"{ CREATE audit:partial; WHILE (true) { LET $x = 1; }; }",
-				)?
-				.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
-			)?;
-			define.commit()?;
+			define
+				.define_event(
+					EventDefinition::new(
+						"busy",
+						target,
+						"true",
+						"{ CREATE audit:partial; WHILE (true) { LET $x = 1; }; }",
+					)
+					.assert_ok()
+					.with_execution(super::super::EventExecution::Async(
+						EventAsyncOptions::default(),
+					)),
+				)
+				.assert_ok();
+			define.commit().assert_ok();
 			let mut source = store.begin();
-			source.create_atom("item:a".parse()?, PropertyMap::new())?;
-			source.commit()?;
-			let id =
-				*store.inner.current_root().event_outbox().invocations.keys().next().ok_or_else(
-					|| FerrosGrynnError::invalid_argument("fixture invocation absent"),
-				)?;
+			source.create_atom("item:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+			source.commit().assert_ok();
+			let id = *store
+				.inner
+				.current_root()
+				.event_outbox()
+				.invocations
+				.keys()
+				.next()
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture invocation absent"))
+				.assert_ok();
 			if running {
 				let started = std::time::Instant::now();
-				while store.job(id)?.is_some_and(|job| job.state() == MaintenanceJobState::Queued) {
+				while store
+					.job(id)
+					.assert_ok()
+					.is_some_and(|job| job.state() == MaintenanceJobState::Queued)
+				{
 					if started.elapsed() > Duration::from_secs(5) {
-						return Err(FerrosGrynnError::invalid_argument("attempt did not start"));
+						return {
+							let test_result: FerrosGrynnResult<()> =
+								Err(FerrosGrynnError::invalid_argument("attempt did not start"));
+							test_result.assert_ok();
+						};
 					}
 					std::thread::sleep(Duration::from_millis(1));
 				}
 			} else {
 				assert_eq!(
-					store.job(id)?.map(|job| job.state()),
+					store.job(id).assert_ok().map(|job| job.state()),
 					Some(MaintenanceJobState::Queued)
 				);
 			}
-			assert_eq!(store.kill_job(id)?.state(), MaintenanceJobState::Cancelled);
-			assert_eq!(wait_jobs(&store, 1)?[0].state(), MaintenanceJobState::Cancelled);
-			assert!(store.begin().atom(&"audit:partial".parse()?)?.is_none());
+			assert_eq!(store.kill_job(id).assert_ok().state(), MaintenanceJobState::Cancelled);
+			assert_eq!(wait_jobs(&store, 1).assert_ok()[0].state(), MaintenanceJobState::Cancelled);
+			assert!(store.begin().atom(&"audit:partial".parse().assert_ok()).assert_ok().is_none());
 			assert_eq!(store.inner.current_root().event_outbox().pending_count, 0);
 		}
-		Ok(())
 	}
 
+	/// Verifies event processing interval uses positive milliseconds.
 	#[test]
 	fn event_processing_interval_uses_positive_milliseconds() {
 		assert_eq!(interval_from_value(None), Duration::from_secs(5));
@@ -575,65 +632,80 @@ mod tests {
 		}
 	}
 
+	/// Verifies event async worker keeps definition context and then sources
+	/// after remove.
 	#[test]
-	fn event_async_worker_keeps_definition_context_and_then_sources_after_remove()
-	-> FerrosGrynnResult<()> {
-		let (store, target, value) = fast_store()?;
+	fn event_async_worker_keeps_definition_context_and_then_sources_after_remove() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, value) = fast_store().assert_ok();
 		let mut seed = store.begin();
-		for result in seed.execute(
-			"DEFINE PURE FUNCTION fn::gate() -> bool { RETURN true; }; DEFINE STABLE FUNCTION \
-			 fn::read() -> int { RETURN <int>item:a.value; };",
-			&Object::new(),
-		)? {
-			let _value = result.result?;
+		for result in seed
+			.execute(
+				"DEFINE PURE FUNCTION fn::gate() -> bool { RETURN true; }; DEFINE STABLE FUNCTION \
+				 fn::read() -> int { RETURN <int>item:a.value; };",
+				&Object::new(),
+			)
+			.assert_ok()
+		{
+			let _value = result.result.assert_ok();
 		}
-		let event = seed.define_event(
-			EventDefinition::new(
-				"frozen",
-				target,
-				"$event = 'CREATE' AND fn::gate()",
-				"{ CREATE audit:old CONTENT { value: fn::read(), accepted: $after.value, input: \
-				 $input.value }; }",
-			)?
-			.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
-		)?;
-		let snapshot = seed.query_snapshot()?;
+		let event = seed
+			.define_event(
+				EventDefinition::new(
+					"frozen",
+					target,
+					"$event = 'CREATE' AND fn::gate()",
+					"{ CREATE audit:old CONTENT { value: fn::read(), accepted: $after.value, \
+					 input: $input.value }; }",
+				)
+				.assert_ok()
+				.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
+			)
+			.assert_ok();
+		let snapshot = seed.query_snapshot().assert_ok();
 		let mut functions = Vec::new();
 		for name in ["gate", "read"] {
 			functions.push(
-				seed.query_schema_functions(&snapshot, "fn", name)?
+				seed.query_schema_functions(&snapshot, "fn", name)
+					.assert_ok()
 					.first()
 					.and_then(|function| function.id())
-					.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture function absent"))?,
+					.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture function absent"))
+					.assert_ok(),
 			);
 		}
-		seed.commit()?;
-		let record = "item:a".parse()?;
+		seed.commit().assert_ok();
+		let record = "item:a".parse().assert_ok();
 		let mut source = store.begin();
-		source.create_atom(record, PropertyMap::from_iter([(value, Value::from(1))]))?;
-		source.set_base_property(&"item:a".parse()?, value, Value::from(9))?;
+		source.create_atom(record, PropertyMap::from_iter([(value, Value::from(1))])).assert_ok();
+		source.set_base_property(&"item:a".parse().assert_ok(), value, Value::from(9)).assert_ok();
 		let current = source
-			.event(event)?
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture EVENT absent"))?;
+			.event(event)
+			.assert_ok()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture EVENT absent"))
+			.assert_ok();
 		let replacement = EventDefinition::new(
 			current.name().clone(),
 			current.target(),
 			current.when().clone(),
 			"{ CREATE audit:new; }",
-		)?
+		)
+		.assert_ok()
 		.with_execution(current.execution());
-		source.replace_event(event, replacement)?;
-		source.remove_event(event)?;
+		source.replace_event(event, replacement).assert_ok();
+		source.remove_event(event).assert_ok();
 		for function in functions {
-			source.remove_function(function)?;
+			source.remove_function(function).assert_ok();
 		}
 		for result in source
-			.execute("DEFINE STABLE FUNCTION fn::read() -> int { RETURN 100; };", &Object::new())?
+			.execute("DEFINE STABLE FUNCTION fn::read() -> int { RETURN 100; };", &Object::new())
+			.assert_ok()
 		{
-			let _value = result.result?;
+			let _value = result.result.assert_ok();
 		}
-		source.commit()?;
-		let jobs = wait_jobs(&store, 1)?;
+		source.commit().assert_ok();
+		let jobs = wait_jobs(&store, 1).assert_ok();
 		assert_eq!(jobs[0].state(), MaintenanceJobState::Completed);
 		assert_eq!(jobs[0].event().map(EventJobInfo::id), Some(event));
 		assert_eq!(
@@ -643,110 +715,140 @@ mod tests {
 		let dictionary = store.property_dictionary();
 		let accepted = dictionary
 			.get("accepted")
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("accepted key absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("accepted key absent"))
+			.assert_ok();
 		let input = dictionary
 			.get("input")
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("input key absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("input key absent"))
+			.assert_ok();
 		let atom = store
 			.begin()
-			.atom(&"audit:old".parse()?)?
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("frozen effect absent"))?;
+			.atom(&"audit:old".parse().assert_ok())
+			.assert_ok()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("frozen effect absent"))
+			.assert_ok();
 		assert_eq!(atom.properties().get(value), Some(&Value::from(9)));
 		assert_eq!(atom.properties().get(accepted), Some(&Value::from(1)));
 		assert_eq!(atom.properties().get(input), Some(&Value::from(1)));
-		assert!(store.begin().atom(&"audit:new".parse()?)?.is_none());
-		Ok(())
+		assert!(store.begin().atom(&"audit:new".parse().assert_ok()).assert_ok().is_none());
 	}
 
+	/// Verifies event async try rollback removes accepted payload and handler
+	/// effects.
 	#[test]
-	fn event_async_try_rollback_removes_accepted_payload_and_handler_effects()
-	-> FerrosGrynnResult<()> {
-		let (store, target, value) = fast_store()?;
+	fn event_async_try_rollback_removes_accepted_payload_and_handler_effects() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, value) = fast_store().assert_ok();
 		let mut define = store.begin();
-		define.define_event(
-			EventDefinition::new(
-				"queued",
-				target,
-				"true",
-				"{ CREATE audit:queued CONTENT { value: $after.value }; }",
-			)?
-			.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
-		)?;
-		define.define_event(EventDefinition::new(
-			"rejected",
-			target,
-			"$after.value = 2",
-			"{ CREATE audit:partial; THROW 'blocked'; }",
-		)?)?;
-		define.commit()?;
+		define
+			.define_event(
+				EventDefinition::new(
+					"queued",
+					target,
+					"true",
+					"{ CREATE audit:queued CONTENT { value: $after.value }; }",
+				)
+				.assert_ok()
+				.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
+			)
+			.assert_ok();
+		define
+			.define_event(
+				EventDefinition::new(
+					"rejected",
+					target,
+					"$after.value = 2",
+					"{ CREATE audit:partial; THROW 'blocked'; }",
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
+		define.commit().assert_ok();
 		let mut source = store.begin();
-		for result in source.execute(
-			"TRY { CREATE item:bad CONTENT { value: 2 }; } CATCH |$e| { $e.message; }; CREATE \
-			 item:good CONTENT { value: 3 };",
-			&Object::new(),
-		)? {
-			let _value = result.result?;
+		for result in source
+			.execute(
+				"TRY { CREATE item:bad CONTENT { value: 2 }; } CATCH |$e| { $e.message; }; CREATE \
+				 item:good CONTENT { value: 3 };",
+				&Object::new(),
+			)
+			.assert_ok()
+		{
+			let _value = result.result.assert_ok();
 		}
-		source.commit()?;
-		assert_eq!(wait_jobs(&store, 1)?[0].state(), MaintenanceJobState::Completed);
-		assert!(store.begin().atom(&"item:bad".parse()?)?.is_none());
-		assert!(store.begin().atom(&"audit:partial".parse()?)?.is_none());
+		source.commit().assert_ok();
+		assert_eq!(wait_jobs(&store, 1).assert_ok()[0].state(), MaintenanceJobState::Completed);
+		assert!(store.begin().atom(&"item:bad".parse().assert_ok()).assert_ok().is_none());
+		assert!(store.begin().atom(&"audit:partial".parse().assert_ok()).assert_ok().is_none());
 		assert_eq!(
 			store
 				.begin()
-				.atom(&"audit:queued".parse()?)?
+				.atom(&"audit:queued".parse().assert_ok())
+				.assert_ok()
 				.and_then(|atom| atom.properties().get(value).cloned()),
 			Some(Value::from(3))
 		);
-		Ok(())
 	}
 
+	/// Verifies event async graph delete accepts before metadata and fails on
+	/// current schema.
 	#[test]
-	fn event_async_graph_delete_accepts_before_metadata_and_fails_on_current_schema()
-	-> FerrosGrynnResult<()> {
-		let (store, _target, _value) = fast_store()?;
+	fn event_async_graph_delete_accepts_before_metadata_and_fails_on_current_schema() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _target, _value) = fast_store().assert_ok();
 		let mut seed = store.begin();
-		let graph = seed.define_graph("scope", crate::graph::GraphKind::Graph)?;
-		let record = "item:a".parse()?;
-		seed.create_atom(record, PropertyMap::new())?;
-		seed.attach_node(graph.id(), &"item:a".parse()?, None, None)?;
+		let graph = seed.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
+		let record = "item:a".parse().assert_ok();
+		seed.create_atom(record, PropertyMap::new()).assert_ok();
+		seed.attach_node(graph.id(), &"item:a".parse().assert_ok(), None, None).assert_ok();
 		seed.define_event(
 			EventDefinition::new(
 				"deleted",
 				EventTarget::Graph(graph.id()),
 				"$event = 'DELETE'",
 				"{ SELECT * FROM GRAPH scope; }",
-			)?
+			)
+			.assert_ok()
 			.with_execution(super::super::EventExecution::Async(EventAsyncOptions::default())),
-		)?;
-		seed.commit()?;
+		)
+		.assert_ok();
+		seed.commit().assert_ok();
 		let mut remove = store.begin();
-		remove.remove_graph("scope")?;
-		remove.commit()?;
-		let jobs = wait_jobs(&store, 1)?;
+		remove.remove_graph("scope").assert_ok();
+		remove.commit().assert_ok();
+		let jobs = wait_jobs(&store, 1).assert_ok();
 		assert_eq!(jobs[0].state(), MaintenanceJobState::Failed);
 		assert!(jobs[0].diagnostic().is_some_and(|message| message.contains("scope")));
 		assert!(store.inner.current_root().schema.named_graph("scope").is_none());
-		assert!(store.begin().atom(&"item:a".parse()?)?.is_some());
-		Ok(())
+		assert!(store.begin().atom(&"item:a".parse().assert_ok()).assert_ok().is_some());
 	}
 
+	/// Verifies event async pending count and byte limits reject source
+	/// atomically.
 	#[test]
-	fn event_async_pending_count_and_byte_limits_reject_source_atomically() -> FerrosGrynnResult<()>
-	{
+	fn event_async_pending_count_and_byte_limits_reject_source_atomically() {
+		use crate::test_assertions::AssertResult as _;
+
 		for count_limit in [true, false] {
-			let (store, target, _value) = fast_store()?;
+			let (store, target, _value) = fast_store().assert_ok();
 			let mut define = store.begin();
-			let id = define.define_event(
-				EventDefinition::new("capacity", target, "true", "1")?.with_execution(
-					super::super::EventExecution::Async(EventAsyncOptions::default()),
-				),
-			)?;
-			define.commit()?;
+			let id = define
+				.define_event(
+					EventDefinition::new("capacity", target, "true", "1")
+						.assert_ok()
+						.with_execution(super::super::EventExecution::Async(
+							EventAsyncOptions::default(),
+						)),
+				)
+				.assert_ok();
+			define.commit().assert_ok();
 			let event = store
 				.begin()
-				.event(id)?
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture definition absent"))?;
+				.event(id)
+				.assert_ok()
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture definition absent"))
+				.assert_ok();
 			let mut arguments =
 				[Value::from("CREATE"), Value::Null, Value::Null, Value::Null, Value::Null];
 			let fixed = crate::storage::event_outbox::encode_payload(
@@ -754,7 +856,8 @@ mod tests {
 				&arguments,
 				&[],
 				64 * 1024 * 1024,
-			)?
+			)
+			.assert_ok()
 			.len();
 			if !count_limit {
 				arguments[3] =
@@ -765,7 +868,8 @@ mod tests {
 				&arguments,
 				&[],
 				128 * 1024 * 1024,
-			)?
+			)
+			.assert_ok()
 			.into();
 			let mut root = store.inner.current_root().as_ref().clone();
 			let count = if count_limit {
@@ -778,12 +882,15 @@ mod tests {
 			for _ in 0..count {
 				let invocation = EventInvocation::queued(
 					&event,
-					EventCause::next(None, event.execution())?,
+					EventCause::next(None, event.execution()).assert_ok(),
 					Arc::clone(&payload),
 					due,
-				)?;
+				)
+				.assert_ok();
 				let id = invocation.id;
-				Arc::make_mut(root.event_outbox_mut()).enqueue(Arc::new(invocation), stamp)?;
+				Arc::make_mut(root.event_outbox_mut())
+					.enqueue(Arc::new(invocation), stamp)
+					.assert_ok();
 				root.mark_version(super::super::ConflictKey::EventInvocation(id), stamp);
 			}
 			if count_limit {
@@ -793,9 +900,9 @@ mod tests {
 			}
 			*store.inner.current.write() = Arc::new(root);
 			let mut source = store.begin();
-			let record = "item:rejected".parse()?;
+			let record = "item:rejected".parse().assert_ok();
 			assert!(source.create_atom(record, PropertyMap::new()).is_err());
-			assert!(source.atom(&"item:rejected".parse()?)?.is_none());
+			assert!(source.atom(&"item:rejected".parse().assert_ok()).assert_ok().is_none());
 			assert_eq!(store.inner.current_root().event_outbox().pending_count, count);
 			let imported = store.import(
 				super::super::ImportOptions {
@@ -810,27 +917,39 @@ mod tests {
 				},
 			);
 			assert!(imported.is_err());
-			assert!(store.begin().atom(&"item:import_rejected".parse()?)?.is_none());
+			assert!(
+				store
+					.begin()
+					.atom(&"item:import_rejected".parse().assert_ok())
+					.assert_ok()
+					.is_none()
+			);
 			assert_eq!(store.inner.current_root().event_outbox().pending_count, count);
 		}
-		Ok(())
 	}
 
+	/// Verifies event async gql info and kill use authoritative job projection.
 	#[test]
-	fn event_async_gql_info_and_kill_use_authoritative_job_projection() -> FerrosGrynnResult<()> {
-		let (mut store, target, _value) = fast_store()?;
+	fn event_async_gql_info_and_kill_use_authoritative_job_projection() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (mut store, target, _value) = fast_store().assert_ok();
 		Arc::get_mut(&mut store.inner)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture owner shared"))?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture owner shared"))
+			.assert_ok()
 			.event_processing_interval = Duration::from_secs(5);
 		let mut define = store.begin();
 		define
-			.define_event(EventDefinition::new("pending", target, "true", "1")?.with_execution(
-				super::super::EventExecution::Async(EventAsyncOptions::default()),
-			))?;
-		define.commit()?;
+			.define_event(
+				EventDefinition::new("pending", target, "true", "1").assert_ok().with_execution(
+					super::super::EventExecution::Async(EventAsyncOptions::default()),
+				),
+			)
+			.assert_ok();
+		define.commit().assert_ok();
 		let mut source = store.begin();
-		source.create_atom("item:a".parse()?, PropertyMap::new())?;
-		source.commit()?;
+		source.create_atom("item:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		source.commit().assert_ok();
 		let id = *store
 			.inner
 			.current_root()
@@ -838,7 +957,8 @@ mod tests {
 			.invocations
 			.keys()
 			.next()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture invocation absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture invocation absent"))
+			.assert_ok();
 		let input = Object::from_iter([("job", Value::from(id.as_uuid()))]);
 		for (query, state) in [
 			("INFO FOR JOB $job;", "queued"),
@@ -846,21 +966,24 @@ mod tests {
 			("INFO FOR JOB $job;", "cancelled"),
 		] {
 			let value = store
-				.execute(query, &input)?
+				.execute(query, &input)
+				.assert_ok()
 				.pop()
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("job result absent"))?
-				.result?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("job result absent"))
+				.assert_ok()
+				.result
+				.assert_ok()
 				.into_parts()
 				.0;
-			let object = value.as_object().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("job projection not an object")
-			})?;
+			let object = value
+				.as_object()
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("job projection not an object"))
+				.assert_ok();
 			assert_eq!(object.get("kind").and_then(Value::as_str), Some("event_invocation"));
 			assert_eq!(object.get("state").and_then(Value::as_str), Some(state));
 			assert_eq!(object.get("attempts"), Some(&Value::from(0)));
 			assert_eq!(object.get("depth"), Some(&Value::from(0)));
 		}
-		assert!(store.begin().atom(&"item:a".parse()?)?.is_some());
-		Ok(())
+		assert!(store.begin().atom(&"item:a".parse().assert_ok()).assert_ok().is_some());
 	}
 }

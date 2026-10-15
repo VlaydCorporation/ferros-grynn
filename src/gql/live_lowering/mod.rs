@@ -212,9 +212,15 @@ struct Lowering<'root, 'query> {
 /// recipes.
 enum SourceGraph<'query> {
 	/// One admitted current reference, shared by graph-wide class scans.
-	Reference(crate::graph::GraphRef),
+	Reference(
+		/// One admitted current reference, shared by graph-wide class scans.
+		crate::graph::GraphRef,
+	),
 	/// Lowered through the same compiler as WHERE and projection.
-	Expression(&'query LiveExpr),
+	Expression(
+		/// Lowered through the same compiler as WHERE and projection.
+		&'query LiveExpr,
+	),
 }
 
 impl<'query> Lowering<'_, 'query> {

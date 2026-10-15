@@ -1,9 +1,13 @@
+#![cfg(test)]
 #![cfg(windows)]
 #![allow(
 	clippy::expect_used,
 	clippy::unwrap_used,
 	reason = "the ignored profiling probe must stop on an invalid harness configuration"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::{
 	error::Error,
@@ -35,9 +39,14 @@ use ferros_grynn::{
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-struct TestDirectory(PathBuf);
+/// Temporary directory owner used to keep test files alive for their scenario.
+struct TestDirectory(
+	/// Path retained for the lifetime of the temporary directory owner.
+	PathBuf,
+);
 
 impl TestDirectory {
+	/// Constructs `TestDirectory` from the supplied initial state.
 	fn new() -> Self {
 		let nonce = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
 			.unwrap_or(u64::MAX);
@@ -46,16 +55,20 @@ impl TestDirectory {
 }
 
 impl Drop for TestDirectory {
+	/// Runs cleanup for this `TestDirectory` before its fields are released.
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Verifies stage10 atomic import profile.
 #[test]
 #[ignore = "storage-heavy Stage-10 profiling probe"]
-fn stage10_atomic_import_profile() -> Result<(), Box<dyn Error>> {
-	let items = environment_usize("FG_IMPORT_PROFILE_ITEMS", 20_000)?;
-	let segment_size = environment_usize("FG_IMPORT_PROFILE_SEGMENT_SIZE", 4_096)?;
+fn stage10_atomic_import_profile() {
+	use crate::test_assertions::AssertResult as _;
+
+	let items = environment_usize("FG_IMPORT_PROFILE_ITEMS", 20_000).assert_ok();
+	let segment_size = environment_usize("FG_IMPORT_PROFILE_SEGMENT_SIZE", 4_096).assert_ok();
 	let (mode_name, mode) = match std::env::var("FG_IMPORT_PROFILE_MODE")
 		.unwrap_or_else(|_| "deferred".to_owned())
 		.to_ascii_lowercase()
@@ -63,7 +76,13 @@ fn stage10_atomic_import_profile() -> Result<(), Box<dyn Error>> {
 	{
 		"deferred" => ("deferred", ImportIndexMode::Deferred),
 		"maintained" => ("maintained", ImportIndexMode::Maintained),
-		value => return Err(format!("unsupported FG_IMPORT_PROFILE_MODE '{value}'").into()),
+		value => {
+			return {
+				let test_result: Result<(), Box<dyn Error>> =
+					Err(format!("unsupported FG_IMPORT_PROFILE_MODE '{value}'").into());
+				test_result.assert_ok();
+			};
+		}
 	};
 	let backend = std::env::var("FG_IMPORT_PROFILE_BACKEND")
 		.unwrap_or_else(|_| "local".to_owned())
@@ -73,12 +92,18 @@ fn stage10_atomic_import_profile() -> Result<(), Box<dyn Error>> {
 		"local" => {
 			let mut options = LocalOptions::default();
 			options.buffer_pool_pages = 64;
-			Datastore::create_local(&directory.0, options)?
+			Datastore::create_local(&directory.0, options).assert_ok()
 		}
 		"memory" => Datastore::in_memory(),
-		value => return Err(format!("unsupported FG_IMPORT_PROFILE_BACKEND '{value}'").into()),
+		value => {
+			return {
+				let test_result: Result<(), Box<dyn Error>> =
+					Err(format!("unsupported FG_IMPORT_PROFILE_BACKEND '{value}'").into());
+				test_result.assert_ok();
+			};
+		}
 	};
-	let (group_key, email_key) = define_profile_schema(&store)?;
+	let (group_key, email_key) = define_profile_schema(&store).assert_ok();
 	let wal_before = directory_bytes(&directory.0.join("wal"));
 	let rss_before = process_rss();
 	let running = Arc::new(AtomicBool::new(true));
@@ -111,8 +136,8 @@ fn stage10_atomic_import_profile() -> Result<(), Box<dyn Error>> {
 	});
 	let elapsed = started.elapsed();
 	running.store(false, Ordering::Release);
-	let rss_peak = sampler.join().expect("RSS sampler must not panic");
-	let report = result?;
+	let rss_peak = sampler.join().assert_ok_with("RSS sampler must not panic");
+	let report = result.assert_ok();
 	let wal_bytes = directory_bytes(&directory.0.join("wal")).saturating_sub(wal_before);
 	let database_bytes = directory_bytes(&directory.0);
 	let index_timing_ns = report.index_timings().values().map(Duration::as_nanos).sum::<u128>();
@@ -123,7 +148,7 @@ fn stage10_atomic_import_profile() -> Result<(), Box<dyn Error>> {
 		.checked_div(elapsed_ns.max(1))
 		.unwrap_or(0);
 	let rss_delta = rss_peak.saturating_sub(rss_before);
-	let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+	let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).assert_ok().as_millis();
 	let row = format!(
 		concat!("{},{},{},{},{},{},", "{},{},{},{},{},{},", "{},{},{},{},{}"),
 		timestamp_ms,
@@ -144,12 +169,12 @@ fn stage10_atomic_import_profile() -> Result<(), Box<dyn Error>> {
 		report.built_indexes().len(),
 		index_timing_ns,
 	);
-	write_csv(&row)?;
+	write_csv(&row).assert_ok();
 	println!("FG_IMPORT_STAGE10,{row}");
 	std::hint::black_box(store);
-	Ok(())
 }
 
+/// Returns define profile schema for this module.
 fn define_profile_schema(
 	store: &Datastore,
 ) -> Result<
@@ -182,6 +207,7 @@ fn define_profile_schema(
 	))
 }
 
+/// Returns spawn rss sampler for this module.
 fn spawn_rss_sampler(running: Arc<AtomicBool>, initial: u64) -> thread::JoinHandle<u64> {
 	thread::spawn(move || {
 		let pid = Pid::from(usize::try_from(std::process::id()).unwrap());
@@ -202,6 +228,7 @@ fn spawn_rss_sampler(running: Arc<AtomicBool>, initial: u64) -> thread::JoinHand
 	})
 }
 
+/// Returns process rss for this module.
 fn process_rss() -> u64 {
 	let pid = Pid::from(usize::try_from(std::process::id()).unwrap());
 	let mut system = System::new();
@@ -213,6 +240,7 @@ fn process_rss() -> u64 {
 	system.process(pid).map_or(0, sysinfo::Process::memory)
 }
 
+/// Returns environment usize for this module.
 fn environment_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
 	match std::env::var(name) {
 		Ok(value) => {
@@ -223,6 +251,7 @@ fn environment_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>
 	}
 }
 
+/// Writes csv for this module.
 fn write_csv(row: &str) -> Result<(), Box<dyn Error>> {
 	let path = std::env::var_os("FG_IMPORT_PROFILE_OUTPUT")
 		.map(PathBuf::from)
@@ -247,6 +276,7 @@ fn write_csv(row: &str) -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Returns directory bytes for this module.
 fn directory_bytes(root: &Path) -> u64 {
 	let mut total = 0_u64;
 	let mut directories = vec![root.to_path_buf()];
@@ -266,6 +296,7 @@ fn directory_bytes(root: &Path) -> u64 {
 	total
 }
 
+/// Returns profile error for this module.
 fn profile_error(message: &str) -> ferros_grynn::gql_status::FerrosGrynnError {
 	ferros_grynn::gql_status::FerrosGrynnError::invalid_argument(message)
 }

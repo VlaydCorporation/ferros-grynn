@@ -65,7 +65,10 @@ fn compact_target() -> u64 {
 /// Restores the per-thread compaction target after a real local publication
 /// test.
 #[cfg(test)]
-pub(super) struct CompactionTargetGuard(u64);
+pub(super) struct CompactionTargetGuard(
+	/// Previous thread-local outbox compaction threshold restored on drop.
+	u64,
+);
 
 #[cfg(test)]
 impl CompactionTargetGuard {
@@ -78,6 +81,8 @@ impl CompactionTargetGuard {
 
 #[cfg(test)]
 impl Drop for CompactionTargetGuard {
+	/// Runs cleanup for this `CompactionTargetGuard` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		TEST_COMPACT_TARGET.with(|current| current.set(self.0));
 	}
@@ -85,7 +90,7 @@ impl Drop for CompactionTargetGuard {
 
 impl LocalStore {
 	/// Installs the already allocated descriptor binding after the WAL barrier.
-	pub(crate) fn event_outbox_segments(&self) -> Arc<Vec<HistorySegment>> {
+	pub(crate) fn event_outbox_segments(&self) -> Arc<[HistorySegment]> {
 		Arc::clone(&self.state.lock().event_outbox_segments)
 	}
 }
@@ -293,7 +298,7 @@ pub(super) fn recover(
 	}
 	root.mark_version(ConflictKey::EventOutboxRange, root.commit_ts);
 	*root.event_outbox_mut() = Arc::new(candidate);
-	root.set_event_outbox_segments(Arc::new(catalog.event_outbox_segments.clone()));
+	root.set_event_outbox_segments(Arc::from(catalog.event_outbox_segments.as_slice()));
 	Ok(())
 }
 

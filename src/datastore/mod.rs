@@ -142,6 +142,7 @@ pub(crate) use occurrence::{
 	GraphOccurrence,
 	GraphRoot,
 	OccurrenceState,
+	OccurrenceStateRef,
 	OverlayValue,
 	PropertyOverlay,
 };
@@ -160,7 +161,6 @@ pub use options::{
 };
 pub(crate) use root::{DatabaseRoot, InvariantViolationReport};
 pub use runtime_status::LocalStorageStatus;
-pub(crate) use schema::ClassIndexOptions;
 pub use schema::{
 	AnalyzerFilter,
 	AnalyzerId,
@@ -206,6 +206,7 @@ pub use schema::{
 	TensorCacheFormat,
 	VectorDistance,
 };
+pub(crate) use schema::{ClassIndexOptions, FieldUpdate};
 pub use session::GqlSession;
 pub(crate) use session::validate_control_structure;
 pub use store::Datastore;

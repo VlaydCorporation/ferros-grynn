@@ -9,7 +9,7 @@ use crate::{
 		GraphIndexCost,
 		GraphIndexDefinition,
 		GraphRoot,
-		OccurrenceState,
+		OccurrenceStateRef,
 		PathIndexAlgorithm,
 		graph_index_relation::build_graph_index_relation,
 	},
@@ -195,7 +195,7 @@ impl LandmarkPathArtifact {
 		let header = layout.header;
 		let descriptor = index.descriptor_with_limit(scratch_bytes)?;
 		let (cost_kind, function, function_version) = cost_metadata(cost);
-		let has_cross_level = graph.occurrences().filter(|occurrence| index.edge_labels().len() == 0 || index.edge_labels().any(|label| occurrence.label() == Some(label))).any(|occurrence| matches!(occurrence.state(), OccurrenceState::Edge { topology, .. } if topology.endpoints().any(|endpoint| endpoint.is_cross_level())));
+		let has_cross_level = graph.occurrences().filter(|occurrence| index.edge_labels().len() == 0 || index.edge_labels().any(|label| occurrence.label() == Some(label))).any(|occurrence| matches!(occurrence.state().view(), OccurrenceStateRef::Edge { topology, .. } if topology.endpoints().any(|endpoint| endpoint.is_cross_level())));
 		if header.identity.index != index.id().map_or(0, |id| id.get())
 			|| header.identity.version != index.version().get()
 			|| header.identity.graph != graph.reference().id().get()
@@ -425,11 +425,11 @@ where
 		{
 			continue;
 		}
-		let OccurrenceState::Edge {
+		let OccurrenceStateRef::Edge {
 			topology,
 			weight,
 			..
-		} = occurrence.state()
+		} = occurrence.state().view()
 		else {
 			continue;
 		};

@@ -1,6 +1,8 @@
 //! Exact page projection, streaming order and malformed metadata checks.
 
 use super::*;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 
 /// Checked shape with multiple pages in every applicable section.
 fn header(algorithm: NeighbourhoodTag) -> NeighbourhoodHeader {
@@ -45,26 +47,29 @@ fn header(algorithm: NeighbourhoodTag) -> NeighbourhoodHeader {
 }
 
 /// Encodes reproducible bytes independently of graph algorithms.
-fn element(kind: SectionKind, ordinal: u64, bytes: &mut [u8]) -> FerrosGrynnResult<()> {
+fn element(kind: SectionKind, ordinal: u64, bytes: &mut [u8]) {
 	if matches!(kind, SectionKind::DefinitionDescriptor | SectionKind::NeighbourhoodRegisters) {
 		bytes[0] = (ordinal % 31) as u8;
 	} else {
 		bytes.copy_from_slice(&ordinal.to_le_bytes());
 	}
-	Ok(())
 }
 
+/// Verifies neighbourhood layout streams exact pages for all algorithms.
 #[test]
 fn neighbourhood_layout_streams_exact_pages_for_all_algorithms() {
 	for algorithm in [NeighbourhoodTag::Exact, NeighbourhoodTag::Sketch, NeighbourhoodTag::Landmark]
 	{
-		let layout = NeighbourhoodLayout::new(header(algorithm)).unwrap();
+		let layout = NeighbourhoodLayout::new(header(algorithm)).assert_ok();
 		let mut pages = Vec::with_capacity(layout.page_count as usize);
 		pages.resize_with(layout.page_count as usize, AlignedPage::zeroed);
 		let mut next = 0;
 		layout
 			.stream(
-				element,
+				|kind, ordinal, bytes| {
+					element(kind, ordinal, bytes);
+					Ok(())
+				},
 				|at, page| {
 					assert_eq!(at.get(), next);
 					next += 1;
@@ -73,7 +78,7 @@ fn neighbourhood_layout_streams_exact_pages_for_all_algorithms() {
 				},
 				&mut || Ok(()),
 			)
-			.unwrap();
+			.assert_ok();
 		assert_eq!(next, layout.page_count);
 		assert_eq!(
 			NeighbourhoodLayout::decode_header(
@@ -81,18 +86,23 @@ fn neighbourhood_layout_streams_exact_pages_for_all_algorithms() {
 				layout.header.identity,
 				layout.page_count
 			)
-			.unwrap(),
+			.assert_ok(),
 			layout
 		);
+		let read_calls = std::cell::Cell::new(0);
 		assert!(
 			layout
 				.load_sections(
 					1,
-					|_, _| panic!("scratch admission must precede reads"),
+					|_, _| {
+						read_calls.set(read_calls.get() + 1);
+						Ok(())
+					},
 					&mut || Ok(())
 				)
 				.is_err()
 		);
+		assert_eq!(read_calls.get(), 0, "scratch admission must precede reads");
 		let data = layout
 			.load_sections(
 				8 << 20,
@@ -102,7 +112,7 @@ fn neighbourhood_layout_streams_exact_pages_for_all_algorithms() {
 				},
 				&mut || Ok(()),
 			)
-			.unwrap();
+			.assert_ok();
 		assert_eq!(data[6].len() as u64, layout.header.register_bytes);
 		assert_eq!(data[7].len() as u64, layout.header.descriptor_bytes);
 		for section in layout.sections {
@@ -116,13 +126,13 @@ fn neighbourhood_layout_streams_exact_pages_for_all_algorithms() {
 					},
 					|ordinal, bytes| {
 						let mut expected = vec![0; bytes.len()];
-						element(section.kind, ordinal, &mut expected)?;
+						element(section.kind, ordinal, &mut expected);
 						assert_eq!(bytes, expected);
 						count += 1;
 						Ok(())
 					},
 				)
-				.unwrap();
+				.assert_ok();
 			assert_eq!(count, section.count);
 		}
 		let bytes = layout.page_count * 16_384;
@@ -143,11 +153,12 @@ fn neighbourhood_layout_streams_exact_pages_for_all_algorithms() {
 	}
 }
 
+/// Verifies neighbourhood header and forged sections fail before output.
 #[test]
 fn neighbourhood_header_and_forged_sections_fail_before_output() {
-	let layout = NeighbourhoodLayout::new(header(NeighbourhoodTag::Exact)).unwrap();
+	let layout = NeighbourhoodLayout::new(header(NeighbourhoodTag::Exact)).assert_ok();
 	let mut page = Box::new(AlignedPage::zeroed());
-	layout.encode_header(&mut page).unwrap();
+	layout.encode_header(&mut page).assert_ok();
 	assert_eq!(&page.as_bytes()[0..8], &[0x46, 0x49, 0x4e, 1, 0x2c, 0, 0, 0]);
 	let valid = page.as_bytes().to_vec();
 	for (at, value) in [
@@ -171,7 +182,7 @@ fn neighbourhood_header_and_forged_sections_fail_before_output() {
 	] {
 		page.as_bytes_mut().copy_from_slice(&valid);
 		page.as_bytes_mut()[at] = value;
-		page.seal().unwrap();
+		page.seal().assert_ok();
 		assert!(
 			NeighbourhoodLayout::decode_header(&page, layout.header.identity, layout.page_count)
 				.is_err(),
@@ -203,7 +214,10 @@ fn neighbourhood_header_and_forged_sections_fail_before_output() {
 	assert!(
 		layout
 			.stream(
-				element,
+				|kind, ordinal, bytes| {
+					element(kind, ordinal, bytes);
+					Ok(())
+				},
 				|_, _| {
 					writes += 1;
 					Ok(())
@@ -213,12 +227,16 @@ fn neighbourhood_header_and_forged_sections_fail_before_output() {
 			.is_err()
 	);
 	assert_eq!(writes, 0);
+	let read_calls = std::cell::Cell::new(0);
 	let mut forged = layout.clone();
 	forged.sections[0].width = 0;
 	assert!(
 		forged
 			.stream(
-				element,
+				|kind, ordinal, bytes| {
+					element(kind, ordinal, bytes);
+					Ok(())
+				},
 				|_, _| {
 					writes += 1;
 					Ok(())
@@ -232,20 +250,28 @@ fn neighbourhood_header_and_forged_sections_fail_before_output() {
 		forged.sections[0]
 			.visit(
 				layout.page_count,
-				|_, _| panic!("invalid width must fail before read"),
+				|_, _| {
+					read_calls.set(read_calls.get() + 1);
+					Ok(())
+				},
 				|_, _| Ok(())
 			)
 			.is_err()
 	);
+	assert_eq!(read_calls.get(), 0, "invalid width must fail before read");
 	let mut section = layout.sections[0];
 	section.root = PageNo::new(u64::MAX - 1);
 	assert!(
 		section
 			.visit(
 				layout.page_count,
-				|_, _| panic!("invalid extent must fail before read"),
+				|_, _| {
+					read_calls.set(read_calls.get() + 1);
+					Ok(())
+				},
 				|_, _| Ok(())
 			)
 			.is_err()
 	);
+	assert_eq!(read_calls.get(), 0, "invalid extent must fail before read");
 }

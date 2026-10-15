@@ -15,7 +15,7 @@ use crate::{
 		GraphRoot,
 		GraphSchema,
 		IndexId,
-		OccurrenceState,
+		OccurrenceStateRef,
 		OverlayValue,
 		index_context,
 	},
@@ -34,13 +34,20 @@ use crate::{
 
 /// One owned atom row passed from datastore cursors to query execution.
 #[derive(Clone)]
-pub(crate) struct QueryStorageRow {
+pub struct QueryStorageRow {
+	/// Stable record identifier of the associated atom.
 	pub(crate) record_id: RecordId,
+	/// Kind associated with this query storage row.
 	pub(crate) kind: AtomKind,
+	/// Local id associated with this query storage row.
 	pub(crate) local_id: Option<AtomId>,
+	/// Label associated with this query storage row.
 	pub(crate) label: Option<Text>,
+	/// Values associated with this query storage row.
 	pub(crate) values: Vec<Value>,
+	/// Base properties associated with this query storage row.
 	pub(crate) base_properties: PropertyMap,
+	/// Properties associated with this query storage row.
 	pub(crate) properties: PropertyMap,
 }
 
@@ -124,40 +131,51 @@ impl QueryStorageRow {
 
 /// One query term retained from a validated immutable Fulltext side-file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct QueryFulltextTermRead {
+pub struct QueryFulltextTermRead {
+	/// Document frequency associated with this query fulltext term read.
 	pub(crate) document_frequency: u64,
+	/// Term frequency associated with this query fulltext term read.
 	pub(crate) term_frequency: u32,
+	/// Spans associated with this query fulltext term read.
 	pub(crate) spans: Vec<(u32, u32)>,
 }
 
 /// One matching document projected out of storage-owned index addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct QueryFulltextDocumentRead {
+pub struct QueryFulltextDocumentRead {
+	/// Stable record identifier of the associated atom.
 	pub(crate) record_id: RecordId,
+	/// Document length associated with this query fulltext document read.
 	pub(crate) document_length: u32,
+	/// Terms associated with this query fulltext document read.
 	pub(crate) terms: BTreeMap<Box<str>, QueryFulltextTermRead>,
 }
 
 /// Snapshot-exact Fulltext statistics and matching public identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct QueryFulltextIndexRead {
+pub struct QueryFulltextIndexRead {
+	/// Document count associated with this query fulltext index read.
 	pub(crate) document_count: u64,
+	/// Total document length associated with this query fulltext index read.
 	pub(crate) total_document_length: u64,
+	/// Documents associated with this query fulltext index read.
 	pub(crate) documents: Vec<QueryFulltextDocumentRead>,
 }
 
 /// One public row identity returned by a physical ANN generation after exact
 /// reranking of its full canonical vector.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct QueryVectorIndexRead {
+pub struct QueryVectorIndexRead {
+	/// Stable record identifier of the associated atom.
 	pub(crate) record_id: RecordId,
+	/// Distance associated with this query vector index read.
 	pub(crate) distance: f64,
 }
 
 /// Spatial candidates expressed only through public identities and work
 /// counters.
 #[derive(Default)]
-pub(crate) struct QueryGeometryIndexRead {
+pub struct QueryGeometryIndexRead {
 	/// Snapshot-stable row identities requiring exact refinement.
 	pub(crate) records: Vec<RecordId>,
 	/// Tree node pages visited by the lookup.
@@ -258,24 +276,43 @@ pub struct QueryNeighbourhoodEstimate {
 	pub(crate) work: u64,
 }
 
+/// Query cursor source alternatives.
 enum QueryCursorSource<'snapshot> {
+	/// Empty case of query cursor source.
 	Empty,
-	Base(btree_set::Iter<'snapshot, GlobalAtomId>),
-	BaseOwned(std::vec::IntoIter<GlobalAtomId>),
+	/// Base case of query cursor source.
+	Base(
+		/// Base case of query cursor source.
+		btree_set::Iter<'snapshot, GlobalAtomId>,
+	),
+	/// Base owned case of query cursor source.
+	BaseOwned(
+		/// Base owned case of query cursor source.
+		std::vec::IntoIter<GlobalAtomId>,
+	),
+	/// Graph case of query cursor source.
 	Graph {
+		/// Graph associated with this query cursor source.
 		graph: GraphId,
+		/// Ids associated with this query cursor source.
 		ids: btree_set::Iter<'snapshot, AtomId>,
 	},
+	/// Graph owned case of query cursor source.
 	GraphOwned {
+		/// Graph associated with this query cursor source.
 		graph: GraphId,
+		/// Ids associated with this query cursor source.
 		ids: std::vec::IntoIter<AtomId>,
 	},
 }
 
 /// Snapshot-bound cursor over database-global atoms of one class.
-pub(crate) struct QueryStorageCursor<'snapshot> {
+pub struct QueryStorageCursor<'snapshot> {
+	/// Root associated with this query storage cursor.
 	root: &'snapshot DatabaseRoot,
+	/// Class associated with this query storage cursor.
 	class: Arc<ClassSchema>,
+	/// Source associated with this query storage cursor.
 	source: QueryCursorSource<'snapshot>,
 }
 
@@ -414,7 +451,7 @@ impl<'snapshot> QueryStorageCursor<'snapshot> {
 						"graph class index references an absent occurrence",
 					)
 				})?;
-				row_from_occurrence(&self.root, occurrence, &self.class)?
+				row_from_occurrence(self.root, occurrence, &self.class)?
 			}
 			QueryCursorSource::GraphOwned {
 				graph,
@@ -433,7 +470,7 @@ impl<'snapshot> QueryStorageCursor<'snapshot> {
 						"scalar index references an absent occurrence",
 					)
 				})?;
-				row_from_occurrence(&self.root, occurrence, &self.class)?
+				row_from_occurrence(self.root, occurrence, &self.class)?
 			}
 		};
 		Ok(Some(row))
@@ -442,86 +479,121 @@ impl<'snapshot> QueryStorageCursor<'snapshot> {
 
 /// Scalar comparison available to a class-index probe.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ScalarComparison {
+pub enum ScalarComparison {
+	/// Equal case of scalar comparison.
 	Equal,
+	/// Less case of scalar comparison.
 	Less,
+	/// Less or equal case of scalar comparison.
 	LessOrEqual,
+	/// Greater case of scalar comparison.
 	Greater,
+	/// Greater or equal case of scalar comparison.
 	GreaterOrEqual,
 }
 
 /// One scalar predicate that may be answered by a class index.
 #[derive(Debug, Clone)]
-pub(crate) struct ScalarIndexConstraint {
+pub struct ScalarIndexConstraint {
+	/// Column associated with this scalar index constraint.
 	pub(crate) column: usize,
+	/// Comparison associated with this scalar index constraint.
 	pub(crate) comparison: ScalarComparison,
+	/// Values associated with this scalar index constraint.
 	pub(crate) values: Vec<Value>,
 }
 
 /// Bounded ordered-index window used by LIMIT and keyset continuation.
 #[derive(Debug, Clone)]
-pub(crate) struct ScalarIndexWindow {
+pub struct ScalarIndexWindow {
+	/// After associated with this scalar index window.
 	pub(crate) after: Option<(Vec<Value>, RecordId)>,
+	/// Maximum associated with this scalar index window.
 	pub(crate) maximum: usize,
 }
 
 /// Immutable root captured for one query program.
 #[derive(Clone)]
-pub(crate) struct QuerySnapshot {
+pub struct QuerySnapshot {
+	/// Root associated with this query snapshot.
 	pub(super) root: Arc<DatabaseRoot>,
+	/// Physical associated with this query snapshot.
 	pub(super) physical: Option<LocalQuerySnapshot>,
 }
 
 /// Independently stored statistics parts required by one planner snapshot.
 #[derive(Debug, Default)]
-pub(crate) struct QueryStatisticsDemand {
+pub struct QueryStatisticsDemand {
+	/// Base classes associated with this query statistics demand.
 	pub(crate) base_classes: bool,
+	/// Base properties associated with this query statistics demand.
 	pub(crate) base_properties: bool,
+	/// Graph classes associated with this query statistics demand.
 	pub(crate) graph_classes: BTreeSet<GraphId>,
+	/// Graph labels associated with this query statistics demand.
 	pub(crate) graph_labels: BTreeSet<GraphId>,
+	/// Graph degrees associated with this query statistics demand.
 	pub(crate) graph_degrees: BTreeSet<GraphId>,
+	/// Graph properties associated with this query statistics demand.
 	pub(crate) graph_properties: BTreeSet<GraphId>,
 }
 
 /// One graph-local incidence returned by the datastore physical cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QueryPhysicalTraversalCandidate {
+pub struct QueryPhysicalTraversalCandidate {
+	/// Target associated with this query physical traversal candidate.
 	pub(crate) target: AtomId,
+	/// Edge associated with this query physical traversal candidate.
 	pub(crate) edge: AtomId,
+	/// Direction associated with this query physical traversal candidate.
 	pub(crate) direction: crate::graph::PathDirection,
+	/// Role associated with this query physical traversal candidate.
 	pub(crate) role: crate::graph::EndpointRole,
+	/// Topology associated with this query physical traversal candidate.
 	pub(crate) topology: crate::graph::EdgeDirection,
 }
 
 /// Transport accounting retained without exposing pages or file identities.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct QueryPhysicalTraversalStats {
+pub struct QueryPhysicalTraversalStats {
+	/// Resident pages associated with this query physical traversal stats.
 	pub(crate) resident_pages: u64,
+	/// Wal pages associated with this query physical traversal stats.
 	pub(crate) wal_pages: u64,
+	/// Sync home pages associated with this query physical traversal stats.
 	pub(crate) sync_home_pages: u64,
+	/// Ioring home pages associated with this query physical traversal stats.
 	pub(crate) ioring_home_pages: u64,
 }
 
 /// Complete owned result of one bounded physical frontier expansion.
-pub(crate) struct QueryPhysicalTraversalRead {
+pub struct QueryPhysicalTraversalRead {
+	/// Candidates associated with this query physical traversal read.
 	pub(crate) candidates: Vec<QueryPhysicalTraversalCandidate>,
+	/// Stats associated with this query physical traversal read.
 	pub(crate) stats: QueryPhysicalTraversalStats,
 }
 
 /// One exact physical nested-graph lookup with transport accounting.
-pub(crate) struct QueryPhysicalInnerGraphRead {
+pub struct QueryPhysicalInnerGraphRead {
+	/// Graph associated with this query physical inner graph read.
 	pub(crate) graph: Option<GraphId>,
+	/// Stats associated with this query physical inner graph read.
 	pub(crate) stats: QueryPhysicalTraversalStats,
 }
 
 /// Snapshot-exact public atom fields decoded from local physical pages.
-pub(crate) struct QueryPhysicalFieldsRead {
+pub struct QueryPhysicalFieldsRead {
+	/// Stable record identifier of the associated atom.
 	pub(crate) record_id: RecordId,
+	/// Properties associated with this query physical fields read.
 	pub(crate) properties: PropertyMap,
+	/// Stats associated with this query physical fields read.
 	pub(crate) stats: QueryPhysicalTraversalStats,
 }
 
 impl QuerySnapshot {
+	/// Commits ts.
 	pub(crate) fn commit_ts(&self) -> u64 {
 		self.root.commit_ts
 	}
@@ -870,12 +942,12 @@ impl Transaction {
 		};
 		let relation = ProjectedRelation::build(
 			graph.occurrences().map(GraphOccurrence::local_id),
-			graph.occurrences().filter_map(|occurrence| match occurrence.state() {
-				OccurrenceState::Edge {
+			graph.occurrences().filter_map(|occurrence| match occurrence.state().view() {
+				OccurrenceStateRef::Edge {
 					topology,
 					..
 				} => Some((occurrence.local_id(), topology)),
-				OccurrenceState::Node {
+				OccurrenceStateRef::Node {
 					..
 				} => None,
 			}),
@@ -933,14 +1005,17 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the query scratch root result.
 	pub(crate) fn query_scratch_root(&self) -> std::path::PathBuf {
 		self.store.inner.query_scratch_root()
 	}
 
+	/// Returns the query property dictionary result.
 	pub(crate) fn query_property_dictionary(&self) -> Arc<PropertyDictionary> {
 		self.working.dictionary.clone()
 	}
 
+	/// Returns the query snapshot result.
 	pub(crate) fn query_snapshot(&mut self) -> FerrosGrynnResult<QuerySnapshot> {
 		self.query_snapshot_admitted(false, |_bytes| Ok(()))
 	}
@@ -990,6 +1065,7 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the query class result.
 	pub(crate) fn query_class(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -999,6 +1075,7 @@ impl Transaction {
 		snapshot.root.schema.class(name).ok_or_else(|| FerrosGrynnError::class_does_not_exist(name))
 	}
 
+	/// Returns the query named graph result.
 	pub(crate) fn query_named_graph(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1013,6 +1090,7 @@ impl Transaction {
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))
 	}
 
+	/// Returns the query named graph schema result.
 	pub(crate) fn query_named_graph_schema(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1026,6 +1104,7 @@ impl Transaction {
 		Ok(schema.map(|schema| schema.as_ref().clone()))
 	}
 
+	/// Returns the query schema graphs result.
 	pub(crate) fn query_schema_graphs(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1035,6 +1114,7 @@ impl Transaction {
 		Ok(snapshot.root.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
 	}
 
+	/// Returns the query schema all graphs result.
 	pub(crate) fn query_schema_all_graphs(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1044,6 +1124,7 @@ impl Transaction {
 		Ok(snapshot.root.schema.all_graphs().map(|graph| graph.as_ref().clone()).collect())
 	}
 
+	/// Returns the query schema classes result.
 	pub(crate) fn query_schema_classes(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1071,6 +1152,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Returns the query schema functions result.
 	pub(crate) fn query_schema_functions(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1090,6 +1172,7 @@ impl Transaction {
 			.collect())
 	}
 
+	/// Returns the query schema function result.
 	pub(crate) fn query_schema_function(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1100,6 +1183,7 @@ impl Transaction {
 		Ok(snapshot.root.schema.functions.get(&id).cloned())
 	}
 
+	/// Returns the query schema analyzer result.
 	pub(crate) fn query_schema_analyzer(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1114,6 +1198,7 @@ impl Transaction {
 		Ok(analyzer)
 	}
 
+	/// Returns the query schema analyzer by id result.
 	pub(crate) fn query_schema_analyzer_by_id(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1513,7 +1598,7 @@ impl Transaction {
 		}
 		match scope {
 			crate::datastore::IndexScope::Base => {
-				self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id))
+				self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
 			}
 			crate::datastore::IndexScope::Effective {
 				graph,
@@ -1719,6 +1804,7 @@ impl Transaction {
 		Ok(Some(output))
 	}
 
+	/// Returns the query row cursor result.
 	pub(crate) fn query_row_cursor<'snapshot>(
 		&self,
 		snapshot: &'snapshot QuerySnapshot,
@@ -1910,7 +1996,7 @@ impl Transaction {
 				read_physical_index_groups(
 					&physical,
 					Bound::Included(key.clone()),
-					Bound::Included(key.clone()),
+					Bound::Included(key),
 					false,
 					None,
 					|atom| {
@@ -1947,7 +2033,7 @@ impl Transaction {
 				read_physical_index_groups(
 					&physical,
 					Bound::Included(key.clone()),
-					Bound::Included(key.clone()),
+					Bound::Included(key),
 					false,
 					None,
 					|atom| physical_global_id(&snapshot.root, atom),
@@ -1967,6 +2053,7 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the query count index result.
 	pub(crate) fn query_count_index(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1998,11 +2085,11 @@ impl Transaction {
 				)?;
 				return physical_count(&physical);
 			}
-			return binding.entries.count().ok_or_else(|| {
+			binding.entries.count().ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
 					"planned Count lookup selected a scalar index",
 				)
-			});
+			})
 		} else {
 			let binding = snapshot.root.indexes.base_index(index).ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
@@ -2028,6 +2115,7 @@ impl Transaction {
 		}
 	}
 
+	/// Returns the query physical index result.
 	fn query_physical_index(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -2216,11 +2304,11 @@ impl Transaction {
 		let occurrence = graph
 			.occurrence(owner)
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("atom", owner.to_string()))?;
-		let expected = match occurrence.state() {
-			OccurrenceState::Node {
+		let expected = match occurrence.state().view() {
+			OccurrenceStateRef::Node {
 				nested_graph,
 			} => *nested_graph,
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				transition_graph,
 				..
 			} => *transition_graph,
@@ -2327,6 +2415,7 @@ impl Transaction {
 		}))
 	}
 
+	/// Returns the query point result.
 	pub(crate) fn query_point(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -2378,6 +2467,7 @@ impl Transaction {
 		QueryStorageRow::field_from_atom(&snapshot.root, atom, occurrence, field, admit, copy)
 	}
 
+	/// Returns the track query point result.
 	fn track_query_point(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -2407,6 +2497,7 @@ impl Transaction {
 	}
 }
 
+/// Returns the exact index probe key result.
 fn exact_index_probe_key<Address: Copy + Ord>(
 	binding: &crate::datastore::IndexBinding<Address>,
 	values: &[Value],
@@ -2425,6 +2516,7 @@ fn exact_index_probe_key<Address: Copy + Ord>(
 	crate::values::storage::encode_index_key(&components, context)
 }
 
+/// Returns the query index addresses result.
 fn query_index_addresses<Address: Copy + Ord>(
 	root: &DatabaseRoot,
 	class: &ClassSchema,
@@ -2643,6 +2735,7 @@ fn query_index_addresses<Address: Copy + Ord>(
 	)
 }
 
+/// Returns the ordered index addresses result.
 fn ordered_index_addresses<Address: Copy + Ord>(
 	groups: std::collections::BTreeMap<Vec<u8>, BTreeSet<Address>>,
 	reverse: bool,
@@ -2682,6 +2775,7 @@ fn ordered_index_addresses<Address: Copy + Ord>(
 	Ok(output)
 }
 
+/// Reads memory index groups.
 fn read_memory_index_groups<Address: Copy + Ord>(
 	entries: &crate::datastore::IndexEntries<Address>,
 	lower: Bound<Vec<u8>>,
@@ -2699,6 +2793,7 @@ fn read_memory_index_groups<Address: Copy + Ord>(
 	output
 }
 
+/// Reads physical index groups.
 fn read_physical_index_groups<Address: Copy + Ord>(
 	index: &PhysicalIndexRead,
 	lower: Bound<Vec<u8>>,
@@ -2740,6 +2835,7 @@ fn read_physical_index_groups<Address: Copy + Ord>(
 	Ok(output)
 }
 
+/// Returns whether the key in bounds condition holds.
 fn key_in_bounds(key: &[u8], lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> bool {
 	let above_lower = match lower {
 		Bound::Included(lower) => key >= lower.as_slice(),
@@ -2754,6 +2850,7 @@ fn key_in_bounds(key: &[u8], lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> 
 	above_lower && below_upper
 }
 
+/// Returns the physical global id result.
 fn physical_global_id(
 	root: &DatabaseRoot,
 	atom: PhysicalIndexAtom,
@@ -2774,6 +2871,7 @@ fn physical_global_id(
 	)
 }
 
+/// Returns the physical local id result.
 fn physical_local_id(graph: &GraphRoot, atom: PhysicalIndexAtom) -> FerrosGrynnResult<AtomId> {
 	let slot = usize::try_from(atom.slot)
 		.map_err(|_error| FerrosGrynnError::invalid_storage_file("index slot exceeds usize"))?;
@@ -2788,6 +2886,7 @@ fn physical_local_id(graph: &GraphRoot, atom: PhysicalIndexAtom) -> FerrosGrynnR
 	})
 }
 
+/// Returns the physical count result.
 fn physical_count(index: &PhysicalIndexRead) -> FerrosGrynnResult<u64> {
 	match &index.entries {
 		PhysicalIndexEntries::Count(count) => Ok(*count),
@@ -2809,6 +2908,7 @@ fn physical_count(index: &PhysicalIndexRead) -> FerrosGrynnResult<u64> {
 	}
 }
 
+/// Validates physical index.
 fn validate_physical_index(
 	physical: &PhysicalIndexRead,
 	class_id: crate::datastore::ClassId,
@@ -2825,6 +2925,7 @@ fn validate_physical_index(
 	Ok(())
 }
 
+/// Returns the deferred index missing result.
 fn deferred_index_missing(index: IndexId) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(format!(
 		"deferred index {} has no exact durable binding",
@@ -2832,6 +2933,7 @@ fn deferred_index_missing(index: IndexId) -> FerrosGrynnError {
 	))
 }
 
+/// Returns whether the key is after condition holds.
 fn key_is_after(key: &[u8], reverse: bool, after: Option<&[u8]>) -> bool {
 	after.is_none_or(|after| {
 		if reverse {
@@ -2842,12 +2944,14 @@ fn key_is_after(key: &[u8], reverse: bool, after: Option<&[u8]>) -> bool {
 	})
 }
 
+/// Returns the base record id result.
 fn base_record_id(root: &DatabaseRoot, global: GlobalAtomId) -> FerrosGrynnResult<RecordId> {
 	root.atom(global).map(|atom| atom.record_id().clone()).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("scalar index references an absent global atom")
 	})
 }
 
+/// Returns the graph record id result.
 fn graph_record_id(
 	root: &DatabaseRoot,
 	graph: &GraphRoot,
@@ -2861,6 +2965,7 @@ fn graph_record_id(
 	base_record_id(root, global)
 }
 
+/// Returns the next prefix.
 fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
 	let mut next = prefix.to_vec();
 	for index in (0..next.len()).rev() {
@@ -2873,40 +2978,35 @@ fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
 	None
 }
 
+/// Returns the tighter lower result.
 fn tighter_lower(current: Bound<Vec<u8>>, candidate: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
 	match (&current, &candidate) {
 		(Bound::Unbounded, _) => candidate,
 		(_, Bound::Unbounded) => current,
-		(Bound::Included(left), Bound::Included(right))
-		| (Bound::Included(left), Bound::Excluded(right))
-		| (Bound::Excluded(left), Bound::Included(right))
-		| (Bound::Excluded(left), Bound::Excluded(right))
-			if right > left =>
-		{
-			candidate
-		}
+		(
+			Bound::Included(left) | Bound::Excluded(left),
+			Bound::Included(right) | Bound::Excluded(right),
+		) if right > left => candidate,
 		(Bound::Included(left), Bound::Excluded(right)) if right == left => candidate,
 		_ => current,
 	}
 }
 
+/// Returns the tighter upper result.
 fn tighter_upper(current: Bound<Vec<u8>>, candidate: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
 	match (&current, &candidate) {
 		(Bound::Unbounded, _) => candidate,
 		(_, Bound::Unbounded) => current,
-		(Bound::Included(left), Bound::Included(right))
-		| (Bound::Included(left), Bound::Excluded(right))
-		| (Bound::Excluded(left), Bound::Included(right))
-		| (Bound::Excluded(left), Bound::Excluded(right))
-			if right < left =>
-		{
-			candidate
-		}
+		(
+			Bound::Included(left) | Bound::Excluded(left),
+			Bound::Included(right) | Bound::Excluded(right),
+		) if right < left => candidate,
 		(Bound::Included(left), Bound::Excluded(right)) if right == left => candidate,
 		_ => current,
 	}
 }
 
+/// Returns the planner binding summary result.
 fn planner_binding_summary<Address: Copy + Ord>(
 	binding: Option<&crate::datastore::IndexBinding<Address>>,
 	class_id: crate::datastore::ClassId,
@@ -2930,6 +3030,7 @@ fn planner_binding_summary<Address: Copy + Ord>(
 	Ok((true, (!binding.deferred).then(|| binding.entries.count()).flatten()))
 }
 
+/// Returns the row from atom result.
 fn row_from_atom(atom: &crate::datastore::BaseAtom, class: &ClassSchema) -> QueryStorageRow {
 	let properties = atom.properties().clone();
 	let mut values = Vec::with_capacity(class.fields().len() + 1);
@@ -2948,6 +3049,7 @@ fn row_from_atom(atom: &crate::datastore::BaseAtom, class: &ClassSchema) -> Quer
 	}
 }
 
+/// Returns the row from occurrence result.
 fn row_from_occurrence(
 	root: &DatabaseRoot,
 	occurrence: &GraphOccurrence,
@@ -2986,6 +3088,7 @@ fn row_from_occurrence(
 	})
 }
 
+/// Returns the query graph root result.
 fn query_graph_root<'root>(
 	root: &'root DatabaseRoot,
 	reference: &GraphRef,
@@ -3001,6 +3104,7 @@ fn query_graph_root<'root>(
 	Ok(graph)
 }
 
+/// Returns the intersect sorted result.
 fn intersect_sorted(left: Vec<AtomId>, right: Vec<AtomId>) -> Vec<AtomId> {
 	let (mut left_index, mut right_index) = (0, 0);
 	let mut intersection = Vec::with_capacity(left.len().min(right.len()));

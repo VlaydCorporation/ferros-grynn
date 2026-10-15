@@ -61,86 +61,6 @@ pub(super) fn encode(
 	Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-	use super::{decode, encode, size, validate};
-	use crate::{
-		datastore::{ClassId, LiveRhsScopeAnchor},
-		gql_status::FerrosGrynnResult,
-		graph::GraphId,
-		live::{LiveExpr, LiveJoin, LiveJoinKind, LiveQuery, LiveSource},
-		storage::{catalog::database::codec::Decoder, history_codec::CodecBudget},
-	};
-
-	/// Tail owners, lengths, clocks and reserved bytes never bypass admission.
-	#[test]
-	fn live_rhs_anchor_codec_checks_owners_and_bounds() -> FerrosGrynnResult<()> {
-		let class = ClassId::from_storage(1)?;
-		let graph = GraphId::new(2).ok_or_else(|| super::invalid("fixture graph is zero"))?;
-		let query = LiveQuery::new(LiveSource::Class(class)).with_joins(vec![LiveJoin::new(
-			LiveSource::GraphClassExpr {
-				class,
-				graph: Box::new(LiveExpr::Literal("scope".into())),
-			},
-			"r",
-			LiveJoinKind::Cross,
-			None,
-		)?]);
-		let anchors = vec![LiveRhsScopeAnchor {
-			source: 1,
-			graph,
-			name: "scope".into(),
-		}];
-		let mut bytes = Vec::new();
-		encode(&mut bytes, &anchors)?;
-		assert_eq!(size(&anchors)?, 29);
-		assert_eq!(&bytes[..4], &1_u32.to_le_bytes());
-		assert_eq!(&bytes[4..12], &[1, 0, 0, 0, 0, 0, 0, 0]);
-		assert_eq!(&bytes[12..20], &2_u64.to_le_bytes());
-		assert_eq!(&bytes[20..24], &5_u32.to_le_bytes());
-		assert_eq!(&bytes[24..], b"scope");
-		assert_eq!(
-			decode(&mut Decoder::new(&bytes), &mut CodecBudget::new(1 << 20, 0)?, &query)?,
-			anchors
-		);
-		validate(&anchors, &query, 3)?;
-		assert!(validate(&anchors, &query, 2).is_err());
-		for (offset, value) in [
-			(0, 0),
-			(0, 255),
-			(4, 0),
-			(4, 2),
-			(8, 1),
-			(12, 0),
-			(20, 0),
-			(20, 129),
-			(24, 0),
-			(24, 255),
-		] {
-			let mut bad = bytes.clone();
-			bad[offset] = value;
-			assert!(
-				decode(&mut Decoder::new(&bad), &mut CodecBudget::new(1 << 20, 0)?, &query)
-					.is_err(),
-				"offset {offset}"
-			);
-		}
-		for length in 0..bytes.len() {
-			assert!(
-				decode(
-					&mut Decoder::new(&bytes[..length]),
-					&mut CodecBudget::new(1 << 20, 0)?,
-					&query
-				)
-				.is_err()
-			);
-		}
-		assert!(decode(&mut Decoder::new(&bytes), &mut CodecBudget::new(16, 0)?, &query).is_err());
-		assert!(validate(&anchors, &LiveQuery::new(LiveSource::Class(class)), 3).is_err());
-		Ok(())
-	}
-}
-
 /// Counts and owner references are checked before retaining a decoded vector.
 pub(super) fn decode(
 	decoder: &mut Decoder<'_>,
@@ -200,4 +120,101 @@ pub(super) fn validate(
 		}
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+/// Regression tests for live scope behavior.
+mod tests {
+	use super::{decode, encode, size, validate};
+	use crate::{
+		datastore::{ClassId, LiveRhsScopeAnchor},
+		graph::GraphId,
+		live::{LiveExpr, LiveJoin, LiveJoinKind, LiveQuery, LiveSource},
+		storage::{catalog::database::codec::Decoder, history_codec::CodecBudget},
+	};
+
+	/// Tail owners, lengths, clocks and reserved bytes never bypass admission.
+	#[test]
+	fn live_rhs_anchor_codec_checks_owners_and_bounds() {
+		use crate::test_assertions::AssertResult as _;
+
+		let class = ClassId::from_storage(1).assert_ok();
+		let graph =
+			GraphId::new(2).ok_or_else(|| super::invalid("fixture graph is zero")).assert_ok();
+		let query = LiveQuery::new(LiveSource::Class(class)).with_joins(vec![
+			LiveJoin::new(
+				LiveSource::GraphClassExpr {
+					class,
+					graph: Box::new(LiveExpr::Literal("scope".into())),
+				},
+				"r",
+				LiveJoinKind::Cross,
+				None,
+			)
+			.assert_ok(),
+		]);
+		let anchors = vec![LiveRhsScopeAnchor {
+			source: 1,
+			graph,
+			name: "scope".into(),
+		}];
+		let mut bytes = Vec::new();
+		encode(&mut bytes, &anchors).assert_ok();
+		assert_eq!(size(&anchors).assert_ok(), 29);
+		assert_eq!(&bytes[..4], &1_u32.to_le_bytes());
+		assert_eq!(&bytes[4..12], &[1, 0, 0, 0, 0, 0, 0, 0]);
+		assert_eq!(&bytes[12..20], &2_u64.to_le_bytes());
+		assert_eq!(&bytes[20..24], &5_u32.to_le_bytes());
+		assert_eq!(&bytes[24..], b"scope");
+		assert_eq!(
+			decode(
+				&mut Decoder::new(&bytes),
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
+				&query
+			)
+			.assert_ok(),
+			anchors
+		);
+		validate(&anchors, &query, 3).assert_ok();
+		assert!(validate(&anchors, &query, 2).is_err());
+		for (offset, value) in [
+			(0, 0),
+			(0, 255),
+			(4, 0),
+			(4, 2),
+			(8, 1),
+			(12, 0),
+			(20, 0),
+			(20, 129),
+			(24, 0),
+			(24, 255),
+		] {
+			let mut bad = bytes.clone();
+			bad[offset] = value;
+			assert!(
+				decode(
+					&mut Decoder::new(&bad),
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
+					&query
+				)
+				.is_err(),
+				"offset {offset}"
+			);
+		}
+		for length in 0..bytes.len() {
+			assert!(
+				decode(
+					&mut Decoder::new(&bytes[..length]),
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
+					&query
+				)
+				.is_err()
+			);
+		}
+		assert!(
+			decode(&mut Decoder::new(&bytes), &mut CodecBudget::new(16, 0).assert_ok(), &query)
+				.is_err()
+		);
+		assert!(validate(&anchors, &LiveQuery::new(LiveSource::Class(class)), 3).is_err());
+	}
 }

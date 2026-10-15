@@ -24,6 +24,7 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 /// First payload byte of an array section page.
 const ARRAY_START: usize = 64;
 /// First offset-directory byte of a record section page.
+#[cfg(test)]
 const RECORDS_START: usize = 56;
 
 /// Normative section identities; incompatible page families are rejected.
@@ -104,6 +105,49 @@ pub enum SectionKind {
 }
 
 impl SectionKind {
+	/// Decodes every normative section identity, including reserved pattern
+	/// sections.
+	const fn from_raw(raw: u16) -> Option<Self> {
+		match raw {
+			0x0001 => Some(Self::NodeComponentMap),
+			0x0002 => Some(Self::EdgeComponentMap),
+			0x0003 => Some(Self::SccRepresentativeMap),
+			0x0004 => Some(Self::CondensationCsrOffsets),
+			0x0005 => Some(Self::CondensationCsrTargets),
+			0x0006 => Some(Self::PathVertexMap),
+			0x0007 => Some(Self::LandmarkRefs),
+			0x0008 => Some(Self::LandmarkDistanceFrom),
+			0x0009 => Some(Self::LandmarkDistanceTo),
+			0x000a => Some(Self::DefinitionDescriptor),
+			0x0010 => Some(Self::PatternDescriptor),
+			0x0011 => Some(Self::PatternCanonicalIr),
+			0x0012 => Some(Self::PatternBindingSchema),
+			0x0013 => Some(Self::PatternDependencies),
+			0x0014 => Some(Self::PatternBindingRows),
+			0x0100 => Some(Self::TreeCoverIntervals),
+			0x0101 => Some(Self::GrailIntervals),
+			0x0102 => Some(Self::FerrariIntervals),
+			0x0103 => Some(Self::BflBitsets),
+			0x0104 => Some(Self::ChainCoordinates),
+			0x0105 => Some(Self::ChainReachabilityCells),
+			0x0106 => Some(Self::PostorderRanks),
+			0x0200 => Some(Self::NeighbourhoodCenters),
+			0x0201 => Some(Self::NeighbourhoodOffsets),
+			0x0202 => Some(Self::NeighbourhoodMembers),
+			0x0203 => Some(Self::NeighbourhoodRegisters),
+			0x0204 => Some(Self::NeighbourhoodLandmarkMembers),
+			0x0205 => Some(Self::NeighbourhoodVertexMap),
+			0x0300 => Some(Self::TensorMetadata),
+			0x0301 => Some(Self::TensorSourceOffsets),
+			0x0302 => Some(Self::TensorSourceOrdinals),
+			0x0303 => Some(Self::TensorTargetOffsets),
+			0x0304 => Some(Self::TensorTargetOrdinals),
+			0x0305 => Some(Self::TensorSourceBits),
+			0x0306 => Some(Self::TensorTargetBits),
+			_ => None,
+		}
+	}
+
 	/// Checks a requested array width and returns its concrete page family.
 	fn array_type(self, width: u16) -> FerrosGrynnResult<PageType> {
 		let (page_type, valid) = match self {
@@ -152,6 +196,7 @@ impl SectionKind {
 	}
 
 	/// Rejects array sections at the variable-record boundary.
+	#[cfg(test)]
 	fn check_records(self) -> FerrosGrynnResult<()> {
 		if !(0x0010..=0x0014).contains(&(self as u16)) {
 			return Err(invalid("array section cannot use a records page"));
@@ -165,12 +210,14 @@ pub(super) struct ArrayPage<'a> {
 	/// Forward page link, or NULL for the final page.
 	pub(super) next: PageNo,
 	/// Ordinal of the first element in this page.
+	#[cfg(test)]
 	pub(super) first_ordinal: u64,
 	/// Exact-width element bytes.
 	pub(super) elements: &'a [u8],
 }
 
 /// A validated records page retains only its bounded directory and payload.
+#[cfg(test)]
 pub(super) struct RecordsPage<'a> {
 	/// Forward page link, or NULL for the final page.
 	pub(super) next: PageNo,
@@ -182,6 +229,7 @@ pub(super) struct RecordsPage<'a> {
 	payload: &'a [u8],
 }
 
+#[cfg(test)]
 impl RecordsPage<'_> {
 	/// Iterates validated records in ordinal order, including empty records.
 	pub(super) fn records(&self) -> impl Iterator<Item = &[u8]> {
@@ -265,6 +313,7 @@ pub(super) fn decode_array(
 	check_link(at, next, page_count)?;
 	Ok(ArrayPage {
 		next,
+		#[cfg(test)]
 		first_ordinal,
 		elements: &bytes[ARRAY_START..ARRAY_START + used],
 	})
@@ -274,6 +323,7 @@ pub(super) fn decode_array(
 ///
 /// # Errors
 /// Returns an error before writing for excessive sizes or invalid ordinals.
+#[cfg(test)]
 pub(super) fn encode_records(
 	page: &mut AlignedPage,
 	at: PageNo,
@@ -319,6 +369,7 @@ pub(super) fn encode_records(
 ///
 /// # Errors
 /// Returns corruption for invalid counts, offsets, links, ordinals or padding.
+#[cfg(test)]
 pub(super) fn decode_records(
 	page: &AlignedPage,
 	at: PageNo,
@@ -371,6 +422,7 @@ pub(super) fn decode_records(
 ///
 /// # Errors
 /// Returns corruption if the referenced object is outside its captured extent.
+#[cfg(test)]
 pub(super) fn check_reference(value: u64, limit: u64, nullable: bool) -> FerrosGrynnResult<()> {
 	if value < limit || (nullable && value == u64::MAX) {
 		return Ok(());
@@ -383,6 +435,7 @@ pub(super) fn check_reference(value: u64, limit: u64, nullable: bool) -> FerrosG
 /// # Errors
 /// Returns corruption or the callback error without publishing a partial
 /// artifact.
+#[cfg(test)]
 pub(super) fn visit_array_section(
 	mut read: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -425,6 +478,7 @@ pub(super) fn visit_array_section(
 /// # Errors
 /// Returns corruption or the callback error without publishing a partial
 /// artifact.
+#[cfg(test)]
 pub(super) fn visit_record_section(
 	mut read: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -472,7 +526,7 @@ fn check_header(
 	let header = page.validate(at)?;
 	if header.page_type() != page_type
 		|| !header.flags().is_empty()
-		|| short(page.as_bytes(), 40) != kind as u16
+		|| SectionKind::from_raw(short(page.as_bytes(), 40)) != Some(kind)
 	{
 		return Err(invalid("derived section page family, flags or kind is incompatible"));
 	}

@@ -34,6 +34,7 @@ use crate::{
 };
 
 impl<Read: QueryRead> TraversalMachine<'_, Read> {
+	/// Executes algorithm for `TraversalMachine<'_, Read>`.
 	pub(super) fn execute_algorithm(
 		&self,
 		kind: TraverseStepKind,
@@ -71,6 +72,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		}
 	}
 
+	/// Executes seed algorithm for `TraversalMachine<'_, Read>`.
 	fn execute_seed_algorithm(
 		&self,
 		kind: TraverseStepKind,
@@ -407,6 +409,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		)?)))
 	}
 
+	/// Executes induced algorithm for `TraversalMachine<'_, Read>`.
 	fn execute_induced_algorithm(
 		&self,
 		kind: TraverseStepKind,
@@ -745,6 +748,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	}
 }
 
+/// Returns occurrence for this module.
 pub(super) fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
 	value.as_atom_occurrence().ok_or_else(|| {
 		FerrosGrynnError::traversal_source_type_mismatch(
@@ -754,6 +758,7 @@ pub(super) fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef>
 	})
 }
 
+/// Returns non negative usize for this module.
 pub(super) fn non_negative_usize(value: Option<&Value>) -> FerrosGrynnResult<usize> {
 	let value = value.ok_or_else(|| FerrosGrynnError::invalid_argument("Missing depth."))?;
 	value
@@ -768,6 +773,7 @@ pub(super) fn non_negative_usize(value: Option<&Value>) -> FerrosGrynnResult<usi
 		})
 }
 
+/// Returns target id for this module.
 fn target_id<Graph: GraphRead>(
 	graph: &Graph,
 	scope: &GraphRef,
@@ -795,6 +801,7 @@ fn target_id<Graph: GraphRead>(
 		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", atom.id().to_string()))
 }
 
+/// Returns occurrence value for this module.
 fn occurrence_value<Graph: GraphRead>(
 	graph: &Graph,
 	reference: Arc<GraphRef>,
@@ -806,6 +813,7 @@ fn occurrence_value<Graph: GraphRead>(
 	Ok(Value::AtomOccurrence(Box::new(AtomOccurrenceRef::new(atom, reference))))
 }
 
+/// Returns occurrence values for this module.
 fn occurrence_values<Graph: GraphRead>(
 	graph: &Graph,
 	reference: Arc<GraphRef>,
@@ -814,6 +822,8 @@ fn occurrence_values<Graph: GraphRead>(
 	ids.into_iter().map(|id| occurrence_value(graph, reference.clone(), id)).collect()
 }
 
+/// Collects distinct node identities from traversers after checking that they
+/// share one graph.
 #[allow(
 	clippy::mutable_key_type,
 	reason = "AtomRef ordering uses immutable atom kind and RecordId fields"
@@ -838,6 +848,7 @@ fn induced_atoms(input: &[Traverser]) -> FerrosGrynnResult<(Arc<GraphRef>, BTree
 	Ok((graph, atoms))
 }
 
+/// Returns induced edges for this module.
 fn induced_edges<Graph: GraphRead>(
 	graph: &Graph,
 	nodes: &BTreeSet<AtomId>,
@@ -861,6 +872,7 @@ fn induced_edges<Graph: GraphRead>(
 	Ok(edges)
 }
 
+/// Returns binary local endpoints for this module.
 fn binary_local_endpoints(topology: &EdgeTopology) -> Option<(AtomId, AtomId)> {
 	let endpoints = match topology {
 		EdgeTopology::Directed {
@@ -879,6 +891,7 @@ fn binary_local_endpoints(topology: &EdgeTopology) -> Option<(AtomId, AtomId)> {
 	Some((endpoints.0.local_id()?, endpoints.1.local_id()?))
 }
 
+/// Returns components value for this module.
 fn components_value<Graph: GraphRead>(
 	graph: &Graph,
 	reference: Arc<GraphRef>,
@@ -894,6 +907,7 @@ fn components_value<Graph: GraphRead>(
 		.map(Value::Array)
 }
 
+/// Returns condensation value for this module.
 fn condensation_value<Graph: GraphRead>(
 	graph: &Graph,
 	reference: Arc<GraphRef>,
@@ -920,6 +934,7 @@ fn condensation_value<Graph: GraphRead>(
 	Ok(Value::Object(object))
 }
 
+/// Returns spanning value for this module.
 fn spanning_value<Graph: GraphRead>(
 	graph: &Graph,
 	reference: Arc<GraphRef>,
@@ -935,6 +950,7 @@ fn spanning_value<Graph: GraphRead>(
 	Ok(Value::Object(object))
 }
 
+/// Returns cuts value for this module.
 fn cuts_value<Graph: GraphRead>(
 	graph: &Graph,
 	reference: Arc<GraphRef>,
@@ -959,6 +975,7 @@ fn cuts_value<Graph: GraphRead>(
 	Ok(Value::Object(object))
 }
 
+/// Returns graph is directed for this module.
 fn graph_is_directed<Graph: GraphRead>(
 	graph: &Graph,
 	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
@@ -1034,6 +1051,7 @@ fn shortest_hop_distance(
 	Ok(None)
 }
 
+/// Returns predecessor distance for this module.
 fn predecessor_distance(
 	predecessor: &BTreeMap<AtomId, (AtomId, crate::graph::TraversalStep)>,
 	source: AtomId,
@@ -1051,6 +1069,7 @@ fn predecessor_distance(
 	Ok(distance)
 }
 
+/// Returns lowest common ancestor for this module.
 fn lowest_common_ancestor<Graph: GraphRead>(
 	graph: &Graph,
 	left: AtomId,
@@ -1111,52 +1130,20 @@ fn lowest_common_ancestor<Graph: GraphRead>(
 	Ok(None)
 }
 
+/// Returns domain error for this module.
 fn domain_error(reason: &str) -> FerrosGrynnError {
 	FerrosGrynnError::graph_constraint_violation("traversal algorithm", reason)
 }
 
+/// Borrowed graph reader restricted to selected node and edge identifiers.
 struct InducedGraph<'a, Graph: GraphRead> {
+	/// Graph reader whose node and edge sets are restricted by this induced
+	/// view.
 	inner: &'a Graph,
+	/// Selected node identifiers or retained physical node storage.
 	nodes: BTreeSet<AtomId>,
+	/// Selected edge identifiers or retained physical edge storage.
 	edges: BTreeSet<AtomId>,
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn hop_astar_reopens_improved_vertices_for_inconsistent_admissible_bounds() {
-		let mut graph = crate::graph::Graph::<crate::graph::Mutable>::new();
-		let nodes =
-			(0..9).map(|_| graph.add_node(None, PropertyMap::new()).unwrap()).collect::<Vec<_>>();
-		// The long prefix reaches v before c; h(c)=5 is admissible but
-		// inconsistent with h(v)=0. Reopening v improves the answer to 6.
-		for (source, target) in
-			[(0, 1), (1, 2), (2, 3), (0, 4), (4, 3), (3, 5), (5, 6), (6, 7), (7, 8)]
-		{
-			graph
-				.add_edge(
-					EdgeTopology::directed([nodes[source]], [nodes[target]]),
-					None,
-					PropertyMap::new(),
-				)
-				.unwrap();
-		}
-		let index = TraversalIndex::new(&graph, TraversalSemantics::Node).unwrap();
-		let control = ExecutionControl::new(&crate::gql::QueryExecutionOptions::default(), None);
-		assert_eq!(
-			shortest_hop_distance(&index, nodes[0], nodes[8], &control, &mut |node| Ok(
-				if node == nodes[4] {
-					5
-				} else {
-					0
-				}
-			))
-			.unwrap(),
-			Some(6)
-		);
-	}
 }
 
 impl<Graph: GraphRead> GraphRead for InducedGraph<'_, Graph> {
@@ -1177,30 +1164,37 @@ impl<Graph: GraphRead> GraphRead for InducedGraph<'_, Graph> {
 	where
 		Self: 'a;
 
+	/// Returns identity for `InducedGraph<'_, Graph>`.
 	fn identity(&self) -> Uuid {
 		self.inner.identity()
 	}
 
+	/// Returns revision for `InducedGraph<'_, Graph>`.
 	fn revision(&self) -> u64 {
 		self.inner.revision()
 	}
 
+	/// Returns kind for `InducedGraph<'_, Graph>`.
 	fn kind(&self) -> GraphKind {
 		self.inner.kind()
 	}
 
+	/// Returns properties for `InducedGraph<'_, Graph>`.
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.inner.properties()
 	}
 
+	/// Returns node ids for `InducedGraph<'_, Graph>`.
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		Ok(Box::new(self.nodes.iter().copied().map(Ok)))
 	}
 
+	/// Returns edge ids for `InducedGraph<'_, Graph>`.
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		Ok(Box::new(self.edges.iter().copied().map(Ok)))
 	}
 
+	/// Returns node for `InducedGraph<'_, Graph>`.
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		if self.nodes.contains(&id) {
 			self.inner.node(id)
@@ -1209,6 +1203,7 @@ impl<Graph: GraphRead> GraphRead for InducedGraph<'_, Graph> {
 		}
 	}
 
+	/// Returns edge for `InducedGraph<'_, Graph>`.
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		if self.edges.contains(&id) {
 			self.inner.edge(id)
@@ -1217,15 +1212,62 @@ impl<Graph: GraphRead> GraphRead for InducedGraph<'_, Graph> {
 		}
 	}
 
+	/// Returns storage mode for `InducedGraph<'_, Graph>`.
 	fn storage_mode(&self) -> GraphStorageMode {
 		self.inner.storage_mode()
 	}
 
+	/// Returns snapshot id for `InducedGraph<'_, Graph>`.
 	fn snapshot_id(&self) -> SnapshotId {
 		self.inner.snapshot_id()
 	}
 
+	/// Returns graph ref for `InducedGraph<'_, Graph>`.
 	fn graph_ref(&self) -> Option<&GraphRef> {
 		self.inner.graph_ref()
+	}
+}
+
+#[cfg(test)]
+/// Regression tests for algorithms behavior.
+mod tests {
+	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
+
+	/// Verifies hop astar reopens improved vertices for inconsistent admissible
+	/// bounds.
+	#[test]
+	fn hop_astar_reopens_improved_vertices_for_inconsistent_admissible_bounds() {
+		let mut graph = crate::graph::Graph::<crate::graph::Mutable>::new();
+		let nodes = (0..9)
+			.map(|_| graph.add_node(None, PropertyMap::new()).assert_ok())
+			.collect::<Vec<_>>();
+		// The long prefix reaches v before c; h(c)=5 is admissible but
+		// inconsistent with h(v)=0. Reopening v improves the answer to 6.
+		for (source, target) in
+			[(0, 1), (1, 2), (2, 3), (0, 4), (4, 3), (3, 5), (5, 6), (6, 7), (7, 8)]
+		{
+			graph
+				.add_edge(
+					EdgeTopology::directed([nodes[source]], [nodes[target]]),
+					None,
+					PropertyMap::new(),
+				)
+				.assert_ok();
+		}
+		let index = TraversalIndex::new(&graph, TraversalSemantics::Node).assert_ok();
+		let control = ExecutionControl::new(&crate::gql::QueryExecutionOptions::default(), None);
+		assert_eq!(
+			shortest_hop_distance(&index, nodes[0], nodes[8], &control, &mut |node| Ok(
+				if node == nodes[4] {
+					5
+				} else {
+					0
+				}
+			))
+			.assert_ok(),
+			Some(6)
+		);
 	}
 }

@@ -17,9 +17,14 @@ pub(super) struct Waiter {
 }
 
 /// Deferred wake scope must be created before every publication guard.
-pub(in crate::datastore) struct Notification<'a>(&'a Consumers);
+pub(in crate::datastore) struct Notification<'a>(
+	/// Consumer registry whose ready waiters are awakened when this scope
+	/// drops.
+	&'a Consumers,
+);
 
 impl Drop for Notification<'_> {
+	/// Runs cleanup for this `Notification<'_>` before its fields are released.
 	fn drop(&mut self) {
 		self.0.wake_ready();
 	}
@@ -136,12 +141,11 @@ impl Consumers {
 						.waiter
 						.as_ref()
 						.is_some_and(|waiter| closed || ready(consumer, waiter.lifecycle_only))
+						&& let Some(waiter) = consumer.waiter.take()
 					{
-						if let Some(waiter) = consumer.waiter.take() {
-							batch[count] = Some(waiter.waker);
-							count += 1;
-							self.waiters.fetch_sub(1, Ordering::Relaxed);
-						}
+						batch[count] = Some(waiter.waker);
+						count += 1;
+						self.waiters.fetch_sub(1, Ordering::Relaxed);
 					}
 					if count == batch.len() {
 						break;
@@ -162,6 +166,7 @@ impl Consumers {
 }
 
 #[cfg(test)]
+/// Regression tests for readiness behavior.
 mod tests {
 	use std::{
 		sync::{Arc, Weak, atomic::AtomicUsize},
@@ -171,14 +176,26 @@ mod tests {
 	use super::*;
 	use crate::live::{LiveCursor, LiveOptions};
 
+	/// Test guard recording destruction through shared observation state.
 	struct DropProbe {
+		/// Owner observed by the fixture without retaining shared ownership.
 		owner: Weak<Consumers>,
+		/// Shared counter recording drops observed by the test fixture.
 		drops: Arc<AtomicUsize>,
+		/// Counts explicit wake calls independently from destruction.
+		wakes: Arc<AtomicUsize>,
 	}
 	impl Wake for DropProbe {
-		fn wake(self: Arc<Self>) {}
+		/// Records a wake after checking that the consumer mutex is available.
+		fn wake(self: Arc<Self>) {
+			if let Some(owner) = self.owner.upgrade() {
+				assert!(owner.state.try_lock().is_some(), "Waker woken under consumer mutex");
+			}
+			self.wakes.fetch_add(1, Ordering::Relaxed);
+		}
 	}
 	impl Drop for DropProbe {
+		/// Runs cleanup for this `DropProbe` before its fields are released.
 		fn drop(&mut self) {
 			if let Some(owner) = self.owner.upgrade() {
 				assert!(owner.state.try_lock().is_some(), "Waker dropped under consumer mutex");
@@ -186,39 +203,46 @@ mod tests {
 			self.drops.fetch_add(1, Ordering::Relaxed);
 		}
 	}
-	struct Noop;
-	impl Wake for Noop {
-		fn wake(self: Arc<Self>) {}
-	}
 
+	/// Verifies readiness changed waker drop and shutdown cancel cleanup.
 	#[test]
-	fn readiness_changed_waker_drop_and_shutdown_cancel_cleanup() -> FerrosGrynnResult<()> {
+	fn readiness_changed_waker_drop_and_shutdown_cancel_cleanup() {
+		use crate::test_assertions::AssertResult as _;
+
 		let owner = Arc::new(Consumers::default());
 		let cursor = LiveCursor::new(
 			uuid::Uuid::from_u128(1).into(),
-			crate::live::LiveId::from_uuid(uuid::Uuid::from_u128(2).into())?,
+			crate::live::LiveId::from_uuid(uuid::Uuid::from_u128(2).into()).assert_ok(),
 			crate::live::LiveVersion::default(),
 			1.into(),
-		)?;
-		let key = owner.attach(cursor, LiveOptions::default(), true)?;
+		)
+		.assert_ok();
+		let key = owner.attach(cursor, LiveOptions::default(), true).assert_ok();
 		let drops = Arc::new(AtomicUsize::new(0));
+		let wakes = Arc::new(AtomicUsize::new(0));
 		let first = Waker::from(Arc::new(DropProbe {
 			owner: Arc::downgrade(&owner),
 			drops: Arc::clone(&drops),
+			wakes: Arc::clone(&wakes),
 		}));
 		let mut registration = None;
-		assert!(!owner.poll_ready(key, &mut registration, false, &first)?);
+		assert!(!owner.poll_ready(key, &mut registration, false, &first).assert_ok());
+		assert_eq!(wakes.load(Ordering::Relaxed), 0);
+		first.wake_by_ref();
+		assert_eq!(wakes.load(Ordering::Relaxed), 1);
+		assert_eq!(drops.load(Ordering::Relaxed), 0);
 		drop(first);
-		let second = Waker::from(Arc::new(Noop));
-		assert!(!owner.poll_ready(key, &mut registration, false, &second)?);
+		let second = Waker::noop();
+		assert!(!owner.poll_ready(key, &mut registration, false, second).assert_ok());
 		assert_eq!(drops.load(Ordering::Relaxed), 1);
+		assert_eq!(wakes.load(Ordering::Relaxed), 1);
 		owner.shutdown();
 		let registration = registration
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("waiter registration absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("waiter registration absent"))
+			.assert_ok();
 		owner.cancel_ready(key, registration);
 		owner.wake_ready();
 		assert_eq!(owner.waiters.load(Ordering::Relaxed), 0);
 		assert!(owner.state.lock().consumers.is_empty());
-		Ok(())
 	}
 }

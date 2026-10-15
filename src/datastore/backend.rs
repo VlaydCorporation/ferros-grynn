@@ -52,23 +52,36 @@ use crate::{
 	values::{RecordId, Uuid, Vector, storage::DecodeContext},
 };
 
-pub(crate) struct StoreInner {
+/// Store inner state.
+pub struct StoreInner {
+	/// Options associated with this store inner.
 	pub(crate) options: DatastoreOptions,
+	/// Backend associated with this store inner.
 	pub(crate) backend: StoreBackend,
+	/// Next transaction associated with this store inner.
 	pub(crate) next_transaction: AtomicU64,
+	/// Next schema id associated with this store inner.
 	pub(crate) next_schema_id: AtomicU64,
+	/// Next graph id associated with this store inner.
 	pub(crate) next_graph_id: AtomicU64,
+	/// Import owner associated with this store inner.
 	pub(crate) import_owner: AtomicU64,
+	/// Datastore handles associated with this store inner.
 	pub(crate) datastore_handles: AtomicUsize,
+	/// Current associated with this store inner.
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
+	/// Commit associated with this store inner.
 	pub(crate) commit: Mutex<()>,
 	/// Runtime-only clients are independent of durable mapping definitions.
 	pub(crate) bridge_adapters:
 		RwLock<BTreeMap<crate::bridge::BridgeDatabaseId, Arc<dyn crate::bridge::Bridge>>>,
 	/// Transient whole-commit delivery authority, independent of MVCC roots.
 	pub(in crate::datastore) live_consumers: super::live_queue::Consumers,
+	/// Query scratch root associated with this store inner.
 	pub(crate) query_scratch_root: PathBuf,
+	/// Quarantines associated with this store inner.
 	pub(crate) quarantines: Mutex<BTreeMap<Uuid, PathBuf>>,
+	/// Maintenance associated with this store inner.
 	pub(crate) maintenance: MaintenanceCoordinator,
 	/// Positive millisecond setting captured once for accepted invocation
 	/// scheduling.
@@ -80,12 +93,19 @@ pub(crate) struct StoreInner {
 	pub(in crate::datastore) live_observation: super::live_observation::Counters,
 }
 
-pub(crate) enum StoreBackend {
+/// Store backend alternatives.
+pub enum StoreBackend {
+	/// In memory case of store backend.
 	InMemory,
-	Local(Box<LocalStore>),
+	/// Local case of store backend.
+	Local(
+		/// Local case of store backend.
+		Box<LocalStore>,
+	),
 }
 
 impl StoreInner {
+	/// Returns the allocate schema id result.
 	pub(crate) fn allocate_schema_id(&self) -> FerrosGrynnResult<SchemaId> {
 		let raw = self
 			.next_schema_id
@@ -102,6 +122,7 @@ impl StoreInner {
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("schema identity is reserved"))
 	}
 
+	/// Returns the allocate graph id result.
 	pub(crate) fn allocate_graph_id(&self) -> FerrosGrynnResult<GraphId> {
 		let raw = self
 			.next_graph_id
@@ -113,10 +134,12 @@ impl StoreInner {
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("graph identity zero is reserved"))
 	}
 
+	/// Returns the current root result.
 	pub(crate) fn current_root(&self) -> Arc<DatabaseRoot> {
 		self.current.read().clone()
 	}
 
+	/// Returns the transaction limits result.
 	pub(crate) const fn transaction_limits(&self) -> InMemoryOptions {
 		match self.options {
 			DatastoreOptions::InMemory(options) => options,
@@ -128,6 +151,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the graph storage mode result.
 	pub(crate) const fn graph_storage_mode(&self) -> GraphStorageMode {
 		match &self.backend {
 			StoreBackend::InMemory => GraphStorageMode::InMemory,
@@ -135,6 +159,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the persist root result.
 	pub(crate) fn persist_root(
 		&self,
 		root: &mut DatabaseRoot,
@@ -218,6 +243,7 @@ impl StoreInner {
 		result
 	}
 
+	/// Returns the persist import root result.
 	pub(crate) fn persist_import_root(
 		&self,
 		root: &mut DatabaseRoot,
@@ -285,6 +311,7 @@ impl StoreInner {
 		result
 	}
 
+	/// Opens quarantine.
 	pub(crate) fn open_quarantine(&self, id: Uuid) -> FerrosGrynnResult<QuarantineArchiveReader> {
 		match &self.backend {
 			StoreBackend::InMemory => {
@@ -297,6 +324,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Removes quarantine.
 	pub(crate) fn remove_quarantine(&self, id: Uuid) -> FerrosGrynnResult<()> {
 		match &self.backend {
 			StoreBackend::InMemory => {
@@ -338,6 +366,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the import scratch root result.
 	pub(crate) fn import_scratch_root(&self) -> std::path::PathBuf {
 		match &self.backend {
 			StoreBackend::InMemory => std::env::temp_dir().join("ferros-grynn-import"),
@@ -345,6 +374,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the persist maintenance jobs result.
 	pub(crate) fn persist_maintenance_jobs(
 		&self,
 		jobs: &[MaintenanceJobInfo],
@@ -355,6 +385,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns whether the maintenance publication matches condition holds.
 	pub(crate) fn maintenance_publication_matches(&self, job: &MaintenanceJobInfo) -> bool {
 		let Some(fingerprint) = job.candidate_fingerprint else {
 			return false;
@@ -407,6 +438,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns whether the maintenance target exists condition holds.
 	pub(crate) fn maintenance_target_exists(&self, target: MaintenanceTarget) -> bool {
 		let root = self.current_root();
 		match target {
@@ -440,6 +472,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Resolves analyze mode.
 	pub(crate) fn resolve_analyze_mode(
 		&self,
 		target: MaintenanceTarget,
@@ -498,6 +531,7 @@ impl StoreInner {
 		})
 	}
 
+	/// Returns the run maintenance job result.
 	pub(crate) fn run_maintenance_job(
 		&self,
 		id: super::JobId,
@@ -505,6 +539,7 @@ impl StoreInner {
 		self.run_maintenance_job_inner(id, || Ok(()))
 	}
 
+	/// Returns run maintenance job interleaved for `StoreInner`.
 	#[cfg(test)]
 	pub(crate) fn run_maintenance_job_interleaved(
 		&self,
@@ -514,6 +549,7 @@ impl StoreInner {
 		self.run_maintenance_job_inner(id, interleave)
 	}
 
+	/// Returns the run maintenance job inner result.
 	fn run_maintenance_job_inner(
 		&self,
 		id: super::JobId,
@@ -658,6 +694,7 @@ impl StoreInner {
 		)
 	}
 
+	/// Builds maintenance candidate.
 	fn build_maintenance_candidate(
 		&self,
 		snapshot: &DatabaseRoot,
@@ -712,6 +749,7 @@ impl StoreInner {
 		Ok(next)
 	}
 
+	/// Returns the query scratch root result.
 	pub(crate) fn query_scratch_root(&self) -> std::path::PathBuf {
 		self.query_scratch_root.clone()
 	}
@@ -723,6 +761,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Captures physical query snapshot.
 	pub(crate) fn capture_physical_query_snapshot(
 		&self,
 		commit_ts: u64,
@@ -827,6 +866,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns whether this value has physical index.
 	pub(crate) fn has_physical_index(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -834,10 +874,11 @@ impl StoreInner {
 	) -> bool {
 		match &self.backend {
 			StoreBackend::InMemory => false,
-			StoreBackend::Local(local) => local.has_physical_index(snapshot, index),
+			StoreBackend::Local(_local) => LocalStore::has_physical_index(snapshot, index),
 		}
 	}
 
+	/// Returns the physical index result.
 	pub(crate) fn physical_index(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -849,6 +890,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the search diskann index result.
 	pub(crate) fn search_diskann_index(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -865,6 +907,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the search geometry index result.
 	pub(crate) fn search_geometry_index(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -878,6 +921,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the search hnsw index result.
 	pub(crate) fn search_hnsw_index(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -900,6 +944,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Loads planner statistics.
 	pub(crate) fn load_planner_statistics(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -912,6 +957,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the hydrate statistics result.
 	pub(crate) fn hydrate_statistics(&self, database: &mut DatabaseRoot) -> FerrosGrynnResult<()> {
 		if !database.statistics.auxiliary_deferred() {
 			return Ok(());
@@ -928,6 +974,7 @@ impl StoreInner {
 		clippy::too_many_arguments,
 		reason = "the local frontier contract keeps graph, source, and direction axes explicit"
 	)]
+	/// Returns the physical traversal expand result.
 	pub(crate) fn physical_traversal_expand(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -944,6 +991,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the physical traversal inner graph result.
 	pub(crate) fn physical_traversal_inner_graph(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -958,6 +1006,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the physical traversal fields result.
 	pub(crate) fn physical_traversal_fields(
 		&self,
 		snapshot: &LocalQuerySnapshot,
@@ -973,6 +1022,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the checkpoint result.
 	pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<bool> {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(false),
@@ -980,6 +1030,7 @@ impl StoreInner {
 		}
 	}
 
+	/// Returns the local storage status result.
 	pub(crate) fn local_storage_status(&self) -> Option<LocalStorageStatus> {
 		match (&self.backend, self.options) {
 			(StoreBackend::Local(local), DatastoreOptions::Local(options)) => {
@@ -990,6 +1041,7 @@ impl StoreInner {
 	}
 
 	#[cfg(feature = "storage-engine-prototype-api")]
+	/// Clears unpinned resident pages for an isolated storage measurement.
 	pub(crate) fn clear_resident_for_prototype(&self) -> FerrosGrynnResult<usize> {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(0),
@@ -999,6 +1051,7 @@ impl StoreInner {
 }
 
 impl Drop for StoreInner {
+	/// Runs cleanup for this `StoreInner` before its fields are released.
 	fn drop(&mut self) {
 		self.maintenance.shutdown();
 		if matches!(self.backend, StoreBackend::InMemory) {
@@ -1007,6 +1060,7 @@ impl Drop for StoreInner {
 	}
 }
 
+/// Prepares index maintenance.
 fn prepare_index_maintenance(
 	database: &mut DatabaseRoot,
 	target: MaintenanceTarget,
@@ -1153,6 +1207,7 @@ fn prepare_index_maintenance(
 	Ok(())
 }
 
+/// Returns the maintenance source items result.
 fn maintenance_source_items(database: &DatabaseRoot, target: MaintenanceTarget) -> u64 {
 	match target {
 		MaintenanceTarget::Index {
@@ -1205,42 +1260,18 @@ fn maintenance_source_items(database: &DatabaseRoot, target: MaintenanceTarget) 
 	}
 }
 
-pub(crate) struct ValidatedLocalOptions {
+/// Validated local options state.
+pub struct ValidatedLocalOptions {
+	/// Pool pages associated with this validated local options.
 	pub(crate) pool_pages: NonZeroUsize,
+	/// Checkpoint page threshold associated with this validated local options.
 	pub(crate) checkpoint_page_threshold: usize,
+	/// Io mode associated with this validated local options.
 	pub(crate) io_mode: PageIoMode,
 }
 
-#[cfg(test)]
-mod query_scratch_tests {
-	use super::*;
-
-	#[test]
-	fn in_memory_stores_own_distinct_query_scratch_roots() {
-		let first = crate::datastore::Datastore::in_memory();
-		let second = crate::datastore::Datastore::in_memory();
-		let first_root = first.inner.query_scratch_root();
-		let second_root = second.inner.query_scratch_root();
-		assert_ne!(first_root, second_root);
-		fs::create_dir_all(&first_root).unwrap();
-		fs::create_dir_all(&second_root).unwrap();
-
-		drop(first);
-		assert!(!first_root.exists());
-		assert!(second_root.exists());
-		drop(second);
-		assert!(!second_root.exists());
-	}
-
-	#[test]
-	fn in_memory_has_no_local_storage_status() {
-		assert!(crate::datastore::Datastore::in_memory().local_storage_status().is_none());
-	}
-}
-
-pub(crate) fn validate_local_options(
-	options: LocalOptions,
-) -> FerrosGrynnResult<ValidatedLocalOptions> {
+/// Validates local options.
+pub fn validate_local_options(options: LocalOptions) -> FerrosGrynnResult<ValidatedLocalOptions> {
 	let io_mode = match options.io_mode {
 		IoMode::Sync => PageIoMode::Sync,
 		IoMode::NativeAsync => {
@@ -1276,4 +1307,36 @@ pub(crate) fn validate_local_options(
 		checkpoint_page_threshold,
 		io_mode,
 	})
+}
+
+#[cfg(test)]
+/// Regression tests for backend behavior.
+mod query_scratch_tests {
+	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
+
+	/// Verifies in memory stores own distinct query scratch roots.
+	#[test]
+	fn in_memory_stores_own_distinct_query_scratch_roots() {
+		let first = crate::datastore::Datastore::in_memory();
+		let second = crate::datastore::Datastore::in_memory();
+		let first_root = first.inner.query_scratch_root();
+		let second_root = second.inner.query_scratch_root();
+		assert_ne!(first_root, second_root);
+		fs::create_dir_all(&first_root).assert_ok();
+		fs::create_dir_all(&second_root).assert_ok();
+
+		drop(first);
+		assert!(!first_root.exists());
+		assert!(second_root.exists());
+		drop(second);
+		assert!(!second_root.exists());
+	}
+
+	/// Verifies in memory has no local storage status.
+	#[test]
+	fn in_memory_has_no_local_storage_status() {
+		assert!(crate::datastore::Datastore::in_memory().local_storage_status().is_none());
+	}
 }

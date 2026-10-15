@@ -5,6 +5,7 @@ use ferros_grynn::{
 
 use crate::support::{create_person, people, record};
 
+/// Verifies sdk create read update remove property and delete.
 #[test]
 fn sdk_create_read_update_remove_property_and_delete() {
 	let db = database();
@@ -31,6 +32,7 @@ fn sdk_create_read_update_remove_property_and_delete() {
 	db.assert_committed(|store| assert!(store.begin().atom(&id).unwrap().is_none()));
 }
 
+/// Verifies dropped sdk writes leave all committed records unchanged.
 #[test]
 fn dropped_sdk_writes_leave_all_committed_records_unchanged() {
 	let db = database();
@@ -55,6 +57,7 @@ fn dropped_sdk_writes_leave_all_committed_records_unchanged() {
 	});
 }
 
+/// Verifies duplicate create is rejected without overwriting the record.
 #[test]
 fn duplicate_create_is_rejected_without_overwriting_the_record() {
 	let db = database();
@@ -76,6 +79,8 @@ fn duplicate_create_is_rejected_without_overwriting_the_record() {
 	});
 }
 
+/// Verifies detach preserves base atom and cascade delete removes all
+/// memberships.
 #[test]
 fn detach_preserves_base_atom_and_cascade_delete_removes_all_memberships() {
 	let db = database();

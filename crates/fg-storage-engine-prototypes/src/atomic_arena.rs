@@ -152,9 +152,15 @@ pub(super) enum DenseLocatorLayout {
 /// Compact locator slots owned by one exact immutable source epoch.
 enum DenseLocatorSlots {
 	/// Direct page-number indexing.
-	Flat(Box<[AtomicU64]>),
+	Flat(
+		/// Direct page-number indexing.
+		Box<[AtomicU64]>,
+	),
 	/// Sparse page-number indexing without allocating untouched leaves.
-	TwoLevel(Box<[OnceLock<Box<[AtomicU64]>>]>),
+	TwoLevel(
+		/// Sparse page-number indexing without allocating untouched leaves.
+		Box<[OnceLock<Box<[AtomicU64]>>]>,
+	),
 }
 
 /// Source-bound translation from page number to arena frame generation.
@@ -377,7 +383,10 @@ enum DirectoryEntry {
 		signal: Arc<LoadSignal>,
 	},
 	/// Fully validated and atomically published frame.
-	Resident(FrameLocator),
+	Resident(
+		/// Fully validated and atomically published frame.
+		FrameLocator,
+	),
 }
 
 impl DirectoryEntry {
@@ -414,9 +423,15 @@ enum DirectoryLookup {
 	/// No exact key is mapped.
 	Absent,
 	/// A load is in progress and may be awaited without a directory lock.
-	Loading(Arc<LoadSignal>),
+	Loading(
+		/// A load is in progress and may be awaited without a directory lock.
+		Arc<LoadSignal>,
+	),
 	/// A resident locator may be atomically pinned.
-	Resident(FrameLocator),
+	Resident(
+		/// A resident locator may be atomically pinned.
+		FrameLocator,
+	),
 }
 
 /// One independently locked, cache-line-separated directory partition.
@@ -672,11 +687,21 @@ impl Drop for CapacityWaiter<'_> {
 /// Result of serialized miss admission.
 enum ReserveDecision {
 	/// Another caller published a resident mapping before replacement locked.
-	Resident(FrameLocator),
+	Resident(
+		/// Another caller published a resident mapping before replacement
+		/// locked.
+		FrameLocator,
+	),
 	/// Another caller started a load before replacement locked.
-	Loading(Arc<LoadSignal>),
+	Loading(
+		/// Another caller started a load before replacement locked.
+		Arc<LoadSignal>,
+	),
 	/// This caller owns the new loading frame.
-	Reserved(LoadReservation),
+	Reserved(
+		/// This caller owns the new loading frame.
+		LoadReservation,
+	),
 }
 
 /// Evidence returned by the unique frame writer before authoritative arena
@@ -684,7 +709,12 @@ enum ReserveDecision {
 enum LoadReceipt {
 	/// A normal I/O loader already parsed the header it observed. The arena
 	/// revalidates current bytes and requires the two observations to match.
-	Reported(PageHeader),
+	Reported(
+		/// A normal I/O loader already parsed the header it observed. The arena
+		/// revalidates current bytes and requires the two observations to
+		/// match.
+		PageHeader,
+	),
 	/// Bytes were copied from an already validated resident frame. The copy
 	/// path deliberately does not parse the destination before arena
 	/// validation.
@@ -1021,10 +1051,10 @@ impl AtomicArenaBufferPool {
 	where
 		Loader: FnOnce(&mut AlignedPage) -> FerrosGrynnResult<PageHeader>,
 	{
-		if handle.matches(key) {
-			if let Some(guard) = self.get_resolved(handle)? {
-				return Ok(guard);
-			}
+		if handle.matches(key)
+			&& let Some(guard) = self.get_resolved(handle)?
+		{
+			return Ok(guard);
 		}
 		let guard = self.get_or_load(key, loader)?;
 		*handle = ResolvedFrameHandle::new(self.arena_id, key, guard.locator);
@@ -1613,7 +1643,7 @@ impl AtomicArenaBufferPool {
 
 /// Gives a capacity-starved miss a bounded local spin before yielding.
 fn bounded_capacity_backoff() {
-	// ponytail: this bounded spin/yield avoids a resident-side wake protocol;
+	// shortcut: this bounded spin/yield avoids a resident-side wake protocol;
 	// add `WaitOnAddress` only if measured miss CPU or tail latency requires
 	// it.
 	for _ in 0..MISS_BACKOFF_SPINS {
@@ -1624,7 +1654,7 @@ fn bounded_capacity_backoff() {
 
 /// Cursor-scoped reclamation guard for borrowed arena page addresses.
 ///
-/// ponytail: one global reader count delays every retired frame; replace it
+/// shortcut: one global reader count delays every retired frame; replace it
 /// with generation-bucketed epochs only if measured miss-side backpressure
 /// makes that extra machinery necessary.
 pub(super) struct AtomicReadEpoch<'pool> {
@@ -1786,6 +1816,12 @@ fn directory_shard(key: PageCacheKey) -> usize {
 			generation,
 			ceiling,
 		} => generation.get().rotate_left(11) ^ ceiling.get().rotate_left(29),
+
+		_ => {
+			let mut hasher = std::collections::hash_map::DefaultHasher::new();
+			std::hash::Hash::hash(&key.version(), &mut hasher);
+			std::hash::Hasher::finish(&hasher)
+		}
 	};
 	let mut mixed = page_key.data_space_raw()
 		^ page_key.file_id().get().rotate_left(17)
@@ -1810,6 +1846,7 @@ fn pin_exhausted(key: PageCacheKey) -> FerrosGrynnError {
 	clippy::panic_in_result_fn,
 	reason = "fallible test setup returns Result while assertions report contract failures"
 )]
+/// Regression tests for atomic arena behavior.
 mod tests {
 	use std::{
 		error::Error,
@@ -1888,6 +1925,13 @@ mod tests {
 				ceiling,
 				..
 			} => PageLsn::new(ceiling.get()),
+
+			_ => {
+				return Err(FerrosGrynnError::invalid_storage_page(
+					key.page_no().get(),
+					"unsupported cache-source version",
+				));
+			}
 		};
 		let mut page =
 			AlignedPage::new(PageType::NodeHot, PageFlags::empty(), page_lsn, key.page_no());
@@ -1899,6 +1943,7 @@ mod tests {
 		Ok(header)
 	}
 
+	/// Verifies exact versions and files share one budget without aliasing.
 	#[test]
 	fn exact_versions_and_files_share_one_budget_without_aliasing() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(4).ok_or("zero capacity")?);
@@ -1932,6 +1977,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies resolved handle recovers after frame reuse.
 	#[test]
 	fn resolved_handle_recovers_after_frame_reuse() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::with_counters(
@@ -1967,6 +2013,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies source bound locators reject stale frames and wrong epochs.
 	#[test]
 	fn source_bound_locators_reject_stale_frames_and_wrong_epochs() -> Result<(), Box<dyn Error>> {
 		for layout in [DenseLocatorLayout::Flat, DenseLocatorLayout::TwoLevel] {
@@ -2010,6 +2057,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies read epoch defers reuse and keeps borrowed page stable.
 	#[test]
 	fn read_epoch_defers_reuse_and_keeps_borrowed_page_stable() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
@@ -2030,30 +2078,35 @@ mod tests {
 
 		thread::scope(|scope| -> Result<(), Box<dyn Error>> {
 			let epoch = pool.read_epoch()?;
-			let borrowed =
-				locator.get_epoch_resolved(&epoch, first).ok_or("fresh epoch locator was stale")?;
-			scope.spawn(|| {
-				let _ = entered_tx.send(());
-				let result = pool
-					.get_or_load(second, |page| {
-						let _ = loader_tx.send(());
-						load_valid(second, page)
-					})
-					.map(drop);
-				let _ = done_tx.send(result);
-			});
-			entered_rx.recv_timeout(Duration::from_secs(1))?;
-			let deadline = Instant::now() + Duration::from_secs(1);
-			while pool.retired_count() == 0 && Instant::now() < deadline {
-				thread::yield_now();
+			{
+				let borrowed = locator
+					.get_epoch_resolved(&epoch, first)
+					.ok_or("fresh epoch locator was stale")?;
+				scope.spawn(|| {
+					let _ = entered_tx.send(());
+					let result = pool
+						.get_or_load(second, |page| {
+							let _ = loader_tx.send(());
+							load_valid(second, page)
+						})
+						.map(drop);
+					let _ = done_tx.send(result);
+				});
+				entered_rx.recv_timeout(Duration::from_secs(1))?;
+				let deadline = Instant::now() + Duration::from_secs(1);
+				while pool.retired_count() == 0 && Instant::now() < deadline {
+					thread::yield_now();
+				}
+				assert_eq!(pool.retired_count(), 1);
+				assert!(matches!(
+					loader_rx.recv_timeout(Duration::from_millis(30)),
+					Err(mpsc::RecvTimeoutError::Timeout)
+				));
+				assert_eq!(
+					borrowed.as_page().validate(first.page_no())?.page_no(),
+					first.page_no()
+				);
 			}
-			assert_eq!(pool.retired_count(), 1);
-			assert!(matches!(
-				loader_rx.recv_timeout(Duration::from_millis(30)),
-				Err(mpsc::RecvTimeoutError::Timeout)
-			));
-			assert_eq!(borrowed.as_page().validate(first.page_no())?.page_no(), first.page_no());
-			drop(borrowed);
 			drop(epoch);
 			loader_rx.recv_timeout(Duration::from_secs(1))?;
 			Ok(())
@@ -2066,6 +2119,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies explicit remove retires epoch borrow before freeing frame.
 	#[test]
 	fn explicit_remove_retires_epoch_borrow_before_freeing_frame() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
@@ -2074,17 +2128,19 @@ mod tests {
 		drop(pool.get_or_load(first, |page| load_valid(first, page))?);
 		let handle = pool.resolve(first).ok_or("resident page did not resolve")?;
 		let epoch = pool.read_epoch()?;
-		let borrowed = epoch.get_resolved(&handle).ok_or("fresh epoch handle was stale")?;
-		assert!(pool.remove_resident(first)?);
-		assert_eq!(pool.retired_count(), 1);
-		assert_eq!(borrowed.as_page().validate(first.page_no())?.page_no(), first.page_no());
-		drop(borrowed);
+		{
+			let borrowed = epoch.get_resolved(&handle).ok_or("fresh epoch handle was stale")?;
+			assert!(pool.remove_resident(first)?);
+			assert_eq!(pool.retired_count(), 1);
+			assert_eq!(borrowed.as_page().validate(first.page_no())?.page_no(), first.page_no());
+		}
 		drop(epoch);
 		drop(pool.get_or_load(second, |page| load_valid(second, page))?);
 		assert_eq!(pool.retired_count(), 0);
 		Ok(())
 	}
 
+	/// Verifies failed load is never published.
 	#[test]
 	fn failed_load_is_never_published() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
@@ -2101,6 +2157,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies bytes corrupted after header validation are never published.
 	#[test]
 	fn bytes_corrupted_after_header_validation_are_never_published() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -2129,6 +2186,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies panicking loader rolls back the loading mapping.
 	#[test]
 	fn panicking_loader_rolls_back_the_loading_mapping() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
@@ -2144,6 +2202,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies resolved handle cannot cross arena ownership.
 	#[test]
 	fn resolved_handle_cannot_cross_arena_ownership() -> Result<(), Box<dyn Error>> {
 		let first_pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
@@ -2157,6 +2216,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies direct to frame batch publishes all or none.
 	#[test]
 	fn direct_to_frame_batch_publishes_all_or_none() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(4).ok_or("zero")?);
@@ -2198,6 +2258,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent batches cannot retain mutually blocking partial
+	/// capacity.
 	#[test]
 	fn concurrent_batches_cannot_retain_mutually_blocking_partial_capacity()
 	-> Result<(), Box<dyn Error>> {
@@ -2275,12 +2337,14 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies pinned frame applies backpressure until guard drop.
 	#[test]
 	fn pinned_frame_applies_backpressure_until_guard_drop() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
 		assert_pinned_frame_backpressure(pool)
 	}
 
+	/// Verifies miss side backoff observes last guard drop.
 	#[test]
 	fn miss_side_backoff_observes_last_guard_drop() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::with_miss_side_backoff(
@@ -2322,6 +2386,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent miss is coalesced to one loader.
 	#[test]
 	fn concurrent_miss_is_coalesced_to_one_loader() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -2375,6 +2440,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent reuse never returns the wrong page.
 	#[test]
 	fn concurrent_reuse_never_returns_the_wrong_page() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -2410,6 +2476,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies eight files share one bounded arena without byte aliasing.
 	#[test]
 	fn eight_files_share_one_bounded_arena_without_byte_aliasing() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(4).ok_or("zero capacity")?);
@@ -2425,6 +2492,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies shuttle pin and evict cannot both claim one generation.
 	#[test]
 	fn shuttle_pin_and_evict_cannot_both_claim_one_generation() {
 		shuttle::check_dfs(
@@ -2485,6 +2553,8 @@ mod tests {
 		);
 	}
 
+	/// Verifies shuttle read epoch prevents payload reuse after resident
+	/// validation.
 	#[test]
 	fn shuttle_read_epoch_prevents_payload_reuse_after_resident_validation() {
 		shuttle::check_dfs(
@@ -2537,6 +2607,7 @@ mod tests {
 		);
 	}
 
+	/// Verifies shuttle capacity registration cannot miss the last pin release.
 	#[test]
 	fn shuttle_capacity_registration_cannot_miss_the_last_pin_release() {
 		shuttle::check_dfs(

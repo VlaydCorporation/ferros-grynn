@@ -272,6 +272,7 @@ fn value_matches(
 }
 
 #[cfg(test)]
+/// Regression tests for bindings behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -281,11 +282,13 @@ mod tests {
 
 	/// Erased public container types cannot hide incompatible members.
 	#[test]
-	fn lexical_type_validation_checks_sets_ranges_shapes_and_unions() -> FerrosGrynnResult<()> {
+	fn lexical_type_validation_checks_sets_ranges_shapes_and_unions() {
+		use crate::test_assertions::AssertResult as _;
+
 		let control = ExecutionControl::new(&QueryExecutionOptions::default(), None);
 		let set = Value::Set(Set::from_iter([Value::from(1), Value::from("bad")]));
 		assert!(validate_value(&Type::Set(Box::new(Type::Int)), &set, &control, None).is_err());
-		let range = Value::Range(Range::closed("a", "z")?);
+		let range = Value::Range(Range::closed("a", "z").assert_ok());
 		assert!(validate_value(&Type::Range(Box::new(Type::Int)), &range, &control, None).is_err());
 		assert!(
 			validate_value(&Type::Range(Box::new(Type::String)), &range, &control, None).is_ok()
@@ -299,7 +302,6 @@ mod tests {
 		let union = Type::Union(vec![Type::Int, Type::String]);
 		assert!(validate_value(&union, &Value::from("ok"), &control, None).is_ok());
 		assert!(validate_value(&union, &Value::Bool(true), &control, None).is_err());
-		Ok(())
 	}
 
 	/// Metadata admission and validator interruption precede payload copies.
@@ -327,26 +329,27 @@ mod tests {
 	}
 	/// Empty scopes, snapshots and lexical shadowing retain exact provenance.
 	#[test]
-	fn lazy_lexical_scopes_preserve_snapshots_and_reactive_shadowing() -> FerrosGrynnResult<()> {
+	fn lazy_lexical_scopes_preserve_snapshots_and_reactive_shadowing() {
+		use crate::test_assertions::AssertResult as _;
+
 		let control = ExecutionControl::new(&QueryExecutionOptions::default(), None);
 		let empty = BindingTypes::default();
 		assert!(empty.get("missing").is_none());
 		assert!(!empty.is_reactive("missing"));
-		let outer = empty.with_reactive_binding("tracked", &control, &empty)?;
+		let outer = empty.with_reactive_binding("tracked", &control, &empty).assert_ok();
 		let snapshot = outer.clone();
-		let exported = empty.overlay(&outer, &control)?;
+		let exported = empty.overlay(&outer, &control).assert_ok();
 		assert!(exported.is_reactive("tracked"));
 		assert_eq!(exported.get("tracked"), Some(&Type::Any));
-		let local = empty.with_binding("tracked", &Type::Int, &control, &outer)?;
-		let shadowed = local.overlay(&outer, &control)?;
+		let local = empty.with_binding("tracked", &Type::Int, &control, &outer).assert_ok();
+		let shadowed = local.overlay(&outer, &control).assert_ok();
 		assert_eq!(shadowed.get("tracked"), Some(&Type::Int));
 		assert!(!shadowed.is_reactive("tracked"));
 		assert_eq!(snapshot.get("tracked"), Some(&Type::Any));
 		assert!(snapshot.is_reactive("tracked"));
 		let rich = Type::Array(Box::new(Type::Int));
-		let declared = local.with_binding("rich", &rich, &control, &outer)?;
+		let declared = local.with_binding("rich", &rich, &control, &outer).assert_ok();
 		assert_eq!(declared.get("rich"), Some(&rich));
 		assert!(local.get("rich").is_none());
-		Ok(())
 	}
 }

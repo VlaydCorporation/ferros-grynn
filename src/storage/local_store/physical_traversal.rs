@@ -75,13 +75,18 @@ use crate::{
 /// Storage-transport observations for one logical frontier expansion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PhysicalTraversalReadStats {
+	/// Page count observed through the resident read path.
 	pub(crate) resident_pages: u64,
+	/// Page count observed through the wal read path.
 	pub(crate) wal_pages: u64,
+	/// Page count observed through the sync home read path.
 	pub(crate) sync_home_pages: u64,
+	/// Page count observed through the ioring home read path.
 	pub(crate) ioring_home_pages: u64,
 }
 
 impl PhysicalTraversalReadStats {
+	/// Returns add for `PhysicalTraversalReadStats`.
 	fn add(&mut self, other: Self) {
 		self.resident_pages = self.resident_pages.saturating_add(other.resident_pages);
 		self.wal_pages = self.wal_pages.saturating_add(other.wal_pages);
@@ -93,84 +98,137 @@ impl PhysicalTraversalReadStats {
 /// One owned same-level incidence decoded from graph hot pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PhysicalTraversalIncidence {
+	/// Target endpoint or schema object selected by the operation.
 	pub(crate) target: AtomId,
+	/// Materialization-local atom handle used by this operation.
 	pub(crate) edge: AtomId,
+	/// Traversal orientation or requested sort direction selected by this
+	/// element.
 	pub(crate) direction: PathDirection,
+	/// Source, target or undirected endpoint role of the incidence.
 	pub(crate) role: EndpointRole,
+	/// Directed, bidirectional or undirected topology of the incidence.
 	pub(crate) topology: EdgeDirection,
 }
 
 /// Complete physical result or an explicit request to use materialized
 /// fallback.
-pub(crate) struct PhysicalTraversalRead {
+pub struct PhysicalTraversalRead {
+	/// Decoded traversal candidates retained by the read result.
 	pub(crate) incidences: Vec<PhysicalTraversalIncidence>,
+	/// Read-path counters accumulated while loading the requested physical
+	/// data.
 	pub(crate) stats: PhysicalTraversalReadStats,
 }
 
 /// Exact physical resolution of one meta owner's nested graph.
-pub(crate) struct PhysicalTraversalInnerRead {
+pub struct PhysicalTraversalInnerRead {
+	/// Graph materialization or physical graph files retained by the operation.
 	pub(crate) graph: Option<GraphId>,
+	/// Read-path counters accumulated while loading the requested physical
+	/// data.
 	pub(crate) stats: PhysicalTraversalReadStats,
 }
 
 /// Exact base and graph-local property state decoded from physical pages.
-pub(crate) struct PhysicalTraversalFieldsRead {
+pub struct PhysicalTraversalFieldsRead {
+	/// Materialization-local atom handle used by this operation.
 	pub(crate) global: GlobalAtomId,
+	/// Resolved class identifier associated with the stored record.
 	pub(crate) class_id: ClassId,
+	/// Stable class-qualified record identity used by this operation.
 	pub(crate) record_id: RecordId,
+	/// Properties read from the atom base representation.
 	pub(crate) base_properties: PropertyMap,
+	/// Optional graph-local property overlay applied to the base properties.
 	pub(crate) overlay: Option<PropertyOverlay>,
+	/// Read-path counters accumulated while loading the requested physical
+	/// data.
 	pub(crate) stats: PhysicalTraversalReadStats,
 }
 
 /// Immutable database-global AtomStore binding for one query snapshot.
 struct PhysicalAtomSnapshot {
+	/// Physical file identities retained by the current storage snapshot.
 	files: AtomStoreFileSet,
+	/// Validated superblock describing the retained physical file set.
 	superblock: AtomStoreSuperblock,
+	/// Hot atom file retained by the physical atom snapshot.
 	atoms_hot: Arc<RegisteredDataFile>,
+	/// Registered property file retained by the physical atom snapshot.
 	properties: Arc<RegisteredDataFile>,
 }
 
 /// Immutable physical binding retained with a registered WAL snapshot.
 struct PhysicalGraphSnapshot {
+	/// Physical file identities retained by the current storage snapshot.
 	files: GraphFileSet,
+	/// Validated superblock describing the retained physical file set.
 	superblock: GraphSuperblock,
+	/// Bindings used to resolve atom storage arenas within the graph snapshot.
 	arena: crate::storage::graph_pages::GraphArenaBindings,
+	/// Selected node identifiers or retained physical node storage.
 	nodes: Arc<RegisteredDataFile>,
+	/// Selected edge identifiers or retained physical edge storage.
 	edges: Arc<RegisteredDataFile>,
+	/// Physical adjacency file retained by the graph snapshot.
 	adjacency: Arc<RegisteredDataFile>,
+	/// Property-overlay file retained by the physical graph snapshot.
 	overlays: Arc<RegisteredDataFile>,
+	/// Optional endpoint index retained for physical incidence lookup.
 	endpoint: Option<PhysicalEndpointSnapshot>,
 }
 
 /// Engine identity and immutable qualified postings pinned with graph topology.
 struct PhysicalEndpointSnapshot {
+	/// Resolved binding connecting the fixture or reader to its registered
+	/// resource.
 	binding: crate::storage::catalog::PhysicalIndexBinding,
+	/// Resolved system-index capability used for endpoint lookup.
 	capability: crate::datastore::SystemIndex,
+	/// File owner retaining the bytes read by this storage component.
 	file: Arc<RegisteredDataFile>,
 }
 
 /// Cloneable token keeping the exact WAL visibility boundary alive.
 pub(super) struct LocalQuerySnapshotInner {
+	/// Transaction handle keeping the storage snapshot registered while it is
+	/// read.
 	pub(super) _pin: TxHandle,
+	/// Snapshot identity or retained read snapshot used by the operation.
 	pub(super) snapshot: StorageSnapshot,
+	/// Checkpoint generation whose home-page mappings are visible to the
+	/// snapshot.
 	pub(super) home_generation: crate::storage::types::CheckpointGeneration,
+	/// Highest WAL position admitted by the snapshot home-page mappings.
 	pub(super) home_ceiling: crate::storage::types::Lsn,
+	/// Physical atom files retained by the layout or read snapshot.
 	atoms: PhysicalAtomSnapshot,
+	/// Graph references or physical graph snapshots indexed for resolution.
 	graphs: BTreeMap<GraphId, PhysicalGraphSnapshot>,
+	/// Retained physical indexes or time spent loading indexes during startup.
 	pub(super) indexes: BTreeMap<crate::datastore::IndexId, Arc<PhysicalIndexFile>>,
+	/// Retained statistics files or time spent loading statistics during
+	/// startup.
 	pub(super) statistics: Option<Arc<PhysicalStatisticsFiles>>,
 }
 
 /// Local physical state captured for one immutable query snapshot.
 #[derive(Clone)]
-pub(crate) struct LocalQuerySnapshot(pub(super) Arc<LocalQuerySnapshotInner>);
+pub struct LocalQuerySnapshot(
+	/// Shared exact WAL visibility and physical file bindings for this query
+	/// snapshot.
+	pub(super) Arc<LocalQuerySnapshotInner>,
+);
 
 /// One bounded physical traversal reader. It never exposes pages or file ids
 /// above the datastore boundary.
 struct PhysicalTraversalCursor<'store> {
+	/// Backing blob store used to resolve unloaded tree nodes.
 	store: &'store LocalStore,
+	/// Snapshot identity or retained read snapshot used by the operation.
 	snapshot: &'store LocalQuerySnapshotInner,
+	/// Graph materialization or physical graph files retained by the operation.
 	graph: &'store PhysicalGraphSnapshot,
 }
 
@@ -299,6 +357,7 @@ impl LocalStore {
 }
 
 impl PhysicalTraversalCursor<'_> {
+	/// Returns fields for `PhysicalTraversalCursor<'_>`.
 	fn fields(
 		&self,
 		owner: AtomId,
@@ -418,6 +477,7 @@ impl PhysicalTraversalCursor<'_> {
 		}))
 	}
 
+	/// Reads record for `PhysicalTraversalCursor<'_>`.
 	#[allow(
 		clippy::too_many_arguments,
 		reason = "one record read needs an exact source identity and page ceiling"
@@ -485,6 +545,7 @@ impl PhysicalTraversalCursor<'_> {
 		}
 	}
 
+	/// Returns inner graph for `PhysicalTraversalCursor<'_>`.
 	fn inner_graph(&self, owner: AtomId) -> FerrosGrynnResult<Option<PhysicalTraversalInnerRead>> {
 		let mut stats = PhysicalTraversalReadStats::default();
 		let (page_no, within) = hot_slot_address(owner.slot())?;
@@ -530,6 +591,7 @@ impl PhysicalTraversalCursor<'_> {
 		}))
 	}
 
+	/// Returns expand inline for `PhysicalTraversalCursor<'_>`.
 	fn expand_inline(
 		&self,
 		source: AtomId,
@@ -934,6 +996,7 @@ impl PhysicalTraversalCursor<'_> {
 		}))
 	}
 
+	/// Appends node side for `PhysicalTraversalCursor<'_>`.
 	fn append_node_side<const N: usize>(
 		&self,
 		output: &mut Vec<(DiskAtomRef, RequestedDirection)>,
@@ -966,6 +1029,7 @@ impl PhysicalTraversalCursor<'_> {
 		Ok(true)
 	}
 
+	/// Reads adjacency chain for `PhysicalTraversalCursor<'_>`.
 	fn read_adjacency_chain(
 		&self,
 		first: PageNo,
@@ -1006,6 +1070,7 @@ impl PhysicalTraversalCursor<'_> {
 		Ok(Some(entries))
 	}
 
+	/// Reads pages for `PhysicalTraversalCursor<'_>`.
 	fn read_pages(
 		&self,
 		space: DataSpaceId,
@@ -1084,6 +1149,7 @@ pub(super) fn read_snapshot_pages(
 	})
 }
 
+/// Reads cold home for this module.
 fn read_cold_home(
 	store: &LocalStore,
 	file: &Arc<RegisteredDataFile>,
@@ -1144,26 +1210,42 @@ fn read_cold_home(
 	Ok(())
 }
 
+/// Read pages and transport counters collected for one physical traversal
+/// window.
 pub(super) struct LoadedPages {
+	/// Loaded pages retained by this read or page-store owner.
 	pub(super) pages: Vec<AlignedPage>,
+	/// Read-path counters accumulated while loading the requested physical
+	/// data.
 	pub(super) stats: PhysicalTraversalReadStats,
 }
 
+/// Physical target reference and incidence roles decoded from a traversal page.
 #[derive(Clone, Copy)]
 struct EncodedCandidate {
+	/// On-disk atom reference decoded for the candidate incidence.
 	target: DiskAtomRef,
+	/// Traversal orientation or requested sort direction selected by this
+	/// element.
 	direction: PathDirection,
+	/// Source, target or undirected endpoint role of the incidence.
 	role: EndpointRole,
+	/// Directed, bidirectional or undirected topology of the incidence.
 	topology: EdgeDirection,
 }
 
+/// Physical incidence direction selected when filtering traversal candidates.
 #[derive(Clone, Copy)]
 enum RequestedDirection {
+	/// Accept forward physical incidences.
 	Forward,
+	/// Accept reverse physical incidences.
 	Backward,
+	/// Accept incidences interpreted without directed orientation.
 	Undirected,
 }
 
+/// Returns physical graph snapshot for this module.
 fn physical_graph_snapshot(
 	registry: &crate::storage::file_registry::FileRegistry,
 	binding: &GraphBinding,
@@ -1192,6 +1274,7 @@ fn physical_graph_snapshot(
 	})
 }
 
+/// Returns physical atom snapshot for this module.
 fn physical_atom_snapshot(
 	registry: &crate::storage::file_registry::FileRegistry,
 	files: AtomStoreFileSet,
@@ -1205,6 +1288,7 @@ fn physical_atom_snapshot(
 	})
 }
 
+/// Returns bounded record pages for this module.
 fn bounded_record_pages(
 	record_id: PropertyRef,
 	properties: PropertyRef,
@@ -1220,6 +1304,7 @@ fn bounded_record_pages(
 	)
 }
 
+/// Records page count for this module.
 fn record_page_count(reference: PropertyRef) -> FerrosGrynnResult<usize> {
 	match reference {
 		PropertyRef::None => Ok(0),
@@ -1235,6 +1320,7 @@ fn record_page_count(reference: PropertyRef) -> FerrosGrynnResult<usize> {
 	}
 }
 
+/// Returns contiguous pages for this module.
 fn contiguous_pages(first: PageNo, count: usize) -> FerrosGrynnResult<Vec<PageNo>> {
 	if count == 0 || count > MAX_READ_SCOPE_OPERATIONS {
 		return Err(invalid("physical property chain exceeds its bounded read scope"));
@@ -1252,6 +1338,7 @@ fn contiguous_pages(first: PageNo, count: usize) -> FerrosGrynnResult<Vec<PageNo
 		.collect()
 }
 
+/// Returns unique hot pages for this module.
 fn unique_hot_pages(references: &[DiskAtomRef]) -> FerrosGrynnResult<Vec<PageNo>> {
 	let mut pages = references
 		.iter()
@@ -1262,10 +1349,12 @@ fn unique_hot_pages(references: &[DiskAtomRef]) -> FerrosGrynnResult<Vec<PageNo>
 	Ok(pages)
 }
 
+/// Returns page index for this module.
 fn page_index(pages: &[PageNo]) -> RapidHashMap<PageNo, usize> {
 	pages.iter().enumerate().map(|(index, page)| (*page, index)).collect()
 }
 
+/// Validates node identity for this module.
 fn validate_node_identity(slot: &NodeHotSlot, source: AtomId) -> FerrosGrynnResult<()> {
 	if slot.flags.contains(NodeSlotFlags::TOMBSTONE)
 		|| slot.generation != source.generation()
@@ -1276,6 +1365,7 @@ fn validate_node_identity(slot: &NodeHotSlot, source: AtomId) -> FerrosGrynnResu
 	Ok(())
 }
 
+/// Validates edge identity for this module.
 fn validate_edge_identity(slot: &EdgeHotSlot, source: AtomId) -> FerrosGrynnResult<()> {
 	if slot.flags.contains(EdgeSlotFlags::TOMBSTONE)
 		|| slot.generation != source.generation()
@@ -1286,6 +1376,7 @@ fn validate_edge_identity(slot: &EdgeHotSlot, source: AtomId) -> FerrosGrynnResu
 	Ok(())
 }
 
+/// Returns inline candidate for this module.
 fn inline_candidate(
 	slot: &EdgeHotSlot,
 	edge: DiskAtomRef,
@@ -1385,6 +1476,7 @@ fn inline_candidate(
 	Ok(result)
 }
 
+/// Returns invalid for this module.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

@@ -218,6 +218,8 @@ impl UnpublishedGeneration {
 }
 
 impl Drop for UnpublishedGeneration {
+	/// Runs cleanup for this `UnpublishedGeneration` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		if !self.armed {
 			return;
@@ -276,6 +278,8 @@ impl PendingChangefeedFiles {
 }
 
 impl Drop for PendingChangefeedFiles {
+	/// Runs cleanup for this `PendingChangefeedFiles` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		if self.armed {
 			for path in &self.paths {
@@ -533,6 +537,7 @@ fn remove_generation_directory(path: &Path) -> FerrosGrynnResult<()> {
 
 #[cfg(test)]
 thread_local! {
+	/// Cleanup failures still to inject on this test thread after publication succeeds.
 	static INJECTED_CLEANUP_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -563,27 +568,34 @@ fn io_failure(operation: impl Into<String>, source: std::io::Error) -> FerrosGry
 }
 
 #[cfg(test)]
+/// Regression tests for cleanup behavior.
 mod query_run_tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies startup cleanup removes orphan query runs idempotently.
 	#[test]
 	fn startup_cleanup_removes_orphan_query_runs_idempotently() {
 		let root = std::env::temp_dir()
 			.join(format!("fg-query-cleanup-{}", crate::values::Uuid::now_v7()));
 		let session = root.join("tmp").join("query").join("orphan");
-		fs::create_dir_all(&session).unwrap();
-		fs::write(session.join("0000000000000000.run"), b"orphan").unwrap();
+		fs::create_dir_all(&session).assert_ok();
+		fs::write(session.join("0000000000000000.run"), b"orphan").assert_ok();
 
-		cleanup_query_runs(&root).unwrap();
+		cleanup_query_runs(&root).assert_ok();
 		assert!(!root.join("tmp").join("query").exists());
-		cleanup_query_runs(&root).unwrap();
+		cleanup_query_runs(&root).assert_ok();
 		drop(fs::remove_dir_all(root));
 	}
 }
 
 #[cfg(test)]
+/// Regression tests for cleanup behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 	use crate::{
 		datastore::DataSpaceId,
 		storage::{
@@ -593,8 +605,11 @@ mod tests {
 		},
 	};
 
+	/// Verifies startup cleanup removes only unreachable uuid generations.
 	#[test]
-	fn startup_cleanup_removes_only_unreachable_uuid_generations() -> FerrosGrynnResult<()> {
+	fn startup_cleanup_removes_only_unreachable_uuid_generations() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::temp_dir().join(format!("fg-gc-{}", Uuid::now_v7()));
 		let reachable = Uuid::now_v7().to_string();
 		let orphan = Uuid::now_v7().to_string();
@@ -602,34 +617,40 @@ mod tests {
 		let orphan_path = root.join("atoms").join(&orphan);
 		let unrelated = root.join("atoms").join("keep-me");
 		fs::create_dir_all(&reachable_path)
-			.map_err(|source| io_failure("create reachable fixture", source))?;
+			.map_err(|source| io_failure("create reachable fixture", source))
+			.assert_ok();
 		fs::create_dir_all(&orphan_path)
-			.map_err(|source| io_failure("create orphan fixture", source))?;
+			.map_err(|source| io_failure("create orphan fixture", source))
+			.assert_ok();
 		fs::create_dir_all(&unrelated)
-			.map_err(|source| io_failure("create unrelated fixture", source))?;
-		let mut catalog = FileCatalog::bootstrap()?;
+			.map_err(|source| io_failure("create unrelated fixture", source))
+			.assert_ok();
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
 		catalog.files.push(FileCatalogEntry {
 			space_id: DataSpaceId::Database,
-			file_id: DataFileId::new(1, DataFileKind::AtomsHot).unwrap(),
+			file_id: DataFileId::new(1, DataFileKind::AtomsHot).assert_some(),
 			companion_of: None,
 			role: DataFileRole::WalBackfilled,
-			path: CatalogPath::parse(&format!("atoms/{reachable}/atoms_hot.fgb"))?,
+			path: CatalogPath::parse(&format!("atoms/{reachable}/atoms_hot.fgb")).assert_ok(),
 		});
 
-		cleanup_orphan_generations(&root, &catalog)?;
+		cleanup_orphan_generations(&root, &catalog).assert_ok();
 		assert!(reachable_path.is_dir());
 		assert!(!orphan_path.exists());
 		assert!(unrelated.is_dir());
 		drop(fs::remove_dir_all(root));
-		Ok(())
 	}
 
+	/// Verifies startup cleanup removes only unreachable quarantines.
 	#[test]
-	fn startup_cleanup_removes_only_unreachable_quarantines() -> FerrosGrynnResult<()> {
+	fn startup_cleanup_removes_only_unreachable_quarantines() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::temp_dir().join(format!("fg-quarantine-cleanup-{}", Uuid::now_v7()));
 		let directory = root.join("admin").join("quarantine");
 		fs::create_dir_all(&directory)
-			.map_err(|source| io_failure("create quarantine fixture directory", source))?;
+			.map_err(|source| io_failure("create quarantine fixture directory", source))
+			.assert_ok();
 		let reachable = Uuid::now_v7();
 		let orphan = Uuid::now_v7();
 		let reachable_path = directory.join(format!("{reachable}.fgq"));
@@ -637,35 +658,41 @@ mod tests {
 		let unrelated = directory.join("keep-me");
 		for path in [&reachable_path, &orphan_path, &unrelated] {
 			fs::write(path, b"fixture")
-				.map_err(|source| io_failure("write quarantine fixture", source))?;
+				.map_err(|source| io_failure("write quarantine fixture", source))
+				.assert_ok();
 		}
-		let mut catalog = FileCatalog::bootstrap()?;
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
 		catalog.files.push(FileCatalogEntry {
 			space_id: DataSpaceId::Database,
 			file_id: DataFileId::new(1, DataFileKind::ImportQuarantine)
-				.ok_or_else(|| invalid("test quarantine identity is invalid"))?,
+				.ok_or_else(|| invalid("test quarantine identity is invalid"))
+				.assert_ok(),
 			companion_of: None,
 			role: DataFileRole::AuxiliaryImmutable,
-			path: CatalogPath::parse(&format!("admin/quarantine/{reachable}.fgq"))?,
+			path: CatalogPath::parse(&format!("admin/quarantine/{reachable}.fgq")).assert_ok(),
 		});
 
-		cleanup_orphan_quarantines(&root, &catalog)?;
+		cleanup_orphan_quarantines(&root, &catalog).assert_ok();
 		assert!(reachable_path.is_file());
 		assert!(!orphan_path.exists());
 		assert!(unrelated.is_file());
 		drop(fs::remove_dir_all(root));
-		Ok(())
 	}
 
+	/// Verifies unpublished generation drop removes every owned directory.
 	#[test]
-	fn unpublished_generation_drop_removes_every_owned_directory() -> FerrosGrynnResult<()> {
+	fn unpublished_generation_drop_removes_every_owned_directory() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::temp_dir().join(format!("fg-import-drop-{}", Uuid::now_v7()));
 		let first = root.join("atoms").join(Uuid::now_v7().to_string());
 		let second = root.join("graphs").join("0000000000000001").join(Uuid::now_v7().to_string());
 		fs::create_dir_all(&first)
-			.map_err(|source| io_failure("create first unpublished generation", source))?;
+			.map_err(|source| io_failure("create first unpublished generation", source))
+			.assert_ok();
 		fs::create_dir_all(&second)
-			.map_err(|source| io_failure("create second unpublished generation", source))?;
+			.map_err(|source| io_failure("create second unpublished generation", source))
+			.assert_ok();
 		let generation = UnpublishedGeneration {
 			directories: vec![first.clone(), second.clone()],
 			armed: true,
@@ -675,6 +702,5 @@ mod tests {
 		assert!(!first.exists());
 		assert!(!second.exists());
 		drop(fs::remove_dir_all(root));
-		Ok(())
 	}
 }

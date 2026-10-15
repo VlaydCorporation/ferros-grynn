@@ -38,9 +38,13 @@ use crate::{
 	values::{PropertyKeyId, Value, Vector, storage::DiskAtomRef},
 };
 
+/// Vector source state.
 struct VectorSource {
+	/// Spec associated with this vector source.
 	spec: VectorBuildSpec,
+	/// Kind associated with this vector source.
 	kind: ClassIndexKind,
+	/// Relative path associated with this vector source.
 	relative_path: String,
 }
 
@@ -125,6 +129,7 @@ pub(in crate::storage) fn write_streamed_vector_index_images(
 	Ok(images)
 }
 
+/// Returns the vector sources result.
 fn vector_sources(
 	database: &DatabaseRoot,
 	skipped: &BTreeSet<IndexId>,
@@ -176,11 +181,7 @@ fn vector_sources(
 					index.build_revision(),
 				),
 			};
-			let kind_tag = if index.kind() == ClassIndexKind::Hnsw {
-				0
-			} else {
-				1
-			};
+			let kind_tag = u8::from(index.kind() != ClassIndexKind::Hnsw);
 			let ordinal = ordinals.entry((index.scope(), kind_tag)).or_default();
 			let current = *ordinal;
 			*ordinal =
@@ -200,6 +201,7 @@ fn vector_sources(
 	Ok(sources)
 }
 
+/// Returns the vector documents result.
 fn vector_documents<'a>(
 	database: &'a DatabaseRoot,
 	source: &VectorSource,
@@ -212,6 +214,7 @@ fn vector_documents<'a>(
 	}
 }
 
+/// Returns the explicit kind result.
 fn explicit_kind(source: &VectorSource) -> ScopedIndexKind {
 	ScopedIndexKind::Explicit {
 		index: source.spec.index,
@@ -221,6 +224,7 @@ fn explicit_kind(source: &VectorSource) -> ScopedIndexKind {
 	}
 }
 
+/// Pushes buffered.
 fn push_buffered(images: &mut ScopedIndexImages, scope: IndexScope, file: ScopedIndexFile) {
 	match scope {
 		IndexScope::Base => images.base.push(file),
@@ -230,6 +234,7 @@ fn push_buffered(images: &mut ScopedIndexImages, scope: IndexScope, file: Scoped
 	}
 }
 
+/// Pushes streamed.
 fn push_streamed(
 	images: &mut StreamedScopedIndexImages,
 	scope: IndexScope,
@@ -243,11 +248,12 @@ fn push_streamed(
 	}
 }
 
-fn base_documents<'a>(
-	database: &'a DatabaseRoot,
+/// Returns the base documents result.
+fn base_documents(
+	database: &DatabaseRoot,
 	class: ClassId,
 	key: PropertyKeyId,
-) -> FerrosGrynnResult<Vec<VectorDocument<&'a Vector>>> {
+) -> FerrosGrynnResult<Vec<VectorDocument<&Vector>>> {
 	database
 		.atoms
 		.atoms()
@@ -267,12 +273,13 @@ fn base_documents<'a>(
 		.collect()
 }
 
-fn effective_documents<'a>(
-	database: &'a DatabaseRoot,
+/// Returns the effective documents result.
+fn effective_documents(
+	database: &DatabaseRoot,
 	graph: crate::graph::GraphId,
 	class: ClassId,
 	key: PropertyKeyId,
-) -> FerrosGrynnResult<Vec<VectorDocument<&'a Vector>>> {
+) -> FerrosGrynnResult<Vec<VectorDocument<&Vector>>> {
 	let graph_root = database
 		.graph(graph)
 		.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?;
@@ -300,6 +307,7 @@ fn effective_documents<'a>(
 		.collect()
 }
 
+/// Builds seed.
 fn build_seed(
 	index: crate::datastore::IndexId,
 	version: crate::datastore::SchemaVersion,
@@ -314,6 +322,7 @@ fn build_seed(
 	rapidhash_v3(&bytes)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

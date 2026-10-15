@@ -10,9 +10,13 @@ use crate::syn::{ExprKind, Literal};
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct CreateStatement {
+	/// Targets processed by the data-mutation statement.
 	pub targets: Vec<DmlTarget>,
+	/// Payload bytes, elements or retained storage backing this representation.
 	pub data: Option<DmlData>,
+	/// Optional projection of values returned after the data mutation.
 	pub returning: Option<DmlReturn>,
+	/// Optional existence or predicate requirement checked before the mutation.
 	pub expect: Option<ExpectClause>,
 }
 
@@ -20,14 +24,22 @@ pub struct CreateStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct MutateStatement {
+	/// Targets processed by the data-mutation statement.
 	pub targets: Vec<DmlTarget>,
+	/// Graph materialization or physical graph files retained by the operation.
 	pub graph: Option<Identifier>,
 	/// Label mutation: omitted clause, explicit `LABEL NONE`, or a new label.
 	pub label: Option<Option<Identifier>>,
+	/// Payload bytes, elements or retained storage backing this representation.
 	pub data: Option<DmlData>,
+	/// Predicate or adapter deciding which input values continue downstream.
 	pub filter: Option<Expr>,
+	/// Optional policy retaining named containment levels while mutating
+	/// records.
 	pub keep_levelpath: Option<KeepLevelPathClause>,
+	/// Optional projection of values returned after the data mutation.
 	pub returning: Option<DmlReturn>,
+	/// Optional existence or predicate requirement checked before the mutation.
 	pub expect: Option<ExpectClause>,
 }
 
@@ -35,10 +47,15 @@ pub struct MutateStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DeleteStatement {
+	/// Targets processed by the data-mutation statement.
 	pub targets: Vec<DmlTarget>,
+	/// Whether dependent contents may be removed with the selected target.
 	pub cascade: bool,
+	/// Predicate or adapter deciding which input values continue downstream.
 	pub filter: Option<Expr>,
+	/// Optional projection of values returned after the data mutation.
 	pub returning: Option<DmlReturn>,
+	/// Optional existence or predicate requirement checked before the mutation.
 	pub expect: Option<ExpectClause>,
 }
 
@@ -46,20 +63,35 @@ pub struct DeleteStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DmlTarget {
-	Class(Identifier),
+	/// Class-wide mutation target.
+	Class(
+		/// Class-wide mutation target.
+		Identifier,
+	),
+	/// One explicitly identified record.
 	Record {
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
+		/// Record key expression retained for target resolution.
 		key: Expr,
+		/// Source byte range used to report diagnostics for this syntax
+		/// element.
 		span: TextSpan,
 	},
+	/// Bounded range of generated or addressed record targets.
 	Range {
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
+		/// Number of targets requested by the bounded target syntax.
 		count: u32,
+		/// Source byte range used to report diagnostics for this syntax
+		/// element.
 		span: TextSpan,
 	},
 }
 
 impl DmlTarget {
+	/// Parses the class syntax.
 	pub(crate) fn class(&self) -> &Identifier {
 		match self {
 			Self::Class(class)
@@ -74,6 +106,7 @@ impl DmlTarget {
 		}
 	}
 
+	/// Returns whether this value is exact.
 	pub(crate) const fn is_exact(&self) -> bool {
 		matches!(self, Self::Record { .. })
 	}
@@ -83,20 +116,50 @@ impl DmlTarget {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DmlData {
-	Content(Expr),
-	Merge(Expr),
-	Patch(Expr),
-	Replace(Expr),
-	Set(Vec<Assignment>),
-	Unset(Vec<Identifier>),
-	Reset(Vec<Identifier>),
+	/// Supply the full object content for the mutation.
+	Content(
+		/// Supply the full object content for the mutation.
+		Expr,
+	),
+	/// Merge supplied object fields into existing properties.
+	Merge(
+		/// Merge supplied object fields into existing properties.
+		Expr,
+	),
+	/// Apply a structured patch to existing properties.
+	Patch(
+		/// Apply a structured patch to existing properties.
+		Expr,
+	),
+	/// Replace the selected property content.
+	Replace(
+		/// Replace the selected property content.
+		Expr,
+	),
+	/// Assign the listed property expressions.
+	Set(
+		/// Assign the listed property expressions.
+		Vec<Assignment>,
+	),
+	/// Remove the listed properties.
+	Unset(
+		/// Remove the listed properties.
+		Vec<Identifier>,
+	),
+	/// Reset selected properties according to the mutation clause.
+	Reset(
+		/// Reset selected properties according to the mutation clause.
+		Vec<Identifier>,
+	),
 }
 
 /// One top-level field assignment.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Assignment {
+	/// Property name addressed by this expression or schema declaration.
 	pub field: Identifier,
+	/// Payload retained for the operation or its expected result.
 	pub value: Expr,
 }
 
@@ -104,34 +167,63 @@ pub struct Assignment {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DmlReturn {
+	/// Return no mutation row images.
 	None,
+	/// Return row images from before the mutation.
 	Before,
+	/// Return row images from after the mutation.
 	After,
+	/// Return the differences produced by the mutation.
 	Diff,
-	Fields(Vec<DmlReturnItem>),
-	Value(Expr),
+	/// Return the selected named projection fields.
+	Fields(
+		/// Return the selected named projection fields.
+		Vec<DmlReturnItem>,
+	),
+	/// Return the selected value expression.
+	Value(
+		/// Return the selected value expression.
+		Expr,
+	),
 }
 
 /// One item in an object-shaped DML return.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DmlReturnItem {
-	Wildcard(TextSpan),
-	Expr(Expr),
+	/// Project all available fields.
+	Wildcard(
+		/// Project all available fields.
+		TextSpan,
+	),
+	/// Project an expression with an optional alias.
+	Expr(
+		/// Project an expression with an optional alias.
+		Expr,
+	),
 }
 
 /// A pre-image condition evaluated before any target is changed.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ExpectClause {
+	/// Require or forbid the target record existing before mutation.
 	Exists {
+		/// Whether the target is expected to exist before the mutation.
 		expected: bool,
+		/// Source byte range used to report diagnostics for this syntax
+		/// element.
 		span: TextSpan,
 	},
-	Predicate(Expr),
+	/// Require the supplied expectation predicate to hold.
+	Predicate(
+		/// Require the supplied expectation predicate to hold.
+		Expr,
+	),
 }
 
 impl Parser<'_> {
+	/// Creates statement.
 	pub(in crate::syn) async fn create_statement(
 		&mut self,
 		context: &mut Stk,
@@ -156,6 +248,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the mutate statement syntax.
 	pub(in crate::syn) async fn mutate_statement(
 		&mut self,
 		context: &mut Stk,
@@ -223,6 +316,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Deletes statement.
 	pub(in crate::syn) async fn delete_statement(
 		&mut self,
 		context: &mut Stk,
@@ -250,6 +344,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the dml targets syntax.
 	async fn dml_targets(
 		&mut self,
 		context: &mut Stk,
@@ -262,6 +357,7 @@ impl Parser<'_> {
 		Ok(targets)
 	}
 
+	/// Parses the dml target syntax.
 	pub(super) async fn dml_target(
 		&mut self,
 		context: &mut Stk,
@@ -348,6 +444,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the dml data syntax.
 	pub(super) async fn dml_data(
 		&mut self,
 		context: &mut Stk,
@@ -405,6 +502,7 @@ impl Parser<'_> {
 		Ok(None)
 	}
 
+	/// Parses the dml return syntax.
 	pub(super) async fn dml_return(
 		&mut self,
 		context: &mut Stk,
@@ -458,6 +556,7 @@ impl Parser<'_> {
 		Ok(Some(DmlReturn::Fields(items)))
 	}
 
+	/// Parses the expect clause syntax.
 	pub(super) async fn expect_clause(
 		&mut self,
 		context: &mut Stk,
@@ -483,6 +582,7 @@ impl Parser<'_> {
 			.map(Some)
 	}
 
+	/// Finishes dml.
 	pub(super) fn finish_dml(&self, statement: &str) -> FerrosGrynnResult<()> {
 		if self.at_keyword(keywords::TIMEOUT) || self.at_eof() || self.at_symbol(Symbol::Semicolon)
 		{

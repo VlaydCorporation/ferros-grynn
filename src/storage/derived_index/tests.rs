@@ -2,8 +2,11 @@
 
 use super::*;
 
+/// Verifies arrays round trip every normative width and reject corruption.
 #[test]
-fn arrays_round_trip_every_normative_width_and_reject_corruption() -> FerrosGrynnResult<()> {
+fn arrays_round_trip_every_normative_width_and_reject_corruption() {
+	use crate::test_assertions::AssertResult as _;
+
 	let cases = [
 		(SectionKind::NodeComponentMap, 8),
 		(SectionKind::EdgeComponentMap, 8),
@@ -36,15 +39,15 @@ fn arrays_round_trip_every_normative_width_and_reject_corruption() -> FerrosGryn
 	let mut page = Box::new(AlignedPage::zeroed());
 	for (kind, width) in cases {
 		let payload = vec![17; usize::from(width) * 2];
-		encode_array(&mut page, PageNo::new(1), PageNo::NULL, kind, width, 4, &payload)?;
-		let decoded = decode_array(&page, PageNo::new(1), 2, kind, width, 4)?;
+		encode_array(&mut page, PageNo::new(1), PageNo::NULL, kind, width, 4, &payload).assert_ok();
+		let decoded = decode_array(&page, PageNo::new(1), 2, kind, width, 4).assert_ok();
 		assert_eq!(decoded.first_ordinal, 4);
 		assert_eq!(decoded.next, PageNo::NULL);
 		assert_eq!(decoded.elements, payload);
 	}
 	let kind = SectionKind::NodeComponentMap;
 	let payload = 7_u64.to_le_bytes();
-	encode_array(&mut page, PageNo::new(1), PageNo::NULL, kind, 8, 0, &payload)?;
+	encode_array(&mut page, PageNo::new(1), PageNo::NULL, kind, 8, 0, &payload).assert_ok();
 	assert_eq!(&page.as_bytes()[0..8], &[0x46, 0x49, 0x44, 1, 0x3e, 0, 0, 0]);
 	assert_eq!(&page.as_bytes()[32..64], &[
 		255, 255, 255, 255, 255, 255, 255, 255, 1, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8,
@@ -65,7 +68,7 @@ fn arrays_round_trip_every_normative_width_and_reject_corruption() -> FerrosGryn
 	] {
 		page.as_bytes_mut().copy_from_slice(&valid);
 		page.as_bytes_mut()[offset] = value;
-		page.seal()?;
+		page.seal().assert_ok();
 		assert!(decode_array(&page, PageNo::new(1), 2, kind, 8, 0).is_err(), "offset {offset}");
 	}
 	page.as_bytes_mut().copy_from_slice(&valid);
@@ -89,14 +92,16 @@ fn arrays_round_trip_every_normative_width_and_reject_corruption() -> FerrosGryn
 		.is_err()
 	);
 	assert!(check_reference(3, 3, false).is_err());
-	check_reference(2, 3, false)?;
-	check_reference(u64::MAX, 0, true)?;
+	check_reference(2, 3, false).assert_ok();
+	check_reference(u64::MAX, 0, true).assert_ok();
 	assert!(check_reference(u64::MAX, 3, false).is_err());
-	Ok(())
 }
 
+/// Verifies record offsets round trip empty rows and reject malformed lengths.
 #[test]
-fn record_offsets_round_trip_empty_rows_and_reject_malformed_lengths() -> FerrosGrynnResult<()> {
+fn record_offsets_round_trip_empty_rows_and_reject_malformed_lengths() {
+	use crate::test_assertions::AssertResult as _;
+
 	let kinds = [
 		SectionKind::PatternDescriptor,
 		SectionKind::PatternCanonicalIr,
@@ -107,14 +112,14 @@ fn record_offsets_round_trip_empty_rows_and_reject_malformed_lengths() -> Ferros
 	let records: [&[u8]; 3] = [b"a", b"", b"bc"];
 	let mut page = Box::new(AlignedPage::zeroed());
 	for kind in kinds {
-		encode_records(&mut page, PageNo::new(1), PageNo::NULL, kind, 5, &records)?;
-		let decoded = decode_records(&page, PageNo::new(1), 2, kind, 5)?;
+		encode_records(&mut page, PageNo::new(1), PageNo::NULL, kind, 5, &records).assert_ok();
+		let decoded = decode_records(&page, PageNo::new(1), 2, kind, 5).assert_ok();
 		assert_eq!(decoded.first_ordinal, 5);
 		assert_eq!(decoded.next, PageNo::NULL);
 		assert_eq!(decoded.records().collect::<Vec<_>>(), records);
 	}
 	let kind = SectionKind::PatternBindingRows;
-	encode_records(&mut page, PageNo::new(1), PageNo::NULL, kind, 0, &records)?;
+	encode_records(&mut page, PageNo::new(1), PageNo::NULL, kind, 0, &records).assert_ok();
 	assert_eq!(&page.as_bytes()[0..8], &[0x46, 0x49, 0x44, 1, 0x3f, 0, 0, 0]);
 	assert_eq!(&page.as_bytes()[40..48], &[0x14, 0, 3, 0, 11, 0, 0, 0]);
 	assert_eq!(&page.as_bytes()[56..67], &[0, 0, 1, 0, 1, 0, 3, 0, b'a', b'b', b'c']);
@@ -136,7 +141,7 @@ fn record_offsets_round_trip_empty_rows_and_reject_malformed_lengths() -> Ferros
 	] {
 		page.as_bytes_mut().copy_from_slice(&valid);
 		page.as_bytes_mut()[offset] = value;
-		page.seal()?;
+		page.seal().assert_ok();
 		assert!(decode_records(&page, PageNo::new(1), 2, kind, 0).is_err(), "offset {offset}");
 	}
 	assert!(
@@ -158,16 +163,20 @@ fn record_offsets_round_trip_empty_rows_and_reject_malformed_lengths() -> Ferros
 		encode_records(&mut page, PageNo::new(1), PageNo::NULL, kind, 0, &[&vec![0; PAGE_SIZE]])
 			.is_err()
 	);
-	Ok(())
 }
 
+/// Verifies chains require contiguous ordinals exact totals and forward links.
 #[test]
-fn chains_require_contiguous_ordinals_exact_totals_and_forward_links() -> FerrosGrynnResult<()> {
+fn chains_require_contiguous_ordinals_exact_totals_and_forward_links() {
+	use crate::test_assertions::AssertResult as _;
+
 	// Fill final aligned slots before sealing; the vector never reallocates.
 	let mut pages = (0..4).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 	let kind = SectionKind::CondensationCsrTargets;
-	encode_array(&mut pages[1], PageNo::new(1), PageNo::new(3), kind, 8, 0, &4_u64.to_le_bytes())?;
-	encode_array(&mut pages[3], PageNo::new(3), PageNo::NULL, kind, 8, 1, &5_u64.to_le_bytes())?;
+	encode_array(&mut pages[1], PageNo::new(1), PageNo::new(3), kind, 8, 0, &4_u64.to_le_bytes())
+		.assert_ok();
+	encode_array(&mut pages[3], PageNo::new(3), PageNo::NULL, kind, 8, 1, &5_u64.to_le_bytes())
+		.assert_ok();
 	let mut values = Vec::new();
 	let read = |at: PageNo, out: &mut AlignedPage| {
 		out.as_bytes_mut().copy_from_slice(pages[at.get() as usize].as_bytes());
@@ -176,11 +185,13 @@ fn chains_require_contiguous_ordinals_exact_totals_and_forward_links() -> Ferros
 	visit_array_section(read, PageNo::new(1), 4, kind, 8, 2, |ordinal, bytes| {
 		values.push((ordinal, number(bytes, 0)));
 		Ok(())
-	})?;
+	})
+	.assert_ok();
 	assert_eq!(values, [(0, 4), (1, 5)]);
 	assert!(visit_array_section(read, PageNo::new(1), 4, kind, 8, 3, |_, _| Ok(())).is_err());
 	assert!(visit_array_section(read, PageNo::new(1), 4, kind, 8, 1, |_, _| Ok(())).is_err());
-	visit_array_section(|_, _| unreachable!(), PageNo::NULL, 1, kind, 8, 0, |_, _| unreachable!())?;
+	visit_array_section(|_, _| unreachable!(), PageNo::NULL, 1, kind, 8, 0, |_, _| unreachable!())
+		.assert_ok();
 	assert!(
 		visit_array_section(
 			|_, _| unreachable!(),
@@ -205,7 +216,8 @@ fn chains_require_contiguous_ordinals_exact_totals_and_forward_links() -> Ferros
 		)
 		.is_err()
 	);
-	encode_array(&mut pages[3], PageNo::new(3), PageNo::NULL, kind, 8, 2, &5_u64.to_le_bytes())?;
+	encode_array(&mut pages[3], PageNo::new(3), PageNo::NULL, kind, 8, 2, &5_u64.to_le_bytes())
+		.assert_ok();
 	assert!(
 		visit_array_section(
 			|at, out| {
@@ -222,8 +234,9 @@ fn chains_require_contiguous_ordinals_exact_totals_and_forward_links() -> Ferros
 		.is_err()
 	);
 	let kind = SectionKind::PatternBindingRows;
-	encode_records(&mut pages[1], PageNo::new(1), PageNo::new(3), kind, 0, &[b"first"])?;
-	encode_records(&mut pages[3], PageNo::new(3), PageNo::NULL, kind, 1, &[b"", b"last"])?;
+	encode_records(&mut pages[1], PageNo::new(1), PageNo::new(3), kind, 0, &[b"first"]).assert_ok();
+	encode_records(&mut pages[3], PageNo::new(3), PageNo::NULL, kind, 1, &[b"", b"last"])
+		.assert_ok();
 	let mut values = Vec::new();
 	visit_record_section(
 		|at, out| {
@@ -238,8 +251,9 @@ fn chains_require_contiguous_ordinals_exact_totals_and_forward_links() -> Ferros
 			values.push((ordinal, bytes.to_vec()));
 			Ok(())
 		},
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(values, [(0, b"first".to_vec()), (1, vec![]), (2, b"last".to_vec())]);
-	visit_record_section(|_, _| unreachable!(), PageNo::NULL, 1, kind, 0, |_, _| unreachable!())?;
-	Ok(())
+	visit_record_section(|_, _| unreachable!(), PageNo::NULL, 1, kind, 0, |_, _| unreachable!())
+		.assert_ok();
 }

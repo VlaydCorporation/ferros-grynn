@@ -2,6 +2,13 @@
 name = "fg-gql-status"
 version = "0.1.0"
 edition = "2024"
+authors = ["Vlayd Detect"]
+description = "Typed GQL statuses and diagnostics for Ferros-Grynn"
+license = "Apache-2.0"
+repository = "https://github.com/VlaydCorporation/ferros-grynn"
+readme = "../../README.md"
+keywords = ["database", "gql", "diagnostics"]
+categories = ["database-implementations"]
 
 [dependencies]
 ferros-grynn-macros = { workspace = true }

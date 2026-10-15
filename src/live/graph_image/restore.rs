@@ -83,9 +83,9 @@ fn properties(
 }
 
 /// Reuses a built child while admitting each additional owned COW handle.
-fn clone_child<'a>(
+fn clone_child(
 	key: Option<&LiveGraphScopeId>,
-	built: &BTreeMap<&LiveGraphScopeId, Built<'a>>,
+	built: &BTreeMap<&LiveGraphScopeId, Built<'_>>,
 	admit: &mut Admission<'_>,
 ) -> FerrosGrynnResult<Option<Graph<Frozen>>> {
 	let Some(key) = key else {
@@ -114,11 +114,11 @@ fn clone_child<'a>(
 
 /// Resolves every qualified owner and terminal through the checked logical
 /// scope map.
-fn endpoint<'a>(
+fn endpoint(
 	value: &LiveGraphEndpoint,
 	scope: &LiveGraphScopeId,
 	local: &BTreeMap<&AtomRef, AtomId>,
-	built: &BTreeMap<&LiveGraphScopeId, Built<'a>>,
+	built: &BTreeMap<&LiveGraphScopeId, Built<'_>>,
 	admit: &mut Admission<'_>,
 ) -> FerrosGrynnResult<EdgeEndpoint> {
 	let id = |target: &LiveGraphAtomId| -> FerrosGrynnResult<AtomId> {
@@ -148,6 +148,7 @@ fn endpoint<'a>(
 impl LiveGraphImage {
 	/// Restores a complete candidate using existing layouts and all family
 	/// validators.
+	#[cfg(test)]
 	pub(crate) fn restore(
 		&self,
 		id: LiveId,

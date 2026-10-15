@@ -20,33 +20,47 @@ use crate::{
 	values::{Text, storage::DiskAtomRef},
 };
 
+/// Format version for format.
 const FORMAT_VERSION: u16 = 1;
+/// Configured delta tag value.
 const DELTA_TAG: u8 = 1;
+/// Configured null page value.
 const NULL_PAGE: u64 = u64::MAX;
+/// Configured header fixed end value.
 const HEADER_FIXED_END: usize = 136;
+/// Configured stream header bytes value.
 const STREAM_HEADER_BYTES: usize = 48;
+/// Configured stream payload bytes value.
 const STREAM_PAYLOAD_BYTES: usize = PAGE_SIZE - STREAM_HEADER_BYTES;
 
 /// Exact identity and revision captured by one Fulltext delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FulltextDeltaSpec {
+pub struct FulltextDeltaSpec {
+	/// Base associated with this fulltext delta spec.
 	pub(crate) base: FulltextBuildSpec,
+	/// Revision identifying this version of the data.
 	pub(crate) revision: u64,
 }
 
 /// Complete replacement or removal of one indexed document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FulltextDeltaRecord {
+pub enum FulltextDeltaRecord {
+	/// Upsert case of fulltext delta record.
 	Upsert {
+		/// Atom associated with this fulltext delta record.
 		atom: DiskAtomRef,
+		/// Tokens associated with this fulltext delta record.
 		tokens: Vec<AnalyzedToken>,
 	},
+	/// Delete case of fulltext delta record.
 	Delete {
+		/// Atom associated with this fulltext delta record.
 		atom: DiskAtomRef,
 	},
 }
 
 impl FulltextDeltaRecord {
+	/// Returns the atom result.
 	pub(crate) const fn atom(&self) -> DiskAtomRef {
 		match self {
 			Self::Upsert {
@@ -62,21 +76,26 @@ impl FulltextDeltaRecord {
 
 /// Fully validated logical projection of one Fulltext delta.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodedFulltextDelta {
+pub struct DecodedFulltextDelta {
+	/// Spec associated with this decoded fulltext delta.
 	pub(crate) spec: FulltextDeltaSpec,
+	/// Records associated with this decoded fulltext delta.
 	pub(crate) records: Vec<FulltextDeltaRecord>,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Stream location state.
 struct StreamLocation {
+	/// First associated with this stream location.
 	first: u64,
+	/// Pages associated with this stream location.
 	pages: u64,
 }
 
 /// Builds deterministic replacement records ordered by physical atom address.
-pub(crate) fn build_fulltext_delta(
+pub fn build_fulltext_delta<RecordsArg: IntoIterator<Item = FulltextDeltaRecord>>(
 	spec: FulltextDeltaSpec,
-	records: impl IntoIterator<Item = FulltextDeltaRecord>,
+	records: RecordsArg,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
 	let records =
 		records.into_iter().map(|record| (record.atom(), record)).collect::<BTreeMap<_, _>>();
@@ -148,7 +167,7 @@ pub(crate) fn build_fulltext_delta(
 }
 
 /// Decodes and validates a delta against its exact immutable base definition.
-pub(crate) fn decode_fulltext_delta(
+pub fn decode_fulltext_delta(
 	pages: &[AlignedPage],
 	expected: FulltextBuildSpec,
 ) -> FerrosGrynnResult<DecodedFulltextDelta> {
@@ -170,6 +189,7 @@ pub(crate) fn decode_fulltext_delta(
 	})
 }
 
+/// Encodes header.
 fn encode_header(
 	page: &mut AlignedPage,
 	spec: FulltextDeltaSpec,
@@ -215,6 +235,7 @@ fn encode_header(
 	page.seal()
 }
 
+/// Decodes header.
 fn decode_header(
 	page: &AlignedPage,
 	expected: FulltextBuildSpec,
@@ -265,6 +286,7 @@ fn decode_header(
 	))
 }
 
+/// Decodes records.
 fn decode_records(count: u32, payload: &[u8]) -> FerrosGrynnResult<Vec<FulltextDeltaRecord>> {
 	let mut cursor = 0_usize;
 	let mut records = Vec::with_capacity(
@@ -340,6 +362,7 @@ fn decode_records(count: u32, payload: &[u8]) -> FerrosGrynnResult<Vec<FulltextD
 	Ok(records)
 }
 
+/// Returns the fingerprint result.
 fn fingerprint(spec: FulltextBuildSpec) -> u64 {
 	let mut bytes = Vec::with_capacity(64);
 	bytes.extend_from_slice(&spec.index.get().to_le_bytes());
@@ -364,6 +387,7 @@ fn fingerprint(spec: FulltextBuildSpec) -> u64 {
 	rapidhash_v3(&bytes)
 }
 
+/// Returns the page count result.
 fn page_count(bytes: usize) -> FerrosGrynnResult<u64> {
 	if bytes == 0 {
 		return Ok(0);
@@ -372,6 +396,7 @@ fn page_count(bytes: usize) -> FerrosGrynnResult<u64> {
 		.map_err(|_error| invalid("Fulltext delta stream page count exceeds u64"))
 }
 
+/// Encodes stream.
 fn encode_stream(pages: &mut [AlignedPage], payload: &[u8]) -> FerrosGrynnResult<StreamLocation> {
 	let count = page_count(payload.len())?;
 	if count == 0 {
@@ -420,6 +445,7 @@ fn encode_stream(pages: &mut [AlignedPage], payload: &[u8]) -> FerrosGrynnResult
 	})
 }
 
+/// Decodes stream.
 fn decode_stream(pages: &[AlignedPage], location: StreamLocation) -> FerrosGrynnResult<Vec<u8>> {
 	if location.pages == 0 {
 		if location.first != NULL_PAGE {
@@ -464,26 +490,32 @@ fn decode_stream(pages: &[AlignedPage], location: StreamLocation) -> FerrosGrynn
 	Ok(output)
 }
 
+/// Writes u16.
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 	bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32.
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64.
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 	bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32 vec.
 fn write_u32_vec(bytes: &mut Vec<u8>, value: u32) {
 	bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64 vec.
 fn write_u64_vec(bytes: &mut Vec<u8>, value: u64) {
 	bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Reads u16.
 fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 	let value = bytes
 		.get(offset..offset + 2)
@@ -491,6 +523,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 	Ok(u16::from_le_bytes(value.try_into().map_err(|_error| invalid("invalid u16"))?))
 }
 
+/// Reads u32.
 fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 	let value = bytes
 		.get(offset..offset + 4)
@@ -498,6 +531,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 	Ok(u32::from_le_bytes(value.try_into().map_err(|_error| invalid("invalid u32"))?))
 }
 
+/// Reads u64.
 fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 	let value = bytes
 		.get(offset..offset + 8)
@@ -505,34 +539,40 @@ fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 	Ok(u64::from_le_bytes(value.try_into().map_err(|_error| invalid("invalid u64"))?))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for fulltext index delta behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{AnalyzerId, FulltextIndexOptions, IndexId, SchemaVersion},
 		graph::AtomKind,
 		values::PropertyKeyId,
 	};
 
+	/// Returns spec for this module.
 	fn spec() -> FulltextBuildSpec {
-		let analyzer = AnalyzerId::new(2).unwrap();
+		let analyzer = AnalyzerId::new(2).assert_some();
 		FulltextBuildSpec {
-			index: IndexId::new(3).unwrap(),
+			index: IndexId::new(3).assert_some(),
 			index_version: SchemaVersion::INITIAL,
 			analyzer,
 			analyzer_version: SchemaVersion::INITIAL,
 			scope: IndexScope::Base,
-			class: crate::datastore::ClassId::new(4).unwrap(),
+			class: crate::datastore::ClassId::new(4).assert_some(),
 			field: PropertyKeyId::new(5),
 			options: FulltextIndexOptions::defaults(analyzer, SchemaVersion::INITIAL, true),
 			build_revision: 6,
 		}
 	}
 
+	/// Verifies round trips upserts and tombstones.
 	#[test]
 	fn round_trips_upserts_and_tombstones() {
 		let expected = spec();
@@ -543,7 +583,7 @@ mod tests {
 			},
 			[
 				FulltextDeltaRecord::Upsert {
-					atom: DiskAtomRef::from_parts(AtomKind::Node, 1).unwrap(),
+					atom: DiskAtomRef::from_parts(AtomKind::Node, 1).assert_ok(),
 					tokens: vec![AnalyzedToken {
 						term: Text::from("term"),
 						start: 1,
@@ -551,12 +591,12 @@ mod tests {
 					}],
 				},
 				FulltextDeltaRecord::Delete {
-					atom: DiskAtomRef::from_parts(AtomKind::Edge, 2).unwrap(),
+					atom: DiskAtomRef::from_parts(AtomKind::Edge, 2).assert_ok(),
 				},
 			],
 		)
-		.unwrap();
-		let decoded = decode_fulltext_delta(&pages, expected).unwrap();
+		.assert_ok();
+		let decoded = decode_fulltext_delta(&pages, expected).assert_ok();
 		assert_eq!(decoded.spec.revision, 9);
 		assert_eq!(decoded.records.len(), 2);
 	}

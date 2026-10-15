@@ -55,6 +55,7 @@ pub struct ProjectionOptions {
 }
 
 impl Default for ProjectionOptions {
+	/// Constructs the default initial state of `ProjectionOptions`.
 	fn default() -> Self {
 		Self {
 			mode: TraversalSemantics::Node,
@@ -319,10 +320,10 @@ impl EndpointTensor {
 	///
 	/// # Errors
 	/// Propagates check errors and rejects overflow or exhausted budgets.
-	pub fn project_with_check(
+	pub fn project_with_check<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		&self,
 		options: ProjectionOptions,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<TensorProjection> {
 		self.project_selected(options, None, check)
 	}
@@ -332,11 +333,11 @@ impl EndpointTensor {
 	///
 	/// # Errors
 	/// Rejects foreign or boundary-only members and exhausted resource budgets.
-	pub fn project_induced_with_check(
+	pub fn project_induced_with_check<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		&self,
 		options: ProjectionOptions,
 		members: &BTreeSet<TensorAtom>,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<TensorProjection> {
 		self.project_selected(options, Some(members), check)
 	}

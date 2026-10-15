@@ -9,6 +9,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GraphPropertyPath {
+	/// Ordered property names addressed by the clause.
 	pub fields: Vec<Identifier>,
 }
 
@@ -16,7 +17,9 @@ pub struct GraphPropertyPath {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct GraphPropertyAssignment {
+	/// Address or key path accumulated while visiting the selected value.
 	pub path: GraphPropertyPath,
+	/// Payload retained for the operation or its expected result.
 	pub value: Expr,
 }
 
@@ -24,20 +27,32 @@ pub struct GraphPropertyAssignment {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum GraphPropertyMutation {
-	Set(Vec<GraphPropertyAssignment>),
-	Unset(Vec<GraphPropertyPath>),
+	/// Assign the selected graph properties.
+	Set(
+		/// Assign the selected graph properties.
+		Vec<GraphPropertyAssignment>,
+	),
+	/// Remove the selected graph properties.
+	Unset(
+		/// Remove the selected graph properties.
+		Vec<GraphPropertyPath>,
+	),
 }
 
 /// Catalog-owned graph-property update.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct UpdateGraphStatement {
+	/// Graph materialization or physical graph files retained by the operation.
 	pub graph: Identifier,
+	/// Graph-property assignments or removals requested by the statement.
 	pub mutation: GraphPropertyMutation,
+	/// Optional projection of values returned after the data mutation.
 	pub returning: Option<DmlReturn>,
 }
 
 impl Parser<'_> {
+	/// Updates graph statement.
 	pub(in crate::syn) async fn update_graph_statement(
 		&mut self,
 		context: &mut Stk,
@@ -86,6 +101,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the graph property path syntax.
 	fn graph_property_path(&mut self) -> FerrosGrynnResult<GraphPropertyPath> {
 		let root = self.identifier()?;
 		if !root.value.eq_ignore_ascii_case("properties") {

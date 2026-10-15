@@ -93,7 +93,7 @@ fn connected(rings: &[Vec<Position>]) -> FerrosGrynnResult<()> {
 	}
 	let mut contacts = BTreeMap::<[u64; 2], BTreeSet<usize>>::new();
 	let mut elements = 0;
-	// ponytail: pairwise ring segments; replace with a bounded sweep if
+	// shortcut: pairwise ring segments; replace with a bounded sweep if
 	// hole-heavy workloads dominate.
 	for (left_id, left) in rings.iter().enumerate() {
 		for (right_id, right) in rings.iter().enumerate().skip(left_id + 1) {

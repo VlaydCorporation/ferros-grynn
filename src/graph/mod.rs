@@ -16,32 +16,49 @@
 pub mod algo;
 /// Qualified sparse graph analytics and convergence metadata.
 pub mod analytics;
+/// Directed acyclic graph operations and validation.
 mod dag;
+/// Tree, rooted-tree and forest structural invariants.
 mod forest;
+/// General mutable and frozen graph operations.
 mod general;
+/// Graph storage and validation for hyperedge incidence.
 mod hypergraph;
+/// Snapshot-local atom handles and their generation layout.
 mod id;
 mod live;
+/// Owned graph-family results and memory estimates.
 mod materialized;
+/// Graphs with nested graph atoms and cross-level incidence.
 mod metagraph;
+/// Owned qualified paths and trace materialization.
 mod path;
+/// Shared graph-read contracts for runtime and storage-backed views.
 mod read;
+/// Graph metadata and family-specific atom layouts.
 mod storage;
+/// Scoped subsets of existing graphs.
 mod subgraph;
 pub mod tensor;
+/// Incidence directions, endpoint roles and topology constraints.
 mod topology;
+/// Graph traversal, connectivity and path algorithms.
 mod traversal;
 mod validate;
+/// Borrowed and filtered graph views.
 mod view;
+/// Derived component workspaces attached to graph snapshots.
 mod workspace;
 
 pub(crate) use read::nested_graph_reference;
 pub(crate) use traversal::{visit_endpoint_steps, visit_incidence_targets};
 
+/// Type-state marker enabling structural mutation of a graph family.
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub struct Mutable;
 
+/// Type-state marker exposing a graph family as an immutable snapshot.
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub struct Frozen;
@@ -59,8 +76,8 @@ pub use forest::{
 	Tree,
 	TreeOrientation,
 };
+pub(crate) use general::remap_topology;
 pub use general::{FrozenGraph, Graph, MutableGraph};
-pub(crate) use general::{merge_transaction_graph, remap_topology};
 pub use hypergraph::{FrozenHypergraph, Hypergraph, MutableHypergraph};
 pub(crate) use id::SlotAllocator;
 pub use id::{AtomId, AtomKind, GraphId};

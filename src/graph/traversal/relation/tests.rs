@@ -1,15 +1,21 @@
 //! Differential local relation and SCC checks across incidence projections.
 
 use super::*;
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	graph::{EdgeEndpoint, EdgeRead, GraphRead, MutableGraph, QualifiedAtomId, TraversalIndex},
 	values::PropertyMap,
 };
 
+/// Verifies restored general relation accepts cycles and checks every
+/// reference.
 #[test]
 fn restored_general_relation_accepts_cycles_and_checks_every_reference() {
 	let vertices = (0..3)
-		.map(|slot| AtomId::from_parts(crate::graph::AtomKind::Node, slot, 1).unwrap())
+		.map(|slot| AtomId::from_parts(crate::graph::AtomKind::Node, slot, 1).assert_ok())
 		.collect::<Vec<_>>();
 	let restore = |offsets, targets, budget| {
 		ProjectedRelation::from_csr(
@@ -23,7 +29,7 @@ fn restored_general_relation_accepts_cycles_and_checks_every_reference() {
 			&mut || Ok(()),
 		)
 	};
-	let valid = restore(vec![0, 2, 3, 4], vec![0, 1, 2, 0], 1 << 20).unwrap();
+	let valid = restore(vec![0, 2, 3, 4], vec![0, 1, 2, 0], 1 << 20).assert_ok();
 	assert!(valid.has_cross_level);
 	assert_eq!(valid.reverse.offsets, [0, 2, 3, 4]);
 	assert_eq!(valid.reverse.targets, [0, 2, 0, 1]);
@@ -66,10 +72,11 @@ fn restored_general_relation_accepts_cycles_and_checks_every_reference() {
 	);
 }
 
+/// Verifies restored condensation rejects malformed csr and cycles.
 #[test]
 fn restored_condensation_rejects_malformed_csr_and_cycles() {
 	let representatives = (0..3)
-		.map(|slot| AtomId::from_parts(crate::graph::AtomKind::Node, slot, 1).unwrap())
+		.map(|slot| AtomId::from_parts(crate::graph::AtomKind::Node, slot, 1).assert_ok())
 		.collect::<Vec<_>>();
 	let restore = |offsets, targets, components, budget| {
 		ProjectedCondensation::from_csr(
@@ -83,7 +90,7 @@ fn restored_condensation_rejects_malformed_csr_and_cycles() {
 			&mut || Ok(()),
 		)
 	};
-	let valid = restore(vec![0, 2, 3, 3], vec![1, 2, 2], vec![0, 1, 2], 1 << 20).unwrap();
+	let valid = restore(vec![0, 2, 3, 3], vec![1, 2, 2], vec![0, 1, 2], 1 << 20).assert_ok();
 	assert_eq!(valid.reverse.offsets, vec![0, 0, 1, 3]);
 	assert_eq!(valid.reverse.targets, vec![0, 0, 1]);
 	assert_eq!(valid.topological_order, vec![0, 1, 2]);
@@ -116,12 +123,14 @@ fn restored_condensation_rejects_malformed_csr_and_cycles() {
 	);
 }
 
+/// Verifies projected relations and scc match exact all pairs.
 #[test]
 fn projected_relations_and_scc_match_exact_all_pairs() {
 	for seed in 0..64_usize {
 		let mut graph = MutableGraph::new();
-		let nodes =
-			(0..5).map(|_| graph.add_node(None, PropertyMap::new()).unwrap()).collect::<Vec<_>>();
+		let nodes = (0..5)
+			.map(|_| graph.add_node(None, PropertyMap::new()).assert_ok())
+			.collect::<Vec<_>>();
 		let mut bases = Vec::new();
 		for edge in 0..5 {
 			bases.push(
@@ -135,7 +144,7 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 						}),
 						PropertyMap::new(),
 					)
-					.unwrap(),
+					.assert_ok(),
 			);
 		}
 		for edge in 0..3 {
@@ -144,29 +153,30 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 			let topology = match (seed + edge) % 3 {
 				0 => EdgeTopology::directed(source, target),
 				1 => EdgeTopology::bidirectional(source, target),
-				_ => EdgeTopology::undirected(
-					source.into_iter().chain(target).collect::<BTreeSet<_>>(),
-				),
+				_ => {
+					let endpoints = source.into_iter().chain(target).collect::<BTreeSet<_>>();
+					EdgeTopology::undirected(endpoints.iter().copied())
+				}
 			};
-			graph.add_edge(topology, Some("keep".into()), PropertyMap::new()).unwrap();
+			graph.add_edge(topology, Some("keep".into()), PropertyMap::new()).assert_ok();
 		}
 		let all_vertices = graph
 			.node_ids()
-			.unwrap()
-			.chain(graph.edge_ids().unwrap())
+			.assert_ok()
+			.chain(graph.edge_ids().assert_ok())
 			.collect::<FerrosGrynnResult<Vec<_>>>()
-			.unwrap();
+			.assert_ok();
 		for filtered in [false, true] {
 			let topologies = graph
 				.edge_ids()
-				.unwrap()
+				.assert_ok()
 				.map(|id| {
-					let id = id.unwrap();
-					let edge = GraphRead::edge(&graph, id).unwrap().unwrap();
+					let id = id.assert_ok();
+					let edge = GraphRead::edge(&graph, id).assert_ok().assert_some();
 					(
 						id,
-						EdgeRead::topology(&edge).unwrap().into_owned(),
-						EdgeRead::label_text(&edge).unwrap().map(|label| label.into_owned()),
+						EdgeRead::topology(&edge).assert_ok().into_owned(),
+						EdgeRead::label_text(&edge).assert_ok().map(|label| label.into_owned()),
 					)
 				})
 				.filter(|(_, _, label)| {
@@ -174,7 +184,7 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 				})
 				.collect::<Vec<_>>();
 			for mode in [TraversalSemantics::Node, TraversalSemantics::Atom] {
-				let exact = TraversalIndex::new(&graph, mode).unwrap();
+				let exact = TraversalIndex::new(&graph, mode).assert_ok();
 				for direction in [
 					TraversalDirection::Forward,
 					TraversalDirection::Backward,
@@ -189,8 +199,8 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 						|atom| Ok(atom.raw()),
 						&mut || Ok(()),
 					)
-					.unwrap();
-					let condensation = relation.condensation(1 << 20, &mut || Ok(())).unwrap();
+					.assert_ok();
+					let condensation = relation.condensation(1 << 20, &mut || Ok(())).assert_ok();
 					let count = relation.vertices.len();
 					let mut reach = vec![vec![false; count]; count];
 					for (source, atom) in relation.vertices.iter().enumerate() {
@@ -225,12 +235,12 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 							}
 						}
 					}
-					for source in 0..count {
-						for target in 0..count {
+					for (source, row) in reach.iter().enumerate() {
+						for (target, &forward_reachable) in row.iter().enumerate() {
 							assert_eq!(
 								condensation.component_by_vertex[source]
 									== condensation.component_by_vertex[target],
-								reach[source][target] && reach[target][source],
+								forward_reachable && reach[target][source],
 								"seed {seed}"
 							);
 						}
@@ -255,9 +265,9 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 						|atom| Ok(atom.raw()),
 						&mut || Ok(()),
 					)
-					.unwrap();
+					.assert_ok();
 					assert_eq!(
-						reversed.condensation(1 << 20, &mut || Ok(())).unwrap(),
+						reversed.condensation(1 << 20, &mut || Ok(())).assert_ok(),
 						condensation
 					);
 				}
@@ -266,13 +276,14 @@ fn projected_relations_and_scc_match_exact_all_pairs() {
 	}
 }
 
+/// Verifies relation budgets cancellation and qualified endpoints are checked.
 #[test]
 fn relation_budgets_cancellation_and_qualified_endpoints_are_checked() {
-	let node = AtomId::from_parts(crate::graph::AtomKind::Node, 0, 1).unwrap();
-	let target = AtomId::from_parts(crate::graph::AtomKind::Node, 1, 1).unwrap();
-	let edge = AtomId::from_parts(crate::graph::AtomKind::Edge, 0, 1).unwrap();
+	let node = AtomId::from_parts(crate::graph::AtomKind::Node, 0, 1).assert_ok();
+	let target = AtomId::from_parts(crate::graph::AtomKind::Node, 1, 1).assert_ok();
+	let edge = AtomId::from_parts(crate::graph::AtomKind::Edge, 0, 1).assert_ok();
 	let topology = EdgeTopology::directed([EdgeEndpoint::Local(node)], [EdgeEndpoint::Nested(
-		QualifiedAtomId::new(vec![node], target).unwrap(),
+		QualifiedAtomId::new(vec![node], target).assert_ok(),
 	)]);
 	let vertices = [node, target, edge];
 	let relation = ProjectedRelation::build(
@@ -284,10 +295,10 @@ fn relation_budgets_cancellation_and_qualified_endpoints_are_checked() {
 		|atom| Ok(atom.raw()),
 		&mut || Ok(()),
 	)
-	.unwrap();
+	.assert_ok();
 	assert!(relation.has_cross_level);
 	assert!(relation.forward.targets.is_empty());
-	assert_eq!(relation.condensation(4096, &mut || Ok(())).unwrap().representatives.len(), 2);
+	assert_eq!(relation.condensation(4096, &mut || Ok(())).assert_ok().representatives.len(), 2);
 	assert!(
 		ProjectedRelation::build(
 			vertices.into_iter(),
@@ -314,7 +325,7 @@ fn relation_budgets_cancellation_and_qualified_endpoints_are_checked() {
 	);
 	let malformed =
 		EdgeTopology::directed([node], [
-			AtomId::from_parts(crate::graph::AtomKind::Node, 42, 1).unwrap()
+			AtomId::from_parts(crate::graph::AtomKind::Node, 42, 1).assert_ok()
 		]);
 	assert!(
 		ProjectedRelation::build(
@@ -337,5 +348,5 @@ fn relation_budgets_cancellation_and_qualified_endpoints_are_checked() {
 		|atom| Ok(atom.raw()),
 		&mut || Ok(()),
 	)
-	.unwrap();
+	.assert_ok();
 }

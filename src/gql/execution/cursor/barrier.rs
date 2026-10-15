@@ -9,12 +9,16 @@ use crate::gql::{
 /// Preserves the standalone input row when the complete optional clause has no
 /// match.
 pub(in crate::gql::execution) struct OptionalCursor<'a> {
+	/// Input associated with this optional cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Fallback associated with this optional cursor.
 	pub(in crate::gql::execution) fallback: Option<Row>,
+	/// Yielded associated with this optional cursor.
 	pub(in crate::gql::execution) yielded: bool,
 }
 
 impl RowCursor for OptionalCursor<'_> {
+	/// Advances this `OptionalCursor<'_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		if let Some(row) = self.input.next(control)? {
 			self.yielded = true;
@@ -31,17 +35,27 @@ impl RowCursor for OptionalCursor<'_> {
 /// Projects MATCH bindings while retaining ordering keys and stable public
 /// identities for the result barriers.
 pub(in crate::gql::execution) struct MatchProjectCursor<'a> {
+	/// Input associated with this match project cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Expressions associated with this match project cursor.
 	pub(in crate::gql::execution) expressions: &'a [TypedExpr],
+	/// Order associated with this match project cursor.
 	pub(in crate::gql::execution) order: &'a [LogicalOrder],
+	/// Slots associated with this match project cursor.
 	pub(in crate::gql::execution) slots: &'a [Value],
+	/// Source associated with this match project cursor.
 	pub(in crate::gql::execution) source: &'a str,
+	/// Fields associated with this match project cursor.
 	pub(in crate::gql::execution) fields: &'a dyn AtomFieldRead,
+	/// Random seed associated with this match project cursor.
 	pub(in crate::gql::execution) random_seed: Option<u64>,
+	/// Ordinal associated with this match project cursor.
 	pub(in crate::gql::execution) ordinal: usize,
 }
 
 impl RowCursor for MatchProjectCursor<'_> {
+	/// Advances this `MatchProjectCursor<'_>` and returns its next element, if
+	/// any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		let Some(row) = self.input.next(control)? else {
 			return Ok(None);
@@ -65,7 +79,7 @@ impl RowCursor for MatchProjectCursor<'_> {
 		}
 		let mut order_row = row.clone();
 		order_row.values.extend(projected.iter().cloned());
-		let binding_key = row.values.clone();
+		let binding_key = row.values;
 		let order = self
 			.order
 			.iter()
@@ -124,7 +138,7 @@ pub(in crate::gql::execution) fn distinct_rows<'a, Read: QueryRead>(
 		vec![ascending()],
 		control.barrier_account(),
 		false,
-	)?;
+	);
 	let mut ordinal = 0_usize;
 	while let Some(row) = input.next(control)? {
 		let key = Value::Array(row.values.clone().into());
@@ -141,7 +155,7 @@ pub(in crate::gql::execution) fn distinct_rows<'a, Read: QueryRead>(
 		vec![ascending()],
 		control.barrier_account(),
 		false,
-	)?;
+	);
 	let mut previous = None;
 	while let Some(record) = grouped.next()? {
 		control.check()?;
@@ -198,7 +212,7 @@ pub(in crate::gql::execution) fn sort_match_rows<'a, Read: QueryRead>(
 		fields,
 		control.barrier_account(),
 		false,
-	)?;
+	);
 	while let Some(row) = input.next(control)? {
 		let keys = if order.is_empty() {
 			vec![Value::Array(row.stable.clone().into())]
@@ -212,6 +226,7 @@ pub(in crate::gql::execution) fn sort_match_rows<'a, Read: QueryRead>(
 	}))
 }
 
+/// Returns the ascending result.
 fn ascending() -> SortField {
 	SortField {
 		descending: false,
@@ -219,17 +234,21 @@ fn ascending() -> SortField {
 	}
 }
 
+/// Record row cursor state.
 struct RecordRowCursor {
+	/// Records associated with this record row cursor.
 	records: RecordStream,
 }
 
 impl RowCursor for RecordRowCursor {
+	/// Advances this `RecordRowCursor` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		control.check()?;
 		self.records.next()?.map(match_row).transpose()
 	}
 }
 
+/// Matches record.
 fn match_record(row: Row, order_keys: Vec<Value>, stable_key: Vec<Value>) -> CursorRecord {
 	let atoms = row
 		.atoms
@@ -263,6 +282,7 @@ fn match_record(row: Row, order_keys: Vec<Value>, stable_key: Vec<Value>) -> Cur
 	}
 }
 
+/// Matches row.
 fn match_row(record: CursorRecord) -> FerrosGrynnResult<Row> {
 	let Value::Array(fields) = record.value else {
 		return Err(invalid_match_run("record is not an array"));
@@ -319,6 +339,7 @@ fn match_row(record: CursorRecord) -> FerrosGrynnResult<Row> {
 	})
 }
 
+/// Takes array.
 fn take_array(
 	fields: &mut impl Iterator<Item = Value>,
 	name: &'static str,
@@ -329,10 +350,12 @@ fn take_array(
 	}
 }
 
+/// Returns the bound atom value result.
 fn bound_atom_value(atom: BoundAtom) -> Value {
 	Value::Array(vec![Value::from(atom.graph.get()), Value::from(atom.atom.raw())].into())
 }
 
+/// Returns the optional atom result.
 fn optional_atom(value: Value) -> FerrosGrynnResult<Option<BoundAtom>> {
 	match value {
 		Value::None => Ok(None),
@@ -340,6 +363,7 @@ fn optional_atom(value: Value) -> FerrosGrynnResult<Option<BoundAtom>> {
 	}
 }
 
+/// Returns the required atom result.
 fn required_atom(value: Value) -> FerrosGrynnResult<BoundAtom> {
 	let Value::Array(parts) = value else {
 		return Err(invalid_match_run("bound atom is not a pair"));
@@ -365,6 +389,7 @@ fn required_atom(value: Value) -> FerrosGrynnResult<BoundAtom> {
 	Ok(BoundAtom::new(graph, atom))
 }
 
+/// Returns the required u64 result.
 fn required_u64(value: Value, name: &'static str) -> FerrosGrynnResult<u64> {
 	let Value::Number(number) = value else {
 		return Err(invalid_match_run(&format!("{name} is not an integer")));
@@ -372,6 +397,7 @@ fn required_u64(value: Value, name: &'static str) -> FerrosGrynnResult<u64> {
 	u64::try_from(number).map_err(|_error| invalid_match_run(&format!("{name} does not fit u64")))
 }
 
+/// Returns the invalid match run result.
 fn invalid_match_run(message: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(format!("invalid MATCH query run: {message}"))
 }

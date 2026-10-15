@@ -142,35 +142,54 @@ fn io(error: std::io::Error) -> FerrosGrynnError {
 /// A single fresh fixture owns registrations and its optional disposable
 /// database.
 struct Fixture {
+	/// Datastore retained by the fixture or operation.
 	store: Option<Datastore>,
+	/// Directory retaining the local files used by the scenario.
 	directory: Option<PathBuf>,
+	/// Directory retaining the local files used by the scenario.
 	root: Option<PathBuf>,
+	/// Configured row count of the fixture or measurement.
 	rows: usize,
+	/// Class selected by the schema declaration, query target or fixture.
 	class: ClassId,
+	/// Stable class-qualified record identity used by this operation.
 	hot: Vec<RecordId>,
+	/// Stable class-qualified record identity used by this operation.
 	boss: RecordId,
+	/// Interned property-name identifier used for value lookup.
 	value_key: PropertyKeyId,
+	/// Interned property-name identifier used for value lookup.
 	hot_key: PropertyKeyId,
+	/// Interned property-name identifier used for value lookup.
 	manager_key: PropertyKeyId,
+	/// Payload retained for the operation or its expected result.
 	value: i64,
+	/// Value preceding the mutation whose change image is being checked.
 	previous: i64,
+	/// Version stamp associated with the committed fixture state.
 	stamp: Versionstamp,
+	/// Optional value captured before applying the fixture mutation.
 	before_image: Option<Value>,
+	/// Resolved binding connecting the fixture or reader to its registered
+	/// resource.
 	binding: Option<LiveBindingId>,
+	/// Live subscription handles retained for the scenario lifetime.
 	handles: Vec<LiveSubscription>,
 }
 
 impl Drop for Fixture {
+	/// Runs cleanup for this `Fixture` before its fields are released.
 	fn drop(&mut self) {
 		self.handles.clear();
 		drop(self.store.take());
 		if let (Some(directory), Some(root)) = (self.directory.take(), self.root.take()) {
 			// Delete only the unique directory created beneath this fixture's
 			// canonical root.
-			if let Ok(directory) = directory.canonicalize() {
-				if directory.starts_with(&root) && directory != root {
-					drop(std::fs::remove_dir_all(directory));
-				}
+			if let Ok(directory) = directory.canonicalize()
+				&& directory.starts_with(&root)
+				&& directory != root
+			{
+				drop(std::fs::remove_dir_all(directory));
 			}
 		}
 	}
@@ -288,17 +307,16 @@ impl Fixture {
 	fn evaluation_fault(&mut self, case: &str) -> FerrosGrynnResult<bool> {
 		let mut faults = 0;
 		for handle in &mut self.handles {
-			if let LiveNext::Delivery(delivery) = handle.next()? {
-				if let LivePayload::Fault {
+			if let LiveNext::Delivery(delivery) = handle.next()?
+				&& let LivePayload::Fault {
 					diagnostic,
 					..
 				} = delivery.payload()
-				{
-					if !resource(diagnostic) {
-						return Err(diagnostic.clone());
-					}
-					faults += 1;
+			{
+				if !resource(diagnostic) {
+					return Err(diagnostic.clone());
 				}
+				faults += 1;
 			}
 		}
 		if faults > 0 {

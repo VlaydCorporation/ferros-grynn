@@ -9,6 +9,7 @@ use syn::{
 
 use crate::derive::get_metadata_inner;
 
+/// Attribute keywords accepted by the heap-measurement derive parser.
 mod kw {
 	use syn::custom_keyword;
 
@@ -16,22 +17,30 @@ mod kw {
 	custom_keyword!(add_m);
 }
 
+/// Returns occurrence error for this module.
 pub fn occurrence_error<T: ToTokens>(fst: T, snd: T, attr: &str) -> syn::Error {
 	let mut e = syn::Error::new_spanned(snd, format!("Found multiple occurrences of m({})", attr));
 	e.combine(syn::Error::new_spanned(fst, "first one here"));
 	e
 }
 
+/// Field attributes selecting explicit bytes or nested heap measurements for a
+/// derive.
 enum Attrs {
+	/// Adds the annotated field value as an explicit heap-byte count.
 	Add {
+		/// Parsed attribute keyword retained for span-aware derive diagnostics.
 		kw: kw::add,
 	},
+	/// Adds the annotated field own heap measurement to the derived total.
 	AddM {
+		/// Parsed attribute keyword retained for span-aware derive diagnostics.
 		kw: kw::add_m,
 	},
 }
 
 impl Parse for Attrs {
+	/// Parses and validates the input syntax for this type.
 	fn parse(input: ParseStream) -> syn::Result<Self> {
 		let lookahead = input.lookahead1();
 		if lookahead.peek(kw::add) {
@@ -50,6 +59,8 @@ impl Parse for Attrs {
 	}
 }
 
+/// Generates heap-measurement code for fields selected by the derive
+/// attributes.
 pub fn measurable_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 	let ident = &input.ident;
 	let generics = &input.generics;
@@ -109,6 +120,7 @@ pub fn measurable_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 
 			Ok(quote! {
 				impl #gen_impl crate::common::memory::Measurable for #ident #gen_tys #gen_where {
+					/// Returns the heap allocation estimate generated for this type.
 					fn estimated_heap_usage(&self) -> usize {
 						crate::unsafed::shallow_size_of::<#ident>() #(+ #arms)*
 					}
@@ -133,6 +145,7 @@ pub fn measurable_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 
 			Ok(quote! {
 				impl #gen_impl crate::common::memory::Measurable for #ident #gen_tys #gen_where {
+					/// Returns the heap allocation estimate generated for this type.
 					fn estimated_heap_usage(&self) -> usize {
 						match self {
 							#(#arms)*

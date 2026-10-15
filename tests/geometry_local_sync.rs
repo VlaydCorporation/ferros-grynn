@@ -1,8 +1,12 @@
+#![cfg(test)]
 #![cfg(windows)]
 #![allow(
 	clippy::unwrap_used,
 	reason = "Public backend contract test fails on the first unexpected error"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
@@ -13,14 +17,19 @@ use ferros_grynn::{
 };
 
 /// Removes the unique integration database after handles have been dropped.
-struct Directory(PathBuf);
+struct Directory(
+	/// Removes the unique integration database after handles have been dropped.
+	PathBuf,
+);
 
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Verifies geometry sync effective delta private writes and recovery.
 #[test]
 fn geometry_sync_effective_delta_private_writes_and_recovery() {
 	let directory = Directory(

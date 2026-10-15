@@ -11,33 +11,63 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MaintenanceIndexOwner {
-	Class(Identifier),
-	Graph(Identifier),
+	/// Index owned by a class schema.
+	Class(
+		/// Index owned by a class schema.
+		Identifier,
+	),
+	/// Index owned by a graph schema.
+	Graph(
+		/// Index owned by a graph schema.
+		Identifier,
+	),
 }
 
 /// Logical target selected by an administrative maintenance statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MaintenanceTargetName {
+	/// All database storage selected as the maintenance target.
 	Database,
-	ClassBase(Identifier),
+	/// Base class data selected independently of graph overlays.
+	ClassBase(
+		/// Base class data selected independently of graph overlays.
+		Identifier,
+	),
+	/// Effective class data selected inside a graph scope.
 	ClassEffective {
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
+		/// Graph materialization or physical graph files retained by the
+		/// operation.
 		graph: Identifier,
 	},
-	Graph(Identifier),
+	/// One graph selected as the maintenance target.
+	Graph(
+		/// One graph selected as the maintenance target.
+		Identifier,
+	),
+	/// One named index and its schema owner.
 	Index {
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Owner retained to keep the referenced storage or operation state
+		/// alive.
 		owner: MaintenanceIndexOwner,
 	},
 }
 
 /// Statistics build policy selected by `ANALYZE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnalyzeModeName {
+	/// Let the maintenance planner select the statistics build mode.
 	Automatic,
+	/// Build statistics from the complete selected population.
 	Full,
+	/// Build approximate statistics with an optional explicit sample count.
 	Approximate {
+		/// Optional explicit number of rows sampled for approximate statistics.
 		sample_count: Option<u64>,
 	},
 }
@@ -46,23 +76,38 @@ pub enum AnalyzeModeName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MaintenanceOperationName {
+	/// Build or refresh statistics for the selected target.
 	Analyze {
+		/// Target endpoint or schema object selected by the operation.
 		target: MaintenanceTargetName,
+		/// Execution or declaration policy selected by this clause.
 		mode: AnalyzeModeName,
 	},
+	/// Build a replacement generation of the selected index.
 	RebuildIndex {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Owner retained to keep the referenced storage or operation state
+		/// alive.
 		owner: MaintenanceIndexOwner,
 	},
-	Compact(MaintenanceTargetName),
+	/// Compact the physical representation of the selected target.
+	Compact(
+		/// Compact the physical representation of the selected target.
+		MaintenanceTargetName,
+	),
 }
 
 /// Parsed maintenance operation and its execution mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MaintenanceStatement {
+	/// Selected administrative maintenance operation.
 	pub operation: MaintenanceOperationName,
+	/// Whether the operation requests background concurrent execution.
 	pub concurrently: bool,
 	/// Optional aggregate sort-memory override in bytes.
 	pub sort_memory_bytes: Option<u64>,
@@ -74,10 +119,12 @@ pub struct MaintenanceStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KillStatement {
+	/// Maintenance job identifier targeted by the KILL command.
 	pub job: Identifier,
 }
 
 impl Parser<'_> {
+	/// Analyzes statement.
 	pub(in crate::syn) fn analyze_statement(&mut self) -> FerrosGrynnResult<MaintenanceStatement> {
 		let target = if self.consume_keyword(keywords::CLASS).is_some() {
 			let class = self.identifier()?;
@@ -123,6 +170,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Rebuilds index statement.
 	pub(in crate::syn) fn rebuild_index_statement(
 		&mut self,
 	) -> FerrosGrynnResult<MaintenanceStatement> {
@@ -137,6 +185,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the compact statement syntax.
 	pub(in crate::syn) fn compact_statement(&mut self) -> FerrosGrynnResult<MaintenanceStatement> {
 		let target = if self.consume_keyword(keywords::DATABASE).is_some()
 			|| self.consume_keyword(keywords::DB).is_some()
@@ -159,6 +208,7 @@ impl Parser<'_> {
 		self.finish_maintenance(MaintenanceOperationName::Compact(target))
 	}
 
+	/// Parses the alter database compact statement syntax.
 	pub(in crate::syn) fn alter_database_compact_statement(
 		&mut self,
 	) -> FerrosGrynnResult<MaintenanceStatement> {
@@ -166,6 +216,7 @@ impl Parser<'_> {
 		self.finish_maintenance(MaintenanceOperationName::Compact(MaintenanceTargetName::Database))
 	}
 
+	/// Parses the kill statement syntax.
 	pub(in crate::syn) fn kill_statement(&mut self) -> FerrosGrynnResult<KillStatement> {
 		let job = self.parameter()?;
 		self.expect_statement_end("KILL")?;
@@ -174,6 +225,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Finishes maintenance.
 	fn finish_maintenance(
 		&mut self,
 		operation: MaintenanceOperationName,
@@ -193,6 +245,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the maintenance options syntax.
 	fn maintenance_options(&mut self) -> FerrosGrynnResult<(Option<u64>, Option<u64>)> {
 		self.expect_symbol(Symbol::LeftParen, "Expected `(` after maintenance `WITH`.")?;
 		let mut sort_memory_bytes = None;
@@ -228,11 +281,13 @@ impl Parser<'_> {
 		Ok((sort_memory_bytes, parallelism))
 	}
 
+	/// Parses the maintenance unsigned integer syntax.
 	fn maintenance_unsigned_integer(&mut self) -> FerrosGrynnResult<u64> {
 		self.expect_symbol(Symbol::Equal, "Expected `=` after maintenance option name.")?;
 		self.maintenance_positive_integer("maintenance option")
 	}
 
+	/// Parses the maintenance positive integer syntax.
 	pub(in crate::syn) fn maintenance_positive_integer(
 		&mut self,
 		field: &str,
@@ -257,6 +312,7 @@ impl Parser<'_> {
 		Ok(value)
 	}
 
+	/// Parses the maintenance index owner syntax.
 	pub(in crate::syn) fn maintenance_index_owner(
 		&mut self,
 	) -> FerrosGrynnResult<MaintenanceIndexOwner> {

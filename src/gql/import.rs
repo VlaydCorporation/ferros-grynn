@@ -132,12 +132,16 @@ pub fn execute_import(
 /// Storable source projection retained when one GrynQL import item is
 /// quarantined.
 pub(super) struct ImportItemPayload {
+	/// Statement associated with this import item payload.
 	statement: Box<str>,
+	/// Kind associated with this import item payload.
 	kind: Box<str>,
+	/// Binding associated with this import item payload.
 	binding: Option<Box<str>>,
 }
 
 impl ImportItemPayload {
+	/// Creates from statement.
 	fn from_statement(statement: &Statement, source: &str) -> FerrosGrynnResult<Self> {
 		let start = usize::try_from(statement.span.offset).map_err(|_error| {
 			FerrosGrynnError::invalid_argument("import statement offset exceeds usize")
@@ -161,10 +165,12 @@ impl ImportItemPayload {
 		})
 	}
 
+	/// Returns the binding name result.
 	pub(super) fn binding_name(&self) -> Option<&str> {
 		self.binding.as_deref()
 	}
 
+	/// Returns the value result.
 	pub(super) fn value(&self, item: u64, binding: Option<(&str, &Value)>) -> Value {
 		let mut bindings = Object::new();
 		if let Some((name, value)) = binding {
@@ -451,6 +457,7 @@ fn normalize_statement(
 	Ok(())
 }
 
+/// Normalizes block.
 fn normalize_block(
 	block: &mut crate::syn::Block,
 	default_graph: Option<&Identifier>,

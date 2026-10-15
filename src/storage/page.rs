@@ -38,7 +38,10 @@ const PAGE_HEADER_END: usize = PAGE_NO_OFFSET + size_of::<u64>();
 /// A validated four-byte page-family marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub(super) struct PageMagic(u32);
+pub(super) struct PageMagic(
+	/// Four-byte page-family marker stored in the common page header.
+	u32,
+);
 
 impl PageMagic {
 	/// Adjacency overflow marker (`b"FAO\x01"`).
@@ -105,6 +108,7 @@ impl PageMagic {
 	}
 
 	/// Returns the format version encoded in the most-significant byte.
+	#[cfg(test)]
 	pub(super) const fn format_version(self) -> u8 {
 		(self.0 >> (u32::BITS - u8::BITS)) as u8
 	}
@@ -121,6 +125,7 @@ macro_rules! define_page_types {
 		/// A validated format-v1 page type.
 		#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 		#[repr(u16)]
+		#[non_exhaustive]
 		pub enum PageType {
 			$(
 				$(#[$metadata])*
@@ -303,7 +308,10 @@ bitflags! {
 /// The WAL position whose image is stored in a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct PageLsn(u64);
+pub struct PageLsn(
+	/// WAL record position of the image currently stored in this page.
+	u64,
+);
 
 impl PageLsn {
 	/// LSN used for a page that has not yet been written by WAL replay.
@@ -323,7 +331,11 @@ impl PageLsn {
 /// A physical page number within one data or index file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct PageNo(u64);
+pub struct PageNo(
+	/// Physical page ordinal within one file; the maximum value denotes no
+	/// page.
+	u64,
+);
 
 impl PageNo {
 	/// Sentinel used by disk structures to denote the absence of a page.
@@ -403,6 +415,7 @@ impl AlignedPage {
 	/// This is the only raw-memory conversion needed by batched Direct I/O.
 	/// The returned slice has the same lifetime and exclusive borrow as
 	/// `pages`.
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	pub fn slice_as_bytes_mut(pages: &mut [Self]) -> &mut [u8] {
 		let byte_len = size_of_val(pages);
 		let bytes = pages.as_mut_ptr().cast::<u8>();
@@ -483,6 +496,11 @@ impl AlignedPage {
 }
 
 /// Validates one complete page image without imposing Direct-I/O alignment.
+///
+/// # Errors
+///
+/// Returns a storage-page error when its header, identity or checksum is
+/// invalid.
 pub fn validate_page_bytes(
 	bytes: &[u8; PAGE_SIZE],
 	expected_page_no: PageNo,
@@ -546,6 +564,7 @@ impl PageHeader {
 	}
 
 	/// Returns the validated page-family magic.
+	#[cfg(test)]
 	pub(super) const fn magic(self) -> PageMagic {
 		self.magic
 	}
@@ -566,6 +585,7 @@ impl PageHeader {
 	}
 
 	/// Returns the stored page checksum.
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	pub const fn checksum(self) -> u64 {
 		self.checksum
 	}
@@ -669,6 +689,8 @@ impl RawPageHeader {
 
 /// Computes the portable format-v1 checksum through the optimized bulk path.
 fn page_checksum(bytes: &[u8; PAGE_SIZE]) -> u64 {
+	/// Zero bytes hashed in place of the stored checksum so the checksum
+	/// excludes itself.
 	const ZERO_CHECKSUM: [u8; size_of::<u64>()] = [0; size_of::<u64>()];
 
 	let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
@@ -705,6 +727,8 @@ fn read_u64_le(bytes: &[u8; PAGE_SIZE], offset: usize) -> u64 {
 	u64::from_le_bytes(encoded)
 }
 
+/// Compile-time checks binding header field widths, page size and page
+/// alignment to the disk layout.
 const _: () = {
 	assert!(PAGE_HEADER_END == PAGE_HEADER_SIZE);
 	assert!(size_of::<PageMagic>() == size_of::<u32>());
@@ -721,9 +745,11 @@ const _: () = {
 	clippy::panic_in_result_fn,
 	reason = "fallible test setup returns Result while assertions report contract failures"
 )]
+/// Regression tests for page behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies aligned page has exact size and alignment.
 	#[test]
 	fn aligned_page_has_exact_size_and_alignment() {
 		let page = AlignedPage::zeroed();
@@ -731,6 +757,7 @@ mod tests {
 		assert_eq!((page.as_bytes().as_ptr() as usize) % PAGE_SIZE, 0);
 	}
 
+	/// Verifies aligned page slice is one contiguous byte extent.
 	#[test]
 	fn aligned_page_slice_is_one_contiguous_byte_extent() {
 		let mut pages = (0..3).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
@@ -744,6 +771,7 @@ mod tests {
 		assert_eq!(AlignedPage::slice_as_bytes(&pages)[PAGE_SIZE], 7);
 	}
 
+	/// Verifies all page types round trip their typed values.
 	#[test]
 	fn all_page_types_round_trip_their_typed_values() {
 		for page_type in PageType::ALL {
@@ -761,6 +789,7 @@ mod tests {
 		assert_eq!(PageType::from_raw(0x0040), None);
 	}
 
+	/// Verifies page codec round trips little endian header.
 	#[test]
 	fn page_codec_round_trips_little_endian_header() -> FerrosGrynnResult<()> {
 		let page =
@@ -776,6 +805,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies page checksum rejects payload corruption.
 	#[test]
 	fn page_checksum_rejects_payload_corruption() -> FerrosGrynnResult<()> {
 		let mut page = AlignedPage::new(
@@ -794,6 +824,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies page codec rejects wrong page number and invalid raw fields.
 	#[test]
 	fn page_codec_rejects_wrong_page_number_and_invalid_raw_fields() {
 		let page = AlignedPage::new(
@@ -874,6 +905,7 @@ mod tests {
 		);
 	}
 
+	/// Verifies rapid hash v3 format vectors are stable.
 	#[test]
 	fn rapid_hash_v3_format_vectors_are_stable() -> FerrosGrynnResult<()> {
 		let zero_page = AlignedPage::zeroed();

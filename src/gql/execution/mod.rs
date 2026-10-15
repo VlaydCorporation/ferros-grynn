@@ -3,13 +3,18 @@
 	reason = "the executor intentionally uses match ergonomics for borrowed IR and runtime values"
 )]
 
+/// Transaction adapters for query execution.
 mod adapter;
 mod bridge;
+/// Implementation of query-language built-in operations.
 mod builtins;
 mod changefeed;
 mod collation;
+/// Pull-based graph matching and traversal execution.
 mod cursor;
+/// Execution of validated atom and graph mutations.
 mod dml;
+/// Typed expression evaluation and function dispatch.
 mod eval;
 /// Source-only event compilation through the ordinary closure analyzer.
 mod event;
@@ -19,12 +24,15 @@ mod event;
 )]
 pub(crate) use event::{execute_event, execute_event_handler, validate_event_definition};
 mod explain;
+/// Evaluation of graph property operations.
 mod graph_properties;
 mod graph_result;
 mod live_planning;
 mod root_read;
 pub(in crate::gql) use root_read::RootRead;
+/// Execution of typed schema commands.
 mod schema;
+/// SELECT row production, expressions and materialization barriers.
 mod select;
 mod traversal;
 
@@ -38,10 +46,14 @@ use std::{
 use adapter::TransactionRead;
 pub(super) use adapter::analyze_import_preflight;
 #[cfg(test)]
-pub(crate) use adapter::execute_parsed_transaction_with_bindings;
-pub(crate) use adapter::{analyze_parsed_transaction, execute_parsed_statement_with_bindings};
+pub use adapter::execute_parsed_transaction_with_bindings;
+pub use adapter::{
+	analyze_parsed_transaction,
+	execute_parsed_statement_with_bindings,
+	execute_transaction,
+	execute_transaction_with_options,
+};
 pub(in crate::gql) use adapter::{atom_source_schema, query_schema};
-pub use adapter::{execute_transaction, execute_transaction_with_options};
 pub(in crate::gql) use cursor::{AtomFieldRead, RootFields};
 use dml::{execute_dml, execute_graph_dml};
 pub(in crate::gql) use eval::{invoke_logical_closure, invoke_root_logical_closure};
@@ -63,6 +75,7 @@ pub(in crate::gql) use select::{
 )]
 use {cursor::*, eval::*};
 
+/// Evaluates constant.
 pub(in crate::gql) fn evaluate_constant(expression: &TypedExpr) -> Option<Value> {
 	eval(expression, None, &[], "", None, None).ok()
 }
@@ -101,7 +114,7 @@ use super::{
 		LogicalDmlData,
 		LogicalDmlKind,
 		LogicalDmlReturn,
-		LogicalDmlReturnItem,
+		LogicalDmlReturnField,
 		LogicalDmlSelector,
 		LogicalDmlStatement,
 		LogicalDmlTarget,
@@ -214,6 +227,7 @@ fn execute_program<Read: QueryRead>(
 	execute_logical_program(read, source, &logical, bindings, control)
 }
 
+/// Executes parsed statement.
 fn execute_parsed_statement<Read: QueryRead>(
 	read: &mut Read,
 	source: &str,
@@ -280,6 +294,7 @@ fn discard_statement_cursor(
 	}
 }
 
+/// Executes logical program.
 fn execute_logical_program<Read: QueryRead>(
 	read: &mut Read,
 	source: &str,
@@ -302,6 +317,7 @@ fn execute_logical_program<Read: QueryRead>(
 	Ok(results)
 }
 
+/// Executes logical statement.
 fn execute_logical_statement<Read: QueryRead>(
 	read: &mut Read,
 	source: &str,
@@ -346,7 +362,8 @@ fn execute_logical_statement<Read: QueryRead>(
 	})
 }
 
-pub(crate) fn execute_import_program(
+/// Executes import program.
+pub fn execute_import_program(
 	session: &mut ImportSession,
 	source: &str,
 	logical: &LogicalProgram,
@@ -377,7 +394,7 @@ pub(crate) fn execute_import_program(
 				iterable_values(eval(iterable, None, &slots, source, None, Some(&control))?)?;
 			for value in values {
 				control.check()?;
-				record_iteration(&mut runtime, &control)?;
+				record_iteration(&runtime, &control)?;
 				slots[*slot as usize] = value;
 				let binding_name = payload.binding_name().ok_or_else(|| {
 					FerrosGrynnError::invalid_argument(
@@ -436,6 +453,7 @@ pub(crate) fn execute_import_program(
 }
 
 #[allow(clippy::too_many_arguments, reason = "the import item reuses the concrete interpreter")]
+/// Executes import statement.
 fn execute_import_statement(
 	transaction: &mut Transaction,
 	statement: &LogicalStatement,
@@ -463,6 +481,7 @@ fn execute_import_statement(
 }
 
 #[allow(clippy::too_many_arguments, reason = "the import item reuses the concrete interpreter")]
+/// Executes import block.
 fn execute_import_block(
 	transaction: &mut Transaction,
 	block: &crate::gql::ir::LogicalBlock,
@@ -482,6 +501,7 @@ fn execute_import_block(
 	execute_block(&mut read, block, slots, bindings, source, control, runtime, 1)
 }
 
+/// Control runtime state.
 pub(in crate::gql::execution) struct ControlRuntime {
 	/// Invocation-local view of the control's shared loop gas authority.
 	budget: Arc<crate::gql::options::RuntimeBudget>,
@@ -496,21 +516,37 @@ impl ControlRuntime {
 	}
 }
 
+/// Control flow alternatives.
 enum ControlFlow {
-	Value(Value),
-	Return(Value),
+	/// Value case of control flow.
+	Value(
+		/// Value case of control flow.
+		Value,
+	),
+	/// Return case of control flow.
+	Return(
+		/// Return case of control flow.
+		Value,
+	),
+	/// Break case of control flow.
 	Break,
+	/// Continue case of control flow.
 	Continue,
 }
 
 #[derive(Clone, Copy)]
+/// Closure invocation mode alternatives.
 pub(in crate::gql::execution) enum ClosureInvocationMode {
+	/// Read only traversal case of closure invocation mode.
 	ReadOnlyTraversal,
+	/// Traversal side effect case of closure invocation mode.
 	TraversalSideEffect,
+	/// Standalone case of closure invocation mode.
 	Standalone,
 }
 
 #[allow(clippy::too_many_arguments, reason = "the interpreter keeps one concrete execution path")]
+/// Executes statement.
 fn execute_statement<Read: QueryRead>(
 	read: &mut Read,
 	statement: &LogicalStatement,
@@ -682,7 +718,7 @@ fn execute_statement<Read: QueryRead>(
 				)? {
 					ControlFlow::Value(value) => last = value,
 					ControlFlow::Break => break,
-					ControlFlow::Continue => continue,
+					ControlFlow::Continue => {}
 					flow @ ControlFlow::Return(_) => return Ok(flow),
 				}
 			}
@@ -710,7 +746,7 @@ fn execute_statement<Read: QueryRead>(
 				)? {
 					ControlFlow::Value(value) => last = value,
 					ControlFlow::Break => break,
-					ControlFlow::Continue => continue,
+					ControlFlow::Continue => {}
 					flow @ ControlFlow::Return(_) => return Ok(flow),
 				}
 			}
@@ -823,6 +859,7 @@ fn eval_query_duration<Read: QueryRead>(
 	}
 }
 
+/// Returns the cooperative sleep result.
 fn cooperative_sleep(duration: Duration, control: &ExecutionControl) -> FerrosGrynnResult<()> {
 	let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("SLEEP duration is too large for this platform.")
@@ -837,6 +874,7 @@ fn cooperative_sleep(duration: Duration, control: &ExecutionControl) -> FerrosGr
 	}
 }
 
+/// Returns the eval query expression result.
 fn eval_query_expression<Read: QueryRead>(
 	read: &mut Read,
 	expression: &TypedExpr,
@@ -1334,6 +1372,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 	}
 }
 
+/// Returns the query constant result.
 fn query_constant(expression: &TypedExpr, value: Value) -> TypedExpr {
 	TypedExpr {
 		kind: TypedExprKind::Constant(value),
@@ -1342,6 +1381,7 @@ fn query_constant(expression: &TypedExpr, value: Value) -> TypedExpr {
 	}
 }
 
+/// Returns whether the query expression requires read condition holds.
 fn query_expression_requires_read(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::LiveSlot(_) => true,
@@ -1445,6 +1485,7 @@ fn query_expression_requires_read(expression: &TypedExpr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments, reason = "the interpreter keeps one concrete execution path")]
+/// Executes block.
 fn execute_block<Read: QueryRead>(
 	read: &mut Read,
 	block: &crate::gql::ir::LogicalBlock,
@@ -1633,13 +1674,12 @@ pub(in crate::gql::execution) fn invoke_logical_closure_with_read<Read: QueryRea
 	result
 }
 
-fn record_iteration(
-	runtime: &mut ControlRuntime,
-	control: &ExecutionControl,
-) -> FerrosGrynnResult<()> {
+/// Records iteration.
+fn record_iteration(runtime: &ControlRuntime, control: &ExecutionControl) -> FerrosGrynnResult<()> {
 	runtime.budget.record_iteration(control.max_loop_iterations)
 }
 
+/// Returns the iterable values result.
 fn iterable_values(value: Value) -> FerrosGrynnResult<IterableValues> {
 	match value {
 		Value::Array(values) => Ok(IterableValues::Array(values.into_iter())),
@@ -1652,15 +1692,29 @@ fn iterable_values(value: Value) -> FerrosGrynnResult<IterableValues> {
 	}
 }
 
+/// Iterable values alternatives.
 enum IterableValues {
-	Array(std::vec::IntoIter<Value>),
-	Set(std::collections::btree_set::IntoIter<Value>),
-	Integer(IntegerValues),
+	/// Array case of iterable values.
+	Array(
+		/// Array case of iterable values.
+		std::vec::IntoIter<Value>,
+	),
+	/// Set case of iterable values.
+	Set(
+		/// Set case of iterable values.
+		std::collections::btree_set::IntoIter<Value>,
+	),
+	/// Integer case of iterable values.
+	Integer(
+		/// Integer case of iterable values.
+		IntegerValues,
+	),
 }
 
 impl Iterator for IterableValues {
 	type Item = Value;
 
+	/// Advances this `IterableValues` and returns its next element, if any.
 	fn next(&mut self) -> Option<Self::Item> {
 		match self {
 			Self::Array(values) => values.next(),
@@ -1670,16 +1724,22 @@ impl Iterator for IterableValues {
 	}
 }
 
+/// Integer values state.
 struct IntegerValues {
+	/// Current associated with this integer values.
 	current: i64,
+	/// End associated with this integer values.
 	end: i64,
+	/// Inclusive associated with this integer values.
 	inclusive: bool,
+	/// Done associated with this integer values.
 	done: bool,
 }
 
 impl Iterator for IntegerValues {
 	type Item = Value;
 
+	/// Advances this `IntegerValues` and returns its next element, if any.
 	fn next(&mut self) -> Option<Self::Item> {
 		if self.done || self.current > self.end || self.current == self.end && !self.inclusive {
 			return None;
@@ -1693,6 +1753,7 @@ impl Iterator for IntegerValues {
 	}
 }
 
+/// Returns the integer range result.
 fn integer_range(range: crate::values::Range) -> FerrosGrynnResult<IntegerValues> {
 	let (start, end) = range.into_bounds();
 	let std::ops::Bound::Included(Value::Number(Number::Int(start))) = start else {
@@ -1715,6 +1776,7 @@ fn integer_range(range: crate::values::Range) -> FerrosGrynnResult<IntegerValues
 	})
 }
 
+/// Returns whether the catchable condition holds.
 fn catchable(error: &FerrosGrynnError) -> bool {
 	use crate::gql_status::{Condition, Domain, ErrorClassification};
 	let status = error.status();
@@ -1737,6 +1799,7 @@ fn catchable(error: &FerrosGrynnError) -> bool {
 		)
 }
 
+/// Returns the logical statement kind result.
 const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementKind {
 	match statement {
 		LogicalStatement::SetBinding {
@@ -1784,6 +1847,7 @@ const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementK
 	}
 }
 
+/// Returns the initialize slots result.
 pub(in crate::gql) fn initialize_slots(program: &LogicalProgram, variables: &Object) -> Vec<Value> {
 	let mut slots = vec![Value::None; program.slot_count];
 	for (name, slot, _) in &program.initial_slots {
@@ -1794,6 +1858,7 @@ pub(in crate::gql) fn initialize_slots(program: &LogicalProgram, variables: &Obj
 	slots
 }
 
+/// Returns the persist mutable initial slots result.
 fn persist_mutable_initial_slots(
 	program: &LogicalProgram,
 	slots: &[Value],
@@ -1923,6 +1988,7 @@ fn execute_match<Read: QueryRead>(
 	execute_match_with_environment(read, snapshot, plan, slots, source, control, &Object::new())
 }
 
+/// Executes match with environment.
 fn execute_match_with_environment<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -1955,6 +2021,7 @@ fn execute_match_with_environment<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "MATCH pull execution retains the analyzed statement and lexical environment"
 )]
+/// Visits match with environment.
 fn visit_match_with_environment<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -2021,32 +2088,9 @@ fn visit_match_with_environment<Read: QueryRead>(
 		source,
 		fields: &fields,
 	};
-	let mut seed = Row::bindings(plan.bindings.columns.len());
-	let mut seed_is_valid = true;
-	for (column, binding) in plan.bindings.columns.iter().enumerate() {
-		if let Some(value) = environment.get(&binding.name) {
-			let Value::AtomOccurrence(occurrence) = value else {
-				seed.values[column] = value.clone();
-				continue;
-			};
-			if occurrence.graph().id() != graph_ref.id() {
-				seed.values[column] = value.clone();
-				continue;
-			}
-			let Some(atom) = graph.atom_id(occurrence.atom())? else {
-				seed.values[column] = value.clone();
-				continue;
-			};
-			seed_is_valid &= seed.seed_binding(
-				column,
-				value.clone(),
-				BoundAtom::new(graph_ref.id(), atom),
-				plan.mode,
-			);
-		}
-	}
+	let seed = seed_match_environment(plan, environment, graph.as_ref(), &graph_ref)?;
 	let mut cursor: Box<dyn RowCursor + '_> = Box::new(OneRowCursor {
-		row: seed_is_valid.then_some(seed),
+		row: seed,
 	});
 	for pattern_index in physical.pattern_order.iter().copied() {
 		let logical = &plan.patterns[pattern_index];
@@ -2284,8 +2328,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 					read,
 					snapshot,
 					&fields,
-					graph.clone(),
-					graph_ref.clone(),
+					(graph.clone(), graph_ref.clone()),
 					edge,
 					contains,
 					plan.mode,
@@ -2328,7 +2371,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 			yielded: false,
 		});
 	}
-	if plan.binding_distinct {
+	if plan.distinctness.bindings {
 		cursor = distinct_rows(read, snapshot, cursor, control)?;
 	}
 	if let Some(graph_plan) = &plan.return_graph {
@@ -2369,7 +2412,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 		random_seed,
 		ordinal: 0,
 	});
-	if plan.projection_distinct {
+	if plan.distinctness.projection {
 		cursor = distinct_rows(read, snapshot, cursor, control)?;
 	}
 	if !plan.order.is_empty() || control.deterministic() {
@@ -2388,6 +2431,45 @@ fn visit_match_with_environment<Read: QueryRead>(
 	}
 	invocation_control.as_ref().map_or(Ok(()), ExecutionControl::check)?;
 	Ok(None)
+}
+
+/// Resolves pre-bound MATCH values against the graph already opened by the
+/// caller.
+///
+/// # Errors
+/// Returns the existing atom-reference resolution error without skipping later
+/// bindings merely because an earlier binding already made the seed invalid.
+fn seed_match_environment<Graph: GraphRead>(
+	plan: &LogicalMatch,
+	environment: &Object,
+	graph: &Graph,
+	graph_ref: &GraphRef,
+) -> FerrosGrynnResult<Option<Row>> {
+	let mut seed = Row::bindings(plan.bindings.columns.len());
+	let mut seed_is_valid = true;
+	for (column, binding) in plan.bindings.columns.iter().enumerate() {
+		if let Some(value) = environment.get(&binding.name) {
+			let Value::AtomOccurrence(occurrence) = value else {
+				seed.values[column] = value.clone();
+				continue;
+			};
+			if occurrence.graph().id() != graph_ref.id() {
+				seed.values[column] = value.clone();
+				continue;
+			}
+			let Some(atom) = graph.atom_id(occurrence.atom())? else {
+				seed.values[column] = value.clone();
+				continue;
+			};
+			seed_is_valid &= seed.seed_binding(
+				column,
+				value.clone(),
+				BoundAtom::new(graph_ref.id(), atom),
+				plan.mode,
+			);
+		}
+	}
+	Ok(seed_is_valid.then_some(seed))
 }
 
 /// Builds legacy adjacency only for operations that consume it.
@@ -2459,13 +2541,16 @@ fn pattern_requires_scoped(pattern: &LogicalMatchPattern) -> bool {
 	})
 }
 
+/// Row cursor draining a prepared vector through the query cursor interface.
 #[cfg(test)]
 struct VecCursor {
+	/// Rows retained for keyed lookup or sequential output.
 	rows: std::vec::IntoIter<Row>,
 }
 
 #[cfg(test)]
 impl VecCursor {
+	/// Constructs `VecCursor` from the supplied initial state.
 	fn new(rows: Vec<Row>) -> Self {
 		Self {
 			rows: rows.into_iter(),
@@ -2475,6 +2560,7 @@ impl VecCursor {
 
 #[cfg(test)]
 impl RowCursor for VecCursor {
+	/// Advances this `VecCursor` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		control.check()?;
 		Ok(self.rows.next())
@@ -2482,4 +2568,5 @@ impl RowCursor for VecCursor {
 }
 
 #[cfg(test)]
+/// Regression tests for execution behavior.
 mod tests;

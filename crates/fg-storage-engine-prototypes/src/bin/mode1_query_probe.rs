@@ -3,26 +3,34 @@
 use std::{error::Error, hint::black_box, io, time::Instant};
 
 use ferros_grynn::{
-	datastore::{Datastore, TableField, TableKind, TableSchema},
-	graph::{Graph, Mutable},
-	values::{Object, PropertyMap, Type, Value},
+	datastore::{ClassField, ClassSchema, Datastore},
+	graph::{AtomKind, GraphKind},
+	values::{Object, PropertyMap, RecordId, Type, Value},
 };
 
-/// Builds one immutable in-memory table used by both feature variants.
+/// Builds one class of graph-attached nodes before either measured variant
+/// runs.
 fn build_store(row_count: usize) -> Result<Datastore, Box<dyn Error>> {
 	let store = Datastore::in_memory();
-	let payload = store.intern_property("payload")?;
-	let mut graph = Graph::<Mutable>::with_capacity(row_count, 0);
+	let mut schema = store.begin();
+	schema.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
+		"payload",
+		Type::Int,
+	)])?)?;
+	let graph = schema.define_graph("mode1-probe", GraphKind::Graph)?;
+	schema.commit()?;
+	let payload = store
+		.property_dictionary()
+		.get("payload")
+		.ok_or_else(|| io::Error::other("published class is missing the payload property"))?;
+	let mut transaction = store.begin();
 	for row in 0..row_count {
 		let mut properties = PropertyMap::new();
 		properties.insert(payload, i64::try_from(row)?);
-		graph.add_node_with_id(format!("item:{row}").parse()?, None, properties)?;
+		let record = format!("item:{row}").parse::<RecordId>()?;
+		transaction.create_atom(record.clone(), properties)?;
+		transaction.attach_node(graph.id(), &record, None, None)?;
 	}
-	let mut transaction = store.begin();
-	let graph = transaction.create_graph("graph:mode1-probe".parse()?, graph.freeze().into())?;
-	transaction.define_table(TableSchema::new("item", graph, TableKind::Normal, [
-		TableField::new("payload", Type::Int),
-	])?)?;
 	transaction.commit()?;
 	Ok(store)
 }
@@ -76,4 +84,39 @@ fn main() -> Result<(), Box<dyn Error>> {
 		observed_rows as f64 / elapsed.as_secs_f64(),
 	);
 	Ok(())
+}
+
+/// Assertions shared with the production crate's unit-test harness.
+#[cfg(test)]
+#[path = "../../../../tests/common/assertions.rs"]
+pub mod test_assertions;
+
+#[cfg(test)]
+/// Regression tests for mode1 query probe behavior.
+mod tests {
+	use ferros_grynn::{
+		graph::GraphRead,
+		values::{Object, Value},
+	};
+
+	use super::{build_store, query_row_count};
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
+
+	/// Verifies the probe's class rows, payloads and graph membership agree.
+	#[test]
+	fn fixture_uses_current_class_and_graph_api() {
+		let store = build_store(3).assert_ok();
+		assert_eq!(query_row_count(&store).assert_ok(), 3);
+		let results = store
+			.execute("SELECT VALUE payload FROM item ORDER BY payload", &Object::new())
+			.assert_ok();
+		let outcome = results.first().assert_some().result.as_ref().assert_ok();
+		let rows = outcome.value().as_array().assert_some();
+		assert_eq!(rows.as_slice(), &[Value::from(0), Value::from(1), Value::from(2)]);
+		let mut transaction = store.begin();
+		let graph = transaction.named_graph("mode1-probe").assert_ok().assert_some();
+		let view = graph.read(&transaction).assert_ok();
+		assert_eq!(view.node_count().assert_ok(), 3);
+		assert_eq!(view.edge_count().assert_ok(), 0);
+	}
 }

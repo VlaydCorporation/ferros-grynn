@@ -60,6 +60,7 @@ pub(in crate::storage) fn validate_scoped_index_images(
 	Ok(())
 }
 
+/// Validates explicit.
 fn validate_explicit(file: &ScopedIndexFile, database: &DatabaseRoot) -> FerrosGrynnResult<()> {
 	let ScopedIndexKind::Explicit {
 		index,
@@ -90,6 +91,7 @@ fn validate_explicit(file: &ScopedIndexFile, database: &DatabaseRoot) -> FerrosG
 	}
 }
 
+/// Validates global entries.
 fn validate_global_entries(
 	file: &ScopedIndexFile,
 	kind: ClassIndexKind,
@@ -126,6 +128,7 @@ fn validate_global_entries(
 	}
 }
 
+/// Validates local entries.
 fn validate_local_entries(
 	file: &ScopedIndexFile,
 	kind: ClassIndexKind,
@@ -165,6 +168,7 @@ fn validate_local_entries(
 	}
 }
 
+/// Returns the local entries result.
 fn local_entries(
 	entries: &std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<crate::graph::AtomId>>,
 ) -> FerrosGrynnResult<Vec<crate::storage::graph_index::ScalarIndexEntry<DiskAtomRef>>> {
@@ -190,6 +194,7 @@ fn local_entries(
 		.collect()
 }
 
+/// Validates count.
 fn validate_count(
 	file: &ScopedIndexFile,
 	class: crate::datastore::ClassId,
@@ -206,6 +211,7 @@ fn validate_count(
 	Ok(())
 }
 
+/// Returns the reader result.
 fn reader(
 	file: &ScopedIndexFile,
 ) -> impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()> + '_ {
@@ -218,6 +224,7 @@ fn reader(
 	}
 }
 
+/// Ensures equal.
 fn ensure_equal<T: PartialEq>(actual: T, expected: T, name: &str) -> FerrosGrynnResult<()> {
 	if actual != expected {
 		return Err(invalid(format!("{name} image disagrees with logical index")));
@@ -225,6 +232,7 @@ fn ensure_equal<T: PartialEq>(actual: T, expected: T, name: &str) -> FerrosGrynn
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

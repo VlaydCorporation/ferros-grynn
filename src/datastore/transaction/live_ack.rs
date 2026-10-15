@@ -90,6 +90,7 @@ impl Transaction {
 }
 
 #[cfg(test)]
+/// Regression tests for live ack behavior.
 mod tests {
 	use crate::{
 		datastore::{ClassSchema, Datastore},
@@ -102,25 +103,36 @@ mod tests {
 	/// Historical replay tokens retain at most a confirmed and an issued
 	/// witness.
 	#[test]
-	fn live_gql_ack_historical_witnesses_are_bounded_and_rollback_aware() -> FerrosGrynnResult<()> {
+	fn live_gql_ack_historical_witnesses_are_bounded_and_rollback_aware() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		setup.commit()?;
+		let class = setup
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
 		for index in 0..32 {
 			let mut write = store.begin();
-			write.create_atom(format!("person:p{index}").parse()?, PropertyMap::new())?;
-			write.commit()?;
+			write
+				.create_atom(format!("person:p{index}").parse().assert_ok(), PropertyMap::new())
+				.assert_ok();
+			write.commit().assert_ok();
 		}
 		let mut handle = store
-			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
 		let confirmed = handle.cursor().clone();
 		let attachment = handle.inner.gql_attachment();
 		let mut write = store.begin();
-		write.create_atom("person:next".parse()?, PropertyMap::new())?;
-		write.commit()?;
-		let LiveNext::Delivery(delivery) = handle.next()? else {
-			return Err(FerrosGrynnError::invalid_argument("witness delivery missing"));
+		write.create_atom("person:next".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		write.commit().assert_ok();
+		let LiveNext::Delivery(delivery) = handle.next().assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("witness delivery missing"));
+				test_result.assert_ok();
+			};
 		};
 		let mut tx = store.begin();
 		for stamp in 0..=confirmed.versionstamp().get() {
@@ -129,22 +141,22 @@ mod tests {
 				confirmed.live_id(),
 				confirmed.version(),
 				stamp.into(),
-			)?;
-			tx.acknowledge_gql_live(attachment, token)?;
+			)
+			.assert_ok();
+			tx.acknowledge_gql_live(attachment, token).assert_ok();
 			assert_eq!(tx.gql_live_acks().len(), 1);
 			assert_eq!(tx.gql_live_acks()[0].cursor, confirmed);
 		}
 		let savepoint = tx.gql_savepoint();
-		tx.acknowledge_gql_live(attachment, delivery.token().clone())?;
+		tx.acknowledge_gql_live(attachment, delivery.token().clone()).assert_ok();
 		assert_eq!(tx.gql_live_acks().len(), 2);
 		let bytes = tx.write_set_bytes();
 		for _ in 0..100 {
-			tx.acknowledge_gql_live(attachment, delivery.token().clone())?;
+			tx.acknowledge_gql_live(attachment, delivery.token().clone()).assert_ok();
 		}
 		assert_eq!(tx.write_set_bytes(), bytes);
 		tx.restore_gql_savepoint(savepoint);
 		assert_eq!(tx.gql_live_acks().len(), 1);
-		assert_eq!(tx.live_info(confirmed.live_id())?.cursor(), &confirmed);
-		Ok(())
+		assert_eq!(tx.live_info(confirmed.live_id()).assert_ok().cursor(), &confirmed);
 	}
 }

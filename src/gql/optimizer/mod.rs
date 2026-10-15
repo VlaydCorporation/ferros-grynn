@@ -15,11 +15,11 @@ mod snapshot;
 mod traverse_plan;
 mod write_plan;
 
-pub(crate) use cost::{Cardinality, PlanCost};
+pub use cost::{Cardinality, PlanCost};
 pub(in crate::gql) use deterministic::validate_deterministic_statement;
-pub(crate) use encode::{CanonicalHasher, canonical_hash};
+pub use encode::{CanonicalHasher, canonical_hash};
 pub(in crate::gql) use estimate::estimate_predicate;
-pub(crate) use estimate::{CostWeights, join_cost, lookup_cost, range_lookup_cost, scan_cost};
+pub use estimate::{CostWeights, join_cost, lookup_cost, range_lookup_cost, scan_cost};
 pub(in crate::gql) use graph_result_plan::{
 	finish_match_graph_result,
 	plan_build_graph,
@@ -39,7 +39,7 @@ pub(crate) use plan::PhysicalChangefeedPlan;
 	reason = "Shared physical metadata is read by both query consumers"
 )]
 pub(crate) use plan::TensorProjectionPlan;
-pub(crate) use plan::{
+pub use plan::{
 	AppliedRule,
 	GraphResultMode,
 	GraphResultOperator,
@@ -68,7 +68,7 @@ pub(crate) use plan::{
 pub(in crate::gql) use plan::{LiveOperation, PhysicalLivePlan, PhysicalLiveSource};
 pub(in crate::gql) use rules::prepare_select;
 pub(in crate::gql) use select_plan::{plan_select, spatial_query};
-pub(crate) use snapshot::{
+pub use snapshot::{
 	PlannerClass,
 	PlannerDemand,
 	PlannerField,
@@ -83,7 +83,8 @@ pub(in crate::gql) use traverse_plan::plan_traverse;
 pub(in crate::gql) use write_plan::plan_write;
 
 /// Version mixed into canonical query and physical-plan fingerprints.
-pub(crate) const PLAN_ENCODING_VERSION: u16 = 10;
+pub const PLAN_ENCODING_VERSION: u16 = 10;
 
 #[cfg(test)]
+/// Regression tests for optimizer behavior.
 mod tests;

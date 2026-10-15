@@ -7,25 +7,37 @@ use std::{
 use super::Value;
 use crate::gql_status::FerrosGrynnError;
 
+/// Runtime interval whose start and end may be inclusive, exclusive or
+/// unbounded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Range {
+	/// Start associated with this range.
 	start: Bound<Box<Value>>,
+	/// End associated with this range.
 	end: Bound<Box<Value>>,
 }
 
 impl PartialOrd for Range {
+	/// Compares this `Range` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Range {
+	/// Compares this `Range` with another value using its ordering contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		compare_start(&self.start, &other.start).then_with(|| compare_end(&self.end, &other.end))
 	}
 }
 
 impl Range {
+	/// Constructs `Range` from the supplied initial state.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn new(start: Bound<Value>, end: Bound<Value>) -> Result<Self, FerrosGrynnError> {
 		Self::new_with_diagnostic_admission(start, end, |_, _| Ok(()))
 	}
@@ -51,6 +63,12 @@ impl Range {
 		})
 	}
 
+	/// Returns closed for `Range`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn closed<Start, End>(start: Start, end: End) -> Result<Self, FerrosGrynnError>
 	where
 		Start: Into<Value>,
@@ -59,10 +77,12 @@ impl Range {
 		Self::new(Bound::Included(start.into()), Bound::Included(end.into()))
 	}
 
+	/// Performs the start operation for `Range`.
 	pub fn start(&self) -> Bound<&Value> {
 		borrow_bound(&self.start)
 	}
 
+	/// Returns end for `Range`.
 	pub fn end(&self) -> Bound<&Value> {
 		borrow_bound(&self.end)
 	}
@@ -72,6 +92,7 @@ impl Range {
 		(unbox_bound(self.start), unbox_bound(self.end))
 	}
 
+	/// Reports whether the contains condition holds for `Range`.
 	pub fn contains(&self, value: &Value) -> bool {
 		let compatible = self
 			.start()
@@ -96,6 +117,7 @@ impl Range {
 	}
 }
 
+/// Validates bounds.
 fn validate_bounds<Admission>(
 	start: &Bound<Value>,
 	end: &Bound<Value>,
@@ -121,6 +143,7 @@ where
 	Ok(())
 }
 
+/// Returns the bound value result.
 const fn bound_value(bound: &Bound<Value>) -> Option<&Value> {
 	match bound {
 		Bound::Included(value) | Bound::Excluded(value) => Some(value),
@@ -128,6 +151,7 @@ const fn bound_value(bound: &Bound<Value>) -> Option<&Value> {
 	}
 }
 
+/// Returns the box bound result.
 fn box_bound(bound: Bound<Value>) -> Bound<Box<Value>> {
 	match bound {
 		Bound::Included(value) => Bound::Included(Box::new(value)),
@@ -136,6 +160,7 @@ fn box_bound(bound: Bound<Value>) -> Bound<Box<Value>> {
 	}
 }
 
+/// Returns the unbox bound result.
 fn unbox_bound(bound: Bound<Box<Value>>) -> Bound<Value> {
 	match bound {
 		Bound::Included(value) => Bound::Included(*value),
@@ -144,6 +169,7 @@ fn unbox_bound(bound: Bound<Box<Value>>) -> Bound<Value> {
 	}
 }
 
+/// Returns the borrow bound result.
 fn borrow_bound(bound: &Bound<Box<Value>>) -> Bound<&Value> {
 	match bound {
 		Bound::Included(value) => Bound::Included(value.as_ref()),
@@ -152,6 +178,7 @@ fn borrow_bound(bound: &Bound<Box<Value>>) -> Bound<&Value> {
 	}
 }
 
+/// Compares start.
 fn compare_start(left: &Bound<Box<Value>>, right: &Bound<Box<Value>>) -> Ordering {
 	match (left, right) {
 		(Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
@@ -164,6 +191,7 @@ fn compare_start(left: &Bound<Box<Value>>, right: &Bound<Box<Value>>) -> Orderin
 	}
 }
 
+/// Compares end.
 fn compare_end(left: &Bound<Box<Value>>, right: &Bound<Box<Value>>) -> Ordering {
 	match (left, right) {
 		(Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
@@ -176,11 +204,14 @@ fn compare_end(left: &Bound<Box<Value>>, right: &Bound<Box<Value>>) -> Ordering 
 	}
 }
 
+/// Operations required for bound ext.
 trait BoundExt<T> {
+	/// Converts this value into value.
 	fn into_value(self) -> Option<T>;
 }
 
 impl<T> BoundExt<T> for Bound<T> {
+	/// Converts this value into value for `Bound<T>`.
 	fn into_value(self) -> Option<T> {
 		match self {
 			Bound::Included(value) | Bound::Excluded(value) => Some(value),
@@ -190,6 +221,7 @@ impl<T> BoundExt<T> for Bound<T> {
 }
 
 impl Display for Range {
+	/// Formats `Range` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self.start() {
 			Bound::Included(value) => write!(f, "[{value}")?,
@@ -206,9 +238,13 @@ impl Display for Range {
 }
 
 #[cfg(test)]
+/// Regression tests for range behavior.
 mod tests {
 	use super::Range;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies validates bound domains and order.
 	#[test]
 	fn validates_bound_domains_and_order() {
 		assert!(Range::closed(1_i64, 2.0_f64).is_ok());
@@ -216,9 +252,10 @@ mod tests {
 		assert!(Range::closed(1_i64, "two").is_err());
 	}
 
+	/// Verifies checks inclusion.
 	#[test]
 	fn checks_inclusion() {
-		let range = Range::closed(1_i64, 3_i64).unwrap();
+		let range = Range::closed(1_i64, 3_i64).assert_ok();
 		assert!(range.contains(&2_i64.into()));
 		assert!(!range.contains(&4_i64.into()));
 		assert!(!range.contains(&"2".into()));

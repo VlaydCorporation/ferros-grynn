@@ -19,14 +19,20 @@ use crate::{
 /// Fixed root pages keep catalog discovery independent of a per-commit
 /// database-superblock rewrite.
 pub(super) const DATABASE_CATALOG_ROOT: PageNo = PageNo::new(0);
+/// Configured file catalog root value.
 pub(super) const FILE_CATALOG_ROOT: PageNo = PageNo::new(1);
+/// Configured database catalog continuation value.
 pub(super) const DATABASE_CATALOG_CONTINUATION: PageNo = PageNo::new(2);
+/// Configured file catalog continuation value.
 pub(super) const FILE_CATALOG_CONTINUATION: PageNo = PageNo::new(1030);
 
 /// Complete page image of one newly allocated physical file.
 pub(super) struct FileImage {
+	/// Entry associated with this file image.
 	pub(super) entry: FileCatalogEntry,
+	/// Page numbers associated with this file image.
 	pub(super) page_numbers: Vec<PageNo>,
+	/// Pages associated with this file image.
 	pub(super) pages: Vec<AlignedPage>,
 	/// Exact page count for an immutable side-file already written and synced
 	/// by its bounded streaming builder.
@@ -35,21 +41,30 @@ pub(super) struct FileImage {
 
 /// Exact roots required to reopen one full normalized generation.
 pub(super) struct GenerationBindings {
+	/// Atoms associated with this generation bindings.
 	pub(super) atoms: AtomStoreFileSet,
+	/// Reverse associated with this generation bindings.
 	pub(super) reverse: ReverseMembershipFile,
+	/// Graphs associated with this generation bindings.
 	pub(super) graphs: Vec<GraphBinding>,
+	/// Physical indexes associated with this generation bindings.
 	pub(super) physical_indexes: BTreeMap<IndexId, PhysicalIndexBinding>,
+	/// Physical deltas associated with this generation bindings.
 	pub(super) physical_deltas: BTreeMap<IndexId, PhysicalIndexBinding>,
 }
 
 /// Allocation helper shared by the AtomStore, graph, and index packers.
 pub(super) struct LayoutBuilder {
+	/// Next file instance id associated with this layout builder.
 	next_file_instance_id: u64,
+	/// Files associated with this layout builder.
 	files: Vec<FileImage>,
+	/// Retained associated with this layout builder.
 	retained: Vec<FileCatalogEntry>,
 }
 
 impl LayoutBuilder {
+	/// Creates a new `LayoutBuilder` value.
 	pub(super) const fn new(next_file_instance_id: u64) -> Self {
 		Self {
 			next_file_instance_id,
@@ -69,6 +84,7 @@ impl LayoutBuilder {
 		Ok(())
 	}
 
+	/// Returns the add result.
 	pub(super) fn add(
 		&mut self,
 		space_id: DataSpaceId,
@@ -140,6 +156,7 @@ impl LayoutBuilder {
 		Ok(file_id)
 	}
 
+	/// Returns the add freelist result.
 	pub(super) fn add_freelist(
 		&mut self,
 		space_id: DataSpaceId,
@@ -157,6 +174,7 @@ impl LayoutBuilder {
 		)
 	}
 
+	/// Finishes layout builder.
 	pub(super) fn finish(mut self) -> FerrosGrynnResult<(FileCatalog, Vec<FileImage>)> {
 		let mut catalog = FileCatalog::bootstrap()?;
 		catalog.next_file_instance_id = self.next_file_instance_id;
@@ -169,19 +187,23 @@ impl LayoutBuilder {
 	}
 }
 
+/// Returns the atom prefix result.
 pub(super) fn atom_prefix(generation: &str) -> String {
 	format!("atoms/{generation}")
 }
 
+/// Returns the graph prefix result.
 pub(super) fn graph_prefix(graph: crate::graph::GraphId, generation: &str) -> String {
 	format!("graphs/{:016x}/{generation}", graph.get())
 }
 
+/// Returns the invalid result.
 pub(super) fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for layout behavior.
 mod tests {
 	use super::*;
 	use crate::storage::page::{PageFlags, PageLsn, PageType};
@@ -189,7 +211,9 @@ mod tests {
 	/// Keeps over-aligned page storage separate from per-page numbers so moving
 	/// a generated image cannot corrupt its first header byte.
 	#[test]
-	fn file_image_preserves_over_aligned_page_bytes() -> FerrosGrynnResult<()> {
+	fn file_image_preserves_over_aligned_page_bytes() {
+		use crate::test_assertions::AssertResult as _;
+
 		let page = AlignedPage::new(
 			PageType::IndexUniqueBtreeLeaf,
 			PageFlags::LEAF,
@@ -198,18 +222,19 @@ mod tests {
 		);
 		let expected = page.as_bytes()[..8].to_vec();
 		let mut layout = LayoutBuilder::new(1);
-		layout.add(
-			DataSpaceId::Database,
-			DataFileKind::Index,
-			DataFileRole::WalBackfilled,
-			"atoms/test/primary.fgidx".to_owned(),
-			None,
-			vec![page],
-		)?;
+		layout
+			.add(
+				DataSpaceId::Database,
+				DataFileKind::Index,
+				DataFileRole::WalBackfilled,
+				"atoms/test/primary.fgidx".to_owned(),
+				None,
+				vec![page],
+			)
+			.assert_ok();
 
 		assert_eq!(layout.files[0].page_numbers, [PageNo::new(0)]);
 		assert_eq!(&layout.files[0].pages[0].as_bytes()[..8], expected);
-		layout.files[0].pages[0].validate(PageNo::new(0))?;
-		Ok(())
+		layout.files[0].pages[0].validate(PageNo::new(0)).assert_ok();
 	}
 }

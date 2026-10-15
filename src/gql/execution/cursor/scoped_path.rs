@@ -9,30 +9,50 @@ use std::{
 
 use super::*;
 
+/// Scoped dfs frame state.
 struct ScopedDfsFrame {
+	/// Endpoint associated with this scoped dfs frame.
 	endpoint: BoundAtom,
+	/// Candidates associated with this scoped dfs frame.
 	candidates: Vec<ScopedTraversalCandidate>,
+	/// Next candidate associated with this scoped dfs frame.
 	next_candidate: usize,
+	/// Yielded associated with this scoped dfs frame.
 	yielded: bool,
+	/// Accounted bytes associated with this scoped dfs frame.
 	accounted_bytes: usize,
 }
 
 /// Incremental DFS over scoped adjacency. Only the active path and one
 /// candidate list per active depth are retained.
 pub(in crate::gql::execution) struct ScopedPathExpandCursor<'a, Read: QueryRead> {
+	/// Input associated with this scoped path expand cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Read associated with this scoped path expand cursor.
 	read: &'a Read,
+	/// Snapshot associated with this scoped path expand cursor.
 	snapshot: Snapshot,
+	/// Fields associated with this scoped path expand cursor.
 	fields: &'a MatchGraphFields<'a, Read>,
+	/// Index associated with this scoped path expand cursor.
 	index: Rc<ScopedTraversalIndex>,
+	/// Expand associated with this scoped path expand cursor.
 	expand: ResolvedPathExpand,
+	/// Predicate associated with this scoped path expand cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Trace associated with this scoped path expand cursor.
 	trace: Option<Rc<RefCell<MatchPathTrace>>>,
+	/// Origin associated with this scoped path expand cursor.
 	origin: crate::values::Uuid,
+	/// Snapshot id associated with this scoped path expand cursor.
 	snapshot_id: crate::graph::SnapshotId,
+	/// Row associated with this scoped path expand cursor.
 	row: Option<Row>,
+	/// Frames associated with this scoped path expand cursor.
 	frames: Vec<ScopedDfsFrame>,
+	/// Hops associated with this scoped path expand cursor.
 	hops: Vec<ScopedTraversalCandidate>,
+	/// Memory admission account retained with the owned data.
 	account: Option<BarrierAccount>,
 }
 
@@ -41,6 +61,7 @@ impl<'a, Read: QueryRead> ScopedPathExpandCursor<'a, Read> {
 		clippy::too_many_arguments,
 		reason = "the physical path operator keeps its planned inputs explicit"
 	)]
+	/// Creates a new `ScopedPathExpandCursor<'a, Read>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		read: &'a Read,
@@ -71,6 +92,7 @@ impl<'a, Read: QueryRead> ScopedPathExpandCursor<'a, Read> {
 		}
 	}
 
+	/// Returns the start row result.
 	fn start_row(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<bool> {
 		let Some(row) = self.input.next(control)? else {
 			return Ok(false);
@@ -85,6 +107,7 @@ impl<'a, Read: QueryRead> ScopedPathExpandCursor<'a, Read> {
 		Ok(true)
 	}
 
+	/// Pushes frame.
 	fn push_frame(
 		&mut self,
 		endpoint: BoundAtom,
@@ -112,6 +135,7 @@ impl<'a, Read: QueryRead> ScopedPathExpandCursor<'a, Read> {
 		Ok(())
 	}
 
+	/// Pops frame.
 	fn pop_frame(&mut self) {
 		if let Some(frame) = self.frames.pop()
 			&& let Some(account) = &mut self.account
@@ -125,6 +149,7 @@ impl<'a, Read: QueryRead> ScopedPathExpandCursor<'a, Read> {
 		}
 	}
 
+	/// Clears frames.
 	fn clear_frames(&mut self) {
 		self.frames.clear();
 		if let Some(account) = &mut self.account {
@@ -134,6 +159,8 @@ impl<'a, Read: QueryRead> ScopedPathExpandCursor<'a, Read> {
 }
 
 impl<Read: QueryRead> RowCursor for ScopedPathExpandCursor<'_, Read> {
+	/// Advances this `ScopedPathExpandCursor<'_, Read>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -242,28 +269,44 @@ impl<Read: QueryRead> RowCursor for ScopedPathExpandCursor<'_, Read> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Canonical scoped hop state.
 struct CanonicalScopedHop {
+	/// Edge graph associated with this canonical scoped hop.
 	edge_graph: crate::graph::GraphId,
+	/// Edge associated with this canonical scoped hop.
 	edge: crate::graph::AtomRef,
+	/// Target graph associated with this canonical scoped hop.
 	target_graph: crate::graph::GraphId,
+	/// Target associated with this canonical scoped hop.
 	target: crate::graph::AtomRef,
+	/// Direction associated with this canonical scoped hop.
 	direction: PathDirection,
+	/// Role associated with this canonical scoped hop.
 	role: EndpointRole,
 }
 
 #[derive(Debug, Clone)]
+/// Scoped shortest-path frontier entry retaining graph-qualified endpoints,
+/// hops and numeric bounds.
 struct ScopedSearchState {
+	/// Endpoint associated with this scoped search state.
 	endpoint: BoundAtom,
+	/// Hops associated with this scoped search state.
 	hops: Vec<ScopedTraversalCandidate>,
+	/// Canonical associated with this scoped search state.
 	canonical: Vec<CanonicalScopedHop>,
+	/// Cost associated with this scoped search state.
 	cost: Number,
 	/// Conservative bound on every remaining runtime numeric reduction.
 	priority: Number,
+	/// Serial associated with this scoped search state.
 	serial: u64,
+	/// Accounted bytes associated with this scoped search state.
 	accounted_bytes: usize,
 }
 
 impl ScopedSearchState {
+	/// Returns the estimated heap bytes result.
 	fn estimated_heap_bytes(&self) -> usize {
 		let identities = self.canonical.iter().fold(0_usize, |bytes, hop| {
 			bytes.saturating_add(canonical_atom_bytes(&hop.edge, &hop.target))
@@ -280,6 +323,7 @@ impl ScopedSearchState {
 }
 
 impl PartialEq for ScopedSearchState {
+	/// Compares this `ScopedSearchState` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		(self.priority, self.cost, &self.canonical, self.serial)
 			== (other.priority, other.cost, &other.canonical, other.serial)
@@ -289,12 +333,16 @@ impl PartialEq for ScopedSearchState {
 impl Eq for ScopedSearchState {}
 
 impl PartialOrd for ScopedSearchState {
+	/// Compares this `ScopedSearchState` with another value when they are
+	/// ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for ScopedSearchState {
+	/// Compares this `ScopedSearchState` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		other
 			.priority
@@ -305,12 +353,22 @@ impl Ord for ScopedSearchState {
 	}
 }
 
+/// Scoped search frontier alternatives.
 enum ScopedSearchFrontier {
-	Breadth(VecDeque<ScopedSearchState>),
-	Weighted(BinaryHeap<ScopedSearchState>),
+	/// Breadth case of scoped search frontier.
+	Breadth(
+		/// Breadth case of scoped search frontier.
+		VecDeque<ScopedSearchState>,
+	),
+	/// Weighted case of scoped search frontier.
+	Weighted(
+		/// Weighted case of scoped search frontier.
+		BinaryHeap<ScopedSearchState>,
+	),
 }
 
 impl ScopedSearchFrontier {
+	/// Creates a new `ScopedSearchFrontier` value.
 	fn new(objective: crate::syn::MatchPathObjective) -> Self {
 		match objective {
 			crate::syn::MatchPathObjective::Shortest
@@ -320,6 +378,7 @@ impl ScopedSearchFrontier {
 		}
 	}
 
+	/// Pushes scoped search frontier.
 	fn push(&mut self, state: ScopedSearchState) {
 		match self {
 			Self::Breadth(frontier) => frontier.push_back(state),
@@ -327,6 +386,7 @@ impl ScopedSearchFrontier {
 		}
 	}
 
+	/// Pops scoped search frontier.
 	fn pop(&mut self) -> Option<ScopedSearchState> {
 		match self {
 			Self::Breadth(frontier) => frontier.pop_front(),
@@ -334,6 +394,7 @@ impl ScopedSearchFrontier {
 		}
 	}
 
+	/// Clears scoped search frontier.
 	fn clear(&mut self) {
 		match self {
 			Self::Breadth(frontier) => frontier.clear(),
@@ -341,6 +402,7 @@ impl ScopedSearchFrontier {
 		}
 	}
 
+	/// Returns the number of logical elements.
 	fn len(&self) -> usize {
 		match self {
 			Self::Breadth(frontier) => frontier.len(),
@@ -359,25 +421,42 @@ impl ScopedSearchFrontier {
 
 /// Canonical BFS/Dijkstra over scoped adjacency.
 pub(in crate::gql::execution) struct ScopedShortestPathCursor<'a, Read: QueryRead> {
+	/// Input associated with this scoped shortest path cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Read associated with this scoped shortest path cursor.
 	read: &'a Read,
+	/// Snapshot associated with this scoped shortest path cursor.
 	snapshot: Snapshot,
+	/// Fields associated with this scoped shortest path cursor.
 	fields: &'a MatchGraphFields<'a, Read>,
+	/// Index associated with this scoped shortest path cursor.
 	index: Rc<ScopedTraversalIndex>,
+	/// Expand associated with this scoped shortest path cursor.
 	expand: ResolvedPathExpand,
+	/// Predicate associated with this scoped shortest path cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Trace associated with this scoped shortest path cursor.
 	trace: Option<Rc<RefCell<MatchPathTrace>>>,
+	/// Origin associated with this scoped shortest path cursor.
 	origin: crate::values::Uuid,
+	/// Snapshot id associated with this scoped shortest path cursor.
 	snapshot_id: crate::graph::SnapshotId,
+	/// Row associated with this scoped shortest path cursor.
 	row: Option<Row>,
+	/// Source associated with this scoped shortest path cursor.
 	source: Option<BoundAtom>,
+	/// Bound target associated with this scoped shortest path cursor.
 	bound_target: bool,
+	/// Frontier associated with this scoped shortest path cursor.
 	frontier: ScopedSearchFrontier,
 	/// Qualified terminal rows awaiting proof against pending completion
 	/// bounds.
 	completed: BinaryHeap<CompletedPath<ScopedSearchState>>,
+	/// Seen targets associated with this scoped shortest path cursor.
 	seen_targets: BTreeSet<BoundAtom>,
+	/// Memory admission account retained with the owned data.
 	account: Option<BarrierAccount>,
+	/// Next serial associated with this scoped shortest path cursor.
 	next_serial: u64,
 }
 
@@ -386,6 +465,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		clippy::too_many_arguments,
 		reason = "the concrete shortest operator keeps its physical inputs explicit"
 	)]
+	/// Creates a new `ScopedShortestPathCursor<'a, Read>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		read: &'a Read,
@@ -421,6 +501,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		}
 	}
 
+	/// Pushes state.
 	fn push_state(
 		&mut self,
 		mut state: ScopedSearchState,
@@ -441,6 +522,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		Ok(())
 	}
 
+	/// Returns the start row result.
 	fn start_row(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<bool> {
 		let Some(row) = self.input.next(control)? else {
 			return Ok(false);
@@ -474,6 +556,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		Ok(true)
 	}
 
+	/// Clears row.
 	fn clear_row(&mut self) {
 		self.frontier.clear();
 		self.completed.clear();
@@ -485,6 +568,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		self.row = None;
 	}
 
+	/// Returns the ordered candidates result.
 	fn ordered_candidates(
 		&self,
 		endpoint: BoundAtom,
@@ -525,6 +609,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		Ok(candidates)
 	}
 
+	/// Returns the expand state result.
 	fn expand_state(
 		&mut self,
 		state: &ScopedSearchState,
@@ -628,6 +713,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		Ok(())
 	}
 
+	/// Returns the output row result.
 	fn output_row(
 		&mut self,
 		state: &ScopedSearchState,
@@ -676,6 +762,8 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 }
 
 impl<Read: QueryRead> RowCursor for ScopedShortestPathCursor<'_, Read> {
+	/// Advances this `ScopedShortestPathCursor<'_, Read>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -758,6 +846,7 @@ impl<Read: QueryRead> RowCursor for ScopedShortestPathCursor<'_, Read> {
 	}
 }
 
+/// Returns the scoped atom matches result.
 fn scoped_atom_matches<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -774,6 +863,7 @@ fn scoped_atom_matches<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "one scoped branch validates path, clause, filter, and inline predicates"
 )]
+/// Returns the scoped path candidate allowed result.
 pub(in crate::gql::execution) fn scoped_path_candidate_allowed<Read: QueryRead>(
 	row: &Row,
 	source: BoundAtom,
@@ -853,6 +943,7 @@ pub(in crate::gql::execution) fn scoped_path_candidate_allowed<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "path materialization needs exact graph scope for each retained hop"
 )]
+/// Returns the scoped path row result.
 pub(in crate::gql::execution) fn scoped_path_row<Read: QueryRead>(
 	input: &Row,
 	expand: &ResolvedPathExpand,

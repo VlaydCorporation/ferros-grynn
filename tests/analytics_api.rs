@@ -1,8 +1,13 @@
+#![cfg(test)]
+
 //! Direct qualified analytic SDK checks, without executing query text.
 #![allow(
 	clippy::unwrap_used,
 	reason = "Unexpected SDK errors fail analytic test setup immediately"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use ferros_grynn::{
 	graph::{
@@ -41,6 +46,8 @@ fn capture(graph: &Graph<Mutable>) -> TensorProjection {
 		.unwrap()
 }
 
+/// Verifies analytics api skewed sparse rows preserve counts under either
+/// canonical order.
 #[test]
 fn analytics_api_skewed_sparse_rows_preserve_counts_under_either_canonical_order() {
 	for last in [false, true] {
@@ -89,6 +96,8 @@ fn close(actual: f64, expected: f64) {
 	assert!((actual - expected).abs() < 1.0e-9, "{actual} != {expected}");
 }
 
+/// Verifies analytics api degree pagerank and distances distinguish strength
+/// from cost.
 #[test]
 fn analytics_api_degree_pagerank_and_distances_distinguish_strength_from_cost() {
 	let mut graph = Graph::<Mutable>::new();
@@ -147,6 +156,8 @@ fn analytics_api_degree_pagerank_and_distances_distinguish_strength_from_cost() 
 	assert_eq!(closeness.values.len(), 4);
 }
 
+/// Verifies analytics api generated brandes and harmonic match exhaustive
+/// oracles.
 #[test]
 fn analytics_api_generated_brandes_and_harmonic_match_exhaustive_oracles() {
 	for bits in 0_u64..64 {
@@ -218,6 +229,8 @@ fn analytics_api_generated_brandes_and_harmonic_match_exhaustive_oracles() {
 	}
 }
 
+/// Verifies analytics api parallel shortest paths and undirected degrees are
+/// exact.
 #[test]
 fn analytics_api_parallel_shortest_paths_and_undirected_degrees_are_exact() {
 	let mut graph = Graph::<Mutable>::new();
@@ -256,6 +269,8 @@ fn analytics_api_parallel_shortest_paths_and_undirected_degrees_are_exact() {
 	}
 }
 
+/// Verifies analytics api spectral controls report convergence and original
+/// residuals.
 #[test]
 fn analytics_api_spectral_controls_report_convergence_and_original_residuals() {
 	let mut graph = Graph::<Mutable>::new();
@@ -303,6 +318,8 @@ fn analytics_api_spectral_controls_report_convergence_and_original_residuals() {
 	);
 }
 
+/// Verifies analytics api rejects path counter overflow nonpositive costs and
+/// limits.
 #[test]
 fn analytics_api_rejects_path_counter_overflow_nonpositive_costs_and_limits() {
 	let mut graph = Graph::<Mutable>::new();
@@ -349,6 +366,7 @@ fn analytics_api_rejects_path_counter_overflow_nonpositive_costs_and_limits() {
 	assert!(analytics::page_rank(&capture(&zero), rank, &mut || Ok(())).is_err());
 }
 
+/// Verifies analytics api large numeric distances reject lossy domains.
 #[test]
 fn analytics_api_large_numeric_distances_reject_lossy_domains() {
 	let mut graph = Graph::<Mutable>::new();
@@ -398,6 +416,7 @@ fn analytics_api_large_numeric_distances_reject_lossy_domains() {
 	assert!(analytics::betweenness(&capture(&rounded), options, &mut || Ok(())).is_err());
 }
 
+/// Verifies analytics api katz scales strengths before large intermediates.
 #[test]
 fn analytics_api_katz_scales_strengths_before_large_intermediates() {
 	let mut graph = Graph::<Mutable>::new();
@@ -414,9 +433,11 @@ fn analytics_api_katz_scales_strengths_before_large_intermediates() {
 	options.alpha = Some(0.0);
 	options.beta = 1.0e308;
 	let result = analytics::katz(&capture(&graph), options, &mut || Ok(())).unwrap();
-	assert_eq!(result.values[0].1, options.beta);
+	assert_eq!(result.values[0].1.partial_cmp(&options.beta), Some(std::cmp::Ordering::Equal));
 }
 
+/// Verifies analytics api weighted generated paths match independent
+/// enumeration.
 #[test]
 fn analytics_api_weighted_generated_paths_match_independent_enumeration() {
 	for bits in 0_u64..64 {
@@ -497,6 +518,8 @@ fn analytics_api_weighted_generated_paths_match_independent_enumeration() {
 	}
 }
 
+/// Verifies analytics api full state preserves rounded prefix ties and mixed
+/// parallel costs.
 #[test]
 fn analytics_api_full_state_preserves_rounded_prefix_ties_and_mixed_parallel_costs() {
 	let mut graph = Graph::<Mutable>::new();
@@ -549,6 +572,8 @@ fn analytics_api_full_state_preserves_rounded_prefix_ties_and_mixed_parallel_cos
 	assert!(analytics::betweenness(&capture(&graph), options, &mut || Ok(())).is_err());
 }
 
+/// Verifies analytics api centrality distances exclude repeated projected
+/// vertices.
 #[test]
 fn analytics_api_centrality_distances_exclude_repeated_projected_vertices() {
 	let mut graph = Graph::<Mutable>::new();
@@ -574,6 +599,8 @@ fn analytics_api_centrality_distances_exclude_repeated_projected_vertices() {
 	close(result.values[2].1, 0.5);
 }
 
+/// Verifies analytics api pagerank normalizes subnormal strengths before
+/// multiplication.
 #[test]
 fn analytics_api_pagerank_normalizes_subnormal_strengths_before_multiplication() {
 	let mut graph = Graph::<Mutable>::new();
@@ -590,6 +617,8 @@ fn analytics_api_pagerank_normalizes_subnormal_strengths_before_multiplication()
 	}
 }
 
+/// Verifies analytics api bidirectional hyperedge allows connector reuse across
+/// projected pairs.
 #[test]
 fn analytics_api_bidirectional_hyperedge_allows_connector_reuse_across_projected_pairs() {
 	let mut graph = Graph::<Mutable>::new();
@@ -611,6 +640,8 @@ fn analytics_api_bidirectional_hyperedge_allows_connector_reuse_across_projected
 	}
 }
 
+/// Verifies analytics api directed motifs and clustering match independent
+/// dense oracle.
 #[test]
 fn analytics_api_directed_motifs_and_clustering_match_independent_dense_oracle() {
 	for bits in 0_u64..64 {
@@ -708,6 +739,7 @@ fn analytics_api_directed_motifs_and_clustering_match_independent_dense_oracle()
 	}
 }
 
+/// Verifies analytics api weighted triangle clustering and orientation limits.
 #[test]
 fn analytics_api_weighted_triangle_clustering_and_orientation_limits() {
 	let mut graph = Graph::<Mutable>::new();
@@ -759,6 +791,7 @@ fn analytics_api_weighted_triangle_clustering_and_orientation_limits() {
 	);
 }
 
+/// Verifies analytics api label propagation votes are exact and canonical.
 #[test]
 fn analytics_api_label_propagation_votes_are_exact_and_canonical() {
 	let mut graph = Graph::<Mutable>::new();
@@ -799,6 +832,7 @@ fn analytics_api_label_propagation_votes_are_exact_and_canonical() {
 	assert_ne!(result.assignments.values[0].1, result.assignments.values[1].1);
 }
 
+/// Verifies analytics api louvain aggregates and reports checked limits.
 #[test]
 fn analytics_api_louvain_aggregates_and_reports_checked_limits() {
 	let mut graph = Graph::<Mutable>::new();
@@ -835,6 +869,8 @@ fn analytics_api_louvain_aggregates_and_reports_checked_limits() {
 	assert!(analytics::louvain(&projection, limited, &mut || Ok(())).is_err());
 }
 
+/// Verifies analytics api directed louvain modularity matches independent dense
+/// objective.
 #[test]
 fn analytics_api_directed_louvain_modularity_matches_independent_dense_objective() {
 	for bits in 0_u64..64 {
@@ -902,6 +938,8 @@ fn analytics_api_directed_louvain_modularity_matches_independent_dense_objective
 	}
 }
 
+/// Verifies analytics api structural empty rows obey work and cancellation
+/// preflight.
 #[test]
 fn analytics_api_structural_empty_rows_obey_work_and_cancellation_preflight() {
 	let mut graph = Graph::<Mutable>::new();
@@ -931,6 +969,8 @@ fn analytics_api_structural_empty_rows_obey_work_and_cancellation_preflight() {
 	);
 }
 
+/// Verifies analytics api louvain certifies moves hidden by floating
+/// cancellation.
 #[test]
 fn analytics_api_louvain_certifies_moves_hidden_by_floating_cancellation() {
 	for (matrix, half) in

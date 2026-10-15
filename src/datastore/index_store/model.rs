@@ -12,35 +12,57 @@ use crate::{
 
 /// Resolved field metadata needed to build one scalar key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IndexField {
+pub struct IndexField {
+	/// Key associated with this index field.
 	pub(crate) key: PropertyKeyId,
+	/// Value type associated with this index field.
 	pub(crate) value_type: Type,
 }
 
 /// Logical metadata and values of one explicit class index.
 #[derive(Debug, Clone)]
-pub(crate) struct IndexBinding<Address> {
+pub struct IndexBinding<Address> {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(crate) id: IndexId,
+	/// Version associated with this index binding.
 	pub(crate) version: SchemaVersion,
+	/// Identifier of the schema class.
 	pub(crate) class_id: ClassId,
+	/// Name associated with this index binding.
 	pub(crate) name: Text,
+	/// Kind associated with this index binding.
 	pub(crate) kind: ClassIndexKind,
+	/// Fields associated with this index binding.
 	pub(crate) fields: Vec<IndexField>,
 	/// Whether immutable durable entries remain the read authority until the
 	/// first transaction-private mutation rebuilds mutable index state.
 	pub(crate) deferred: bool,
+	/// Entries associated with this index binding.
 	pub(crate) entries: IndexEntries<Address>,
 }
 
 /// Exact in-memory representation selected by the declared index kind.
 #[derive(Debug, Clone)]
-pub(crate) enum IndexEntries<Address> {
-	Standard(BTreeMap<Vec<u8>, BTreeSet<Address>>),
-	Unique(BTreeMap<Vec<u8>, Address>),
-	Count(u64),
+pub enum IndexEntries<Address> {
+	/// Standard case of index entries.
+	Standard(
+		/// Standard case of index entries.
+		BTreeMap<Vec<u8>, BTreeSet<Address>>,
+	),
+	/// Unique case of index entries.
+	Unique(
+		/// Unique case of index entries.
+		BTreeMap<Vec<u8>, Address>,
+	),
+	/// Count case of index entries.
+	Count(
+		/// Count case of index entries.
+		u64,
+	),
 }
 
 impl<Address: Copy + Ord> IndexEntries<Address> {
+	/// Creates empty storage for the declared scalar index kind.
 	pub(crate) fn empty(kind: ClassIndexKind) -> Self {
 		match kind {
 			ClassIndexKind::Standard => Self::Standard(BTreeMap::new()),
@@ -55,6 +77,7 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		}
 	}
 
+	/// Returns the count-index total, or `None` for scalar posting maps.
 	pub(crate) fn count(&self) -> Option<u64> {
 		match self {
 			Self::Count(count) => Some(*count),
@@ -62,6 +85,7 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		}
 	}
 
+	/// Collects addresses matching one encoded scalar key.
 	pub(crate) fn lookup(&self, key: &[u8]) -> Vec<Address> {
 		match self {
 			Self::Standard(entries) => {
@@ -114,6 +138,7 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		}
 	}
 
+	/// Returns whether this value can insert.
 	pub(crate) fn can_insert(
 		&self,
 		key: &[u8],
@@ -131,6 +156,7 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		Ok(())
 	}
 
+	/// Returns the checked increment result.
 	pub(crate) fn checked_increment(&self) -> FerrosGrynnResult<()> {
 		if let Self::Count(count) = self {
 			count.checked_add(1).ok_or_else(|| {
@@ -140,6 +166,7 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		Ok(())
 	}
 
+	/// Adds a scalar key/address pair or increments a count index.
 	pub(crate) fn insert(
 		&mut self,
 		key: Option<Vec<u8>>,
@@ -161,6 +188,7 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		Ok(())
 	}
 
+	/// Removes a matching scalar posting or decrements a count index.
 	pub(crate) fn remove(&mut self, key: Option<&[u8]>, address: Address) -> FerrosGrynnResult<()> {
 		match self {
 			Self::Standard(entries) => {
@@ -187,38 +215,40 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 		Ok(())
 	}
 
+	/// Returns the scalar entries result.
+	#[cfg(test)]
 	pub(crate) fn scalar_entries(&self) -> Option<&BTreeMap<Vec<u8>, BTreeSet<Address>>> {
 		match self {
 			Self::Standard(entries) => Some(entries),
 			Self::Unique(_) | Self::Count(_) => None,
 		}
 	}
-
-	pub(crate) fn unique_entries(&self) -> Option<&BTreeMap<Vec<u8>, Address>> {
-		match self {
-			Self::Unique(entries) => Some(entries),
-			Self::Standard(_) | Self::Count(_) => None,
-		}
-	}
 }
 
+/// Returns the scalar key result.
 fn scalar_key<T>(key: Option<T>) -> FerrosGrynnResult<T> {
 	key.ok_or_else(|| FerrosGrynnError::invalid_storage_file("scalar index mutation has no key"))
 }
 
 /// Engine-owned and explicit indexes of one graph data space.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct GraphIndexRoot {
+pub struct GraphIndexRoot {
+	/// Classes associated with this graph index root.
 	pub(crate) classes: BTreeMap<ClassId, BTreeSet<AtomId>>,
+	/// Labels associated with this graph index root.
 	pub(crate) labels: BTreeMap<(AtomKind, Text), BTreeSet<AtomId>>,
+	/// Explicit associated with this graph index root.
 	pub(crate) explicit: BTreeMap<IndexId, IndexBinding<AtomId>>,
 }
 
 /// All transaction-visible indexes of one immutable database root.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IndexStoreRoot {
+pub struct IndexStoreRoot {
+	/// Classes associated with this index store root.
 	pub(crate) classes: BTreeMap<ClassId, BTreeSet<GlobalAtomId>>,
+	/// Base associated with this index store root.
 	pub(crate) base: BTreeMap<IndexId, IndexBinding<GlobalAtomId>>,
+	/// Graphs associated with this index store root.
 	pub(crate) graphs: BTreeMap<GraphId, GraphIndexRoot>,
 }
 
@@ -254,6 +284,7 @@ impl IndexStoreRoot {
 		}
 	}
 
+	/// Registers graph.
 	pub(crate) fn register_graph(&mut self, graph: GraphId) -> FerrosGrynnResult<()> {
 		if self.graphs.insert(graph, GraphIndexRoot::default()).is_some() {
 			return Err(FerrosGrynnError::invalid_argument("graph indexes are already registered"));
@@ -261,14 +292,18 @@ impl IndexStoreRoot {
 		Ok(())
 	}
 
+	/// Returns the base index result.
 	pub(crate) fn base_index(&self, id: IndexId) -> Option<&IndexBinding<GlobalAtomId>> {
 		self.base.get(&id)
 	}
 
+	/// Returns the graph index result.
 	pub(crate) fn graph_index(&self, graph: GraphId, id: IndexId) -> Option<&IndexBinding<AtomId>> {
 		self.graphs.get(&graph)?.explicit.get(&id)
 	}
 
+	/// Returns the base class result.
+	#[cfg(test)]
 	pub(crate) fn base_class(&self, class: ClassId) -> Vec<GlobalAtomId> {
 		self.base_class_iter(class).collect()
 	}
@@ -281,6 +316,7 @@ impl IndexStoreRoot {
 		self.classes.get(&class).into_iter().flat_map(BTreeSet::iter).copied()
 	}
 
+	/// Returns the graph class result.
 	pub(crate) fn graph_class(&self, graph: GraphId, class: ClassId) -> Vec<AtomId> {
 		self.graphs
 			.get(&graph)
@@ -291,6 +327,7 @@ impl IndexStoreRoot {
 			.collect()
 	}
 
+	/// Returns the graph label result.
 	pub(crate) fn graph_label(&self, graph: GraphId, kind: AtomKind, label: &Text) -> Vec<AtomId> {
 		self.graphs
 			.get(&graph)

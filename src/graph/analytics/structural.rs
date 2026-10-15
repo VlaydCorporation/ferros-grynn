@@ -191,10 +191,10 @@ pub(super) fn from_pairs<T: Copy>(
 /// # Errors
 /// Rejects asymmetric undirected inputs, count overflow, cancellation or
 /// budgets.
-pub fn triangles(
+pub fn triangles<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: TriangleOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<TriangleResult> {
 	let mut control = Control::new(options.limits, check)?;
 	if options.orientation == AnalyticsOrientation::Undirected {
@@ -262,20 +262,16 @@ pub fn triangles(
 /// # Errors
 /// Rejects incompatible orientation, weights, overflow, cancellation or
 /// budgets.
-pub fn clustering(
+pub fn clustering<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: ClusteringOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<ClusteringResult> {
 	let mut control = Control::new(options.limits, check)?;
 	if options.orientation == AnalyticsOrientation::Undirected {
 		symmetric(
 			projection,
-			if options.weights == WeightSelection::Stored {
-				Some(options.weights)
-			} else {
-				None
-			},
+			(options.weights == WeightSelection::Stored).then_some(options.weights),
 			&mut control,
 		)?;
 	}

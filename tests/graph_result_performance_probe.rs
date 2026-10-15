@@ -1,7 +1,11 @@
+#![cfg(test)]
 #![allow(
 	clippy::unwrap_used,
 	reason = "the ignored profiling probe must stop when its fixed fixture is invalid"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::{
 	error::Error,
@@ -19,6 +23,11 @@ use ferros_grynn::{
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+/// Elapsed nanoseconds, graph population and process-memory delta for one
+/// probe.
+type ProbeMeasurement = (u128, (usize, usize), i128);
+
+/// Graph materialization query shared by the paired graph-result measurements.
 const BUILD_QUERY: &str = "BUILD GRAPH <GRAPH> FROM $graph";
 
 /// Runs the paired Stage-18 full-graph assembly performance gate.
@@ -62,10 +71,8 @@ fn gql_graph_result_stage_18_probe() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
-fn build_graph(
-	store: &Datastore,
-	variables: &Object,
-) -> Result<(u128, (usize, usize), i128), Box<dyn Error>> {
+/// Builds graph for this module.
+fn build_graph(store: &Datastore, variables: &Object) -> Result<ProbeMeasurement, Box<dyn Error>> {
 	let before = process_memory();
 	let started = Instant::now();
 	let mut results = store.execute(BUILD_QUERY, variables)?;
@@ -80,10 +87,8 @@ fn build_graph(
 	Ok((elapsed, counts, i128::from(after) - i128::from(before)))
 }
 
-fn copy_graph(
-	store: &Datastore,
-	graph: &GraphRef,
-) -> Result<(u128, (usize, usize), i128), Box<dyn Error>> {
+/// Returns copy graph for this module.
+fn copy_graph(store: &Datastore, graph: &GraphRef) -> Result<ProbeMeasurement, Box<dyn Error>> {
 	let before = process_memory();
 	let started = Instant::now();
 	let transaction = store.begin();
@@ -96,6 +101,7 @@ fn copy_graph(
 	Ok((elapsed, counts, i128::from(after) - i128::from(before)))
 }
 
+/// Returns assert counts for this module.
 fn assert_counts(actual: (usize, usize), nodes: usize) -> Result<(), Box<dyn Error>> {
 	let expected = (nodes, nodes.saturating_sub(1));
 	if actual != expected {
@@ -104,6 +110,7 @@ fn assert_counts(actual: (usize, usize), nodes: usize) -> Result<(), Box<dyn Err
 	Ok(())
 }
 
+/// Builds the fixture fixture used by nearby scenarios.
 fn fixture(nodes: usize) -> Result<(Datastore, GraphRef), Box<dyn Error>> {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
@@ -133,10 +140,12 @@ fn fixture(nodes: usize) -> Result<(Datastore, GraphRef), Box<dyn Error>> {
 	Ok((store, graph))
 }
 
+/// Returns env usize for this module.
 fn env_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
+/// Returns process memory for this module.
 fn process_memory() -> u64 {
 	let pid = Pid::from(std::process::id() as usize);
 	let mut system = System::new();
@@ -148,6 +157,7 @@ fn process_memory() -> u64 {
 	system.process(pid).map_or(0, sysinfo::Process::memory)
 }
 
+/// Returns artifact file for this module.
 fn artifact_file() -> Result<PathBuf, Box<dyn Error>> {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("gql-stage18");
 	fs::create_dir_all(&root)?;

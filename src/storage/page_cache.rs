@@ -8,9 +8,13 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 /// Immutable source version represented by one resident entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum PageCacheVersion {
 	/// Exact full-page image retained in WAL.
-	Wal(PageLsn),
+	Wal(
+		/// Exact full-page image retained in WAL.
+		PageLsn,
+	),
 	/// Home-file image under one logical checkpoint generation.
 	Home {
 		/// Generation that invalidates every older home-cache entry.
@@ -21,6 +25,8 @@ pub enum PageCacheVersion {
 }
 
 /// Complete identity of one immutable page version.
+/// Page numbers alone cannot distinguish retained WAL images from newer
+/// checkpoint generations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageCacheKey {
 	/// Complete database page identity.
@@ -55,6 +61,10 @@ impl PageCacheKey {
 }
 
 /// Ensures a loader returned the immutable page version named by its key.
+///
+/// # Errors
+///
+/// Returns a storage-page error for a mismatched page identity or source LSN.
 pub fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGrynnResult<()> {
 	if header.page_no() != key.page_no() {
 		return Err(FerrosGrynnError::invalid_storage_page(

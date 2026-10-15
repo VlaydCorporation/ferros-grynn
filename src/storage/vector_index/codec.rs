@@ -41,34 +41,40 @@ use crate::{
 	},
 };
 
+/// Format version for side format.
 const SIDE_FORMAT_VERSION: u16 = 2;
+/// Configured null page value.
 const NULL_PAGE: u64 = u64::MAX;
+/// Configured null node value.
 const NULL_NODE: u32 = u32::MAX;
+/// Configured flag hashed vector value.
 const FLAG_HASHED_VECTOR: u8 = 1;
+/// Configured header fixed end value.
 const HEADER_FIXED_END: usize = 184;
+/// Configured stream header bytes value.
 const STREAM_HEADER_BYTES: usize = 48;
-pub(crate) const STREAM_PAYLOAD_BYTES: usize = PAGE_SIZE - STREAM_HEADER_BYTES;
+/// Configured stream payload bytes value.
+pub const STREAM_PAYLOAD_BYTES: usize = PAGE_SIZE - STREAM_HEADER_BYTES;
+/// Configured directory entry bytes value.
 const DIRECTORY_ENTRY_BYTES: usize = 16;
-pub(crate) const VECTOR_NODE_HEADER_BYTES: usize = 24;
+/// Configured vector node header bytes value.
+pub const VECTOR_NODE_HEADER_BYTES: usize = 24;
+/// Configured disk atom ref bytes value.
 const DISK_ATOM_REF_BYTES: usize = 8;
+/// Format version for diskann vector.
 const DISKANN_VECTOR_VERSION: &str = "0.59.0";
 
 /// Physical algorithm encoded by one vector side-file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VectorAlgorithm {
+pub enum VectorAlgorithm {
+	/// Hnsw case of vector algorithm.
 	Hnsw,
+	/// Disk ann case of vector algorithm.
 	DiskAnn,
 }
 
 impl VectorAlgorithm {
-	pub(crate) const fn from_kind(kind: ClassIndexKind) -> Option<Self> {
-		match kind {
-			ClassIndexKind::Hnsw => Some(Self::Hnsw),
-			ClassIndexKind::DiskAnn => Some(Self::DiskAnn),
-			_ => None,
-		}
-	}
-
+	/// Returns the kind result.
 	pub(crate) const fn kind(self) -> ClassIndexKind {
 		match self {
 			Self::Hnsw => ClassIndexKind::Hnsw,
@@ -76,6 +82,7 @@ impl VectorAlgorithm {
 		}
 	}
 
+	/// Returns the tag result.
 	pub(super) const fn tag(self) -> u8 {
 		match self {
 			Self::Hnsw => 1,
@@ -83,6 +90,7 @@ impl VectorAlgorithm {
 		}
 	}
 
+	/// Creates from tag.
 	fn from_tag(tag: u8) -> FerrosGrynnResult<Self> {
 		match tag {
 			1 => Ok(Self::Hnsw),
@@ -94,24 +102,35 @@ impl VectorAlgorithm {
 
 /// One source row presented to a deterministic vector builder.
 pub(in crate::storage) struct VectorDocument<V = Vector> {
+	/// Atom associated with this vector document.
 	pub(in crate::storage) atom: DiskAtomRef,
+	/// Vector associated with this vector document.
 	pub(in crate::storage) vector: V,
 }
 
 /// Catalog metadata captured by one immutable vector generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VectorBuildSpec {
+pub struct VectorBuildSpec {
+	/// Index associated with this vector build spec.
 	pub(crate) index: IndexId,
+	/// Schema version of the index definition.
 	pub(crate) index_version: SchemaVersion,
+	/// Scope associated with this vector build spec.
 	pub(crate) scope: IndexScope,
+	/// Class associated with this vector build spec.
 	pub(crate) class: ClassId,
+	/// Field associated with this vector build spec.
 	pub(crate) field: PropertyKeyId,
+	/// Options associated with this vector build spec.
 	pub(crate) options: ClassIndexOptions,
+	/// Build revision associated with this vector build spec.
 	pub(crate) build_revision: u64,
+	/// Build seed associated with this vector build spec.
 	pub(crate) build_seed: u64,
 }
 
 impl VectorBuildSpec {
+	/// Returns the algorithm result.
 	pub(crate) fn algorithm(self) -> FerrosGrynnResult<VectorAlgorithm> {
 		match self.options {
 			ClassIndexOptions::Hnsw(_) => Ok(VectorAlgorithm::Hnsw),
@@ -120,6 +139,7 @@ impl VectorBuildSpec {
 		}
 	}
 
+	/// Returns the element result.
 	pub(crate) fn element(self) -> FerrosGrynnResult<VectorKind> {
 		match self.options {
 			ClassIndexOptions::Hnsw(options) => Ok(options.element()),
@@ -128,6 +148,7 @@ impl VectorBuildSpec {
 		}
 	}
 
+	/// Returns the dimension result.
 	pub(crate) fn dimension(self) -> FerrosGrynnResult<NonZeroU16> {
 		match self.options {
 			ClassIndexOptions::Hnsw(options) => Ok(options.dimension()),
@@ -136,6 +157,7 @@ impl VectorBuildSpec {
 		}
 	}
 
+	/// Returns the distance result.
 	pub(crate) fn distance(self) -> FerrosGrynnResult<VectorDistance> {
 		match self.options {
 			ClassIndexOptions::Hnsw(options) => Ok(options.distance()),
@@ -144,6 +166,7 @@ impl VectorBuildSpec {
 		}
 	}
 
+	/// Returns whether the hashed vector condition holds.
 	pub(crate) fn hashed_vector(self) -> bool {
 		matches!(self.options, ClassIndexOptions::DiskAnn(options) if options.hashed_vector())
 	}
@@ -151,9 +174,12 @@ impl VectorBuildSpec {
 
 /// One decoded graph ordinal with full-precision vector bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VectorNode<V = Vector> {
+pub struct VectorNode<V = Vector> {
+	/// Postings associated with this vector node.
 	pub(crate) postings: Vec<DiskAtomRef>,
+	/// Vector associated with this vector node.
 	pub(crate) vector: V,
+	/// Vector hash associated with this vector node.
 	pub(crate) vector_hash: u64,
 	/// Level zero first. DiskANN always has exactly one level.
 	pub(crate) neighbors: Vec<Vec<u32>>,
@@ -161,67 +187,94 @@ pub(crate) struct VectorNode<V = Vector> {
 
 /// Fully validated immutable vector generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodedVectorIndex {
+pub struct DecodedVectorIndex {
+	/// Spec associated with this decoded vector index.
 	pub(crate) spec: VectorBuildSpec,
+	/// Entrypoint associated with this decoded vector index.
 	pub(crate) entrypoint: Option<u32>,
+	/// Nodes associated with this decoded vector index.
 	pub(crate) nodes: Vec<VectorNode>,
+	/// Fingerprint associated with this decoded vector index.
 	pub(crate) fingerprint: u64,
+	/// Provider fingerprint associated with this decoded vector index.
 	pub(crate) provider_fingerprint: u64,
 }
 
 /// Resident HNSW topology. Full-precision vectors stay in the shared bounded
 /// vector cache and are loaded from the immutable side-file on demand.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodedHnswIndex {
+pub struct DecodedHnswIndex {
+	/// Spec associated with this decoded hnsw index.
 	pub(crate) spec: VectorBuildSpec,
+	/// Entrypoint associated with this decoded hnsw index.
 	pub(crate) entrypoint: Option<u32>,
+	/// Nodes associated with this decoded hnsw index.
 	pub(crate) nodes: Vec<HnswGraphNode>,
+	/// Posting count associated with this decoded hnsw index.
 	pub(crate) posting_count: usize,
 }
 
 /// One resident HNSW ordinal without its potentially large vector payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HnswGraphNode {
+pub struct HnswGraphNode {
+	/// Postings associated with this hnsw graph node.
 	pub(crate) postings: Vec<DiskAtomRef>,
+	/// Vector hash associated with this hnsw graph node.
 	pub(crate) vector_hash: u64,
+	/// Neighbors associated with this hnsw graph node.
 	pub(crate) neighbors: Vec<Vec<u32>>,
 }
 
 /// Encoded immutable vector file before catalog publication.
 pub(in crate::storage) struct BuiltVectorIndex {
+	/// Root associated with this built vector index.
 	pub(in crate::storage) root: PageNo,
+	/// Pages associated with this built vector index.
 	pub(in crate::storage) pages: Vec<AlignedPage>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StreamLocation {
+/// Stream location state.
+pub struct StreamLocation {
+	/// First associated with this stream location.
 	pub(crate) first: u64,
+	/// Pages associated with this stream location.
 	pub(crate) pages: u64,
 }
 
 /// Byte range of one vector node in the immutable data stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VectorNodeLocation {
+pub struct VectorNodeLocation {
+	/// Position relative to the beginning of the associated buffer.
 	pub(crate) offset: u64,
+	/// Length associated with this vector node location.
 	pub(crate) length: u32,
 }
 
 /// Bounds needed to read one vector node without materializing an unbounded
 /// `HASHED_VECTOR` posting list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VectorNodeRecordLayout {
+pub struct VectorNodeRecordLayout {
+	/// Record length associated with this vector node record layout.
 	pub(crate) record_length: usize,
+	/// Posting count associated with this vector node record layout.
 	pub(crate) posting_count: usize,
+	/// Postings end associated with this vector node record layout.
 	pub(crate) postings_end: usize,
+	/// Vector length associated with this vector node record layout.
 	pub(crate) vector_length: usize,
+	/// Level count associated with this vector node record layout.
 	pub(crate) level_count: usize,
+	/// Vector hash associated with this vector node record layout.
 	pub(crate) vector_hash: u64,
 }
 
 /// One page-loaded DiskANN node. `postings` may be a stable prefix while
 /// `posting_count` records the complete durable group size.
-pub(crate) struct PagedVectorNode {
+pub struct PagedVectorNode {
+	/// Node associated with this paged vector node.
 	pub(crate) node: VectorNode,
+	/// Posting count associated with this paged vector node.
 	pub(crate) posting_count: usize,
 }
 
@@ -306,7 +359,7 @@ pub(super) fn encode_vector_index<V: Borrow<Vector>>(
 }
 
 /// Decodes and structurally validates one HNSW or DiskANN generation.
-pub(crate) fn decode_vector_index(pages: &[AlignedPage]) -> FerrosGrynnResult<DecodedVectorIndex> {
+pub fn decode_vector_index(pages: &[AlignedPage]) -> FerrosGrynnResult<DecodedVectorIndex> {
 	if pages.is_empty() {
 		return Err(invalid("vector index contains no header page"));
 	}
@@ -351,20 +404,30 @@ pub(crate) fn decode_vector_index(pages: &[AlignedPage]) -> FerrosGrynnResult<De
 	})
 }
 
-pub(crate) struct PagedVectorHeader {
+/// Paged vector header state.
+pub struct PagedVectorHeader {
+	/// Spec associated with this paged vector header.
 	pub(crate) spec: VectorBuildSpec,
+	/// Entrypoint associated with this paged vector header.
 	pub(crate) entrypoint: Option<u32>,
+	/// Node count associated with this paged vector header.
 	pub(crate) node_count: u32,
+	/// Directory associated with this paged vector header.
 	pub(crate) directory: StreamLocation,
+	/// Stream associated with this paged vector header.
 	pub(crate) stream: StreamLocation,
+	/// Fingerprint associated with this paged vector header.
 	pub(crate) fingerprint: u64,
+	/// Provider fingerprint associated with this paged vector header.
 	pub(crate) provider_fingerprint: u64,
+	/// Rebuild threshold associated with this paged vector header.
 	pub(crate) rebuild_threshold: u64,
+	/// Posting count associated with this paged vector header.
 	pub(crate) posting_count: usize,
 }
 
 /// Validates topology projected from bounded page-loaded HNSW records.
-pub(crate) fn assemble_hnsw_index(
+pub fn assemble_hnsw_index(
 	header: &PagedVectorHeader,
 	nodes: Vec<HnswGraphNode>,
 ) -> FerrosGrynnResult<DecodedHnswIndex> {
@@ -421,6 +484,7 @@ pub(crate) fn assemble_hnsw_index(
 	})
 }
 
+/// Encodes header.
 pub(super) fn encode_header(
 	page: &mut AlignedPage,
 	spec: VectorBuildSpec,
@@ -489,7 +553,8 @@ pub(super) fn encode_header(
 	page.seal()
 }
 
-pub(crate) fn decode_vector_header(page: &AlignedPage) -> FerrosGrynnResult<PagedVectorHeader> {
+/// Decodes vector header.
+pub fn decode_vector_header(page: &AlignedPage) -> FerrosGrynnResult<PagedVectorHeader> {
 	let header = page.validate(PageNo::new(0))?;
 	if header.page_type() != PageType::IndexVector || !header.flags().is_empty() {
 		return Err(invalid("vector header page has the wrong type or flags"));
@@ -612,6 +677,7 @@ pub(crate) fn decode_vector_header(page: &AlignedPage) -> FerrosGrynnResult<Page
 	Ok(decoded)
 }
 
+/// Validates stream locations.
 fn validate_stream_locations(
 	node_count: u32,
 	directory: StreamLocation,
@@ -646,7 +712,7 @@ fn validate_stream_locations(
 
 /// Validates that a registered side-file contains exactly the pages declared
 /// by its immutable header.
-pub(crate) fn validate_vector_file_pages(
+pub fn validate_vector_file_pages(
 	header: &PagedVectorHeader,
 	file_pages: u64,
 ) -> FerrosGrynnResult<()> {
@@ -662,7 +728,7 @@ pub(crate) fn validate_vector_file_pages(
 
 /// Resolves one ordinal to the page and within-payload offset of its directory
 /// entry. Directory entries never straddle pages.
-pub(crate) fn vector_directory_address(
+pub fn vector_directory_address(
 	header: &PagedVectorHeader,
 	ordinal: u32,
 ) -> FerrosGrynnResult<(PageNo, usize)> {
@@ -691,7 +757,7 @@ pub(crate) fn vector_directory_address(
 
 /// Decodes one page from a known contiguous vector stream after its immutable
 /// page image has already passed common-header and checksum validation.
-pub(crate) fn decode_validated_vector_stream_page(
+pub fn decode_validated_vector_stream_page(
 	page: &AlignedPage,
 	page_no: PageNo,
 	location: StreamLocation,
@@ -729,6 +795,7 @@ pub(crate) fn decode_validated_vector_stream_page(
 	Ok(&bytes[STREAM_HEADER_BYTES..STREAM_HEADER_BYTES + payload_len])
 }
 
+/// Decodes nodes.
 fn decode_nodes(
 	spec: VectorBuildSpec,
 	directory: &[VectorNodeLocation],
@@ -750,6 +817,7 @@ fn decode_nodes(
 	Ok(nodes)
 }
 
+/// Decodes directory.
 fn decode_directory(
 	bytes: &[u8],
 	node_count: u32,
@@ -765,7 +833,7 @@ fn decode_directory(
 	}
 	let mut locations = Vec::with_capacity(count);
 	let mut expected_offset = 0_u64;
-	for entry in bytes.chunks_exact(DIRECTORY_ENTRY_BYTES) {
+	for entry in bytes.as_chunks::<DIRECTORY_ENTRY_BYTES>().0 {
 		let location = decode_vector_directory_entry(entry)?;
 		if location.offset != expected_offset || location.length < 24 {
 			return Err(invalid("vector directory is not a contiguous record map"));
@@ -782,12 +850,14 @@ fn decode_directory(
 	Ok(locations)
 }
 
+/// Encodes vector payload.
 pub(super) fn encode_vector_payload<V: Borrow<Vector>>(
 	node: &VectorNode<V>,
 ) -> FerrosGrynnResult<Vec<u8>> {
 	CanonicalCodec::encode(StorageValue::Vector(node.vector.borrow().clone()).as_ref())
 }
 
+/// Returns the vector node record length result.
 pub(super) fn vector_node_record_length<V>(
 	node: &VectorNode<V>,
 	vector_length: usize,
@@ -810,6 +880,7 @@ pub(super) fn vector_node_record_length<V>(
 		.ok_or_else(|| invalid("vector node record length overflows usize"))
 }
 
+/// Encodes vector node header.
 pub(super) fn encode_vector_node_header<V>(
 	node: &VectorNode<V>,
 	vector_length: usize,
@@ -841,7 +912,7 @@ pub(super) fn encode_vector_node_header<V>(
 }
 
 /// Decodes one 16-byte ordinal-directory entry.
-pub(crate) fn decode_vector_directory_entry(bytes: &[u8]) -> FerrosGrynnResult<VectorNodeLocation> {
+pub fn decode_vector_directory_entry(bytes: &[u8]) -> FerrosGrynnResult<VectorNodeLocation> {
 	if bytes.len() != DIRECTORY_ENTRY_BYTES || read_u32(bytes, 12)? != 0 {
 		return Err(invalid("vector directory entry is malformed"));
 	}
@@ -852,7 +923,7 @@ pub(crate) fn decode_vector_directory_entry(bytes: &[u8]) -> FerrosGrynnResult<V
 }
 
 /// Decodes one complete record selected through the ordinal directory.
-pub(crate) fn decode_vector_node_record(
+pub fn decode_vector_node_record(
 	spec: VectorBuildSpec,
 	record: &[u8],
 ) -> FerrosGrynnResult<VectorNode> {
@@ -877,7 +948,7 @@ pub(crate) fn decode_vector_node_record(
 }
 
 /// Validates the fixed header of one vector node against its directory entry.
-pub(crate) fn decode_vector_node_record_layout(
+pub fn decode_vector_node_record_layout(
 	header: &[u8],
 	directory_length: u32,
 ) -> FerrosGrynnResult<VectorNodeRecordLayout> {
@@ -929,7 +1000,7 @@ pub(crate) fn decode_vector_node_record_layout(
 }
 
 /// Decodes a bounded posting prefix and the complete bounded node tail.
-pub(crate) fn decode_vector_node_parts(
+pub fn decode_vector_node_parts(
 	spec: VectorBuildSpec,
 	layout: VectorNodeRecordLayout,
 	posting_bytes: &[u8],
@@ -950,10 +1021,8 @@ pub(crate) fn decode_vector_node_parts(
 		return Err(invalid("vector node parts do not match their record layout"));
 	}
 	let mut postings = Vec::with_capacity(posting_bytes.len() / DISK_ATOM_REF_BYTES);
-	for bytes in posting_bytes.chunks_exact(DISK_ATOM_REF_BYTES) {
-		let atom = DiskAtomRef::from_raw(u64::from_le_bytes(
-			bytes.try_into().map_err(|_error| invalid("vector posting has the wrong width"))?,
-		))?;
+	for bytes in posting_bytes.as_chunks::<DISK_ATOM_REF_BYTES>().0 {
+		let atom = DiskAtomRef::from_raw(u64::from_le_bytes(*bytes))?;
 		if postings.last().is_some_and(|previous| previous >= &atom) {
 			return Err(invalid("vector postings are not strictly ordered"));
 		}
@@ -1007,6 +1076,7 @@ pub(crate) fn decode_vector_node_parts(
 	})
 }
 
+/// Validates nodes.
 pub(super) fn validate_nodes<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	entrypoint: Option<u32>,
@@ -1061,6 +1131,7 @@ pub(super) fn validate_nodes<V: Borrow<Vector>>(
 	Ok(())
 }
 
+/// Validates vector.
 pub(super) fn validate_vector(spec: VectorBuildSpec, vector: &Vector) -> FerrosGrynnResult<()> {
 	if vector.kind() != spec.element()? || vector.len() != usize::from(spec.dimension()?.get()) {
 		return Err(invalid("vector kind or dimension disagrees with the index definition"));
@@ -1068,6 +1139,7 @@ pub(super) fn validate_vector(spec: VectorBuildSpec, vector: &Vector) -> FerrosG
 	validate_ann_vector(vector)
 }
 
+/// Returns the deterministic level result.
 pub(super) fn deterministic_level(
 	spec: VectorBuildSpec,
 	atom: DiskAtomRef,
@@ -1088,13 +1160,14 @@ pub(super) fn deterministic_level(
 	};
 	let mut level = 0_usize;
 	let mut sample = hash;
-	while level < 31 && sample % u64::from(m.max(2)) == 0 {
+	while level < 31 && sample.is_multiple_of(u64::from(m.max(2))) {
 		level += 1;
 		sample /= u64::from(m.max(2));
 	}
 	Ok(level)
 }
 
+/// Returns the maximum degree result.
 pub(super) fn maximum_degree(spec: VectorBuildSpec, level: usize) -> FerrosGrynnResult<usize> {
 	match spec.options {
 		ClassIndexOptions::Hnsw(options) => Ok(usize::from(if level == 0 {
@@ -1110,6 +1183,7 @@ pub(super) fn maximum_degree(spec: VectorBuildSpec, level: usize) -> FerrosGrynn
 	}
 }
 
+/// Returns the option parameters result.
 fn option_parameters(options: ClassIndexOptions) -> FerrosGrynnResult<(u16, u16, u16, u32)> {
 	match options {
 		ClassIndexOptions::Hnsw(options) => {
@@ -1125,6 +1199,7 @@ fn option_parameters(options: ClassIndexOptions) -> FerrosGrynnResult<(u16, u16,
 	}
 }
 
+/// Encodes distance.
 fn encode_distance(distance: VectorDistance) -> (u8, u32, u32, u64) {
 	match distance {
 		VectorDistance::Euclidean => (0, 0, 0, 0),
@@ -1140,6 +1215,7 @@ fn encode_distance(distance: VectorDistance) -> (u8, u32, u32, u64) {
 	}
 }
 
+/// Decodes distance.
 fn decode_distance(
 	tag: u8,
 	function: u32,
@@ -1165,6 +1241,7 @@ fn decode_distance(
 	Ok(distance)
 }
 
+/// Encodes vector kind.
 fn encode_vector_kind(kind: VectorKind) -> u8 {
 	match kind {
 		VectorKind::F64 => 0,
@@ -1178,6 +1255,7 @@ fn encode_vector_kind(kind: VectorKind) -> u8 {
 	}
 }
 
+/// Decodes vector kind.
 fn decode_vector_kind(tag: u8) -> FerrosGrynnResult<VectorKind> {
 	match tag {
 		0 => Ok(VectorKind::F64),
@@ -1192,6 +1270,7 @@ fn decode_vector_kind(tag: u8) -> FerrosGrynnResult<VectorKind> {
 	}
 }
 
+/// Returns the implementation fingerprint result.
 pub(super) fn implementation_fingerprint(spec: VectorBuildSpec) -> FerrosGrynnResult<u64> {
 	let mut bytes = Vec::with_capacity(96);
 	bytes.extend_from_slice(b"ferros-grynn/vector-index/v1");
@@ -1213,6 +1292,7 @@ pub(super) fn implementation_fingerprint(spec: VectorBuildSpec) -> FerrosGrynnRe
 	Ok(rapidhash_v3(&bytes))
 }
 
+/// Returns the provider fingerprint result.
 fn provider_fingerprint(algorithm: VectorAlgorithm) -> u64 {
 	if algorithm == VectorAlgorithm::Hnsw {
 		return 0;
@@ -1221,12 +1301,14 @@ fn provider_fingerprint(algorithm: VectorAlgorithm) -> u64 {
 	rapidhash_v3(value.as_bytes())
 }
 
+/// Rebuilds threshold.
 fn rebuild_threshold(posting_count: usize) -> FerrosGrynnResult<u64> {
 	let posting_count = u64::try_from(posting_count)
 		.map_err(|_error| invalid("vector posting count exceeds u64"))?;
 	Ok(4096.min((posting_count / 1000).max(1)))
 }
 
+/// Returns the page count for stream result.
 fn page_count_for_stream(bytes: usize) -> FerrosGrynnResult<u64> {
 	if bytes == 0 {
 		return Ok(0);
@@ -1235,6 +1317,7 @@ fn page_count_for_stream(bytes: usize) -> FerrosGrynnResult<u64> {
 		.map_err(|_error| invalid("vector stream page count exceeds u64"))
 }
 
+/// Encodes stream.
 fn encode_stream(
 	pages: &mut [AlignedPage],
 	first: u64,
@@ -1290,6 +1373,7 @@ fn encode_stream(
 	})
 }
 
+/// Decodes stream.
 fn decode_stream(pages: &[AlignedPage], location: StreamLocation) -> FerrosGrynnResult<Vec<u8>> {
 	if location.pages == 0 {
 		if location.first != NULL_PAGE {
@@ -1338,30 +1422,32 @@ fn decode_stream(pages: &[AlignedPage], location: StreamLocation) -> FerrosGrynn
 	Ok(output)
 }
 
-fn write_u16_vec(output: &mut Vec<u8>, value: u16) {
-	output.extend_from_slice(&value.to_le_bytes());
-}
-
+/// Writes u32 vec.
 fn write_u32_vec(output: &mut Vec<u8>, value: u32) {
 	output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64 vec.
 fn write_u64_vec(output: &mut Vec<u8>, value: u64) {
 	output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u16.
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 	bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32.
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64.
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 	bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Reads u16.
 fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 	bytes
 		.get(offset..offset + 2)
@@ -1370,6 +1456,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 		.ok_or_else(|| invalid("vector u16 field crosses its input"))
 }
 
+/// Reads u32.
 fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 	bytes
 		.get(offset..offset + 4)
@@ -1378,6 +1465,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 		.ok_or_else(|| invalid("vector u32 field crosses its input"))
 }
 
+/// Reads u64.
 fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 	bytes
 		.get(offset..offset + 8)
@@ -1386,6 +1474,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 		.ok_or_else(|| invalid("vector u64 field crosses its input"))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

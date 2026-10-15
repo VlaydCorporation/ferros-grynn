@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
 use crate::{
 	datastore::{
 		ClassField,
@@ -15,81 +17,109 @@ use crate::{
 	values::{PropertyMap, RecordId, RecordIdPart, Type, Value},
 };
 
+/// Returns record for this module.
 fn record(name: &str) -> FerrosGrynnResult<RecordId> {
 	RecordId::new("person", RecordIdPart::String(name.into()))
 }
 
+/// Verifies base and effective indexes track normalized mutations.
 #[test]
-fn base_and_effective_indexes_track_normalized_mutations() -> FerrosGrynnResult<()> {
+fn base_and_effective_indexes_track_normalized_mutations() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut define = store.begin();
-	let graph = define.define_graph("work", GraphKind::Graph)?;
+	let graph = define.define_graph("work", GraphKind::Graph).assert_ok();
 	let class = ClassSchema::new("person", AtomKind::Node, [
 		ClassField::new("email", Type::String),
 		ClassField::new("age", Type::Int),
-	])?
-	.with_index(ClassIndex::new("by_age", ClassIndexKind::Standard, IndexScope::Base, ["age"])?)?
-	.with_index(ClassIndex::new("unique_email", ClassIndexKind::Unique, IndexScope::Base, [
-		"email",
-	])?)?
-	.with_index(ClassIndex::new(
-		"base_count",
-		ClassIndexKind::Count,
-		IndexScope::Base,
-		std::iter::empty::<&str>(),
-	)?)?
-	.with_index(ClassIndex::new(
-		"effective_email",
-		ClassIndexKind::Unique,
-		IndexScope::Effective {
-			graph: graph.id(),
-		},
-		["email"],
-	)?)?
-	.with_index(ClassIndex::new(
-		"effective_count",
-		ClassIndexKind::Count,
-		IndexScope::Effective {
-			graph: graph.id(),
-		},
-		std::iter::empty::<&str>(),
-	)?)?;
-	define.define_class(class)?;
-	define.commit()?;
+	])
+	.assert_ok()
+	.with_index(
+		ClassIndex::new("by_age", ClassIndexKind::Standard, IndexScope::Base, ["age"]).assert_ok(),
+	)
+	.assert_ok()
+	.with_index(
+		ClassIndex::new("unique_email", ClassIndexKind::Unique, IndexScope::Base, ["email"])
+			.assert_ok(),
+	)
+	.assert_ok()
+	.with_index(
+		ClassIndex::new(
+			"base_count",
+			ClassIndexKind::Count,
+			IndexScope::Base,
+			std::iter::empty::<&str>(),
+		)
+		.assert_ok(),
+	)
+	.assert_ok()
+	.with_index(
+		ClassIndex::new(
+			"effective_email",
+			ClassIndexKind::Unique,
+			IndexScope::Effective {
+				graph: graph.id(),
+			},
+			["email"],
+		)
+		.assert_ok(),
+	)
+	.assert_ok()
+	.with_index(
+		ClassIndex::new(
+			"effective_count",
+			ClassIndexKind::Count,
+			IndexScope::Effective {
+				graph: graph.id(),
+			},
+			std::iter::empty::<&str>(),
+		)
+		.assert_ok(),
+	)
+	.assert_ok();
+	define.define_class(class).assert_ok();
+	define.commit().assert_ok();
 
 	let schema = store
 		.class("person")
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::class_does_not_exist("person"))?;
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::class_does_not_exist("person"))
+		.assert_ok();
 	let email = schema
 		.fields()
 		.find(|field| field.name().as_str() == "email")
 		.and_then(|field| field.key)
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("email key absent"))?;
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("email key absent"))
+		.assert_ok();
 	let age = schema
 		.fields()
 		.find(|field| field.name().as_str() == "age")
 		.and_then(|field| field.key)
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("age key absent"))?;
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("age key absent"))
+		.assert_ok();
 
-	let first = record("first")?;
-	let second = record("second")?;
+	let first = record("first").assert_ok();
+	let second = record("second").assert_ok();
 	let mut mutate = store.begin();
 	let mut first_values = PropertyMap::new();
 	first_values.insert(email, "a@example.test");
 	first_values.insert(age, 30_i64);
-	mutate.create_atom(first.clone(), first_values)?;
+	mutate.create_atom(first.clone(), first_values).assert_ok();
 	let mut second_values = PropertyMap::new();
 	second_values.insert(email, "b@example.test");
 	second_values.insert(age, 30_i64);
-	mutate.create_atom(second.clone(), second_values)?;
-	mutate.attach_node(graph.id(), &first, Some("Engineer".into()), None)?;
-	mutate.attach_node(graph.id(), &second, Some("Engineer".into()), None)?;
-	mutate.commit()?;
+	mutate.create_atom(second.clone(), second_values).assert_ok();
+	mutate.attach_node(graph.id(), &first, Some("Engineer".into()), None).assert_ok();
+	mutate.attach_node(graph.id(), &second, Some("Engineer".into()), None).assert_ok();
+	mutate.commit().assert_ok();
 
 	let root = store.inner.current_root();
-	let class_id = schema.id().ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("published class has no id")
-	})?;
+	let class_id = schema
+		.id()
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("published class has no id")
+		})
+		.assert_ok();
 	assert_eq!(root.indexes.base_class(class_id).len(), 2);
 	assert_eq!(root.indexes.graph_class(graph.id(), class_id).len(), 2);
 	assert_eq!(root.indexes.graph_label(graph.id(), AtomKind::Node, &"Engineer".into()).len(), 2);
@@ -110,84 +140,101 @@ fn base_and_effective_indexes_track_normalized_mutations() -> FerrosGrynnResult<
 	drop(root);
 
 	let mut overlay = store.begin();
-	overlay.set_overlay(graph.id(), &second, email, Value::from("shared@example.test"))?;
-	overlay.commit()?;
+	overlay.set_overlay(graph.id(), &second, email, Value::from("shared@example.test")).assert_ok();
+	overlay.commit().assert_ok();
 	let mut conflicting = store.begin();
 	let error =
 		match conflicting.set_base_property(&first, email, Value::from("shared@example.test")) {
 			Ok(_previous) => {
-				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-					"effective unique conflict was not detected",
-				));
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+							"effective unique conflict was not detected",
+						));
+					test_result.assert_ok();
+				};
 			}
 			Err(error) => error,
 		};
 	assert_eq!(error.status().code().to_string(), "FG-G2F04");
 	assert_eq!(
-		conflicting.atom(&first)?.and_then(|atom| atom.properties().get(email).cloned()),
+		conflicting.atom(&first).assert_ok().and_then(|atom| atom.properties().get(email).cloned()),
 		Some(Value::from("a@example.test"))
 	);
-	Ok(())
 }
 
+/// Verifies reopen rebuild restores effective overlay keys and zero class
+/// counts.
 #[test]
-fn reopen_rebuild_restores_effective_overlay_keys_and_zero_class_counts() -> FerrosGrynnResult<()> {
+fn reopen_rebuild_restores_effective_overlay_keys_and_zero_class_counts() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut define = store.begin();
-	let graph = define.define_graph("social", GraphKind::Graph)?;
+	let graph = define.define_graph("social", GraphKind::Graph).assert_ok();
 	let class =
-		ClassSchema::new("person", AtomKind::Node, [ClassField::new("email", Type::String)])?
-			.with_index(ClassIndex::new(
-				"effective_email",
-				ClassIndexKind::Unique,
-				IndexScope::Effective {
-					graph: graph.id(),
-				},
-				["email"],
-			)?)?;
-	define.define_class(class)?;
-	define.commit()?;
+		ClassSchema::new("person", AtomKind::Node, [ClassField::new("email", Type::String)])
+			.assert_ok()
+			.with_index(
+				ClassIndex::new(
+					"effective_email",
+					ClassIndexKind::Unique,
+					IndexScope::Effective {
+						graph: graph.id(),
+					},
+					["email"],
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
+	define.define_class(class).assert_ok();
+	define.commit().assert_ok();
 
 	let schema = store
 		.class("person")
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::class_does_not_exist("person"))?;
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::class_does_not_exist("person"))
+		.assert_ok();
 	let email = schema
 		.fields()
 		.find(|field| field.name().as_str() == "email")
 		.and_then(|field| field.key)
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("email key absent"))?;
-	let first = record("first")?;
-	let second = record("second")?;
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("email key absent"))
+		.assert_ok();
+	let first = record("first").assert_ok();
+	let second = record("second").assert_ok();
 	let mut write = store.begin();
 	let mut first_values = PropertyMap::new();
 	first_values.insert(email, "base-a@example.test");
-	write.create_atom(first.clone(), first_values)?;
+	write.create_atom(first.clone(), first_values).assert_ok();
 	let mut second_values = PropertyMap::new();
 	second_values.insert(email, "base-b@example.test");
-	write.create_atom(second.clone(), second_values)?;
-	write.attach_node(graph.id(), &first, None, None)?;
-	write.attach_node(graph.id(), &second, None, None)?;
-	write.set_overlay(graph.id(), &first, email, Value::from("effective@example.test"))?;
-	write.commit()?;
+	write.create_atom(second.clone(), second_values).assert_ok();
+	write.attach_node(graph.id(), &first, None, None).assert_ok();
+	write.attach_node(graph.id(), &second, None, None).assert_ok();
+	write.set_overlay(graph.id(), &first, email, Value::from("effective@example.test")).assert_ok();
+	write.commit().assert_ok();
 
 	let mut reopened = (*store.inner.current_root()).clone();
 	reopened.indexes = Arc::new(IndexStoreRoot::default());
 	reopened.statistics = Arc::new(crate::stats::StatisticsStore::default());
-	reopened.rebuild_derived_state()?;
-	let class_id = schema.id().ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("published class has no id")
-	})?;
+	reopened.rebuild_derived_state().assert_ok();
+	let class_id = schema
+		.id()
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("published class has no id")
+		})
+		.assert_ok();
 	assert_eq!(reopened.indexes.graph_class(graph.id(), class_id).len(), 2);
-	assert_eq!(reopened.statistics.graph(graph.id()).unwrap().classes[&class_id], 2);
+	assert_eq!(reopened.statistics.graph(graph.id()).assert_some().classes[&class_id], 2);
 
-	let reopened = Datastore::from_root_for_test(Default::default(), reopened);
+	let reopened =
+		Datastore::from_root_for_test(crate::datastore::InMemoryOptions::default(), reopened);
 	let mut conflict = reopened.begin();
 	assert!(
 		conflict
 			.set_overlay(graph.id(), &second, email, Value::from("effective@example.test"))
 			.is_err()
 	);
-	Ok(())
 }
 
 /// Creates the same normalized records with optional immediate scalar indexes.
@@ -258,54 +305,69 @@ fn replacement_fixture(
 /// Empty index work preserves lookup ownership without skipping data or
 /// statistics.
 #[test]
-fn empty_replacement_keeps_lookup_arc_for_base_and_overlay_changes() -> FerrosGrynnResult<()> {
-	let (store, graph, [age, _email, _nick, note]) = replacement_fixture(false)?;
-	let first = record("first")?;
+fn empty_replacement_keeps_lookup_arc_for_base_and_overlay_changes() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, graph, [age, _email, _nick, note]) = replacement_fixture(false).assert_ok();
+	let first = record("first").assert_ok();
 	let before = store.inner.current_root();
 	let mut tx = store.begin();
-	tx.set_base_property(&first, age, 31.into())?;
-	tx.commit()?;
+	tx.set_base_property(&first, age, 31.into()).assert_ok();
+	tx.commit().assert_ok();
 	let after = store.inner.current_root();
 	assert!(Arc::ptr_eq(&before.indexes, &after.indexes));
 	let atom = after
 		.atom_by_record(&first)
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test atom absent"))?;
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test atom absent"))
+		.assert_ok();
 	assert_eq!(atom.properties().get(age), Some(&Value::from(31)));
 	assert_eq!(after.indexes.base_class(atom.class_id()).len(), 2);
 	assert_eq!(after.indexes.graph_class(graph, atom.class_id()).len(), 2);
 	assert_eq!(after.indexes.graph_label(graph, AtomKind::Node, &"Member".into()).len(), 2);
 	assert!(after.statistics.base().dirty_rows > before.statistics.base().dirty_rows);
 	let mut tx = store.begin();
-	tx.set_overlay(graph, &first, note, "local-note".into())?;
-	tx.commit()?;
+	tx.set_overlay(graph, &first, note, "local-note".into()).assert_ok();
+	tx.commit().assert_ok();
 	let overlay = store.inner.current_root();
 	assert!(Arc::ptr_eq(&after.indexes, &overlay.indexes));
-	assert_eq!(store.begin().effective_property(graph, &first, note)?, Some("local-note".into()));
-	let old = after.statistics.graph(graph).ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("test graph statistics absent")
-	})?;
-	let new = overlay.statistics.graph(graph).ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("test graph statistics absent")
-	})?;
+	assert_eq!(
+		store.begin().effective_property(graph, &first, note).assert_ok(),
+		Some("local-note".into())
+	);
+	let old = after
+		.statistics
+		.graph(graph)
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test graph statistics absent")
+		})
+		.assert_ok();
+	let new = overlay
+		.statistics
+		.graph(graph)
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test graph statistics absent")
+		})
+		.assert_ok();
 	assert!(new.dirty_rows > old.dirty_rows);
-	Ok(())
 }
 
 /// Equal/unrelated/masked keys stay shared; real BASE/EFFECTIVE keys detach.
 #[test]
-fn empty_replacement_preserves_count_and_masked_effective_keys() -> FerrosGrynnResult<()> {
-	let (store, graph, [age, _email, nick, note]) = replacement_fixture(true)?;
-	let first = record("first")?;
+fn empty_replacement_preserves_count_and_masked_effective_keys() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, graph, [age, _email, nick, note]) = replacement_fixture(true).assert_ok();
+	let first = record("first").assert_ok();
 	let before = store.inner.current_root();
 	let mut tx = store.begin();
-	tx.set_base_property(&first, note, "unrelated".into())?;
-	tx.set_base_property(&first, age, 30.into())?;
-	tx.commit()?;
+	tx.set_base_property(&first, note, "unrelated".into()).assert_ok();
+	tx.set_base_property(&first, age, 30.into()).assert_ok();
+	tx.commit().assert_ok();
 	let equal = store.inner.current_root();
 	assert!(Arc::ptr_eq(&before.indexes, &equal.indexes));
 	let mut tx = store.begin();
-	tx.set_base_property(&first, age, 31.into())?;
-	tx.commit()?;
+	tx.set_base_property(&first, age, 31.into()).assert_ok();
+	tx.commit().assert_ok();
 	let changed = store.inner.current_root();
 	assert!(!Arc::ptr_eq(&equal.indexes, &changed.indexes));
 	let old_keys = equal
@@ -331,54 +393,69 @@ fn empty_replacement_preserves_count_and_masked_effective_keys() -> FerrosGrynnR
 		Some(2)
 	);
 	let mut tx = store.begin();
-	tx.set_overlay(graph, &first, nick, "masked".into())?;
-	tx.commit()?;
+	tx.set_overlay(graph, &first, nick, "masked".into()).assert_ok();
+	tx.commit().assert_ok();
 	let masked = store.inner.current_root();
 	let mut tx = store.begin();
-	tx.set_base_property(&first, nick, "new-base".into())?;
-	tx.commit()?;
+	tx.set_base_property(&first, nick, "new-base".into()).assert_ok();
+	tx.commit().assert_ok();
 	let base_changed = store.inner.current_root();
 	assert!(Arc::ptr_eq(&masked.indexes, &base_changed.indexes));
-	assert_eq!(store.begin().effective_property(graph, &first, nick)?, Some("masked".into()));
+	assert_eq!(
+		store.begin().effective_property(graph, &first, nick).assert_ok(),
+		Some("masked".into())
+	);
 	let mut tx = store.begin();
-	tx.reset_property(graph, &first, nick)?;
-	tx.commit()?;
+	tx.reset_property(graph, &first, nick).assert_ok();
+	tx.commit().assert_ok();
 	let inherited = store.inner.current_root();
 	assert!(!Arc::ptr_eq(&base_changed.indexes, &inherited.indexes));
-	assert_eq!(store.begin().effective_property(graph, &first, nick)?, Some("new-base".into()));
-	Ok(())
+	assert_eq!(
+		store.begin().effective_property(graph, &first, nick).assert_ok(),
+		Some("new-base".into())
+	);
 }
 
 /// Nonempty replacement remains staged through unique and late statistics
 /// errors.
 #[test]
-fn empty_replacement_guard_keeps_unique_and_statistics_failures_atomic() -> FerrosGrynnResult<()> {
-	let (store, graph, [age, email, nick, _note]) = replacement_fixture(true)?;
+fn empty_replacement_guard_keeps_unique_and_statistics_failures_atomic() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, graph, [age, email, nick, _note]) = replacement_fixture(true).assert_ok();
 	let before = store.inner.current_root();
 	let global = before
-		.resolve_atom(&record("first")?)
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test atom absent"))?;
+		.resolve_atom(&record("first").assert_ok())
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test atom absent"))
+		.assert_ok();
 	let local = before
 		.memberships(global)
 		.and_then(|memberships| memberships.get(&graph))
 		.copied()
 		.ok_or_else(|| {
 			crate::gql_status::FerrosGrynnError::invalid_argument("test membership absent")
-		})?;
+		})
+		.assert_ok();
 	let mut candidate = (*before).clone();
-	let error =
-		candidate.set_base_property(global, email, "email-b".into()).err().ok_or_else(|| {
+	let error = candidate
+		.set_base_property(global, email, "email-b".into())
+		.err()
+		.ok_or_else(|| {
 			crate::gql_status::FerrosGrynnError::invalid_argument("unique BASE conflict absent")
-		})?;
+		})
+		.assert_ok();
 	assert_eq!(error.status().code().to_string(), "FG-G2F04");
 	assert!(Arc::ptr_eq(&before.indexes, &candidate.indexes));
 	assert!(Arc::ptr_eq(&before.atoms, &candidate.atoms));
-	let error =
-		candidate.set_overlay(graph, local, nick, "nick-b".into()).err().ok_or_else(|| {
+	let error = candidate
+		.set_overlay(graph, local, nick, "nick-b".into())
+		.err()
+		.ok_or_else(|| {
 			crate::gql_status::FerrosGrynnError::invalid_argument(
 				"unique EFFECTIVE conflict absent",
 			)
-		})?;
+		})
+		.assert_ok();
 	assert_eq!(error.status().code().to_string(), "FG-G2F04");
 	assert!(Arc::ptr_eq(&before.indexes, &candidate.indexes));
 	assert!(Arc::ptr_eq(&before.graphs[&graph], &candidate.graphs[&graph]));
@@ -390,43 +467,56 @@ fn empty_replacement_guard_keeps_unique_and_statistics_failures_atomic() -> Ferr
 	);
 	assert!(Arc::ptr_eq(&before.atoms, &candidate.atoms));
 	assert!(Arc::ptr_eq(&before, &store.inner.current_root()));
-	Ok(())
 }
 
 /// Already-stale deferred definitions still notify catch-up without copying
 /// unchanged bindings; immediate-only schemas do not detach either catalog.
 #[test]
-fn empty_deferred_invalidation_keeps_sharing_and_reports_stale_definitions() -> FerrosGrynnResult<()>
-{
-	let (store, _graph, _keys) = replacement_fixture(true)?;
+fn empty_deferred_invalidation_keeps_sharing_and_reports_stale_definitions() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, _graph, _keys) = replacement_fixture(true).assert_ok();
 	let before = store.inner.current_root();
 	let mut candidate = (*before).clone();
-	assert!(candidate.mark_deferred_indexes_stale()?.is_empty());
+	assert!(candidate.mark_deferred_indexes_stale().assert_ok().is_empty());
 	assert!(Arc::ptr_eq(&before.indexes, &candidate.indexes));
 	assert!(Arc::ptr_eq(&before.schema, &candidate.schema));
 	let class_id = before
-		.atom_by_record(&record("first")?)
-		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test atom absent"))?
+		.atom_by_record(&record("first").assert_ok())
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test atom absent"))
+		.assert_ok()
 		.class_id();
 	let schema = Arc::make_mut(&mut candidate.schema);
-	let class = Arc::make_mut(schema.classes.get_mut(&class_id).ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("test class absent")
-	})?);
-	let index =
-		class.indexes.iter_mut().find(|index| index.name().as_str() == "age_idx").ok_or_else(
-			|| crate::gql_status::FerrosGrynnError::invalid_argument("test index absent"),
-		)?;
-	*index =
-		index.clone().with_maintenance_mode(crate::datastore::IndexMaintenanceMode::Deferred)?;
-	let id = index.id().ok_or_else(|| {
-		crate::gql_status::FerrosGrynnError::invalid_argument("test index identity absent")
-	})?;
-	let first = candidate.mark_deferred_indexes_stale()?;
+	let class = Arc::make_mut(
+		schema
+			.classes
+			.get_mut(&class_id)
+			.ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument("test class absent")
+			})
+			.assert_ok(),
+	);
+	let index = class
+		.indexes
+		.iter_mut()
+		.find(|index| index.name().as_str() == "age_idx")
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("test index absent"))
+		.assert_ok();
+	*index = index
+		.clone()
+		.with_maintenance_mode(crate::datastore::IndexMaintenanceMode::Deferred)
+		.assert_ok();
+	let id = index
+		.id()
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test index identity absent")
+		})
+		.assert_ok();
+	let first = candidate.mark_deferred_indexes_stale().assert_ok();
 	assert_eq!(first.len(), 1);
 	assert_eq!(first[0].1, id);
 	assert!(candidate.indexes.base_index(id).is_none());
 	let bindings = Arc::clone(&candidate.indexes);
-	assert_eq!(candidate.mark_deferred_indexes_stale()?, first);
+	assert_eq!(candidate.mark_deferred_indexes_stale().assert_ok(), first);
 	assert!(Arc::ptr_eq(&bindings, &candidate.indexes));
-	Ok(())
 }

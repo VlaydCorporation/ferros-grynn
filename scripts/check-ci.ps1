@@ -15,6 +15,19 @@ foreach ($script in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1') {
     Assert-True ($parseErrors.Count -eq 0) "PowerShell parse error in $($script.Name): $parseErrors"
 }
 
+# Dedicated test files must not inflate either production line metric.
+$coverageScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'coverage.ps1') -Raw
+$exclusions = @([regex]::Matches($coverageScript, '(?m)^\s*\$exclude = ''([^'']+)''') | ForEach-Object { $_.Groups[1].Value })
+Assert-True ($exclusions.Count -eq 2) 'Expected separate workspace and core coverage scopes.'
+foreach ($pattern in $exclusions) {
+    foreach ($testFile in @('src/gql/analysis/layout_tests.rs', 'src/storage/changefeed/tests.rs', 'tests/system.rs', 'src\gql\analysis\layout_tests.rs')) {
+        Assert-True ($testFile -match $pattern) "Test code enters production coverage: $testFile"
+    }
+    Assert-True ('src/gql/analysis/mod.rs' -notmatch $pattern) 'Production code was excluded from coverage.'
+}
+Assert-True ('crates/ferros-grynn-macros/src/lib.rs' -notmatch $exclusions[0]) 'Workspace coverage excludes a workspace package.'
+Assert-True ('crates/ferros-grynn-macros/src/lib.rs' -match $exclusions[1]) 'Core coverage includes a separate workspace package.'
+
 $report = Join-Path $fixtureRoot 'summary.json'
 $badgePath = Join-Path $fixtureRoot 'coverage.json'
 $generator = Join-Path $PSScriptRoot 'coverage-badge.ps1'
@@ -32,6 +45,10 @@ try {
         $badge = Get-Content -LiteralPath $badgePath -Raw | ConvertFrom-Json
         Assert-True ($badge.message -eq $case.expected -and $badge.color -eq $case.color -and $badge.commit -eq 'fixture') 'Badge counts, rounding, culture or provenance mismatch.'
     }
+    $workspaceScope = 'Windows; workspace; default features; library, binary and integration tests'
+    & $generator -Report $report -Output $badgePath -Commit 'fixture' -Scope $workspaceScope
+    $badge = Get-Content -LiteralPath $badgePath -Raw | ConvertFrom-Json
+    Assert-True ($badge.scope -eq $workspaceScope -and $badge.message -eq '0.0%') 'Workspace badge scope or totals mismatch.'
     foreach ($badLines in @(@{ count = 0; covered = 0 }, @{ count = 2; covered = 3 }, @{ count = 2; covered = -1 }, @{ count = 2.5; covered = 1 }, @{})) {
         @{ type = 'llvm.coverage.json.export'; data = @(@{ totals = @{ lines = $badLines } }) } |
             ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $report

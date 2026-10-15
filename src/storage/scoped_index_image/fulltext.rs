@@ -34,9 +34,13 @@ use crate::{
 	values::{PropertyKeyId, Value, storage::DiskAtomRef},
 };
 
+/// Fulltext source state.
 struct FulltextSource {
+	/// Spec associated with this fulltext source.
 	spec: FulltextBuildSpec,
+	/// Analyzer associated with this fulltext source.
 	analyzer: Arc<SchemaAnalyzer>,
+	/// Relative path associated with this fulltext source.
 	relative_path: String,
 }
 
@@ -133,6 +137,7 @@ pub(in crate::storage) fn write_streamed_fulltext_index_images(
 	Ok(images)
 }
 
+/// Returns the fulltext sources result.
 fn fulltext_sources(
 	database: &DatabaseRoot,
 	skipped: &BTreeSet<IndexId>,
@@ -201,6 +206,7 @@ fn fulltext_sources(
 	Ok(sources)
 }
 
+/// Visits documents.
 fn visit_documents(
 	database: &DatabaseRoot,
 	spec: FulltextBuildSpec,
@@ -234,6 +240,7 @@ fn visit_documents(
 	}
 }
 
+/// Visits base documents.
 fn visit_base_documents(
 	database: &DatabaseRoot,
 	class: ClassId,
@@ -258,6 +265,7 @@ fn visit_base_documents(
 	Ok(())
 }
 
+/// Visits effective documents.
 fn visit_effective_documents(
 	database: &DatabaseRoot,
 	graph: GraphId,
@@ -292,6 +300,7 @@ fn visit_effective_documents(
 	Ok(())
 }
 
+/// Analyzes the current state.
 fn analyze(
 	analyzer: &SchemaAnalyzer,
 	input: &str,
@@ -307,6 +316,7 @@ fn analyze(
 	}
 }
 
+/// Returns the explicit kind result.
 const fn explicit_kind(spec: FulltextBuildSpec) -> ScopedIndexKind {
 	ScopedIndexKind::Explicit {
 		index: spec.index,
@@ -316,10 +326,12 @@ const fn explicit_kind(spec: FulltextBuildSpec) -> ScopedIndexKind {
 	}
 }
 
+/// Returns the next ordinal.
 fn next_ordinal(value: u32) -> FerrosGrynnResult<u32> {
 	value.checked_add(1).ok_or_else(|| invalid("Fulltext file ordinal exceeds u32"))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

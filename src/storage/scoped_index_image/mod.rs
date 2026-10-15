@@ -1,11 +1,14 @@
 //! Complete physical index images for normalized base atoms and graph
 //! occurrences.
 
+/// Bulk construction of scoped index images.
 mod build;
 mod fulltext;
 mod geometry;
+/// Scoped index image records and bindings.
 mod model;
 mod stream;
+/// Validation of scoped physical index images.
 mod validate;
 mod vector;
 
@@ -37,4 +40,5 @@ pub(in crate::storage) use vector::{
 };
 
 #[cfg(test)]
+/// Regression tests for scoped index image behavior.
 mod tests;

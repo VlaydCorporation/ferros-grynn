@@ -27,34 +27,47 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+/// Predecessor state.
 struct Predecessor {
+	/// From associated with this predecessor.
 	from: AtomId,
+	/// Step associated with this predecessor.
 	step: TraversalStep,
 }
 
+/// Snapshot-qualified shortest distances and predecessors from one source atom.
 #[derive(Debug, Clone)]
 pub struct ShortestPaths {
+	/// Origin associated with this shortest paths.
 	origin: Uuid,
+	/// Snapshot associated with this shortest paths.
 	snapshot: SnapshotId,
+	/// Source associated with this shortest paths.
 	source: AtomId,
+	/// Distances associated with this shortest paths.
 	distances: RapidHashMap<AtomId, Number>,
+	/// Predecessors associated with this shortest paths.
 	predecessors: RapidHashMap<AtomId, Predecessor>,
 }
 
 impl ShortestPaths {
+	/// Returns the stored source of this `ShortestPaths`.
 	pub const fn source(&self) -> AtomId {
 		self.source
 	}
 
+	/// Returns distance to for `ShortestPaths`.
 	pub fn distance_to(&self, target: AtomId) -> Option<Number> {
 		self.distances.get(&target).copied()
 	}
 
+	/// Returns path to for `ShortestPaths`.
 	pub fn path_to(&self, target: AtomId) -> Option<Vec<AtomId>> {
 		self.reconstruct(target)
 			.map(|path| path.into_iter().map(|(atom, _)| atom).collect::<Vec<_>>())
 	}
 
+	/// Returns edge path to for `ShortestPaths`.
 	pub fn edge_path_to(&self, target: AtomId) -> Option<Vec<AtomId>> {
 		self.reconstruct(target).map(|path| {
 			path.into_iter()
@@ -63,6 +76,12 @@ impl ShortestPaths {
 		})
 	}
 
+	/// Materializes path for `ShortestPaths`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn materialize_path<R: GraphRead>(
 		&self,
 		graph: &R,
@@ -145,6 +164,7 @@ impl ShortestPaths {
 		Ok(Some(Path::new(self.origin, self.snapshot, steps, self.distance_to(target))))
 	}
 
+	/// Returns the reconstruct result.
 	fn reconstruct(&self, target: AtomId) -> Option<Vec<(AtomId, Option<Predecessor>)>> {
 		self.distances.contains_key(&target).then_some(())?;
 		let mut path = Vec::new();
@@ -164,12 +184,16 @@ impl ShortestPaths {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Queue entry state.
 struct QueueEntry {
+	/// Distance associated with this queue entry.
 	distance: Number,
+	/// Node associated with this queue entry.
 	node: AtomId,
 }
 
 impl PartialEq for QueueEntry {
+	/// Compares this `QueueEntry` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.distance.cmp(&other.distance) == Ordering::Equal && self.node == other.node
 	}
@@ -178,17 +202,25 @@ impl PartialEq for QueueEntry {
 impl Eq for QueueEntry {}
 
 impl PartialOrd for QueueEntry {
+	/// Compares this `QueueEntry` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for QueueEntry {
+	/// Compares this `QueueEntry` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		other.distance.cmp(&self.distance).then_with(|| other.node.cmp(&self.node))
 	}
 }
 
+/// Returns dijkstra for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn dijkstra<R: GraphRead>(
 	graph: &R,
 	source: AtomId,
@@ -197,6 +229,7 @@ pub fn dijkstra<R: GraphRead>(
 	dijkstra_with_check(graph, source, direction, &mut || Ok(()))
 }
 
+/// Returns the dijkstra with check result.
 fn dijkstra_with_check<R: GraphRead, Check>(
 	graph: &R,
 	source: AtomId,
@@ -400,6 +433,11 @@ where
 	Ok(shortest_paths(graph, source, distances, predecessors))
 }
 
+/// Returns bellman ford for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn bellman_ford<R: GraphRead>(
 	graph: &R,
 	source: AtomId,
@@ -408,7 +446,8 @@ pub fn bellman_ford<R: GraphRead>(
 	bellman_ford_with_check(graph, source, direction, &mut || Ok(()))
 }
 
-pub(crate) fn bellman_ford_with_check<R: GraphRead, Check>(
+/// Returns the bellman ford with check result.
+pub fn bellman_ford_with_check<R: GraphRead, Check>(
 	graph: &R,
 	source: AtomId,
 	direction: TraversalDirection,
@@ -466,13 +505,19 @@ where
 }
 
 #[derive(Debug, Clone)]
+/// Weighted arc state.
 struct WeightedArc {
+	/// From associated with this weighted arc.
 	from: AtomId,
+	/// To associated with this weighted arc.
 	to: AtomId,
+	/// Weight associated with this weighted arc.
 	weight: Number,
+	/// Step associated with this weighted arc.
 	step: TraversalStep,
 }
 
+/// Collects weights with check.
 pub(super) fn collect_weights_with_check<R: GraphRead, Check>(
 	graph: &R,
 	allow_negative: bool,
@@ -504,6 +549,7 @@ where
 	Ok(weights)
 }
 
+/// Returns the local arcs result.
 fn local_arcs<R: GraphRead>(
 	graph: &R,
 	index: &TraversalIndex,
@@ -537,6 +583,7 @@ fn local_arcs<R: GraphRead>(
 	Ok(arcs)
 }
 
+/// Checks candidate.
 fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
 where
 	Check: FnMut() -> FerrosGrynnResult<()>,
@@ -547,6 +594,7 @@ where
 	Ok(())
 }
 
+/// Returns the shortest paths result.
 fn shortest_paths<R: GraphRead>(
 	graph: &R,
 	source: AtomId,

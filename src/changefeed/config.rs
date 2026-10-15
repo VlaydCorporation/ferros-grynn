@@ -101,6 +101,7 @@ impl ChangefeedConfig {
 }
 
 #[cfg(test)]
+/// Regression tests for config behavior.
 mod tests {
 	use super::*;
 
@@ -113,17 +114,19 @@ mod tests {
 		)
 	}
 
+	/// Verifies retention is positive fixed and canonical.
 	#[test]
-	fn retention_is_positive_fixed_and_canonical() -> FerrosGrynnResult<()> {
-		assert_eq!(config("P1D")?, config("PT24H")?);
-		assert_eq!(config("P7D")?, config("P1W")?);
+	fn retention_is_positive_fixed_and_canonical() {
+		use crate::test_assertions::AssertResult as _;
+
+		assert_eq!(config("P1D").assert_ok(), config("PT24H").assert_ok());
+		assert_eq!(config("P7D").assert_ok(), config("P1W").assert_ok());
 		for invalid in ["P1M", "P1Y", "PT0S", "-P1D"] {
 			assert!(config(invalid).is_err(), "{invalid}");
 		}
-		let policy = config("P1D")?.with_full(true).with_include_original(true);
+		let policy = config("P1D").assert_ok().with_full(true).with_include_original(true);
 		assert!(policy.full());
 		assert!(policy.include_original());
-		assert_ne!(policy, config("P1D")?);
-		Ok(())
+		assert_ne!(policy, config("P1D").assert_ok());
 	}
 }

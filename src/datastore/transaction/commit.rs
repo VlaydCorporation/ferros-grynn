@@ -21,19 +21,24 @@ use crate::{
 /// immutable root. Logical conflict checks run before this map is created.
 #[derive(Default)]
 pub(super) struct ReplayRemap {
+	/// Globals associated with this replay remap.
 	globals: BTreeMap<super::GlobalAtomId, super::GlobalAtomId>,
+	/// Locals associated with this replay remap.
 	locals: BTreeMap<(GraphId, AtomId), AtomId>,
 }
 
 impl ReplayRemap {
+	/// Returns the global result.
 	pub(super) fn global(&self, id: super::GlobalAtomId) -> super::GlobalAtomId {
 		self.globals.get(&id).copied().unwrap_or(id)
 	}
 
+	/// Returns the local result.
 	fn local(&self, graph: GraphId, id: AtomId) -> AtomId {
 		self.locals.get(&(graph, id)).copied().unwrap_or(id)
 	}
 
+	/// Returns the conflict result.
 	fn conflict(&self, key: ConflictKey) -> ConflictKey {
 		match key {
 			ConflictKey::BaseAtom(global) => ConflictKey::BaseAtom(self.global(global)),
@@ -98,27 +103,26 @@ impl ReplayRemap {
 		remap_topology(topology, &ids)
 	}
 
+	/// Returns the occurrence state result.
 	fn occurrence_state(
 		&self,
 		root: &DatabaseRoot,
 		graph: GraphId,
 		state: &super::OccurrenceState,
 	) -> FerrosGrynnResult<super::OccurrenceState> {
-		Ok(match state {
-			super::OccurrenceState::Node {
+		Ok(match state.view() {
+			super::OccurrenceStateRef::Node {
 				nested_graph,
-			} => super::OccurrenceState::Node {
-				nested_graph: *nested_graph,
-			},
-			super::OccurrenceState::Edge {
+			} => super::OccurrenceState::node(*nested_graph),
+			super::OccurrenceStateRef::Edge {
 				topology,
 				weight,
 				transition_graph,
-			} => super::OccurrenceState::Edge {
-				topology: self.topology(root, graph, topology)?,
-				weight: *weight,
-				transition_graph: *transition_graph,
-			},
+			} => super::OccurrenceState::edge(
+				self.topology(root, graph, topology)?,
+				*weight,
+				*transition_graph,
+			),
 		})
 	}
 }
@@ -378,6 +382,8 @@ impl Transaction {
 				)?;
 				let _commit = store.inner.commit.lock();
 				let current = store.inner.current_root();
+				// Preparation ran outside the commit lock; stale roots or
+				// reservations require a fresh candidate.
 				if !Arc::ptr_eq(&observed, &current) || !queues.valid() {
 					continue;
 				}
@@ -697,6 +703,7 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the affected graphs result.
 	fn affected_graphs(&self, current: &DatabaseRoot) -> BTreeSet<GraphId> {
 		let mut graphs = BTreeSet::new();
 		for mutation in &self.mutations {
@@ -742,6 +749,7 @@ impl Transaction {
 		graphs
 	}
 
+	/// Returns the index delta records result.
 	fn index_delta_records(
 		&self,
 		current: &DatabaseRoot,
@@ -762,6 +770,7 @@ impl Transaction {
 			.collect()
 	}
 
+	/// Validates against.
 	fn validate_against(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		self.validate_write_requirements(current)?;
 		if self.options.isolation == IsolationLevel::Serializable
@@ -808,6 +817,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Validates write requirements.
 	pub(super) fn validate_write_requirements(
 		&self,
 		current: &DatabaseRoot,
@@ -876,6 +886,7 @@ impl Transaction {
 		}
 	}
 
+	/// Validates commit fanout.
 	fn validate_commit_fanout(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		let initial_fanout_bytes =
 			self.fanout_reservations.len().saturating_mul(EFFECTIVE_FANOUT_WRITE_BYTES);
@@ -885,17 +896,17 @@ impl Transaction {
 			.saturating_add(self.change_journal.bytes);
 		let mut actual = BTreeSet::new();
 		for mutation in &self.mutations {
-			let (global, key) = match mutation {
-				Mutation::SetBaseProperty {
-					global,
-					key,
-					..
-				}
-				| Mutation::RemoveBaseProperty {
-					global,
-					key,
-				} => (global, key),
-				_ => continue,
+			let (Mutation::SetBaseProperty {
+				global,
+				key,
+				..
+			}
+			| Mutation::RemoveBaseProperty {
+				global,
+				key,
+			}) = mutation
+			else {
+				continue;
 			};
 			let current_memberships = (!self.mutations.iter().any(
 				|mutation| matches!(mutation, Mutation::CreateAtom { id, .. } if id == global),
@@ -938,6 +949,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Applies mutations.
 	pub(super) fn apply_mutations(
 		root: &mut DatabaseRoot,
 		mutations: &[Mutation],
@@ -1285,6 +1297,7 @@ impl Transaction {
 	}
 }
 
+/// Returns whether the mutation affects explicit indexes condition holds.
 fn mutation_affects_explicit_indexes(mutation: &Mutation) -> bool {
 	matches!(
 		mutation,
@@ -1304,6 +1317,7 @@ fn mutation_affects_explicit_indexes(mutation: &Mutation) -> bool {
 	)
 }
 
+/// Returns whether the mutation allows physical index delta condition holds.
 fn mutation_allows_physical_index_delta(mutation: &Mutation) -> bool {
 	matches!(
 		mutation,

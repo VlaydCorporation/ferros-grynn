@@ -26,7 +26,7 @@ use crate::{
 
 /// Snapshot-owned physical base and bounded exact replacement set.
 #[derive(Clone)]
-pub(crate) struct ResidentGeometryIndex {
+pub struct ResidentGeometryIndex {
 	/// Validated base metadata.
 	pub(crate) header: GeometryHeader,
 	/// Sealed pages stay in their final aligned allocation across snapshots.
@@ -36,7 +36,7 @@ pub(crate) struct ResidentGeometryIndex {
 	)]
 	base: Arc<Vec<AlignedPage>>,
 	/// Immutable replacements shared by snapshots.
-	delta: Arc<Vec<GeometryDeltaRecord>>,
+	delta: Arc<[GeometryDeltaRecord]>,
 }
 
 impl ResidentGeometryIndex {
@@ -58,7 +58,7 @@ impl ResidentGeometryIndex {
 }
 
 /// Builds or retains geometry generations before publishing a RAM root.
-pub(crate) fn build_resident_geometry_indexes(
+pub fn build_resident_geometry_indexes(
 	previous: Option<&DatabaseRoot>,
 	next: &DatabaseRoot,
 	changed: Option<&BTreeSet<RecordId>>,
@@ -98,7 +98,7 @@ pub(crate) fn build_resident_geometry_indexes(
 				)? {
 					let mut generation = old.clone();
 					if records.values().copied().ne(old.delta.iter().copied()) {
-						generation.delta = Arc::new(records.into_values().collect());
+						generation.delta = records.into_values().collect();
 					}
 					result.insert(id, generation);
 				}
@@ -122,14 +122,19 @@ pub(crate) fn build_resident_geometry_indexes(
 		result.insert(index, ResidentGeometryIndex {
 			header,
 			base: Arc::new(file.pages),
-			delta: Arc::new(Vec::new()),
+			delta: Arc::from([]),
 		});
 	}
 	Ok(result)
 }
 
 #[cfg(test)]
+/// Regression tests for resident behavior.
 mod tests {
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::{
 		datastore::{
 			ClassField,
@@ -143,12 +148,13 @@ mod tests {
 		values::{PropertyMap, RecordId, RecordIdPart, Type},
 	};
 
+	/// Verifies empty geometry index does not reserve pages for other classes.
 	#[test]
 	fn empty_geometry_index_does_not_reserve_pages_for_other_classes() {
 		let store = Datastore::in_memory();
 		let mut define = store.begin();
-		define.define_class(ClassSchema::new("other", AtomKind::Node, []).unwrap()).unwrap();
-		define.commit().unwrap();
+		define.define_class(ClassSchema::new("other", AtomKind::Node, []).assert_ok()).assert_ok();
+		define.commit().assert_ok();
 		store
 			.import(crate::datastore::ImportOptions::default(), |session| {
 				for ordinal in 0..1000_i64 {
@@ -161,7 +167,7 @@ mod tests {
 				}
 				Ok(())
 			})
-			.unwrap();
+			.assert_ok();
 		let mut define = store.begin();
 		define
 			.define_class(
@@ -169,7 +175,7 @@ mod tests {
 					"shape",
 					Type::Geometry,
 				)])
-				.unwrap()
+				.assert_ok()
 				.with_index(
 					ClassIndex::new_geometry(
 						"by_shape",
@@ -177,14 +183,14 @@ mod tests {
 						"shape",
 						GeometryIndexOptions::default(),
 					)
-					.unwrap(),
+					.assert_ok(),
 				)
-				.unwrap(),
+				.assert_ok(),
 			)
-			.unwrap();
-		define.commit().unwrap();
+			.assert_ok();
+		define.commit().assert_ok();
 		let root = store.inner.current_root();
-		let index = root.resident_geometry.values().next().unwrap();
+		let index = root.resident_geometry.values().next().assert_some();
 		assert_eq!(index.header.row_count, 0);
 		assert_eq!(index.header.page_count, 1);
 		assert_eq!(index.base.len(), 1);

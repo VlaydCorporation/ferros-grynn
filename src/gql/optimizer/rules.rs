@@ -42,6 +42,7 @@ pub(in crate::gql) fn prepare_select(
 	Ok((rewritten, physical))
 }
 
+/// Returns whether the fold select condition holds.
 fn fold_select(select: &mut LogicalSelect) -> bool {
 	let mut changed = fold_source(&mut select.source);
 	for join in &mut select.joins {
@@ -101,6 +102,7 @@ fn fold_select(select: &mut LogicalSelect) -> bool {
 	changed
 }
 
+/// Returns whether the fold source condition holds.
 fn fold_source(source: &mut LogicalSelectSource) -> bool {
 	match &mut source.kind {
 		LogicalSelectSourceKind::Empty {
@@ -139,6 +141,7 @@ fn fold_source(source: &mut LogicalSelectSource) -> bool {
 	}
 }
 
+/// Returns whether the fold expr condition holds.
 fn fold_expr(expression: &mut TypedExpr) -> bool {
 	let mut changed = match &mut expression.kind {
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
@@ -265,6 +268,7 @@ fn fold_expr(expression: &mut TypedExpr) -> bool {
 	changed
 }
 
+/// Returns whether the constant expression condition holds.
 fn constant_expression(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Constant(_) => true,
@@ -378,6 +382,7 @@ fn constant_expression(expression: &TypedExpr) -> bool {
 	}
 }
 
+/// Checks for conjunction.
 fn contains_conjunction(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Binary {

@@ -82,7 +82,7 @@ pub(in crate::storage) fn build_scalar_index_sorted(
 			if entry.atoms.last().is_some_and(|previous| *previous >= atom) {
 				return Err(invalid_index("external-sort atoms are not ordered"));
 			}
-			// ponytail: one posting list is retained while its output pages
+			// shortcut: one posting list is retained while its output pages
 			// are already retained by the generation image; stream it
 			// separately only if a single ultra-common key becomes the
 			// measured memory ceiling.

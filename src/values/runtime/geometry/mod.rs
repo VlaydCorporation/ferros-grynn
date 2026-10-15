@@ -61,6 +61,7 @@ impl GeometryKind {
 impl FromStr for GeometryKind {
 	type Err = FerrosGrynnError;
 
+	/// Constructs from str for `GeometryKind`.
 	fn from_str(name: &str) -> FerrosGrynnResult<Self> {
 		match name.to_ascii_lowercase().as_str() {
 			"point" => Ok(Self::Point),
@@ -75,8 +76,12 @@ impl FromStr for GeometryKind {
 	}
 }
 
+/// Validated coordinate sequence used by runtime geometry values.
 #[derive(Debug, Clone)]
-pub struct Position(Vec<f64>);
+pub struct Position(
+	/// Coordinate values in the runtime position representation.
+	Vec<f64>,
+);
 
 impl Position {
 	/// Constructs one finite two-dimensional WGS-84 position.
@@ -118,16 +123,19 @@ impl Position {
 		Ok(Self(coordinates))
 	}
 
+	/// Borrows the elements as a contiguous slice.
 	pub fn as_slice(&self) -> &[f64] {
 		&self.0
 	}
 
+	/// Consumes the collection and returns its owned element vector.
 	pub fn into_vec(self) -> Vec<f64> {
 		self.0
 	}
 }
 
 impl PartialEq for Position {
+	/// Compares this `Position` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -136,18 +144,21 @@ impl PartialEq for Position {
 impl Eq for Position {}
 
 impl PartialOrd for Position {
+	/// Compares this `Position` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Position {
+	/// Compares this `Position` with another value using its ordering contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		compare_float_slices(&self.0, &other.0)
 	}
 }
 
 impl Hash for Position {
+	/// Feeds this `Position` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.0.len().hash(state);
 		for coordinate in &self.0 {
@@ -156,16 +167,45 @@ impl Hash for Position {
 	}
 }
 
+/// Runtime geometry value containing coordinates or other geometries.
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub enum Geometry {
-	Point(Position),
-	MultiPoint(Vec<Position>),
-	LineString(Vec<Position>),
-	MultiLineString(Vec<Vec<Position>>),
-	Polygon(Vec<Vec<Position>>),
-	MultiPolygon(Vec<Vec<Vec<Position>>>),
-	Collection(Vec<Geometry>),
+	/// One coordinate position.
+	Point(
+		/// One coordinate position.
+		Position,
+	),
+	/// Several independent coordinate positions.
+	MultiPoint(
+		/// Several independent coordinate positions.
+		Vec<Position>,
+	),
+	/// One connected coordinate sequence.
+	LineString(
+		/// One connected coordinate sequence.
+		Vec<Position>,
+	),
+	/// Several independent connected coordinate sequences.
+	MultiLineString(
+		/// Several independent connected coordinate sequences.
+		Vec<Vec<Position>>,
+	),
+	/// One polygon represented by coordinate rings.
+	Polygon(
+		/// One polygon represented by coordinate rings.
+		Vec<Vec<Position>>,
+	),
+	/// Several polygon geometries.
+	MultiPolygon(
+		/// Several polygon geometries.
+		Vec<Vec<Vec<Position>>>,
+	),
+	/// A collection of geometry values.
+	Collection(
+		/// A collection of geometry values.
+		Vec<Geometry>,
+	),
 }
 
 impl Geometry {
@@ -194,10 +234,12 @@ impl Geometry {
 		value.value.try_into()
 	}
 
+	/// Converts this value into geojson for `Geometry`.
 	pub fn into_geojson(self) -> GeoJsonGeometry {
 		GeoJsonGeometry::new(self.into())
 	}
 
+	/// Converts to geojson string for `Geometry`.
 	pub fn to_geojson_string(&self) -> String {
 		GeoJson::Geometry(self.clone().into_geojson()).to_string()
 	}
@@ -206,6 +248,7 @@ impl Geometry {
 impl TryFrom<GeoJsonValue> for Geometry {
 	type Error = FerrosGrynnError;
 
+	/// Converts `GeoJsonValue` into `Geometry` after validating the conversion.
 	fn try_from(value: GeoJsonValue) -> Result<Self, Self::Error> {
 		kernels::check_geojson_bounds(&value)?;
 		let geometry = convert_geojson(value)?;
@@ -253,6 +296,7 @@ fn convert_geojson(value: GeoJsonValue) -> FerrosGrynnResult<Geometry> {
 }
 
 impl From<Geometry> for GeoJsonValue {
+	/// Converts `Geometry` into `GeoJsonValue`.
 	fn from(value: Geometry) -> Self {
 		match value {
 			Geometry::Point(value) => Self::Point {
@@ -286,6 +330,7 @@ impl From<Geometry> for GeoJsonValue {
 impl FromStr for Geometry {
 	type Err = FerrosGrynnError;
 
+	/// Constructs from str for `Geometry`.
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		match value.parse::<GeoJson>().map_err(|source| {
 			FerrosGrynnError::invalid_geo_json_geometry().with_technical_source(source)
@@ -300,11 +345,13 @@ impl FromStr for Geometry {
 }
 
 impl Display for Geometry {
+	/// Formats `Geometry` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.to_geojson_string())
 	}
 }
 
+/// Returns the position result.
 fn position(value: GeoJsonPosition) -> FerrosGrynnResult<Position> {
 	if value.as_slice().len() != 2 {
 		return Err(FerrosGrynnError::invalid_geometry_coordinate_dimension(
@@ -314,18 +361,22 @@ fn position(value: GeoJsonPosition) -> FerrosGrynnResult<Position> {
 	Position::new(value.as_slice().to_vec())
 }
 
+/// Returns the positions result.
 fn positions(value: Vec<GeoJsonPosition>) -> FerrosGrynnResult<Vec<Position>> {
 	value.into_iter().map(position).collect()
 }
 
+/// Converts this value into position.
 fn into_position(value: Position) -> GeoJsonPosition {
 	value.into_vec().into()
 }
 
+/// Converts this value into positions.
 fn into_positions(value: Vec<Position>) -> Vec<GeoJsonPosition> {
 	value.into_iter().map(into_position).collect()
 }
 
+/// Compares float slices.
 fn compare_float_slices(left: &[f64], right: &[f64]) -> Ordering {
 	left.iter()
 		.zip(right)
@@ -337,67 +388,78 @@ fn compare_float_slices(left: &[f64], right: &[f64]) -> Ordering {
 }
 
 #[cfg(test)]
+/// Regression tests for geometry behavior.
 mod tests {
 	use super::{Geometry, Position};
 	use crate::gql_status::Domain;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies round trips geojson geometry.
 	#[test]
 	fn round_trips_geojson_geometry() {
 		let source = r#"{"type":"Point","coordinates":[10.0,20.0]}"#;
-		let geometry = source.parse::<Geometry>().unwrap();
-		assert_eq!(geometry, Geometry::Point(Position::new(vec![10.0, 20.0]).unwrap()),);
-		assert_eq!(geometry.to_geojson_string().parse::<Geometry>().unwrap(), geometry,);
+		let geometry = source.parse::<Geometry>().assert_ok();
+		assert_eq!(geometry, Geometry::Point(Position::new(vec![10.0, 20.0]).assert_ok()),);
+		assert_eq!(geometry.to_geojson_string().parse::<Geometry>().assert_ok(), geometry,);
 	}
 
+	/// Verifies rejects non finite and short positions.
 	#[test]
 	fn rejects_non_finite_and_short_positions() {
-		assert_status(Position::new(vec![1.0]).unwrap_err(), "FG-22F06");
-		assert_status(Position::new(vec![1.0, 2.0, 3.0]).unwrap_err(), "FG-22F06");
-		assert_status(Position::new(vec![1.0, f64::NAN]).unwrap_err(), "FG-22F07");
-		assert_status(Position::new(vec![181.0, 0.0]).unwrap_err(), "FG-22F08");
-		assert_status(Position::new(vec![0.0, 91.0]).unwrap_err(), "FG-22F08");
+		assert_status(Position::new(vec![1.0]).assert_err(), "FG-22F06");
+		assert_status(Position::new(vec![1.0, 2.0, 3.0]).assert_err(), "FG-22F06");
+		assert_status(Position::new(vec![1.0, f64::NAN]).assert_err(), "FG-22F07");
+		assert_status(Position::new(vec![181.0, 0.0]).assert_err(), "FG-22F08");
+		assert_status(Position::new(vec![0.0, 91.0]).assert_err(), "FG-22F08");
 	}
 
+	/// Verifies wraps geojson parser errors as technical sources.
 	#[test]
 	fn wraps_geojson_parser_errors_as_technical_sources() {
-		let error = "{invalid".parse::<Geometry>().unwrap_err();
+		let error = "{invalid".parse::<Geometry>().assert_err();
 		assert_status(error.clone(), "FG-22F09");
 		assert!(error.technical_source().is_some());
 		assert!(!error.to_string().contains("expected ident"));
 	}
 
+	/// Verifies rejects non geometry geojson with a value status.
 	#[test]
 	fn rejects_non_geometry_geojson_with_a_value_status() {
 		let error =
-			r#"{"type":"Feature","geometry":null,"properties":{}}"#.parse::<Geometry>().unwrap_err();
+			r#"{"type":"Feature","geometry":null,"properties":{}}"#.parse::<Geometry>().assert_err();
 		assert_status(error, "FG-22F10");
 	}
 
+	/// Returns assert status for this module.
 	fn assert_status(error: crate::gql_status::FerrosGrynnError, code: &str) {
 		assert_eq!(error.status().code().to_string(), code);
 		assert_eq!(error.status().domain(), Domain::Value);
 	}
 
+	/// Verifies validates rings holes and ogc boundaries.
 	#[test]
 	fn validates_rings_holes_and_ogc_boundaries() {
-		let polygon: Geometry = r#"{"type":"Polygon","coordinates":[[[0,0],[8,0],[8,8],[0,8],[0,0]],[[2,2],[4,2],[4,4],[2,4],[2,2]]]}"#.parse().unwrap();
-		let point = |x, y| Geometry::Point(Position::new([x, y]).unwrap());
-		assert!(point(1.0, 1.0).within(&polygon).unwrap());
-		assert!(!point(0.0, 1.0).within(&polygon).unwrap());
-		assert!(point(0.0, 1.0).intersects(&polygon).unwrap());
-		assert!(!point(3.0, 3.0).intersects(&polygon).unwrap());
-		assert!(!point(2.0, 3.0).within(&polygon).unwrap());
-		assert!(point(2.0, 3.0).intersects(&polygon).unwrap());
+		let polygon: Geometry = r#"{"type":"Polygon","coordinates":[[[0,0],[8,0],[8,8],[0,8],[0,0]],[[2,2],[4,2],[4,4],[2,4],[2,2]]]}"#.parse().assert_ok();
+		let point = |x, y| Geometry::Point(Position::new([x, y]).assert_ok());
+		assert!(point(1.0, 1.0).within(&polygon).assert_ok());
+		assert!(!point(0.0, 1.0).within(&polygon).assert_ok());
+		assert!(point(0.0, 1.0).intersects(&polygon).assert_ok());
+		assert!(!point(3.0, 3.0).intersects(&polygon).assert_ok());
+		assert!(!point(2.0, 3.0).within(&polygon).assert_ok());
+		assert!(point(2.0, 3.0).intersects(&polygon).assert_ok());
 		for source in [
 			r#"{"type":"LineString","coordinates":[[0,0]]}"#,
 			r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1]]]}"#,
 			r#"{"type":"Polygon","coordinates":[[[0,0],[1,1],[0,1],[1,0],[0,0]]]}"#,
 			r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]],[[2,2],[3,2],[3,3],[2,2]]]}"#,
 		] {
-			assert_status(source.parse::<Geometry>().unwrap_err(), "FG-22F31");
+			assert_status(source.parse::<Geometry>().assert_err(), "FG-22F31");
 		}
 	}
 
+	/// Verifies empty geometries have no mbr and geodesic distance is in
+	/// metres.
 	#[test]
 	fn empty_geometries_have_no_mbr_and_geodesic_distance_is_in_metres() {
 		let empty = [
@@ -408,21 +470,25 @@ mod tests {
 			Geometry::MultiPolygon(vec![]),
 			Geometry::Collection(vec![]),
 		];
-		let origin = Geometry::Point(Position::new([0.0, 0.0]).unwrap());
+		let origin = Geometry::Point(Position::new([0.0, 0.0]).assert_ok());
 		for geometry in empty {
-			assert_eq!(geometry.mbr().unwrap(), None);
-			assert!(!geometry.within(&origin).unwrap());
-			assert!(!geometry.intersects(&origin).unwrap());
+			assert_eq!(geometry.mbr().assert_ok(), None);
+			assert!(!geometry.within(&origin).assert_ok());
+			assert!(!geometry.intersects(&origin).assert_ok());
 		}
-		let east = Geometry::Point(Position::new([1.0, 0.0]).unwrap());
-		assert!((origin.distance(&east).unwrap() - 111_319.490_793).abs() < 0.001);
-		assert_eq!(origin.distance(&origin).unwrap(), 0.0);
+		let east = Geometry::Point(Position::new([1.0, 0.0]).assert_ok());
+		assert!((origin.distance(&east).assert_ok() - 111_319.490_793).abs() < 0.001);
+		assert_eq!(
+			origin.distance(&origin).assert_ok().partial_cmp(&0.0),
+			Some(std::cmp::Ordering::Equal)
+		);
 		assert!(Geometry::LineString(vec![]).distance(&origin).is_err());
 	}
 
+	/// Verifies checks directly constructed values and depth before kernels.
 	#[test]
 	fn checks_directly_constructed_values_and_depth_before_kernels() {
-		let p = Position::new([0.0, 0.0]).unwrap();
+		let p = Position::new([0.0, 0.0]).assert_ok();
 		assert!(Geometry::Polygon(vec![vec![p.clone(); 4]]).validate().is_err());
 		let mut geometry = Geometry::Point(p);
 		for _ in 0..65 {
@@ -431,6 +497,7 @@ mod tests {
 		assert!(geometry.validate().is_err());
 	}
 
+	/// Verifies rejects collinear rings and disconnected polygon interiors.
 	#[test]
 	fn rejects_collinear_rings_and_disconnected_polygon_interiors() {
 		for source in [
@@ -441,82 +508,90 @@ mod tests {
 		}
 	}
 
+	/// Verifies overlapping collection members are a geometric union.
 	#[test]
 	fn overlapping_collection_members_are_a_geometric_union() {
-		let collection: Geometry = r#"{"type":"GeometryCollection","geometries":[{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,4],[0,4],[0,0]]]},{"type":"Polygon","coordinates":[[[2,-1],[6,-1],[6,3],[2,3],[2,-1]]]}]}"#.parse().unwrap();
-		let point = Geometry::Point(Position::new([3.0, 0.0]).unwrap());
+		let collection: Geometry = r#"{"type":"GeometryCollection","geometries":[{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,4],[0,4],[0,0]]]},{"type":"Polygon","coordinates":[[[2,-1],[6,-1],[6,3],[2,3],[2,-1]]]}]}"#.parse().assert_ok();
+		let point = Geometry::Point(Position::new([3.0, 0.0]).assert_ok());
 		let line = Geometry::LineString(vec![
-			Position::new([1.0, 1.0]).unwrap(),
-			Position::new([5.0, 1.0]).unwrap(),
+			Position::new([1.0, 1.0]).assert_ok(),
+			Position::new([5.0, 1.0]).assert_ok(),
 		]);
-		assert!(point.within(&collection).unwrap());
-		assert!(line.within(&collection).unwrap());
-		assert!(line.within(&Geometry::Collection(vec![collection])).unwrap());
+		assert!(point.within(&collection).assert_ok());
+		assert!(line.within(&collection).assert_ok());
+		assert!(line.within(&Geometry::Collection(vec![collection])).assert_ok());
 	}
 
+	/// Verifies geometry collection preserves small coordinates seams and
+	/// holes.
 	#[test]
 	fn geometry_collection_preserves_small_coordinates_seams_and_holes() {
-		let point = |x, y| Geometry::Point(Position::new([x, y]).unwrap());
+		let point = |x, y| Geometry::Point(Position::new([x, y]).assert_ok());
 		let polygon = |x0, y0, x1, y1| {
 			Geometry::Polygon(vec![vec![
-				Position::new([x0, y0]).unwrap(),
-				Position::new([x1, y0]).unwrap(),
-				Position::new([x1, y1]).unwrap(),
-				Position::new([x0, y1]).unwrap(),
-				Position::new([x0, y0]).unwrap(),
+				Position::new([x0, y0]).assert_ok(),
+				Position::new([x1, y0]).assert_ok(),
+				Position::new([x1, y1]).assert_ok(),
+				Position::new([x0, y1]).assert_ok(),
+				Position::new([x0, y0]).assert_ok(),
 			]])
 		};
 		let tiny = Geometry::Collection(vec![
 			polygon(0.0, 0.0, 1.0e-12, 1.0e-12),
 			polygon(1.0, 1.0, 2.0, 2.0),
 		]);
-		assert!(point(5.0e-13, 5.0e-13).within(&tiny).unwrap());
-		assert!(!point(0.0, 5.0e-13).within(&tiny).unwrap());
+		assert!(point(5.0e-13, 5.0e-13).within(&tiny).assert_ok());
+		assert!(!point(0.0, 5.0e-13).within(&tiny).assert_ok());
 		let adjacent =
 			Geometry::Collection(vec![polygon(0.0, 0.0, 1.0, 2.0), polygon(1.0, 0.0, 2.0, 2.0)]);
-		assert!(point(1.0, 1.0).within(&adjacent).unwrap());
-		assert!(!point(1.0, 0.0).within(&adjacent).unwrap());
-		assert!(polygon(0.0, 0.0, 2.0, 2.0).within(&adjacent).unwrap());
+		assert!(point(1.0, 1.0).within(&adjacent).assert_ok());
+		assert!(!point(1.0, 0.0).within(&adjacent).assert_ok());
+		assert!(polygon(0.0, 0.0, 2.0, 2.0).within(&adjacent).assert_ok());
 		let mut hole = polygon(0.0, 0.0, 4.0, 4.0);
-		if let Geometry::Polygon(rings) = &mut hole {
-			if let Geometry::Polygon(mut interior) = polygon(1.0, 1.0, 3.0, 3.0) {
-				rings.append(&mut interior);
-			}
+		if let Geometry::Polygon(rings) = &mut hole
+			&& let Geometry::Polygon(mut interior) = polygon(1.0, 1.0, 3.0, 3.0)
+		{
+			rings.append(&mut interior);
 		}
 		let unfilled = Geometry::Collection(vec![hole.clone()]);
-		assert!(!polygon(0.0, 0.0, 4.0, 4.0).within(&unfilled).unwrap());
+		assert!(!polygon(0.0, 0.0, 4.0, 4.0).within(&unfilled).assert_ok());
 		let filled = Geometry::Collection(vec![hole, polygon(1.0, 1.0, 3.0, 3.0)]);
-		assert!(polygon(0.0, 0.0, 4.0, 4.0).within(&filled).unwrap());
-		assert!(point(1.0, 2.0).within(&filled).unwrap());
+		assert!(polygon(0.0, 0.0, 4.0, 4.0).within(&filled).assert_ok());
+		assert!(point(1.0, 2.0).within(&filled).assert_ok());
 	}
 
+	/// Verifies geometry collection line boundary uses endpoints.
 	#[test]
 	fn geometry_collection_line_boundary_uses_endpoints() {
-		let point = Geometry::Point(Position::new([0.0, 0.0]).unwrap());
+		let point = Geometry::Point(Position::new([0.0, 0.0]).assert_ok());
 		for coordinates in [
 			vec![[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]],
 			vec![[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [0.0, 1.0]],
 			vec![[-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0]],
 		] {
 			let line = Geometry::LineString(
-				coordinates.into_iter().map(|position| Position::new(position).unwrap()).collect(),
+				coordinates
+					.into_iter()
+					.map(|position| Position::new(position).assert_ok())
+					.collect(),
 			);
-			assert!(point.within(&line).unwrap());
-			assert!(point.within(&Geometry::Collection(vec![line.clone()])).unwrap());
+			assert!(point.within(&line).assert_ok());
+			assert!(point.within(&Geometry::Collection(vec![line.clone()])).assert_ok());
 			assert!(
 				point
 					.within(&Geometry::Collection(vec![Geometry::Collection(vec![line])]))
-					.unwrap()
+					.assert_ok()
 			);
 		}
 	}
 
+	/// Verifies geometry collection work budget counts repeated coordinates.
 	#[test]
 	fn geometry_collection_work_budget_counts_repeated_coordinates() {
-		let mut coordinates = vec![Position::new([0.0, 0.0]).unwrap(); 200_000];
-		coordinates.push(Position::new([1.0, 0.0]).unwrap());
+		let mut coordinates = vec![Position::new([0.0, 0.0]).assert_ok(); 200_000];
+		coordinates.push(Position::new([1.0, 0.0]).assert_ok());
 		let collection = Geometry::Collection(vec![Geometry::LineString(coordinates)]);
-		let points = Geometry::MultiPoint(vec![Position::new([0.5, 0.0]).unwrap(); 100]);
+		let points = Geometry::MultiPoint(vec![Position::new([0.5, 0.0]).assert_ok(); 100]);
 		assert!(collection.validate().is_ok());
 		assert!(points.within(&collection).is_err());
 	}

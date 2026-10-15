@@ -1,7 +1,11 @@
+#![cfg(test)]
 #![allow(
 	clippy::unwrap_used,
 	reason = "the ignored profiling probe must stop when its fixed fixture is invalid"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::{
 	error::Error,
@@ -18,9 +22,13 @@ use ferros_grynn::{
 	values::{Array, Object, PropertyMap, RecordId, Uuid, Value},
 };
 
+/// Branch-and-count traversal used to measure interpreter overhead without
+/// graph I/O.
 const FAST_QUERY: &str = "TRAVERSE FROM [0] |> tv::branch(|$value| $fanout) |> tv::count();";
+/// Pattern-matching query used as the graph traversal comparison.
 const MATCH_QUERY: &str = "MATCH (stage17_node:source AS source)-[stage17_edge]->(stage17_node AS \
                            target) IN GRAPH stage17_probe RETURN target;";
+/// Outgoing-edge traversal query used for the same graph workload as MATCH.
 const TRAVERSE_QUERY: &str = "TRAVERSE FROM $source IN GRAPH $graph |> tv::out();";
 
 /// Runs the paired Stage-17 VM performance gates under the profiling profile.
@@ -101,12 +109,14 @@ fn gql_traversal_stage_17_probe() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Returns begin for this module.
 fn begin(session: &mut GqlSession, statement: &str) -> Result<(), Box<dyn Error>> {
 	let mut results = session.execute(statement, &Object::new())?;
 	results.remove(0).result?;
 	Ok(())
 }
 
+/// Returns assert count for this module.
 fn assert_count(
 	session: &mut GqlSession,
 	variables: &Object,
@@ -124,6 +134,7 @@ fn assert_count(
 	Ok(())
 }
 
+/// Returns measure for this module.
 fn measure(
 	session: &mut GqlSession,
 	query: &str,
@@ -155,6 +166,7 @@ fn measure(
 	Ok((started.elapsed().as_nanos() / iterations as u128, result_items))
 }
 
+/// Returns execute for this module.
 fn execute(
 	session: &mut GqlSession,
 	query: &str,
@@ -164,6 +176,7 @@ fn execute(
 	Ok(results.remove(0).result?.into_parts().0)
 }
 
+/// Builds the fixture fixture used by nearby scenarios.
 fn fixture(
 	fanout: usize,
 ) -> Result<(Datastore, ferros_grynn::graph::GraphRef, RecordId), Box<dyn Error>> {
@@ -194,10 +207,12 @@ fn fixture(
 	Ok((store, graph, "stage17_node:source".parse()?))
 }
 
+/// Returns env usize for this module.
 fn env_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
+/// Returns artifact file for this module.
 fn artifact_file() -> Result<PathBuf, Box<dyn Error>> {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("gql-stage17");
 	fs::create_dir_all(&root)?;

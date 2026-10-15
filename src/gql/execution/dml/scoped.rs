@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use super::{DmlCandidate, LogicalDmlData, Object, apply_dml_data, validate_dml_object};
 use crate::{
-	datastore::{ClassSchema, Transaction},
+	datastore::{ClassSchema, FieldUpdate, Transaction},
 	gql::options::ExecutionControl,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphRef,
@@ -18,7 +18,7 @@ use crate::{
 pub(super) fn apply_graph_update(
 	transaction: &mut Transaction,
 	graph: &GraphRef,
-	label: Option<&Option<Text>>,
+	label: Option<&FieldUpdate<Text>>,
 	data: Option<&LogicalDmlData>,
 	schema: &ClassSchema,
 	candidate: &DmlCandidate,
@@ -67,11 +67,16 @@ pub(super) fn apply_graph_update(
 	validate_dml_object(schema, &after)?;
 	apply_minimal_overlay(transaction, graph, candidate, data, dictionary, &after)?;
 	if let Some(label) = label {
-		transaction.set_occurrence_label(graph.id(), &candidate.record_id, label.clone())?;
+		transaction.set_occurrence_label(
+			graph.id(),
+			&candidate.record_id,
+			label.clone().into_optional(),
+		)?;
 	}
 	Ok(after)
 }
 
+/// Resets effective fields.
 fn reset_effective_fields(
 	fields: &[Box<str>],
 	base: &crate::values::PropertyMap,
@@ -90,6 +95,7 @@ fn reset_effective_fields(
 	}
 }
 
+/// Applies minimal overlay.
 fn apply_minimal_overlay(
 	transaction: &mut Transaction,
 	graph: &GraphRef,

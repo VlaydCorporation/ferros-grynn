@@ -38,11 +38,30 @@ struct LostRange {
 /// At most one inspected group waits behind a coverage gap.
 enum Item {
 	/// Borrowed immutable RAM encoding; values are decoded only on selection.
-	Memory(Arc<[u8]>, LiveGroupInfo),
+	Memory(
+		/// Immutable encoded LIVE group retained until this replay item is
+		/// selected.
+		Arc<[u8]>,
+		/// Inspected commit and event metadata describing the encoded group.
+		LiveGroupInfo,
+	),
 	/// A pinned complete physical group and its checked locator.
-	Local(HistorySegment, u64, u64, LiveGroupInfo),
+	Local(
+		/// History segment containing the selected complete physical group.
+		HistorySegment,
+		/// First physical page of the selected history group.
+		u64,
+		/// Expected first page after the selected group, checked again during
+		/// decoding.
+		u64,
+		/// Inspected commit and event metadata describing the physical group.
+		LiveGroupInfo,
+	),
 	/// Optional file bytes are unavailable under trusted catalog bounds.
-	Lost(HistorySegment),
+	Lost(
+		/// Optional file bytes are unavailable under trusted catalog bounds.
+		HistorySegment,
+	),
 }
 
 /// Cursor for a single physical segment; counts include a purged prefix.
@@ -622,6 +641,7 @@ fn invalid(reason: &str) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for replay behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -635,52 +655,65 @@ mod tests {
 
 	/// An absent final RAM entry differs from optional corrupt segment bytes.
 	#[test]
-	fn live_replay_missing_ram_tail_is_corruption() -> FerrosGrynnResult<()> {
+	fn live_replay_missing_ram_tail_is_corruption() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-		setup.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::from_nanoseconds(86_400_000_000_000)?,
-		)?;
-		setup.commit()?;
+		let class = setup
+			.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		setup
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::from_nanoseconds(86_400_000_000_000).assert_ok(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
 		let initial = store
-			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
 		let saved = initial.cursor().clone();
 		drop(initial);
 		for record in ["item:a", "item:b"] {
 			let mut update = store.begin();
-			update.create_atom(record.parse()?, PropertyMap::new())?;
-			update.commit()?;
+			update.create_atom(record.parse().assert_ok(), PropertyMap::new()).assert_ok();
+			update.commit().assert_ok();
 		}
 		let mut root = (*store.inner.current_root()).clone();
 		let final_stamp = root.live_catalog().histories[&saved.live_id()].last_stamp;
 		Arc::make_mut(root.live_history_mut()).remove(&(saved.live_id(), final_stamp));
-		let mut replay = Replay::new(&root, &saved, &LiveOptions::default(), None)?;
-		assert!(replay.next(&store.inner, &saved)?.is_some());
+		let mut replay = Replay::new(&root, &saved, &LiveOptions::default(), None).assert_ok();
+		assert!(replay.next(&store.inner, &saved).assert_ok().is_some());
 		assert!(replay.next(&store.inner, &saved).is_err());
-		Ok(())
 	}
 
 	/// A valid oversized historical control cannot advance ACK or retain
 	/// permits.
 	#[test]
-	fn live_replay_resource_error_fuses_attachment_and_keeps_ack() -> FerrosGrynnResult<()> {
+	fn live_replay_resource_error_fuses_attachment_and_keeps_ack() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-		setup.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::from_nanoseconds(86_400_000_000_000)?,
-		)?;
-		setup.commit()?;
+		let class = setup
+			.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		setup
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::from_nanoseconds(86_400_000_000_000).assert_ok(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
 		let initial = store
-			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+			.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
 		let saved = initial.cursor().clone();
 		drop(initial);
 		let mut update = store.begin();
-		update.create_atom("item:a".parse()?, PropertyMap::new())?;
-		let stamp = update.commit()?.versionstamp().get();
+		update.create_atom("item:a".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		let stamp = update.commit().assert_ok().versionstamp().get();
 		let mut root = (*store.inner.current_root()).clone();
 		let payload = LivePayload::Fault {
 			diagnostic: FerrosGrynnError::live_evaluation_fault(
@@ -703,21 +736,21 @@ mod tests {
 			stamp,
 			root.committed_at_ns,
 			8 * 1024 * 1024,
-		)?;
+		)
+		.assert_ok();
 		assert!(live_history::decode(&bytes, 8 * 1024 * 1024).is_ok());
 		Arc::make_mut(root.live_history_mut()).insert((saved.live_id(), stamp), bytes.into());
 		*store.inner.current.write() = Arc::new(root);
-		let mut resumed = store.resume_live(&saved)?;
+		let mut resumed = store.resume_live(&saved).assert_ok();
 		assert!(resumed.next().is_err());
-		assert!(matches!(resumed.next()?, LiveNext::Closed));
+		assert!(matches!(resumed.next().assert_ok(), LiveNext::Closed));
 		assert_eq!(resumed.cursor(), &saved);
-		assert_eq!(store.begin().live_info(saved.live_id())?.cursor(), &saved);
-		let replacement = store.resume_live(&saved)?;
+		assert_eq!(store.begin().live_info(saved.live_id()).assert_ok().cursor(), &saved);
+		let replacement = store.resume_live(&saved).assert_ok();
 		assert_eq!(
 			replacement.cursor(),
 			&saved,
 			"failed replay released its consumer and head admission"
 		);
-		Ok(())
 	}
 }

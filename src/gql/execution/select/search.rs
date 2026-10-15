@@ -8,27 +8,43 @@ use std::{
 use super::*;
 use crate::gql::ir::{LogicalFulltextDefinition, LogicalVectorDefinition, NamedFunctionKey};
 
+/// Prepared search state.
 pub(super) struct PreparedSearch {
+	/// Fulltext associated with this prepared search.
 	fulltext: BTreeMap<u32, PreparedFulltext>,
+	/// Knn associated with this prepared search.
 	knn: Option<PreparedKnn>,
+	/// Physical fulltext associated with this prepared search.
 	physical_fulltext: Option<u32>,
+	/// Physical knn associated with this prepared search.
 	physical_knn: Option<u32>,
 }
 
+/// Prepared fulltext state.
 struct PreparedFulltext {
+	/// Terms associated with this prepared fulltext.
 	terms: BTreeSet<Box<str>>,
+	/// Definition associated with this prepared fulltext.
 	definition: LogicalFulltextDefinition,
 }
 
+/// Prepared knn state.
 struct PreparedKnn {
+	/// Predicate associated with this prepared knn.
 	predicate: u32,
+	/// K associated with this prepared knn.
 	k: usize,
+	/// Ef associated with this prepared knn.
 	ef: Option<usize>,
+	/// Query associated with this prepared knn.
 	query: crate::values::Vector,
+	/// Distance associated with this prepared knn.
 	distance: RuntimeDistance,
+	/// Definition associated with this prepared knn.
 	definition: Option<LogicalVectorDefinition>,
 }
 
+/// Checks for search.
 pub(super) fn contains_search(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Fulltext {
@@ -125,6 +141,7 @@ pub(super) fn contains_search(expression: &TypedExpr) -> bool {
 	}
 }
 
+/// Prepares search inputs.
 pub(super) fn prepare_search_inputs(
 	filter: &TypedExpr,
 	access: &LogicalSelectAccess,
@@ -204,7 +221,6 @@ pub(super) fn try_physical_fulltext<Read: QueryRead>(
 	}
 	let TypedExprKind::Fulltext {
 		op,
-		definitions: _,
 		..
 	} = &expression.kind
 	else {
@@ -416,6 +432,7 @@ pub(super) fn try_physical_knn<Read: QueryRead>(
 	))
 }
 
+/// Returns whether this value is positive conjunct.
 fn is_positive_conjunct(expression: &TypedExpr, predicate: u32) -> bool {
 	if expression.span.offset == predicate
 		&& matches!(expression.kind, TypedExprKind::Fulltext { .. })
@@ -432,6 +449,7 @@ fn is_positive_conjunct(expression: &TypedExpr, predicate: u32) -> bool {
 	}
 }
 
+/// Prepares search rows.
 pub(super) fn prepare_search_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -452,7 +470,6 @@ pub(super) fn prepare_search_rows<Read: QueryRead>(
 		let TypedExprKind::Fulltext {
 			left,
 			op,
-			definitions: _,
 			..
 		} = &expression.kind
 		else {
@@ -488,6 +505,7 @@ pub(super) fn prepare_search_rows<Read: QueryRead>(
 	Ok(rows)
 }
 
+/// Collects search predicates.
 fn collect_search_predicates<'a>(
 	expression: &'a TypedExpr,
 	positive_conjunction: bool,
@@ -521,17 +539,17 @@ fn collect_search_predicates<'a>(
 			collect_search_predicates(right, true, fulltext, knn)?;
 		}
 		_ if contains_search(expression) => {
-			collect_nested_search(expression, fulltext, knn)?;
+			collect_nested_search(expression, fulltext)?;
 		}
 		_ => {}
 	}
 	Ok(())
 }
 
+/// Collects nested search.
 fn collect_nested_search<'a>(
 	expression: &'a TypedExpr,
 	fulltext: &mut Vec<&'a TypedExpr>,
-	knn: &mut Option<&'a TypedExpr>,
 ) -> FerrosGrynnResult<()> {
 	match &expression.kind {
 		TypedExprKind::Fulltext {
@@ -557,8 +575,8 @@ fn collect_nested_search<'a>(
 			base: left,
 			predicate: right,
 		} => {
-			collect_nested_search(left, fulltext, knn)?;
-			collect_nested_search(right, fulltext, knn)?;
+			collect_nested_search(left, fulltext)?;
+			collect_nested_search(right, fulltext)?;
 		}
 		TypedExprKind::Unary {
 			expr,
@@ -575,15 +593,15 @@ fn collect_nested_search<'a>(
 		| TypedExprKind::Cast {
 			expr,
 			..
-		} => collect_nested_search(expr, fulltext, knn)?,
+		} => collect_nested_search(expr, fulltext)?,
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
 			for value in values {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Object(fields) => {
 			for (_, value) in fields {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Range {
@@ -592,10 +610,10 @@ fn collect_nested_search<'a>(
 			..
 		} => {
 			if let Some(value) = start {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 			if let Some(value) = end {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Conditional {
@@ -603,9 +621,9 @@ fn collect_nested_search<'a>(
 			then_value,
 			else_value,
 		} => {
-			collect_nested_search(condition, fulltext, knn)?;
-			collect_nested_search(then_value, fulltext, knn)?;
-			collect_nested_search(else_value, fulltext, knn)?;
+			collect_nested_search(condition, fulltext)?;
+			collect_nested_search(then_value, fulltext)?;
+			collect_nested_search(else_value, fulltext)?;
 		}
 		TypedExprKind::Case {
 			operand,
@@ -613,14 +631,14 @@ fn collect_nested_search<'a>(
 			else_value,
 		} => {
 			if let Some(value) = operand {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 			for (condition, value) in branches {
-				collect_nested_search(condition, fulltext, knn)?;
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(condition, fulltext)?;
+				collect_nested_search(value, fulltext)?;
 			}
 			if let Some(value) = else_value {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Builtin {
@@ -632,16 +650,16 @@ fn collect_nested_search<'a>(
 			..
 		} => {
 			for value in arguments {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Invoke {
 			callee,
 			arguments,
 		} => {
-			collect_nested_search(callee, fulltext, knn)?;
+			collect_nested_search(callee, fulltext)?;
 			for value in arguments {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Aggregate {
@@ -649,7 +667,7 @@ fn collect_nested_search<'a>(
 			..
 		} => {
 			if let Some(value) = argument {
-				collect_nested_search(value, fulltext, knn)?;
+				collect_nested_search(value, fulltext)?;
 			}
 		}
 		TypedExprKind::Constant(_)
@@ -666,6 +684,7 @@ fn collect_nested_search<'a>(
 	Ok(())
 }
 
+/// Returns the choose fulltext definition result.
 fn choose_fulltext_definition<'a>(
 	definitions: &'a [LogicalFulltextDefinition],
 	access: &LogicalSelectAccess,
@@ -707,6 +726,7 @@ fn choose_fulltext_definition<'a>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "exact Fulltext uses the complete SELECT context")]
+/// Prepares fulltext.
 fn prepare_fulltext<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -822,6 +842,7 @@ fn prepare_fulltext<Read: QueryRead>(
 	output.finish()
 }
 
+/// Returns the fulltext query terms result.
 fn fulltext_query_terms(
 	op: crate::syn::FulltextOperator,
 	right: &TypedExpr,
@@ -880,6 +901,7 @@ fn fulltext_query_terms(
 	Ok(terms)
 }
 
+/// Analyzes text.
 fn analyze_text(
 	definition: &LogicalFulltextDefinition,
 	input: &str,
@@ -911,6 +933,7 @@ fn analyze_text(
 	}
 }
 
+/// Returns the bm25 score result.
 fn bm25_score(
 	term_frequency: &BTreeMap<Box<str>, u64>,
 	document_frequency: &BTreeMap<Box<str>, u64>,
@@ -935,6 +958,7 @@ fn bm25_score(
 	})
 }
 
+/// Merges spans.
 fn merge_spans(spans: &mut Vec<(u32, u32)>) {
 	let mut write = 0_usize;
 	for read in 0..spans.len() {
@@ -949,13 +973,18 @@ fn merge_spans(spans: &mut Vec<(u32, u32)>) {
 }
 
 #[derive(Debug)]
+/// Heap candidate state.
 struct HeapCandidate {
+	/// Distance associated with this heap candidate.
 	distance: f64,
+	/// Stable associated with this heap candidate.
 	stable: Vec<Value>,
+	/// Ordinal associated with this heap candidate.
 	ordinal: usize,
 }
 
 impl PartialEq for HeapCandidate {
+	/// Compares this `HeapCandidate` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.distance.to_bits() == other.distance.to_bits()
 			&& self.stable == other.stable
@@ -966,12 +995,15 @@ impl PartialEq for HeapCandidate {
 impl Eq for HeapCandidate {}
 
 impl PartialOrd for HeapCandidate {
+	/// Compares this `HeapCandidate` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for HeapCandidate {
+	/// Compares this `HeapCandidate` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.distance
 			.total_cmp(&other.distance)
@@ -981,6 +1013,7 @@ impl Ord for HeapCandidate {
 }
 
 #[allow(clippy::too_many_arguments, reason = "exact KNN uses the complete SELECT context")]
+/// Prepares knn.
 fn prepare_knn<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -1029,7 +1062,7 @@ fn prepare_knn<Read: QueryRead>(
 		let distance = prepared.distance.evaluate(&vector, &prepared.query, control, source)?;
 		heap.push(HeapCandidate {
 			distance,
-			stable: row.stable.clone(),
+			stable: row.stable,
 			ordinal: current,
 		});
 		if heap.len() > prepared.k {
@@ -1069,6 +1102,7 @@ fn prepare_knn<Read: QueryRead>(
 	output.finish()
 }
 
+/// Prepares knn input.
 fn prepare_knn_input(
 	expression: &TypedExpr,
 	access: &LogicalSelectAccess,
@@ -1120,6 +1154,7 @@ fn prepare_knn_input(
 	})
 }
 
+/// Returns the choose vector definition result.
 fn choose_vector_definition(
 	definitions: &[LogicalVectorDefinition],
 	access: &LogicalSelectAccess,
@@ -1174,13 +1209,27 @@ fn choose_vector_definition(
 		.cloned())
 }
 
+/// Runtime distance alternatives.
 enum RuntimeDistance {
-	Builtin(crate::datastore::VectorDistance),
-	Named(NamedFunctionKey),
-	Closure(crate::values::Closure),
+	/// Builtin case of runtime distance.
+	Builtin(
+		/// Builtin case of runtime distance.
+		crate::datastore::VectorDistance,
+	),
+	/// Named case of runtime distance.
+	Named(
+		/// Named case of runtime distance.
+		NamedFunctionKey,
+	),
+	/// Closure case of runtime distance.
+	Closure(
+		/// Closure case of runtime distance.
+		crate::values::Closure,
+	),
 }
 
 impl RuntimeDistance {
+	/// Evaluates runtime distance.
 	fn evaluate(
 		&self,
 		left: &crate::values::Vector,
@@ -1226,6 +1275,7 @@ impl RuntimeDistance {
 	}
 }
 
+/// Returns the runtime distance result.
 fn runtime_distance(
 	distance: &LogicalKnnDistance,
 	slots: &[Value],
@@ -1265,6 +1315,7 @@ fn runtime_distance(
 	}
 }
 
+/// Returns the float distance result.
 fn float_distance(value: Value) -> FerrosGrynnResult<f64> {
 	match value {
 		Value::Number(Number::Float(value)) => Ok(value),
@@ -1272,13 +1323,14 @@ fn float_distance(value: Value) -> FerrosGrynnResult<f64> {
 	}
 }
 
+/// Returns the positive usize result.
 fn positive_usize(value: Value, name: &str) -> FerrosGrynnResult<usize> {
 	let Value::Number(number) = value else {
 		return Err(FerrosGrynnError::invalid_argument(format!(
 			"{name} must be a positive integer"
 		)));
 	};
-	let value = usize::try_from(number).map_err(|_| {
+	let value = usize::try_from(number).map_err(|_conversion_error| {
 		FerrosGrynnError::invalid_argument(format!("{name} must be a positive integer"))
 	})?;
 	if value == 0 {

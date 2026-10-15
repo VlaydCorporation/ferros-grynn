@@ -2,10 +2,15 @@
 use super::*;
 use crate::graph::AtomKind;
 
+/// Byte offset of next page in its encoded layout.
 const NEXT_PAGE_OFFSET: usize = PAGE_HEADER_SIZE;
+/// Byte offset of count in its encoded layout.
 const COUNT_OFFSET: usize = NEXT_PAGE_OFFSET + size_of::<u64>();
+/// Byte offset of reserved in its encoded layout.
 const RESERVED_OFFSET: usize = COUNT_OFFSET + size_of::<u32>();
+/// Byte offset of atoms in its encoded layout.
 const ATOMS_OFFSET: usize = RESERVED_OFFSET + size_of::<u32>();
+/// Configured atoms per page value.
 const ATOMS_PER_PAGE: usize = (PAGE_SIZE - ATOMS_OFFSET) / size_of::<u64>();
 
 /// Packs one exact label membership into immutable sorted-array pages.

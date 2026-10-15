@@ -21,17 +21,25 @@ use crate::{
 /// Fixed-point cost weights. O12 may change these values only from measured
 /// microprobes without changing the cost representation.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CostWeights {
+pub struct CostWeights {
+	/// Source startup associated with this cost weights.
 	pub(crate) source_startup: u64,
+	/// Sequential row associated with this cost weights.
 	pub(crate) sequential_row: u64,
+	/// Random lookup associated with this cost weights.
 	pub(crate) random_lookup: u64,
+	/// Expression associated with this cost weights.
 	pub(crate) expression: u64,
+	/// Memory kib associated with this cost weights.
 	pub(crate) memory_kib: u64,
+	/// Spill kib associated with this cost weights.
 	pub(crate) spill_kib: u64,
+	/// Uncertainty associated with this cost weights.
 	pub(crate) uncertainty: u64,
 }
 
 impl Default for CostWeights {
+	/// Constructs the default initial state of `CostWeights`.
 	fn default() -> Self {
 		Self {
 			source_startup: 64,
@@ -46,7 +54,7 @@ impl Default for CostWeights {
 }
 
 /// Returns the cost of one sequential source scan.
-pub(crate) fn scan_cost(rows: Cardinality, expressions: u64, weights: CostWeights) -> PlanCost {
+pub fn scan_cost(rows: Cardinality, expressions: u64, weights: CostWeights) -> PlanCost {
 	PlanCost {
 		startup: weights.source_startup,
 		sequential: rows.expected.saturating_mul(weights.sequential_row),
@@ -57,7 +65,7 @@ pub(crate) fn scan_cost(rows: Cardinality, expressions: u64, weights: CostWeight
 }
 
 /// Returns the fixed cost of primary or secondary random probes.
-pub(crate) fn lookup_cost(probes: u64, rows: Cardinality, weights: CostWeights) -> PlanCost {
+pub fn lookup_cost(probes: u64, rows: Cardinality, weights: CostWeights) -> PlanCost {
 	PlanCost {
 		startup: weights.source_startup,
 		random: probes.saturating_mul(weights.random_lookup),
@@ -69,7 +77,7 @@ pub(crate) fn lookup_cost(probes: u64, rows: Cardinality, weights: CostWeights) 
 
 /// Returns the cost of seeking into an ordered index and then walking the
 /// matching leaf range. A range is not one random lookup per returned row.
-pub(crate) fn range_lookup_cost(seeks: u64, rows: Cardinality, weights: CostWeights) -> PlanCost {
+pub fn range_lookup_cost(seeks: u64, rows: Cardinality, weights: CostWeights) -> PlanCost {
 	PlanCost {
 		startup: weights.source_startup,
 		random: seeks.saturating_mul(weights.random_lookup),
@@ -81,7 +89,7 @@ pub(crate) fn range_lookup_cost(seeks: u64, rows: Cardinality, weights: CostWeig
 }
 
 /// Returns join memory/spill cost for an estimated build side.
-pub(crate) fn join_cost(
+pub fn join_cost(
 	left: Cardinality,
 	right: Cardinality,
 	row_bytes: u64,
@@ -125,6 +133,7 @@ pub(in crate::gql) fn estimate_predicate(
 	(cardinality, warnings)
 }
 
+/// Estimates expression.
 fn estimate_expression(
 	select: &LogicalSelect,
 	snapshot: &PlannerSnapshot,
@@ -290,6 +299,7 @@ fn spatial_column(expression: &TypedExpr) -> Option<usize> {
 	})
 }
 
+/// Returns the scale histogram cardinality result.
 fn scale_histogram_cardinality(
 	histogram: &crate::stats::PropertyHistogram,
 	sampled: u64,
@@ -302,6 +312,7 @@ fn scale_histogram_cardinality(
 	}
 }
 
+/// Returns the statistics meta result.
 fn statistics_meta(snapshot: &PlannerSnapshot, scope: StatisticsScope) -> PlannerStatisticsMeta {
 	match scope {
 		StatisticsScope::Base => snapshot.base_statistics,
@@ -312,14 +323,21 @@ fn statistics_meta(snapshot: &PlannerSnapshot, scope: StatisticsScope) -> Planne
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Scalar estimate alternatives.
 enum ScalarEstimate {
+	/// Equal case of scalar estimate.
 	Equal,
+	/// Less case of scalar estimate.
 	Less,
+	/// Less or equal case of scalar estimate.
 	LessOrEqual,
+	/// Greater case of scalar estimate.
 	Greater,
+	/// Greater or equal case of scalar estimate.
 	GreaterOrEqual,
 }
 
+/// Returns the scalar column comparison result.
 fn scalar_column_comparison(
 	expression: &TypedExpr,
 ) -> Option<(usize, ScalarEstimate, Option<&Value>)> {
@@ -356,6 +374,7 @@ fn scalar_column_comparison(
 	}
 }
 
+/// Returns the reverse comparison result.
 fn reverse_comparison(comparison: ScalarEstimate) -> ScalarEstimate {
 	match comparison {
 		ScalarEstimate::Equal => ScalarEstimate::Equal,
@@ -366,6 +385,7 @@ fn reverse_comparison(comparison: ScalarEstimate) -> ScalarEstimate {
 	}
 }
 
+/// Returns the histogram cardinality result.
 fn histogram_cardinality(
 	histogram: &crate::stats::PropertyHistogram,
 	key: &[u8],
@@ -394,6 +414,7 @@ fn histogram_cardinality(
 	}
 }
 
+/// Returns the bucket less rows result.
 fn bucket_less_rows(bucket: &crate::stats::PropertyBucket, key: &[u8], inclusive: bool) -> u64 {
 	if key < bucket.lower.as_slice() {
 		return 0;
@@ -421,15 +442,19 @@ fn bucket_less_rows(bucket: &crate::stats::PropertyBucket, key: &[u8], inclusive
 	bucket.frequency.div_ceil(2)
 }
 
+/// Returns the conservative fraction result.
 fn conservative_fraction(input: Cardinality, numerator: u64, denominator: u64) -> Cardinality {
 	Cardinality::new(0, input.expected.saturating_mul(numerator).div_ceil(denominator), input.upper)
 }
 
 #[cfg(test)]
+/// Regression tests for estimate behavior.
 mod tests {
 	use super::*;
 	use crate::stats::{HistogramMethod, PropertyBucket, PropertyHistogram};
 
+	/// Verifies equi depth boundaries estimate ranges without random lookup per
+	/// row.
 	#[test]
 	fn equi_depth_boundaries_estimate_ranges_without_random_lookup_per_row() {
 		let histogram = PropertyHistogram {
@@ -463,7 +488,7 @@ mod tests {
 		let approximate = PropertyHistogram {
 			method: HistogramMethod::Approximate,
 			sample_count: 20,
-			..histogram.clone()
+			..histogram
 		};
 		assert_eq!(scale_histogram_cardinality(&approximate, 5, 100), 25);
 

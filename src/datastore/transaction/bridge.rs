@@ -432,7 +432,7 @@ impl Transaction {
 					.saturating_add(row.external.record.estimated_heap_bytes())
 					.saturating_mul(4),
 			)?;
-			let bytes = self.working.bridges.admit_transition(&row)?;
+			let bytes = self.working.bridges.admit_transition(row)?;
 			self.ensure_capacity(bytes)?;
 			let key = ConflictKey::BridgeMappings(row.external.database.id, row.subject.role());
 			self.record_requirement(key);

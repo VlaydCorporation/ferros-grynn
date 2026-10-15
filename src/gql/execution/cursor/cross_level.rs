@@ -5,20 +5,32 @@ use super::*;
 /// Expands one fixed connector while preserving the graph scope of both the
 /// connector and its selected endpoint.
 pub(in crate::gql::execution) struct CrossLevelExpandCursor<'a, Read: QueryRead> {
+	/// Input associated with this cross level expand cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Read associated with this cross level expand cursor.
 	read: &'a Read,
+	/// Snapshot associated with this cross level expand cursor.
 	snapshot: Snapshot,
+	/// Fields associated with this cross level expand cursor.
 	fields: &'a MatchGraphFields<'a, Read>,
+	/// Index associated with this cross level expand cursor.
 	index: Rc<ScopedTraversalIndex>,
+	/// Expand associated with this cross level expand cursor.
 	expand: ResolvedExpand,
+	/// Predicate associated with this cross level expand cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Trace associated with this cross level expand cursor.
 	trace: Option<Rc<RefCell<MatchPathTrace>>>,
+	/// Row associated with this cross level expand cursor.
 	row: Option<Row>,
+	/// Candidates associated with this cross level expand cursor.
 	candidates: Vec<ScopedTraversalCandidate>,
+	/// Next candidate associated with this cross level expand cursor.
 	next_candidate: usize,
 }
 
 impl<'a, Read: QueryRead> CrossLevelExpandCursor<'a, Read> {
+	/// Creates a new `CrossLevelExpandCursor<'a, Read>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		read: &'a Read,
@@ -44,6 +56,7 @@ impl<'a, Read: QueryRead> CrossLevelExpandCursor<'a, Read> {
 		}
 	}
 
+	/// Returns the emit result.
 	fn emit(
 		&self,
 		input: &Row,
@@ -117,6 +130,8 @@ impl<'a, Read: QueryRead> CrossLevelExpandCursor<'a, Read> {
 }
 
 impl<Read: QueryRead> RowCursor for CrossLevelExpandCursor<'_, Read> {
+	/// Advances this `CrossLevelExpandCursor<'_, Read>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -147,6 +162,7 @@ impl<Read: QueryRead> RowCursor for CrossLevelExpandCursor<'_, Read> {
 	}
 }
 
+/// Returns the scoped filters match result.
 pub(in crate::gql::execution) fn scoped_filters_match<
 	EdgeGraph: GraphRead,
 	TargetGraph: GraphRead,
@@ -188,6 +204,7 @@ pub(in crate::gql::execution) fn scoped_filters_match<
 	Ok(true)
 }
 
+/// Returns the scoped atom is meta result.
 fn scoped_atom_is_meta<Read: QueryRead>(
 	atom: Option<BoundAtom>,
 	read: &Read,
@@ -202,6 +219,7 @@ fn scoped_atom_is_meta<Read: QueryRead>(
 	local_atom_is_meta(&graph, atom.atom)
 }
 
+/// Returns the local atom is meta result.
 fn local_atom_is_meta<Graph: GraphRead>(graph: &Graph, atom: AtomId) -> FerrosGrynnResult<bool> {
 	match atom.kind() {
 		Some(AtomKind::Node) => graph.node(atom)?.map_or(Ok(false), |node| node.is_meta()),
@@ -211,6 +229,7 @@ fn local_atom_is_meta<Graph: GraphRead>(graph: &Graph, atom: AtomId) -> FerrosGr
 }
 
 #[allow(clippy::too_many_arguments, reason = "a path step has separate edge and endpoint scopes")]
+/// Appends scoped trace hop.
 pub(in crate::gql::execution) fn append_scoped_trace_hop<
 	EdgeGraph: GraphRead,
 	TargetGraph: GraphRead,

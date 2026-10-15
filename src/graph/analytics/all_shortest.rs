@@ -217,10 +217,12 @@ impl TensorPath {
 	///
 	/// # Errors
 	/// Propagates reference-resolution, checked size and admission errors.
-	pub fn materialize_path_with_references(
+	pub fn materialize_path_with_references<
+		ReferenceArg: FnMut(Uuid) -> FerrosGrynnResult<Arc<GraphRef>>,
+	>(
 		&self,
 		limits: GraphAlgorithmLimits,
-		reference: &mut impl FnMut(Uuid) -> FerrosGrynnResult<Arc<GraphRef>>,
+		reference: &mut ReferenceArg,
 	) -> FerrosGrynnResult<Path> {
 		let mut check = || Ok(());
 		let mut control = Control::new(limits, &mut check)?;
@@ -415,14 +417,17 @@ impl EndpointTensor {
 	/// # Errors
 	/// Propagates callback/check failures, overflow and hard resource
 	/// rejection.
-	pub fn all_shortest_paths_with_cost(
+	pub fn all_shortest_paths_with_cost<
+		CostArg: FnMut(&PathCostContext<'_>) -> FerrosGrynnResult<Number>,
+		CheckArg: FnMut() -> FerrosGrynnResult<()>,
+	>(
 		&self,
 		source: &TensorAtom,
 		target: &TensorAtom,
 		selection: ProjectionOptions,
 		options: AllShortestOptions,
-		cost: &mut impl FnMut(&PathCostContext<'_>) -> FerrosGrynnResult<Number>,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		cost: &mut CostArg,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<AllShortestPaths> {
 		self.all_shortest_paths_with_filter(
 			source,
@@ -445,16 +450,21 @@ impl EndpointTensor {
 		clippy::too_many_arguments,
 		reason = "Exact constraints, COST and cancellation remain explicit callbacks"
 	)]
-	pub fn all_shortest_paths_with_filter(
+	pub fn all_shortest_paths_with_filter<
+		CostArg: FnMut(&PathCostContext<'_>) -> FerrosGrynnResult<Number>,
+		BranchArg: FnMut(&PathCostContext<'_>) -> FerrosGrynnResult<bool>,
+		TerminalArg: FnMut(&PathTerminalContext<'_>) -> FerrosGrynnResult<bool>,
+		CheckArg: FnMut() -> FerrosGrynnResult<()>,
+	>(
 		&self,
 		source: &TensorAtom,
 		target: &TensorAtom,
 		mut selection: ProjectionOptions,
 		options: AllShortestOptions,
-		cost: &mut impl FnMut(&PathCostContext<'_>) -> FerrosGrynnResult<Number>,
-		branch: &mut impl FnMut(&PathCostContext<'_>) -> FerrosGrynnResult<bool>,
-		terminal: &mut impl FnMut(&PathTerminalContext<'_>) -> FerrosGrynnResult<bool>,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		cost: &mut CostArg,
+		branch: &mut BranchArg,
+		terminal: &mut TerminalArg,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<AllShortestPaths> {
 		if options.limits.max_paths == 0 {
 			return Err(resource("all-shortest enumeration", 0));

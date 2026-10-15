@@ -200,6 +200,7 @@ fn select_landmark_path(
 	clippy::too_many_arguments,
 	reason = "bound clause depth is shared by every physical operator"
 )]
+/// Matches nodes.
 fn match_nodes(
 	statement: &LogicalMatch,
 	graph: Option<&PlannerGraph>,
@@ -437,7 +438,7 @@ fn match_nodes(
 			PlanCost::default(),
 		);
 	}
-	if statement.binding_distinct {
+	if statement.distinctness.bindings {
 		push_match_node(
 			&mut nodes,
 			None,
@@ -455,7 +456,7 @@ fn match_nodes(
 		final_cardinality,
 		PlanCost::default(),
 	);
-	if statement.projection_distinct {
+	if statement.distinctness.projection {
 		push_match_node(
 			&mut nodes,
 			None,
@@ -478,6 +479,7 @@ fn match_nodes(
 	nodes
 }
 
+/// Pushes match node.
 fn push_match_node(
 	nodes: &mut Vec<PhysicalMatchNode>,
 	pattern_index: Option<usize>,
@@ -496,6 +498,7 @@ fn push_match_node(
 	});
 }
 
+/// Estimates pattern.
 fn estimate_pattern(
 	pattern: &LogicalMatchPattern,
 	graph: &PlannerGraph,
@@ -558,6 +561,7 @@ fn estimate_pattern(
 	(rows, cost, warnings)
 }
 
+/// Returns the binding cardinality result.
 fn binding_cardinality(
 	binding: &MatchBinding,
 	graph: &PlannerGraph,
@@ -592,6 +596,7 @@ fn binding_cardinality(
 	}
 }
 
+/// Returns the degree estimate result.
 fn degree_estimate(
 	graph: &PlannerGraph,
 	snapshot: &PlannerSnapshot,
@@ -651,6 +656,7 @@ fn degree_estimate(
 	(expected, maximum)
 }
 
+/// Returns the histogram degree result.
 fn histogram_degree(histogram: &DegreeHistogram) -> (u64, u64) {
 	let mut count = 0_u64;
 	let mut weighted = 0_u64;
@@ -664,6 +670,7 @@ fn histogram_degree(histogram: &DegreeHistogram) -> (u64, u64) {
 	(weighted.div_ceil(count.max(1)), maximum)
 }
 
+/// Returns the path rows result.
 fn path_rows(seed: u64, degree: u64, minimum: u32, maximum: u32) -> u64 {
 	(minimum..=maximum).fold(0_u64, |total, hops| {
 		let rows = (0..hops).fold(seed, |rows, _hop| rows.saturating_mul(degree));
@@ -671,6 +678,7 @@ fn path_rows(seed: u64, degree: u64, minimum: u32, maximum: u32) -> u64 {
 	})
 }
 
+/// Returns the pattern columns result.
 fn pattern_columns(pattern: &LogicalMatchPattern) -> impl Iterator<Item = usize> + '_ {
 	let mut columns = Vec::new();
 	match &pattern.kind {

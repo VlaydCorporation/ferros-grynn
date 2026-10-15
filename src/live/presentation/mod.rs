@@ -91,9 +91,16 @@ pub enum LiveEventOutput {
 		after: Option<Value>,
 	},
 	/// Deterministic object leaf changes; arrays and other values are atomic.
-	Diff(Vec<LiveFieldChange>),
+	Diff(
+		/// Deterministic object leaf changes; arrays and other values are
+		/// atomic.
+		Vec<LiveFieldChange>,
+	),
 	/// Sequential native operations; JSON export is separately checked.
-	Patch(Vec<LivePatchOperation>),
+	Patch(
+		/// Sequential native operations; JSON export is separately checked.
+		Vec<LivePatchOperation>,
+	),
 }
 
 impl LiveEvent {
@@ -644,6 +651,7 @@ fn overflow() -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for presentation behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -664,7 +672,9 @@ mod tests {
 
 	/// Pointer escaping, native types and result presence remain exact.
 	#[test]
-	fn live_presentation_native_paths_and_presence() -> FerrosGrynnResult<()> {
+	fn live_presentation_native_paths_and_presence() {
+		use crate::test_assertions::AssertResult as _;
+
 		let before = Value::Object(Object::from_iter([
 			("a/b", Value::Object(Object::from_iter([("~", Value::from(1)), ("", Value::Null)]))),
 			("gone", Value::None),
@@ -676,12 +686,16 @@ mod tests {
 			),
 			("new", Value::from("owned")),
 		]));
-		let event = event(Some(before.clone()), Some(after.clone()))?;
+		let event = event(Some(before.clone()), Some(after.clone())).assert_ok();
 		let options = LiveBindingOptions::default();
 		let LiveEventOutput::Patch(operations) =
-			event.presented(LiveOutputMode::Patch, &options)?
+			event.presented(LiveOutputMode::Patch, &options).assert_ok()
 		else {
-			return Err(FerrosGrynnError::invalid_argument("PATCH test output"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("PATCH test output"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(operations.iter().map(LivePatchOperation::path).collect::<Vec<_>>(), vec![
 			"/a~1b/~0", "/gone", "/new"
@@ -692,13 +706,18 @@ mod tests {
 			LivePatchKind::Add
 		]);
 		assert!(
-			matches!(operations[0].value(), Some(Value::Number(Number::Float(value))) if *value == 1.0)
+			matches!(operations[0].value(), Some(Value::Number(Number::Float(value))) if value.partial_cmp(&1.0) == Some(std::cmp::Ordering::Equal))
 		);
 		assert_eq!(event.before(), Some(&before));
 		assert_eq!(event.after(), Some(&after));
-		let LiveEventOutput::Diff(changes) = event.presented(LiveOutputMode::Diff, &options)?
+		let LiveEventOutput::Diff(changes) =
+			event.presented(LiveOutputMode::Diff, &options).assert_ok()
 		else {
-			return Err(FerrosGrynnError::invalid_argument("DIFF test output"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("DIFF test output"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(changes[1].before(), Some(&Value::None));
 		assert!(changes[1].after().is_none());
@@ -706,21 +725,28 @@ mod tests {
 			(None, Some(Value::None), LivePatchKind::Add),
 			(Some(Value::Null), None, LivePatchKind::Remove),
 		] {
-			let LiveEventOutput::Patch(operations) =
-				super::tests::event(before, after)?.presented(LiveOutputMode::Patch, &options)?
+			let LiveEventOutput::Patch(operations) = super::tests::event(before, after)
+				.assert_ok()
+				.presented(LiveOutputMode::Patch, &options)
+				.assert_ok()
 			else {
-				return Err(FerrosGrynnError::invalid_argument("root PATCH test output"));
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("root PATCH test output"));
+					test_result.assert_ok();
+				};
 			};
 			assert_eq!(operations.len(), 1);
 			assert_eq!(operations[0].path(), "");
 			assert_eq!(operations[0].kind(), kind);
 		}
-		Ok(())
 	}
 
 	/// Retained output never counts unchanged input images or scratch buffers.
 	#[test]
-	fn live_presentation_retained_excludes_unchanged_images() -> FerrosGrynnResult<()> {
+	fn live_presentation_retained_excludes_unchanged_images() {
+		use crate::test_assertions::AssertResult as _;
+
 		let image = |age| {
 			Value::Object(Object::from_iter([
 				("large", Value::from("x".repeat(16 * 1024))),
@@ -728,104 +754,125 @@ mod tests {
 			]))
 		};
 		let mut batch = crate::live::LiveBatch {
-			id: crate::live::LiveId::from_uuid(uuid::Uuid::now_v7().into())?,
+			id: crate::live::LiveId::from_uuid(uuid::Uuid::now_v7().into()).assert_ok(),
 			version: crate::live::LiveVersion::default(),
 			stamp: 1.into(),
 			committed_at: crate::values::DateTime::from(
 				jiff::Timestamp::UNIX_EPOCH.to_zoned(jiff::tz::TimeZone::UTC),
 			),
-			events: vec![event(Some(image(18)), Some(image(21)))?],
+			events: vec![event(Some(image(18)), Some(image(21))).assert_ok()],
 			bindings: Vec::new(),
 		};
 		let (scratch, _) = prepare_batch_presentation(
 			&mut batch,
 			LiveOutputMode::Diff,
 			&LiveBindingOptions::default(),
-		)?;
+		)
+		.assert_ok();
 		let output = batch.events[0]
 			.output
 			.as_ref()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("prepared DIFF missing"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("prepared DIFF missing"))
+			.assert_ok();
 		assert!(scratch > 32 * 1024);
 		assert!(output.reserved_bytes < 4096, "unchanged images are not retained output");
-		Ok(())
 	}
 
 	/// A complete renderer rejects limits before returning any prefix.
 	#[test]
-	fn live_presentation_native_limits_and_array_replacement() -> FerrosGrynnResult<()> {
+	fn live_presentation_native_limits_and_array_replacement() {
+		use crate::test_assertions::AssertResult as _;
+
 		let before = Value::from(vec![Value::from(1), Value::from(2)]);
 		let after = Value::from(vec![Value::from(2), Value::from(1)]);
-		let event = event(Some(before), Some(after.clone()))?;
+		let event = event(Some(before), Some(after.clone())).assert_ok();
 		let LiveEventOutput::Patch(operations) =
-			event.presented(LiveOutputMode::Patch, &LiveBindingOptions::default())?
+			event.presented(LiveOutputMode::Patch, &LiveBindingOptions::default()).assert_ok()
 		else {
-			return Err(FerrosGrynnError::invalid_argument("array PATCH test output"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("array PATCH test output"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(operations.len(), 1);
 		assert_eq!(operations[0].kind(), LivePatchKind::Replace);
 		assert_eq!(operations[0].value(), Some(&after));
 		for options in [
-			LiveBindingOptions::default().with_budgets(1, 1_000_000)?,
-			LiveBindingOptions::default().with_budgets(256 * 1024 * 1024, 1)?,
+			LiveBindingOptions::default().with_budgets(1, 1_000_000).assert_ok(),
+			LiveBindingOptions::default().with_budgets(256 * 1024 * 1024, 1).assert_ok(),
 		] {
 			assert!(event.presented(LiveOutputMode::Patch, &options).is_err());
 		}
-		Ok(())
 	}
 
 	/// Semantic equality cannot erase a captured temporal representation
 	/// change.
 	#[test]
-	fn live_presentation_native_temporal_representation() -> FerrosGrynnResult<()> {
+	fn live_presentation_native_temporal_representation() {
+		use crate::test_assertions::AssertResult as _;
+
 		let parse_error = |error: jiff::Error| {
 			FerrosGrynnError::invalid_argument("temporal presentation fixture")
 				.with_technical_source(error)
 		};
 		for (before, after) in [
 			(
-				Value::DateTime("2025-01-01T00:00:00+00:00[UTC]".parse().map_err(parse_error)?),
 				Value::DateTime(
-					"2024-12-31T19:00:00-05:00[America/New_York]".parse().map_err(parse_error)?,
+					"2025-01-01T00:00:00+00:00[UTC]".parse().map_err(parse_error).assert_ok(),
+				),
+				Value::DateTime(
+					"2024-12-31T19:00:00-05:00[America/New_York]"
+						.parse()
+						.map_err(parse_error)
+						.assert_ok(),
 				),
 			),
 			(
-				Value::Duration("P1Y".parse().map_err(parse_error)?),
-				Value::Duration("P12M".parse().map_err(parse_error)?),
+				Value::Duration("P1Y".parse().map_err(parse_error).assert_ok()),
+				Value::Duration("P12M".parse().map_err(parse_error).assert_ok()),
 			),
 		] {
 			assert_eq!(before, after);
 			let expected = after.to_string();
-			let event = event(Some(before), Some(after))?;
+			let event = event(Some(before), Some(after)).assert_ok();
 			let LiveEventOutput::Patch(operations) =
-				event.presented(LiveOutputMode::Patch, &LiveBindingOptions::default())?
+				event.presented(LiveOutputMode::Patch, &LiveBindingOptions::default()).assert_ok()
 			else {
-				return Err(FerrosGrynnError::invalid_argument("temporal PATCH output"));
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("temporal PATCH output"));
+					test_result.assert_ok();
+				};
 			};
 			assert_eq!(operations.len(), 1);
 			assert_eq!(operations[0].kind(), LivePatchKind::Replace);
 			assert_eq!(operations[0].value().map(ToString::to_string), Some(expected));
 		}
-		Ok(())
 	}
 
 	/// Composite references and native buffers cannot bypass inspection limits.
 	#[test]
-	fn live_presentation_native_reference_and_buffer_limits() -> FerrosGrynnResult<()> {
-		use crate::values::{Set, Vector};
+	fn live_presentation_native_reference_and_buffer_limits() {
+		use crate::{
+			test_assertions::AssertResult as _,
+			values::{Set, Vector},
+		};
 		let key = RecordId::new(
 			"item",
 			RecordIdPart::Object(Object::from_iter([(
 				"key",
 				Value::from((0..100).map(Value::from).collect::<Vec<_>>()),
 			)])),
-		)?;
+		)
+		.assert_ok();
 		let line = Geometry::LineString(
 			(0..100)
 				.map(|index| Position::new(vec![f64::from(index % 10), 0.0]))
-				.collect::<FerrosGrynnResult<Vec<_>>>()?,
+				.collect::<FerrosGrynnResult<Vec<_>>>()
+				.assert_ok(),
 		);
-		let options = LiveBindingOptions::default().with_budgets(256 * 1024 * 1024, 16)?;
+		let options = LiveBindingOptions::default().with_budgets(256 * 1024 * 1024, 16).assert_ok();
 		for value in [
 			Value::Record(Box::new(key)),
 			Value::Vector(Vector::F64(vec![1.0; 100])),
@@ -833,7 +880,8 @@ mod tests {
 			Value::Geometry(line),
 		] {
 			assert!(
-				event(Some(value.clone()), Some(value))?
+				event(Some(value.clone()), Some(value))
+					.assert_ok()
 					.presented(LiveOutputMode::Full, &options)
 					.is_err()
 			);
@@ -841,29 +889,36 @@ mod tests {
 		let mut set = Set::new();
 		set.insert(Value::from(1));
 		let value = Value::Set(set);
-		let options =
-			LiveBindingOptions::default().with_budgets(4 * size_of::<Value>(), 1_000_000)?;
+		let options = LiveBindingOptions::default()
+			.with_budgets(4 * size_of::<Value>(), 1_000_000)
+			.assert_ok();
 		assert!(
-			event(Some(value.clone()), Some(value))?
+			event(Some(value.clone()), Some(value))
+				.assert_ok()
 				.presented(LiveOutputMode::Full, &options)
 				.is_err()
 		);
-		Ok(())
 	}
 
 	/// JSON numbers remain exact and unsupported native values fail explicitly.
 	#[test]
-	fn live_presentation_json_exact_numbers_and_compatibility() -> FerrosGrynnResult<()> {
+	fn live_presentation_json_exact_numbers_and_compatibility() {
+		use crate::test_assertions::AssertResult as _;
+
 		let options = LiveBindingOptions::default();
-		let output = event(Some(Value::from(1)), Some(Value::from(9_007_199_254_740_993_i64)))?
-			.presented(LiveOutputMode::Patch, &options)?;
+		let output = event(Some(Value::from(1)), Some(Value::from(9_007_199_254_740_993_i64)))
+			.assert_ok()
+			.presented(LiveOutputMode::Patch, &options)
+			.assert_ok();
 		assert_eq!(
-			output.to_json(&options)?,
+			output.to_json(&options).assert_ok(),
 			"[{\"op\":\"replace\",\"path\":\"\",\"value\":9007199254740993}]"
 		);
-		for value in
-			[Value::None, Value::Number(Number::NAN), Value::Record(Box::new("item:a".parse()?))]
-		{
+		for value in [
+			Value::None,
+			Value::Number(Number::NAN),
+			Value::Record(Box::new("item:a".parse().assert_ok())),
+		] {
 			assert!(
 				LiveEventOutput::Full {
 					before: None,
@@ -873,8 +928,7 @@ mod tests {
 				.is_err()
 			);
 		}
-		assert!(output.to_json(&options.clone().with_budgets(1, 1_000_000)?).is_err());
-		assert!(output.to_json(&options.with_budgets(256 * 1024 * 1024, 1)?).is_err());
-		Ok(())
+		assert!(output.to_json(&options.clone().with_budgets(1, 1_000_000).assert_ok()).is_err());
+		assert!(output.to_json(&options.with_budgets(256 * 1024 * 1024, 1).assert_ok()).is_err());
 	}
 }

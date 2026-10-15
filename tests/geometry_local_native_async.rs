@@ -1,8 +1,12 @@
+#![cfg(test)]
 #![cfg(all(windows, feature = "native-async-io"))]
 #![allow(
 	clippy::unwrap_used,
 	reason = "Native I/O contract test fails on the first unexpected error"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::path::PathBuf;
 
@@ -12,14 +16,19 @@ use ferros_grynn::{
 };
 
 /// Removes the test database once all native handles have been released.
-struct Directory(PathBuf);
+struct Directory(
+	/// Removes the test database once all native handles have been released.
+	PathBuf,
+);
 
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Verifies geometry native async index matches scan after mutation and reopen.
 #[test]
 fn geometry_native_async_index_matches_scan_after_mutation_and_reopen() {
 	let directory = Directory(

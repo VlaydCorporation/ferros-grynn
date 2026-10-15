@@ -1,8 +1,13 @@
+#![cfg(test)]
+
 //! Direct SDK checks independent of GQL execution.
 #![allow(
 	clippy::unwrap_used,
 	reason = "test setup and assertions fail on every unexpected SDK error"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use ferros_grynn::{
 	datastore::{ClassSchema, Datastore},
@@ -61,6 +66,7 @@ fn check_family<G: GraphRead>(graph: &G) {
 	}
 }
 
+/// Verifies tensor api accepts every runtime graph family.
 #[test]
 fn tensor_api_accepts_every_runtime_graph_family() {
 	use ferros_grynn::graph::{
@@ -120,6 +126,7 @@ fn tensor_api_accepts_every_runtime_graph_family() {
 	check_family(&Subgraph::from_graph(general));
 }
 
+/// Verifies tensor api generated directed graphs match independent pair oracle.
 #[test]
 fn tensor_api_generated_directed_graphs_match_independent_pair_oracle() {
 	for bits in 0_u64..64 {
@@ -183,6 +190,8 @@ fn tensor_api_generated_directed_graphs_match_independent_pair_oracle() {
 	}
 }
 
+/// Verifies tensor api projects every incidence direction and retains zero
+/// links.
 #[test]
 fn tensor_api_projects_every_incidence_direction_and_retains_zero_links() {
 	let mut graph = Graph::<Mutable>::new();
@@ -285,6 +294,8 @@ fn tensor_api_projects_every_incidence_direction_and_retains_zero_links() {
 	assert!(tensor.validate_binding(&graph).is_err());
 }
 
+/// Verifies tensor api preserves qualified domains and shared child
+/// containment.
 #[test]
 fn tensor_api_preserves_qualified_domains_and_shared_child_containment() {
 	let store = Datastore::in_memory();
@@ -354,6 +365,8 @@ fn tensor_api_preserves_qualified_domains_and_shared_child_containment() {
 	assert_eq!(rooted.connectors().len(), 2);
 }
 
+/// Verifies tensor api rejects malformed csr excessive exports and
+/// cancellation.
 #[test]
 fn tensor_api_rejects_malformed_csr_excessive_exports_and_cancellation() {
 	let limits = GraphAlgorithmLimits::default();
@@ -393,6 +406,8 @@ fn tensor_api_rejects_malformed_csr_excessive_exports_and_cancellation() {
 	assert!(EndpointTensor::from_graph(&graph, small).is_err());
 }
 
+/// Verifies tensor api fallback does not allocate metadata for other index
+/// families.
 #[test]
 fn tensor_api_fallback_does_not_allocate_metadata_for_other_index_families() {
 	use ferros_grynn::datastore::{GraphIndex, GraphIndexDefinition, ReachabilityAlgorithm};
@@ -420,6 +435,8 @@ fn tensor_api_fallback_does_not_allocate_metadata_for_other_index_families() {
 	assert_eq!(tensor.shape(), (0, 0, 2));
 }
 
+/// Verifies tensor api deep rooted and qualified routes use bounded iterative
+/// borrows.
 #[test]
 fn tensor_api_deep_rooted_and_qualified_routes_use_bounded_iterative_borrows() {
 	let mut graph = Graph::<Mutable>::new();
@@ -468,6 +485,7 @@ fn tensor_api_deep_rooted_and_qualified_routes_use_bounded_iterative_borrows() {
 	assert!(EndpointTensor::from_graph(&graph, options).is_err());
 }
 
+/// Verifies tensor api local retains containment without scanning child.
 #[test]
 fn tensor_api_local_retains_containment_without_scanning_child() {
 	let mut child = Graph::<Mutable>::new();
@@ -492,6 +510,7 @@ fn tensor_api_local_retains_containment_without_scanning_child() {
 	);
 }
 
+/// Verifies tensor api kind filtered export counts rejected cells.
 #[test]
 fn tensor_api_kind_filtered_export_counts_rejected_cells() {
 	let mut empty_graph = Graph::<Mutable>::new();
@@ -552,6 +571,7 @@ fn tensor_api_kind_filtered_export_counts_rejected_cells() {
 	);
 }
 
+/// Verifies tensor api tensor admission ignores unrelated large overlay values.
 #[test]
 fn tensor_api_tensor_admission_ignores_unrelated_large_overlay_values() {
 	use ferros_grynn::values::{PropertyKeyId, Value};
@@ -574,6 +594,8 @@ fn tensor_api_tensor_admission_ignores_unrelated_large_overlay_values() {
 	assert!(tensor.admitted_bytes() < 64 * 1024);
 }
 
+/// Verifies tensor cache sdk build snapshot private writes dependencies and
+/// maintenance.
 #[test]
 fn tensor_cache_sdk_build_snapshot_private_writes_dependencies_and_maintenance() {
 	use ferros_grynn::{

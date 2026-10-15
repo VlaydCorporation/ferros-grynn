@@ -14,18 +14,28 @@ use crate::{
 /// One private traversal-stream element.
 #[derive(Debug, Clone)]
 pub(super) struct Traverser {
+	/// Current value carried by the traverser.
 	pub(super) current: Value,
+	/// Optional predecessor-chain identifier for the current traverser.
 	pub(super) trace: Option<PathTraceId>,
+	/// Graph identity from which the retained path trace originated.
 	pub(super) trace_origin: Option<Uuid>,
+	/// Snapshot in which the retained path trace was observed.
 	pub(super) trace_snapshot: Option<SnapshotId>,
+	/// Accumulated numeric cost of the retained traversal path.
 	pub(super) trace_cost: Number,
+	/// Unnamed value carried as mutable traverser-local state.
 	pub(super) sack: Value,
+	/// Named values carried as mutable traverser-local state.
 	pub(super) named_sacks: Object,
+	/// Lexical bindings carried with the traverser.
 	pub(super) env: Object,
+	/// Number of equivalent traversers represented by this entry.
 	pub(super) bulk: NonZeroU64,
 }
 
 impl Traverser {
+	/// Constructs `Traverser` from the supplied initial state.
 	pub(super) fn new(current: Value) -> Self {
 		Self {
 			current,
@@ -40,6 +50,7 @@ impl Traverser {
 		}
 	}
 
+	/// Reports whether the operation can merge for `Traverser`.
 	pub(super) fn can_merge(&self, other: &Self) -> bool {
 		self.trace.is_none()
 			&& other.trace.is_none()
@@ -57,6 +68,7 @@ impl Traverser {
 			&& self.env == other.env
 	}
 
+	/// Returns merge for `Traverser`.
 	pub(super) fn merge(&mut self, other: &Self) -> FerrosGrynnResult<()> {
 		let bulk = self
 			.bulk
@@ -68,6 +80,7 @@ impl Traverser {
 		Ok(())
 	}
 
+	/// Merges fingerprint for `Traverser`.
 	pub(super) fn merge_fingerprint(&self) -> u64 {
 		let mut hasher = rapidhash::fast::RapidHasher::default();
 		self.current.hash(&mut hasher);
@@ -81,11 +94,13 @@ impl Traverser {
 		hasher.finish()
 	}
 
+	/// Configures single bulk for `Traverser`.
 	pub(super) fn with_single_bulk(mut self) -> Self {
 		self.bulk = NonZeroU64::MIN;
 		self
 	}
 
+	/// Returns estimated heap bytes for `Traverser`.
 	pub(super) fn estimated_heap_bytes(&self) -> usize {
 		std::mem::size_of::<Self>()
 			.saturating_add(self.current.estimated_heap_bytes())
@@ -101,9 +116,11 @@ impl Traverser {
 }
 
 #[cfg(test)]
+/// Regression tests for model behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies bulking preserves exact cost prefix representation.
 	#[test]
 	fn bulking_preserves_exact_cost_prefix_representation() {
 		let seed = Traverser::new(Value::None);

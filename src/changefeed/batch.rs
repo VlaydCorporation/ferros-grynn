@@ -94,7 +94,13 @@ impl ChangefeedGap {
 #[non_exhaustive]
 pub enum ChangefeedReadItem {
 	/// Exact selected changes for a whole commit.
-	Commit(ChangeBatch),
+	Commit(
+		/// Exact selected changes for a whole commit.
+		ChangeBatch,
+	),
 	/// Explicit unavailable history, followed by the available tail if any.
-	Gap(ChangefeedGap),
+	Gap(
+		/// Explicit unavailable history, followed by the available tail if any.
+		ChangefeedGap,
+	),
 }

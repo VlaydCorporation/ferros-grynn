@@ -1,10 +1,11 @@
 //! Shared typed identities and clocks for local disk storage.
 
 use super::page::PageNo;
+#[cfg(feature = "storage-engine-prototype-api")]
+use crate::graph::GraphId;
 use crate::{
 	datastore::DataSpaceId,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::GraphId,
 };
 
 /// First assignable WAL record position.
@@ -16,7 +17,11 @@ const MAX_FILE_INSTANCE_ID: u64 = u64::MAX >> u8::BITS;
 /// A non-zero position in the database WAL record stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct Lsn(u64);
+pub struct Lsn(
+	/// WAL record position, including the zero sentinel before any record
+	/// exists.
+	u64,
+);
 
 impl Lsn {
 	/// First assignable WAL record position.
@@ -50,7 +55,11 @@ impl Lsn {
 /// Database-wide logical commit clock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct CommitTs(u64);
+pub(super) struct CommitTs(
+	/// Database-wide logical commit clock persisted with transaction
+	/// visibility.
+	u64,
+);
 
 impl CommitTs {
 	/// Clock value before the first committed transaction.
@@ -70,7 +79,10 @@ impl CommitTs {
 /// Database-wide transaction identity stored in WAL headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct TxId(u64);
+pub(super) struct TxId(
+	/// WAL transaction identity; zero denotes database-level maintenance.
+	u64,
+);
 
 impl TxId {
 	/// Reserved identity for database-level maintenance records.
@@ -90,7 +102,10 @@ impl TxId {
 /// Monotonic checkpoint generation committed by the database superblock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct CheckpointGeneration(u64);
+pub struct CheckpointGeneration(
+	/// Monotonic generation published by the completed database checkpoint.
+	u64,
+);
 
 impl CheckpointGeneration {
 	/// Generation before the first completed checkpoint.
@@ -121,6 +136,7 @@ impl CheckpointGeneration {
 /// Closed format-v1 physical file role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum DataFileKind {
 	/// Database system catalog.
 	SystemCatalog = 0x01,
@@ -246,13 +262,15 @@ impl DataFileKind {
 /// holds the closed [`DataFileKind`] discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct DataFileId(u64);
+pub struct DataFileId(
+	/// Packed non-reused 56-bit file instance identity and eight-bit file-kind
+	/// discriminator.
+	u64,
+);
 
 impl DataFileId {
 	/// First unassignable value used as the exhausted next-id clock.
 	pub(super) const EXHAUSTED_INSTANCE_ID: u64 = MAX_FILE_INSTANCE_ID + 1;
-	/// Largest format-v1 file instance identity.
-	pub(super) const MAX_INSTANCE_ID: u64 = MAX_FILE_INSTANCE_ID;
 
 	/// Creates the canonical zero-instance identity for one singleton family.
 	pub(super) const fn for_kind(kind: DataFileKind) -> Self {
@@ -317,12 +335,14 @@ impl PageKey {
 
 	/// Creates a database-global key for the measurement-only prototype API.
 	#[doc(hidden)]
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub const fn for_database(file_id: DataFileId, page_no: PageNo) -> Self {
 		Self::new(DataSpaceId::Database, file_id, page_no)
 	}
 
 	/// Creates a graph-local key for the measurement-only prototype API.
 	#[doc(hidden)]
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub const fn for_graph(graph_id: GraphId, file_id: DataFileId, page_no: PageNo) -> Self {
 		Self::new(DataSpaceId::Graph(graph_id), file_id, page_no)
 	}
@@ -334,6 +354,7 @@ impl PageKey {
 
 	/// Returns the durable data-space integer for measurement-only tooling.
 	#[doc(hidden)]
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub const fn data_space_raw(self) -> u64 {
 		self.space_id.raw()
 	}
@@ -379,8 +400,11 @@ impl StorageSnapshot {
 }
 
 #[cfg(test)]
+/// Regression tests for types behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 
 	/// Data-file identities preserve both the family and 56-bit instance.
 	#[test]
@@ -424,7 +448,7 @@ mod tests {
 		let file = DataFileId::for_kind(DataFileKind::AtomsHot);
 		let database = PageKey::new(DataSpaceId::Database, file, PageNo::new(3));
 		let graph = PageKey::new(
-			DataSpaceId::Graph(crate::graph::GraphId::new(7).unwrap()),
+			DataSpaceId::Graph(crate::graph::GraphId::new(7).assert_some()),
 			file,
 			PageNo::new(3),
 		);

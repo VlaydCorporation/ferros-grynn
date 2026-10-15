@@ -43,10 +43,10 @@ pub(super) fn finite(value: f64) -> FerrosGrynnResult<f64> {
 ///
 /// # Errors
 /// Rejects arithmetic overflow, cancellation or exhausted operation limits.
-pub fn degree(
+pub fn degree<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	limits: GraphAlgorithmLimits,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<AnalyticsResult<DegreeValues, GraphAlgorithmLimits>> {
 	let mut control = Control::new(limits, check)?;
 	let mut values = control.filled(projection.atoms.len(), DegreeValues::default())?;
@@ -195,10 +195,10 @@ impl Strengths {
 /// # Errors
 /// Rejects invalid weights/controls, overflow, cancellation, resource limits or
 /// nonconvergence.
-pub fn page_rank(
+pub fn page_rank<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: PageRankOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<AnalyticsResult<f64, PageRankOptions>> {
 	options.iteration.validate()?;
 	if !options.damping.is_finite() || !(0.0..1.0).contains(&options.damping) {
@@ -297,10 +297,10 @@ pub fn page_rank(
 /// # Errors
 /// Rejects negative/nonfinite strengths, invalid controls, numeric overflow or
 /// nonconvergence.
-pub fn eigenvector(
+pub fn eigenvector<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: SpectralOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<AnalyticsResult<f64, SpectralOptions>> {
 	options.iteration.validate()?;
 	let mut control = Control::new(options.limits, check)?;
@@ -381,10 +381,10 @@ pub fn eigenvector(
 /// # Errors
 /// Rejects invalid alpha/beta, strengths, overflow, resource limits or
 /// nonconvergence.
-pub fn katz(
+pub fn katz<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	mut options: KatzOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<AnalyticsResult<f64, KatzOptions>> {
 	options.spectral.iteration.validate()?;
 	if !options.beta.is_finite() || options.beta < 0.0 {
@@ -451,10 +451,10 @@ pub fn katz(
 ///
 /// # Errors
 /// Rejects invalid costs, overflow, cancellation or resource exhaustion.
-pub fn harmonic_closeness(
+pub fn harmonic_closeness<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: CentralityOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<AnalyticsResult<f64, CentralityOptions>> {
 	let mut control = Control::new(options.limits, check)?;
 	if needs_full_state(projection, options.weights, &mut control)? {
@@ -473,16 +473,16 @@ pub fn harmonic_closeness(
 		distances.search(source, false, &mut control)?;
 		for (target, distance) in distances.values.iter().enumerate() {
 			control.step()?;
-			if source != target {
-				if let Some(distance) = distance {
-					*score = finite(
-						*score
-							+ 1.0
-								/ distance.as_f64().ok_or_else(|| {
-									invalid("distance cannot be represented as a floating score")
-								})?,
-					)?;
-				}
+			if source != target
+				&& let Some(distance) = distance
+			{
+				*score = finite(
+					*score
+						+ 1.0
+							/ distance.as_f64().ok_or_else(|| {
+								invalid("distance cannot be represented as a floating score")
+							})?,
+				)?;
 			}
 		}
 		if options.normalized && projection.atoms.len() > 1 {
@@ -497,10 +497,10 @@ pub fn harmonic_closeness(
 /// # Errors
 /// Rejects nonpositive costs, unrepresentable Number distance progression,
 /// path-counter overflow, cancellation and resource exhaustion.
-pub fn betweenness(
+pub fn betweenness<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: CentralityOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<AnalyticsResult<f64, CentralityOptions>> {
 	let mut control = Control::new(options.limits, check)?;
 	if needs_full_state(projection, options.weights, &mut control)? {
@@ -523,17 +523,17 @@ pub fn betweenness(
 				distances.values[target].ok_or_else(|| invalid("settled distance is absent"))?;
 			for (previous, cost, multiplicity) in distances.incoming(target) {
 				control.step()?;
-				if let Some(before) = distances.values[previous] {
-					if add_numbers(before, cost)? == target_distance {
-						let numerator = distances.counts[previous]
-							.checked_mul(multiplicity)
-							.ok_or_else(overflow)?;
-						dependency[previous] = finite(
-							dependency[previous]
-								+ numerator as f64 / distances.counts[target] as f64
-									* (1.0 + dependency[target]),
-						)?;
-					}
+				if let Some(before) = distances.values[previous]
+					&& add_numbers(before, cost)? == target_distance
+				{
+					let numerator = distances.counts[previous]
+						.checked_mul(multiplicity)
+						.ok_or_else(overflow)?;
+					dependency[previous] = finite(
+						dependency[previous]
+							+ numerator as f64 / distances.counts[target] as f64
+								* (1.0 + dependency[target]),
+					)?;
 				}
 			}
 			if target != source {

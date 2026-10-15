@@ -12,16 +12,21 @@ use crate::{
 
 /// Every SDK key stays source-local in root, scoped and nested point queries.
 #[test]
-fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
-	use crate::values::{RecordIdPart, Ulid, Uuid};
+fn live_point_sources_all_keys_and_nested_targets() {
+	use crate::{
+		test_assertions::AssertResult as _,
+		values::{RecordIdPart, Ulid, Uuid},
+	};
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-		"score",
-		Type::Int,
-	)])?)?;
-	let score = setup.intern_property("score")?;
-	let graph = setup.define_graph("points", GraphKind::Graph)?;
+	setup
+		.define_class(
+			ClassSchema::new("item", AtomKind::Node, [ClassField::new("score", Type::Int)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	let score = setup.intern_property("score").assert_ok();
+	let graph = setup.define_graph("points", GraphKind::Graph).assert_ok();
 	let keys = [
 		RecordIdPart::Int(9_007_199_254_740_993),
 		RecordIdPart::String("text".into()),
@@ -32,14 +37,15 @@ fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
 	];
 	let mut records = Vec::new();
 	for (ordinal, key) in keys.into_iter().enumerate() {
-		let record = RecordId::new("item", key)?;
+		let record = RecordId::new("item", key).assert_ok();
 		setup
-			.create_atom(record.clone(), PropertyMap::from_iter([(score, Value::from(ordinal))]))?;
-		setup.attach_node(graph.id(), &record, None, None)?;
-		setup.set_overlay(graph.id(), &record, score, Value::from(ordinal + 10))?;
+			.create_atom(record.clone(), PropertyMap::from_iter([(score, Value::from(ordinal))]))
+			.assert_ok();
+		setup.attach_node(graph.id(), &record, None, None).assert_ok();
+		setup.set_overlay(graph.id(), &record, score, Value::from(ordinal + 10)).assert_ok();
 		records.push(record);
 	}
-	setup.commit()?;
+	setup.commit().assert_ok();
 	let evaluate = |query: &LiveQuery| {
 		evaluate_query(
 			&store.inner.current_root(),
@@ -61,8 +67,8 @@ fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
 				LiveSource::Record(record.clone())
 			};
 			let query = LiveQuery::new(source)
-				.with_projection(LiveProjection::Value(LiveExpr::field("score")?));
-			let actual = evaluate(&query)?;
+				.with_projection(LiveProjection::Value(LiveExpr::field("score").assert_ok()));
+			let actual = evaluate(&query).assert_ok();
 			assert_eq!(actual.rows.len(), 1);
 			assert_eq!(
 				actual.rows.into_values().next(),
@@ -79,7 +85,8 @@ fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
 				.inner
 				.current_root()
 				.atom_by_record(record)
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("point fixture missing"))?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("point fixture missing"))
+				.assert_ok()
 				.id();
 			assert!(
 				actual
@@ -91,7 +98,7 @@ fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
 				LiveProjection::Value(LiveExpr::Select(Box::new(query.with_only(true)))),
 			);
 			assert_eq!(
-				evaluate(&outer)?.rows.into_values().next(),
+				evaluate(&outer).assert_ok().rows.into_values().next(),
 				Some(Value::from(
 					ordinal
 						+ if scoped {
@@ -103,11 +110,10 @@ fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
 			);
 		}
 	}
-	let missing = LiveQuery::new(LiveSource::Record(RecordId::new(
-		"item",
-		RecordIdPart::Array(vec![Value::from("missing")].into()),
-	)?));
-	assert!(evaluate(&missing)?.rows.is_empty());
+	let missing = LiveQuery::new(LiveSource::Record(
+		RecordId::new("item", RecordIdPart::Array(vec![Value::from("missing")].into())).assert_ok(),
+	));
+	assert!(evaluate(&missing).assert_ok().rows.is_empty());
 	let count = LiveExpr::Select(Box::new(missing.with_projection(LiveProjection::Value(
 		LiveExpr::Call {
 			name: "count".into(),
@@ -116,36 +122,40 @@ fn live_point_sources_all_keys_and_nested_targets() -> FerrosGrynnResult<()> {
 	))));
 	let outer = LiveQuery::new(LiveSource::Record(records[0].clone()))
 		.with_projection(LiveProjection::Value(count));
-	assert_eq!(evaluate(&outer)?.rows.into_values().next(), Some(Value::from(0)));
-	Ok(())
+	assert_eq!(evaluate(&outer).assert_ok().rows.into_values().next(), Some(Value::from(0)));
 }
 
 /// Bound source metadata cannot freeze a mutable slot or a different class.
 #[test]
-fn live_point_source_metadata_requires_exact_immutable_literal() -> FerrosGrynnResult<()> {
+fn live_point_source_metadata_requires_exact_immutable_literal() {
 	use crate::{
 		gql::root_catalog::RootCatalog,
 		syn::{ParserSettings, SelectTarget, StatementKind, parse},
+		test_assertions::AssertResult as _,
 	};
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-	setup.commit()?;
+	setup.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
+	setup.commit().assert_ok();
 	let root = store.inner.current_root();
 	let catalog = RootCatalog(&root);
 	let text = "SELECT * FROM item;";
-	let mut program = parse(text, ParserSettings::default())?;
+	let mut program = parse(text, ParserSettings::default()).assert_ok();
 	let StatementKind::Select(select) = &mut program.statements[0].kind else {
-		return Err(FerrosGrynnError::invalid_argument("point statement missing"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("point statement missing"));
+			test_result.assert_ok();
+		};
 	};
 	select.source.kind = crate::syn::SelectSourceKind::Atoms(SelectTarget::BoundRecord {
 		class: super::super::identifier("item"),
 		parameter: super::super::identifier("key"),
 	});
 	for (value, mutable, accepted) in [
-		(Value::from("item:a".parse::<RecordId>()?), false, true),
-		(Value::from("item:a".parse::<RecordId>()?), true, false),
-		(Value::from("other:a".parse::<RecordId>()?), false, false),
+		(Value::from("item:a".parse::<RecordId>().assert_ok()), false, true),
+		(Value::from("item:a".parse::<RecordId>().assert_ok()), true, false),
+		(Value::from("other:a".parse::<RecordId>().assert_ok()), false, false),
 		(Value::from(1), false, false),
 	] {
 		let parameters = Object::from_iter([("key", value)]);
@@ -175,20 +185,24 @@ fn live_point_source_metadata_requires_exact_immutable_literal() -> FerrosGrynnR
 		)
 		.is_err()
 	);
-	Ok(())
 }
 
 /// Mid-scan cancellation is inherited by the root reader; partial rows are
 /// discarded and interruption is not retained by ordinary reevaluation.
 #[test]
-fn live_query_initial_scan_inherits_registration_cancellation() -> FerrosGrynnResult<()> {
+fn live_query_initial_scan_inherits_registration_cancellation() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+	let class =
+		setup.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
 	for key in 0..100 {
-		setup.create_atom(format!("item:{key}").parse()?, PropertyMap::new())?;
+		setup
+			.create_atom(format!("item:{key}").parse().assert_ok(), PropertyMap::new())
+			.assert_ok();
 	}
-	setup.commit()?;
+	setup.commit().assert_ok();
 	let query = LiveQuery::new(LiveSource::Class(class));
 	let token = crate::gql::QueryCancellation::default();
 	let control = crate::gql::ExecutionControl::new(
@@ -229,14 +243,16 @@ fn live_query_initial_scan_inherits_registration_cancellation() -> FerrosGrynnRe
 		&LiveOptions::default(),
 		std::env::temp_dir(),
 		&|_| {},
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(later.rows.len(), 100);
-	Ok(())
 }
 
 /// Caller checks reach named PURE compilation without another wall clock.
 #[test]
-fn live_query_initial_compiler_and_deadline_inherit_checks() -> FerrosGrynnResult<()> {
+fn live_query_initial_compiler_and_deadline_inherit_checks() {
+	use crate::test_assertions::AssertResult as _;
+
 	let token = crate::gql::QueryCancellation::default();
 	let control = crate::gql::ExecutionControl::new(
 		&crate::gql::QueryExecutionOptions {
@@ -247,7 +263,7 @@ fn live_query_initial_compiler_and_deadline_inherit_checks() -> FerrosGrynnResul
 	);
 	let compiler = crate::gql::closure::LanguageClosureState::bounded_with_work(1 << 20, 1_000)
 		.with_compile_checks(Some(control.interruption()));
-	let _reservation = compiler.admit_compile(1)?;
+	let _reservation = compiler.admit_compile(1).assert_ok();
 	token.cancel();
 	assert!(compiler.admit_compile(1).is_err());
 	let deadline = crate::gql::ExecutionControl::new(
@@ -262,39 +278,47 @@ fn live_query_initial_compiler_and_deadline_inherit_checks() -> FerrosGrynnResul
 			.inherit_checks(&deadline);
 	assert_eq!(child.deadline(), deadline.deadline());
 	assert!(child.check().is_err());
-	Ok(())
 }
 
 /// Ordinary SELECT and root-bound collection retain exact projection/FETCH
 /// values.
 #[test]
-fn live_query_rows_where_fetch_aliases_and_aggregate() -> FerrosGrynnResult<()> {
+fn live_query_rows_where_fetch_aliases_and_aggregate() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [
-		ClassField::new("age", Type::Int),
-		ClassField::new("manager", Type::Option(Box::new(Type::Record))),
-	])?)?;
-	let age = tx.intern_property("age")?;
-	let manager = tx.intern_property("manager")?;
-	let alice: RecordId = "person:alice".parse()?;
-	let bob: RecordId = "person:bob".parse()?;
+	let class = tx
+		.define_class(
+			ClassSchema::new("person", AtomKind::Node, [
+				ClassField::new("age", Type::Int),
+				ClassField::new("manager", Type::Option(Box::new(Type::Record))),
+			])
+			.assert_ok(),
+		)
+		.assert_ok();
+	let age = tx.intern_property("age").assert_ok();
+	let manager = tx.intern_property("manager").assert_ok();
+	let alice: RecordId = "person:alice".parse().assert_ok();
+	let bob: RecordId = "person:bob".parse().assert_ok();
 	tx.create_atom(
 		alice.clone(),
 		PropertyMap::from_iter([(age, 19_i64.into()), (manager, Value::from(bob.clone()))]),
-	)?;
-	tx.create_atom(bob.clone(), PropertyMap::from_iter([(age, 40_i64.into())]))?;
-	tx.commit()?;
+	)
+	.assert_ok();
+	tx.create_atom(bob.clone(), PropertyMap::from_iter([(age, 40_i64.into())])).assert_ok();
+	tx.commit().assert_ok();
 	let query = LiveQuery::new(LiveSource::Class(class))
 		.with_filter(
-			LiveExpr::field("age")?
+			LiveExpr::field("age")
+				.assert_ok()
 				.binary(LiveBinaryOperator::Less, LiveExpr::Literal(30_i64.into())),
 		)
 		.with_projection(LiveProjection::Fields(vec![
-			LiveField::new(LiveExpr::field("manager")?)
-				.with_alias(LivePath::new(vec!["nested".into(), "boss".into()])?),
+			LiveField::new(LiveExpr::field("manager").assert_ok())
+				.with_alias(LivePath::new(vec!["nested".into(), "boss".into()]).assert_ok()),
 		]))
-		.with_fetch(vec![LivePath::new(vec!["nested".into(), "boss".into()])?]);
+		.with_fetch(vec![LivePath::new(vec!["nested".into(), "boss".into()]).assert_ok()]);
 	let evaluate = |query: &LiveQuery| {
 		evaluate_query(
 			&store.inner.current_root(),
@@ -305,20 +329,33 @@ fn live_query_rows_where_fetch_aliases_and_aggregate() -> FerrosGrynnResult<()> 
 			&|_key| {},
 		)
 	};
-	let before = evaluate(&query)?;
+	let before = evaluate(&query).assert_ok();
 	assert_eq!(before.rows.len(), 1);
 	let projected = before
 		.rows
 		.get(&LiveIdentity::Record(alice.clone()))
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing test source"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing test source"))
+		.assert_ok();
 	let Value::Object(object) = projected else {
-		return Err(FerrosGrynnError::invalid_argument("expected projected object"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("expected projected object"));
+			test_result.assert_ok();
+		};
 	};
 	let Some(Value::Object(nested)) = object.get("nested") else {
-		return Err(FerrosGrynnError::invalid_argument("nested alias was lost"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("nested alias was lost"));
+			test_result.assert_ok();
+		};
 	};
 	let Some(Value::Object(boss)) = nested.get("boss") else {
-		return Err(FerrosGrynnError::invalid_argument("nested FETCH was skipped"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("nested FETCH was skipped"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(boss.get("age"), Some(&Value::from(40_i64)));
 	assert!(
@@ -326,9 +363,9 @@ fn live_query_rows_where_fetch_aliases_and_aggregate() -> FerrosGrynnResult<()> 
 		"class range retains WHERE=false and same-class FETCH dependencies"
 	);
 	let mut change = store.begin();
-	change.set_base_property(&bob, age, 25_i64.into())?;
-	change.commit()?;
-	let after = evaluate(&query)?;
+	change.set_base_property(&bob, age, 25_i64.into()).assert_ok();
+	change.commit().assert_ok();
+	let after = evaluate(&query).assert_ok();
 	assert_eq!(after.rows.len(), 2);
 	assert_ne!(
 		before.rows.get(&LiveIdentity::Record(alice.clone())),
@@ -341,14 +378,17 @@ fn live_query_rows_where_fetch_aliases_and_aggregate() -> FerrosGrynnResult<()> 
 		}),
 	);
 	assert_eq!(
-		evaluate(&aggregate)?.rows.get(&LiveIdentity::Aggregate(Vec::new())),
+		evaluate(&aggregate).assert_ok().rows.get(&LiveIdentity::Aggregate(Vec::new())),
 		Some(&Value::from(2_i64))
 	);
 	let none = LiveQuery::new(LiveSource::Record(bob.clone()))
 		.with_projection(LiveProjection::Value(LiveExpr::Literal(Value::None)));
-	assert_eq!(evaluate(&none)?.rows.get(&LiveIdentity::Record(bob)), Some(&Value::None));
-	let complete = evaluate(&query)?;
-	let limit = LiveOptions::default().with_budgets(64 << 20, complete.work_used - 1)?;
+	assert_eq!(
+		evaluate(&none).assert_ok().rows.get(&LiveIdentity::Record(bob)),
+		Some(&Value::None)
+	);
+	let complete = evaluate(&query).assert_ok();
+	let limit = LiveOptions::default().with_budgets(64 << 20, complete.work_used - 1).assert_ok();
 	assert!(
 		evaluate_query(
 			&store.inner.current_root(),
@@ -360,29 +400,36 @@ fn live_query_rows_where_fetch_aliases_and_aggregate() -> FerrosGrynnResult<()> 
 		)
 		.is_err()
 	);
-	Ok(())
 }
 
 /// Literal OMIT paths share ordinary projection/FETCH and keep result
 /// identities.
 #[test]
-fn live_query_omit_paths_and_identities() -> FerrosGrynnResult<()> {
+fn live_query_omit_paths_and_identities() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [
-		ClassField::new("age", Type::Int),
-		ClassField::new("manager", Type::Option(Box::new(Type::Record))),
-	])?)?;
-	let age = tx.intern_property("age")?;
-	let manager = tx.intern_property("manager")?;
-	let alice: RecordId = "person:alice".parse()?;
-	let bob: RecordId = "person:bob".parse()?;
+	let class = tx
+		.define_class(
+			ClassSchema::new("person", AtomKind::Node, [
+				ClassField::new("age", Type::Int),
+				ClassField::new("manager", Type::Option(Box::new(Type::Record))),
+			])
+			.assert_ok(),
+		)
+		.assert_ok();
+	let age = tx.intern_property("age").assert_ok();
+	let manager = tx.intern_property("manager").assert_ok();
+	let alice: RecordId = "person:alice".parse().assert_ok();
+	let bob: RecordId = "person:bob".parse().assert_ok();
 	tx.create_atom(
 		alice.clone(),
 		PropertyMap::from_iter([(age, 19.into()), (manager, Value::from(bob.clone()))]),
-	)?;
-	tx.create_atom(bob.clone(), PropertyMap::from_iter([(age, 40.into())]))?;
-	tx.commit()?;
+	)
+	.assert_ok();
+	tx.create_atom(bob.clone(), PropertyMap::from_iter([(age, 40.into())])).assert_ok();
+	tx.commit().assert_ok();
 	let evaluate = |query: &LiveQuery| {
 		evaluate_query(
 			&store.inner.current_root(),
@@ -397,33 +444,39 @@ fn live_query_omit_paths_and_identities() -> FerrosGrynnResult<()> {
 		|fields: &[&str]| LivePath::new(fields.iter().map(|field| (*field).into()).collect());
 	let query = LiveQuery::new(LiveSource::Record(alice.clone()))
 		.with_projection(LiveProjection::Fields(vec![
-			LiveField::new(LiveExpr::field("age")?).with_alias(path(&["nested", "age"])?),
-			LiveField::new(LiveExpr::field("manager")?).with_alias(path(&["nested", "boss"])?),
-			LiveField::new(LiveExpr::Literal(5.into())).with_alias(LivePath::field("literal.dot")?),
+			LiveField::new(LiveExpr::field("age").assert_ok())
+				.with_alias(path(&["nested", "age"]).assert_ok()),
+			LiveField::new(LiveExpr::field("manager").assert_ok())
+				.with_alias(path(&["nested", "boss"]).assert_ok()),
+			LiveField::new(LiveExpr::Literal(5.into()))
+				.with_alias(LivePath::field("literal.dot").assert_ok()),
 		]))
 		.with_omit(vec![
-			LivePath::field("id")?,
-			path(&["nested", "age"])?,
-			LivePath::field("literal.dot")?,
-			path(&["nested", "age"])?,
-			LivePath::field("absent")?,
-			path(&["nested", "boss", "age"])?,
+			LivePath::field("id").assert_ok(),
+			path(&["nested", "age"]).assert_ok(),
+			LivePath::field("literal.dot").assert_ok(),
+			path(&["nested", "age"]).assert_ok(),
+			LivePath::field("absent").assert_ok(),
+			path(&["nested", "boss", "age"]).assert_ok(),
 		])
-		.with_fetch(vec![path(&["nested", "boss"])?]);
+		.with_fetch(vec![path(&["nested", "boss"]).assert_ok()]);
 	assert_eq!(query.omit()[2].segments().len(), 1);
-	let result = evaluate(&query)?;
+	let result = evaluate(&query).assert_ok();
 	let image = result
 		.rows
 		.get(&LiveIdentity::Record(alice.clone()))
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT row missing"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT row missing"))
+		.assert_ok();
 	let object = image
 		.as_object()
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT object missing"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT object missing"))
+		.assert_ok();
 	assert!(object.get("id").is_none() && object.get("literal.dot").is_none());
 	let nested = object
 		.get("nested")
 		.and_then(Value::as_object)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("nested OMIT missing"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("nested OMIT missing"))
+		.assert_ok();
 	assert!(nested.get("age").is_none());
 	assert!(
 		matches!(nested.get("boss"), Some(Value::Object(boss)) if boss.get("age") == Some(&40.into()))
@@ -432,12 +485,13 @@ fn live_query_omit_paths_and_identities() -> FerrosGrynnResult<()> {
 		.inner
 		.current_root()
 		.atom_by_record(&bob)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("boss missing"))?
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("boss missing"))
+		.assert_ok()
 		.id();
 	assert!(result.reads.contains(&ConflictKey::BaseAtom(bob_global)));
-	let omitted = query.with_omit(vec![path(&["nested", "boss"])?]);
+	let omitted = query.with_omit(vec![path(&["nested", "boss"]).assert_ok()]);
 	assert!(
-		!evaluate(&omitted)?.reads.contains(&ConflictKey::BaseAtom(bob_global)),
+		!evaluate(&omitted).assert_ok().reads.contains(&ConflictKey::BaseAtom(bob_global)),
 		"OMIT precedes FETCH and removes its external read"
 	);
 	for value in [
@@ -446,52 +500,62 @@ fn live_query_omit_paths_and_identities() -> FerrosGrynnResult<()> {
 	] {
 		let scalar = LiveQuery::new(LiveSource::Record(alice.clone()))
 			.with_projection(LiveProjection::Value(LiveExpr::Literal(value.clone())))
-			.with_omit(vec![LivePath::field("x")?]);
-		assert_eq!(evaluate(&scalar)?.rows.get(&LiveIdentity::Record(alice.clone())), Some(&value));
+			.with_omit(vec![LivePath::field("x").assert_ok()]);
+		assert_eq!(
+			evaluate(&scalar).assert_ok().rows.get(&LiveIdentity::Record(alice.clone())),
+			Some(&value)
+		);
 	}
 	let grouped = LiveQuery::new(LiveSource::Class(class))
-		.with_group_by(vec![LiveExpr::field("age")?])?
+		.with_group_by(vec![LiveExpr::field("age").assert_ok()])
+		.assert_ok()
 		.with_projection(LiveProjection::Fields(vec![
-			LiveField::new(LiveExpr::field("age")?).with_alias(LivePath::field("key")?),
+			LiveField::new(LiveExpr::field("age").assert_ok())
+				.with_alias(LivePath::field("key").assert_ok()),
 			LiveField::new(LiveExpr::Call {
 				name: "count".into(),
 				arguments: Vec::new(),
 			})
-			.with_alias(LivePath::field("n")?),
+			.with_alias(LivePath::field("n").assert_ok()),
 		]))
-		.with_omit(vec![LivePath::field("key")?]);
-	let result = evaluate(&grouped)?;
+		.with_omit(vec![LivePath::field("key").assert_ok()]);
+	let result = evaluate(&grouped).assert_ok();
 	assert_eq!(result.rows.len(), 2);
 	for key in [19, 40] {
 		let image = result
 			.rows
 			.get(&LiveIdentity::Aggregate(vec![Value::from(key)]))
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT group missing"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT group missing"))
+			.assert_ok();
 		assert!(
 			matches!(image, Value::Object(object) if object.get("key").is_none() && object.get("n") == Some(&1.into()))
 		);
 	}
-	Ok(())
 }
 
 /// Qualified identities and unknown FETCH dependencies preserve exact scope.
 #[test]
-fn live_query_qualified_identity_absent_fetch_and_resource_errors() -> FerrosGrynnResult<()> {
+fn live_query_qualified_identity_absent_fetch_and_resource_errors() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let class = tx.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-		"link",
-		Type::Record,
-	)])?)?;
-	let link = tx.intern_property("link")?;
-	let record: RecordId = "item:a".parse()?;
+	let class = tx
+		.define_class(
+			ClassSchema::new("item", AtomKind::Node, [ClassField::new("link", Type::Record)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	let link = tx.intern_property("link").assert_ok();
+	let record: RecordId = "item:a".parse().assert_ok();
 	tx.create_atom(
 		record.clone(),
-		PropertyMap::from_iter([(link, Value::from("missing:no".parse::<RecordId>()?))]),
-	)?;
-	let graph = tx.define_graph("scope", GraphKind::Graph)?;
-	tx.attach_node(graph.id(), &record, None, None)?;
-	tx.commit()?;
+		PropertyMap::from_iter([(link, Value::from("missing:no".parse::<RecordId>().assert_ok()))]),
+	)
+	.assert_ok();
+	let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	tx.attach_node(graph.id(), &record, None, None).assert_ok();
+	tx.commit().assert_ok();
 	for source in [
 		LiveSource::GraphClass {
 			graph: graph.clone(),
@@ -503,8 +567,10 @@ fn live_query_qualified_identity_absent_fetch_and_resource_errors() -> FerrosGry
 		},
 	] {
 		let query = LiveQuery::new(source)
-			.with_projection(LiveProjection::Fields(vec![LiveField::new(LiveExpr::field("link")?)]))
-			.with_fetch(vec![LivePath::field("link")?]);
+			.with_projection(LiveProjection::Fields(vec![LiveField::new(
+				LiveExpr::field("link").assert_ok(),
+			)]))
+			.with_fetch(vec![LivePath::field("link").assert_ok()]);
 		let evaluation = evaluate_query(
 			&store.inner.current_root(),
 			&query,
@@ -512,11 +578,12 @@ fn live_query_qualified_identity_absent_fetch_and_resource_errors() -> FerrosGry
 			&LiveOptions::default(),
 			std::env::temp_dir(),
 			&|_key| {},
-		)?;
+		)
+		.assert_ok();
 		assert!(
 			matches!(evaluation.rows.keys().next(), Some(LiveIdentity::Occurrence(occurrence)) if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record)
 		);
-		let limited = LiveOptions::default().with_budgets(1024, 1)?;
+		let limited = LiveOptions::default().with_budgets(1024, 1).assert_ok();
 		assert!(
 			evaluate_query(
 				&store.inner.current_root(),
@@ -529,16 +596,17 @@ fn live_query_qualified_identity_absent_fetch_and_resource_errors() -> FerrosGry
 			.is_err()
 		);
 	}
-	Ok(())
 }
 
 /// A whole graph has one aggregate across classes, including an empty catalog.
 #[test]
-fn live_query_graph_wide_aggregate_unifies_classes_and_empty_domain() -> FerrosGrynnResult<()> {
+fn live_query_graph_wide_aggregate_unifies_classes_and_empty_domain() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Metagraph)?;
-	tx.commit()?;
+	let graph = tx.define_graph("scope", GraphKind::Metagraph).assert_ok();
+	tx.commit().assert_ok();
 	let query = LiveQuery::new(LiveSource::Graph(graph.clone())).with_projection(
 		LiveProjection::Value(LiveExpr::Call {
 			name: "count".into(),
@@ -556,46 +624,52 @@ fn live_query_graph_wide_aggregate_unifies_classes_and_empty_domain() -> FerrosG
 		)
 	};
 	assert_eq!(
-		evaluate()?.rows.get(&LiveIdentity::Aggregate(Vec::new())),
+		evaluate().assert_ok().rows.get(&LiveIdentity::Aggregate(Vec::new())),
 		Some(&Value::from(0_i64))
 	);
 	let mut create = store.begin();
-	create.define_class(ClassSchema::new("other", AtomKind::Node, [ClassField::new(
-		"extra",
-		Type::String,
-	)])?)?;
-	create.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+	create
+		.define_class(
+			ClassSchema::new("other", AtomKind::Node, [ClassField::new("extra", Type::String)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	create.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
 	for spelling in ["other:a", "item:b", "item:c"] {
-		let record: RecordId = spelling.parse()?;
+		let record: RecordId = spelling.parse().assert_ok();
 		let properties = if spelling.starts_with("other") {
-			PropertyMap::from_iter([(create.intern_property("extra")?, Value::from("value"))])
+			PropertyMap::from_iter([(
+				create.intern_property("extra").assert_ok(),
+				Value::from("value"),
+			)])
 		} else {
 			PropertyMap::new()
 		};
-		create.create_atom(record.clone(), properties)?;
-		create.attach_node(graph.id(), &record, None, None)?;
+		create.create_atom(record.clone(), properties).assert_ok();
+		create.attach_node(graph.id(), &record, None, None).assert_ok();
 	}
-	create.commit()?;
-	let result = evaluate()?;
+	create.commit().assert_ok();
+	let result = evaluate().assert_ok();
 	assert_eq!(result.rows.len(), 1);
 	assert_eq!(result.rows.get(&LiveIdentity::Aggregate(Vec::new())), Some(&Value::from(3_i64)));
-	Ok(())
 }
 
 /// Standard fields and VALUE eligibility do not depend on class count.
 #[test]
-fn live_query_empty_atom_columns_and_collection_modes_are_consistent() -> FerrosGrynnResult<()> {
+fn live_query_empty_atom_columns_and_collection_modes_are_consistent() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Metagraph)?;
-	tx.commit()?;
+	let graph = tx.define_graph("scope", GraphKind::Metagraph).assert_ok();
+	tx.commit().assert_ok();
 	for count in 0..3 {
 		let mut tx = store.begin();
 		let source = LiveSource::Graph(graph.clone());
 		let count_id =
 			LiveQuery::new(source.clone()).with_projection(LiveProjection::Value(LiveExpr::Call {
 				name: "count".into(),
-				arguments: vec![LiveExpr::field("id")?],
+				arguments: vec![LiveExpr::field("id").assert_ok()],
 			}));
 		let result = evaluate_query(
 			&store.inner.current_root(),
@@ -604,21 +678,22 @@ fn live_query_empty_atom_columns_and_collection_modes_are_consistent() -> Ferros
 			&LiveOptions::default(),
 			std::env::temp_dir(),
 			&|_key| {},
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(
 			result.rows.get(&LiveIdentity::Aggregate(Vec::new())),
 			Some(&Value::from(count))
 		);
 		let filtered = LiveQuery::new(source.clone())
-			.with_projection(LiveProjection::Value(LiveExpr::field("id")?))
-			.with_filter(LiveExpr::field("id")?.binary(
+			.with_projection(LiveProjection::Value(LiveExpr::field("id").assert_ok()))
+			.with_filter(LiveExpr::field("id").assert_ok().binary(
 				LiveBinaryOperator::Equal,
-				LiveExpr::Literal(Value::from("item0:a".parse::<RecordId>()?)),
+				LiveExpr::Literal(Value::from("item0:a".parse::<RecordId>().assert_ok())),
 			));
-		tx.register_live(filtered, LiveOptions::default())?;
+		tx.register_live(filtered, LiveOptions::default()).assert_ok();
 		for projection in [
 			LiveProjection::Records,
-			LiveProjection::Fields(vec![LiveField::new(LiveExpr::field("id")?)]),
+			LiveProjection::Fields(vec![LiveField::new(LiveExpr::field("id").assert_ok())]),
 		] {
 			let expression = LiveExpr::Literal(Value::Null).binary(
 				LiveBinaryOperator::In,
@@ -630,13 +705,14 @@ fn live_query_empty_atom_columns_and_collection_modes_are_consistent() -> Ferros
 				LiveQuery::new(source.clone()).with_projection(LiveProjection::Value(expression));
 			assert!(tx.register_live(invalid, LiveOptions::default()).is_err(), "{count} classes");
 		}
-		let expression = LiveExpr::Literal(Value::from("item0:a".parse::<RecordId>()?)).binary(
-			LiveBinaryOperator::In,
-			LiveExpr::Select(Box::new(
-				LiveQuery::new(source)
-					.with_projection(LiveProjection::Value(LiveExpr::field("id")?)),
-			)),
-		);
+		let expression = LiveExpr::Literal(Value::from("item0:a".parse::<RecordId>().assert_ok()))
+			.binary(
+				LiveBinaryOperator::In,
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(source)
+						.with_projection(LiveProjection::Value(LiveExpr::field("id").assert_ok())),
+				)),
+			);
 		let result = crate::gql::live_lowering::evaluate_binding(
 			&store.inner.current_root(),
 			&expression,
@@ -645,33 +721,38 @@ fn live_query_empty_atom_columns_and_collection_modes_are_consistent() -> Ferros
 			&crate::live::LiveBindingOptions::default(),
 			std::env::temp_dir(),
 			&|_key| {},
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(result.value, Value::from(count != 0));
 		let spelling = format!("item{count}");
-		tx.define_class(ClassSchema::new(spelling.clone(), AtomKind::Node, [])?)?;
-		let record: RecordId = format!("{spelling}:a").parse()?;
-		tx.create_atom(record.clone(), PropertyMap::new())?;
-		tx.attach_node(graph.id(), &record, None, None)?;
-		tx.commit()?;
+		tx.define_class(ClassSchema::new(spelling.clone(), AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let record: RecordId = format!("{spelling}:a").parse().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		tx.attach_node(graph.id(), &record, None, None).assert_ok();
+		tx.commit().assert_ok();
 	}
-	Ok(())
 }
 
 /// Root and nested whole-graph scopes are read once independently of class
 /// count, including the empty domain; class namespace reads remain recorded.
 #[test]
-fn live_query_graph_expression_scope_is_single() -> FerrosGrynnResult<()> {
+fn live_query_graph_expression_scope_is_single() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	setup.define_class(ClassSchema::new("policy", AtomKind::Node, [ClassField::new(
-		"scope",
-		Type::String,
-	)])?)?;
-	let key = setup.intern_property("scope")?;
-	let policy: RecordId = "policy:a".parse()?;
-	setup.create_atom(policy.clone(), PropertyMap::from_iter([(key, "scope".into())]))?;
-	let graph = setup.define_graph("scope", GraphKind::Metagraph)?;
-	setup.commit()?;
+	setup
+		.define_class(
+			ClassSchema::new("policy", AtomKind::Node, [ClassField::new("scope", Type::String)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	let key = setup.intern_property("scope").assert_ok();
+	let policy: RecordId = "policy:a".parse().assert_ok();
+	setup.create_atom(policy.clone(), PropertyMap::from_iter([(key, "scope".into())])).assert_ok();
+	let graph = setup.define_graph("scope", GraphKind::Metagraph).assert_ok();
+	setup.commit().assert_ok();
 	let scope = LiveExpr::Access {
 		base: Box::new(LiveExpr::Literal(Value::from(policy.clone()))),
 		field: "scope".into(),
@@ -682,7 +763,8 @@ fn live_query_graph_expression_scope_is_single() -> FerrosGrynnResult<()> {
 		let root = store.inner.current_root();
 		let policy_id = root
 			.atom_by_record(&policy)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("scope policy missing"))?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("scope policy missing"))
+			.assert_ok()
 			.id();
 		let query = LiveQuery::new(LiveSource::GraphExpr(Box::new(scope.clone()))).with_projection(
 			LiveProjection::Value(LiveExpr::Call {
@@ -709,7 +791,8 @@ fn live_query_graph_expression_scope_is_single() -> FerrosGrynnResult<()> {
 					&LiveOptions::default(),
 					std::env::temp_dir(),
 					&observe,
-				)?;
+				)
+				.assert_ok();
 				assert_eq!(
 					result.capture_source,
 					crate::changefeed::ChangefeedSource::Graph(graph.id())
@@ -722,13 +805,15 @@ fn live_query_graph_expression_scope_is_single() -> FerrosGrynnResult<()> {
 				let expression = if mode == 1 {
 					LiveExpr::Select(Box::new(query.clone()))
 				} else {
-					LiveExpr::Literal(Value::from("item0:a".parse::<RecordId>()?)).binary(
-						LiveBinaryOperator::In,
-						LiveExpr::Select(Box::new(
-							LiveQuery::new(query.source().clone())
-								.with_projection(LiveProjection::Value(LiveExpr::field("id")?)),
-						)),
-					)
+					LiveExpr::Literal(Value::from("item0:a".parse::<RecordId>().assert_ok()))
+						.binary(
+							LiveBinaryOperator::In,
+							LiveExpr::Select(Box::new(
+								LiveQuery::new(query.source().clone()).with_projection(
+									LiveProjection::Value(LiveExpr::field("id").assert_ok()),
+								),
+							)),
+						)
 				};
 				let result = crate::gql::live_lowering::evaluate_binding(
 					&root,
@@ -738,7 +823,8 @@ fn live_query_graph_expression_scope_is_single() -> FerrosGrynnResult<()> {
 					&LiveBindingOptions::default(),
 					std::env::temp_dir(),
 					&observe,
-				)?;
+				)
+				.assert_ok();
 				assert_eq!(
 					result.value,
 					if mode == 1 {
@@ -757,30 +843,32 @@ fn live_query_graph_expression_scope_is_single() -> FerrosGrynnResult<()> {
 			}
 		}
 		let mut add = store.begin();
-		add.define_class(ClassSchema::new(format!("item{count}"), AtomKind::Node, [])?)?;
-		let record: RecordId = format!("item{count}:a").parse()?;
-		add.create_atom(record.clone(), PropertyMap::new())?;
-		add.attach_node(graph.id(), &record, None, None)?;
-		add.commit()?;
+		add.define_class(ClassSchema::new(format!("item{count}"), AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let record: RecordId = format!("item{count}:a").parse().assert_ok();
+		add.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		add.attach_node(graph.id(), &record, None, None).assert_ok();
+		add.commit().assert_ok();
 	}
-	Ok(())
 }
 
 /// A nested query owns its captures for both scalar aggregate and collection
 /// unions, even when an outer query shadows the same graph parameter.
 #[test]
-fn live_query_graph_expression_nested_captures() -> FerrosGrynnResult<()> {
+fn live_query_graph_expression_nested_captures() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-	let first = setup.define_graph("first", GraphKind::Graph)?;
-	let second = setup.define_graph("second", GraphKind::Graph)?;
+	setup.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
+	let first = setup.define_graph("first", GraphKind::Graph).assert_ok();
+	let second = setup.define_graph("second", GraphKind::Graph).assert_ok();
 	for (key, graph) in [("a", &first), ("b", &second), ("c", &second)] {
-		let record: RecordId = format!("item:{key}").parse()?;
-		setup.create_atom(record.clone(), PropertyMap::new())?;
-		setup.attach_node(graph.id(), &record, None, None)?;
+		let record: RecordId = format!("item:{key}").parse().assert_ok();
+		setup.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		setup.attach_node(graph.id(), &record, None, None).assert_ok();
 	}
-	setup.commit()?;
+	setup.commit().assert_ok();
 	for classes in 1..4 {
 		for aggregate in [true, false] {
 			let query = LiveQuery::new(LiveSource::GraphExpr(Box::new(LiveExpr::Parameter(
@@ -793,12 +881,12 @@ fn live_query_graph_expression_nested_captures() -> FerrosGrynnResult<()> {
 					arguments: Vec::new(),
 				}
 			} else {
-				LiveExpr::field("id")?
+				LiveExpr::field("id").assert_ok()
 			}));
 			let expression = if aggregate {
 				LiveExpr::Select(Box::new(query))
 			} else {
-				LiveExpr::Literal(Value::from("item:a".parse::<RecordId>()?))
+				LiveExpr::Literal(Value::from("item:a".parse::<RecordId>().assert_ok()))
 					.binary(LiveBinaryOperator::In, LiveExpr::Select(Box::new(query)))
 			};
 			for outer_parameters in
@@ -812,7 +900,8 @@ fn live_query_graph_expression_nested_captures() -> FerrosGrynnResult<()> {
 					&LiveBindingOptions::default(),
 					std::env::temp_dir(),
 					&|_| {},
-				)?;
+				)
+				.assert_ok();
 				assert_eq!(
 					result.value,
 					if aggregate {
@@ -835,7 +924,8 @@ fn live_query_graph_expression_nested_captures() -> FerrosGrynnResult<()> {
 				&LiveOptions::default(),
 				std::env::temp_dir(),
 				&|_| {},
-			)?;
+			)
+			.assert_ok();
 			assert_eq!(result.rows.len(), 2);
 			assert!(result.rows.values().all(|value| *value
 				== if aggregate {
@@ -845,28 +935,33 @@ fn live_query_graph_expression_nested_captures() -> FerrosGrynnResult<()> {
 				}));
 		}
 		let mut add = store.begin();
-		add.define_class(ClassSchema::new(format!("extra{classes}"), AtomKind::Node, [])?)?;
-		add.commit()?;
+		add.define_class(
+			ClassSchema::new(format!("extra{classes}"), AtomKind::Node, []).assert_ok(),
+		)
+		.assert_ok();
+		add.commit().assert_ok();
 	}
-	Ok(())
 }
 
 /// Reused public aliases never become nested query capture owners.
 #[test]
-fn live_join_nested_graph_union_keeps_capture_owners() -> FerrosGrynnResult<()> {
-	use crate::live::{LiveJoin, LiveJoinKind};
+fn live_join_nested_graph_union_keeps_capture_owners() {
+	use crate::{
+		live::{LiveJoin, LiveJoinKind},
+		test_assertions::AssertResult as _,
+	};
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-	setup.define_class(ClassSchema::new("extra", AtomKind::Node, [])?)?;
-	let first = setup.define_graph("first", GraphKind::Graph)?;
-	let second = setup.define_graph("second", GraphKind::Graph)?;
+	setup.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
+	setup.define_class(ClassSchema::new("extra", AtomKind::Node, []).assert_ok()).assert_ok();
+	let first = setup.define_graph("first", GraphKind::Graph).assert_ok();
+	let second = setup.define_graph("second", GraphKind::Graph).assert_ok();
 	for (name, graph) in [("a", &first), ("b", &second), ("c", &second)] {
-		let record: RecordId = format!("item:{name}").parse()?;
-		setup.create_atom(record.clone(), PropertyMap::new())?;
-		setup.attach_node(graph.id(), &record, None, None)?;
+		let record: RecordId = format!("item:{name}").parse().assert_ok();
+		setup.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		setup.attach_node(graph.id(), &record, None, None).assert_ok();
 	}
-	setup.commit()?;
+	setup.commit().assert_ok();
 	let nested = |scope: &str| -> FerrosGrynnResult<LiveExpr> {
 		let source = LiveSource::GraphExpr(Box::new(LiveExpr::Parameter("scope".into())));
 		let query = LiveQuery::new(source)
@@ -884,7 +979,8 @@ fn live_join_nested_graph_union_keeps_capture_owners() -> FerrosGrynnResult<()> 
 			}));
 		Ok(LiveExpr::Select(Box::new(query)))
 	};
-	let expression = LiveExpr::Array(vec![nested("first")?, nested("second")?]);
+	let expression =
+		LiveExpr::Array(vec![nested("first").assert_ok(), nested("second").assert_ok()]);
 	let result = crate::gql::live_lowering::evaluate_binding(
 		&store.inner.current_root(),
 		&expression,
@@ -893,43 +989,55 @@ fn live_join_nested_graph_union_keeps_capture_owners() -> FerrosGrynnResult<()> 
 		&LiveBindingOptions::default(),
 		std::env::temp_dir(),
 		&|_| {},
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(result.value, Value::from(vec![Value::from(1), Value::from(2)]));
-	Ok(())
 }
 
 /// Public qualifiers pay for every typed schema/plan clone before analysis.
 #[test]
-fn live_join_alias_copy_admission_precedes_analysis() -> FerrosGrynnResult<()> {
-	use crate::live::{LiveJoin, LiveJoinKind};
+fn live_join_alias_copy_admission_precedes_analysis() {
+	use crate::{
+		live::{LiveJoin, LiveJoinKind},
+		test_assertions::AssertResult as _,
+	};
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let class = setup.define_class(ClassSchema::new(
-		"item",
-		AtomKind::Node,
-		(0..16).map(|index| ClassField::new(format!("field{index}"), Type::Int)),
-	)?)?;
-	setup.commit()?;
+	let class = setup
+		.define_class(
+			ClassSchema::new(
+				"item",
+				AtomKind::Node,
+				(0..16).map(|index| ClassField::new(format!("field{index}"), Type::Int)),
+			)
+			.assert_ok(),
+		)
+		.assert_ok();
+	setup.commit().assert_ok();
 	let alias = "r".repeat(16 * 1024);
 	for primary in [false, true] {
-		let query = LiveQuery::new(LiveSource::Record("item:missing".parse()?))
+		let query = LiveQuery::new(LiveSource::Record("item:missing".parse().assert_ok()))
 			.with_alias(if primary {
 				alias.as_str()
 			} else {
 				"l"
-			})?
-			.with_joins(vec![LiveJoin::new(
-				LiveSource::Class(class),
-				if primary {
-					"r"
-				} else {
-					alias.as_str()
-				},
-				LiveJoinKind::Cross,
-				None,
-			)?])
+			})
+			.assert_ok()
+			.with_joins(vec![
+				LiveJoin::new(
+					LiveSource::Class(class),
+					if primary {
+						"r"
+					} else {
+						alias.as_str()
+					},
+					LiveJoinKind::Cross,
+					None,
+				)
+				.assert_ok(),
+			])
 			.with_projection(LiveProjection::Value(LiveExpr::Literal(1.into())));
-		let options = LiveOptions::default().with_budgets(320 * 1024, 1_000_000)?;
+		let options = LiveOptions::default().with_budgets(320 * 1024, 1_000_000).assert_ok();
 		let mut tx = store.begin();
 		let result = super::super::validate_registration_controlled(
 			&mut tx,
@@ -939,23 +1047,27 @@ fn live_join_alias_copy_admission_precedes_analysis() -> FerrosGrynnResult<()> {
 			None,
 		);
 		let Err(error) = result else {
-			return Err(FerrosGrynnError::invalid_argument(
-				"long JOIN alias copied without admission",
-			));
+			return {
+				let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+					"long JOIN alias copied without admission",
+				));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
 	}
-	Ok(())
 }
 
 /// Zero classes do not bypass scope typing, graph existence, effects or
 /// resource limits in either Rust entrypoint.
 #[test]
-fn live_query_graph_expression_empty_preflight() -> FerrosGrynnResult<()> {
+fn live_query_graph_expression_empty_preflight() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let graph = setup.define_graph("empty", GraphKind::Graph)?;
-	setup.commit()?;
+	let graph = setup.define_graph("empty", GraphKind::Graph).assert_ok();
+	setup.commit().assert_ok();
 	for scope in [
 		LiveExpr::Literal(graph.clone().into()),
 		LiveExpr::Literal("empty".into()),
@@ -1006,52 +1118,61 @@ fn live_query_graph_expression_empty_preflight() -> FerrosGrynnResult<()> {
 	}
 	let query = LiveQuery::new(LiveSource::GraphExpr(Box::new(LiveExpr::Literal(graph.into()))));
 	assert!(
-		store.begin().register_live(query, LiveOptions::default().with_budgets(64, 1)?).is_err()
+		store
+			.begin()
+			.register_live(query, LiveOptions::default().with_budgets(64, 1).assert_ok())
+			.is_err()
 	);
-	Ok(())
 }
 
 /// Each class retains its resolved overload inside a single aggregate domain.
 #[test]
-fn live_query_graph_aggregate_keeps_class_overloads() -> FerrosGrynnResult<()> {
-	use crate::datastore::{FunctionEffect, SchemaFunction, SchemaFunctionParameter};
+fn live_query_graph_aggregate_keeps_class_overloads() {
+	use crate::{
+		datastore::{FunctionEffect, SchemaFunction, SchemaFunctionParameter},
+		test_assertions::AssertResult as _,
+	};
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Metagraph)?;
-	let value = tx.intern_property("v")?;
+	let graph = tx.define_graph("scope", GraphKind::Metagraph).assert_ok();
+	let value = tx.intern_property("v").assert_ok();
 	for (class, ty, number, result) in [
 		("ints", Type::Int, Value::from(1_i64), 1),
-		("floats", Type::Float, Value::from(1_.0f64), 10),
+		("floats", Type::Float, Value::from(1.0_f64), 10),
 	] {
-		tx.define_class(ClassSchema::new(class, AtomKind::Node, [ClassField::new(
-			"v",
-			ty.clone(),
-		)])?)?;
-		tx.define_function(SchemaFunction::new(
-			"fn",
-			"score",
-			vec![SchemaFunctionParameter::new("v", ty)?],
-			Type::Int,
-			FunctionEffect::Pure,
-			false,
-			None,
-			format!("{{ RETURN {result}; }}"),
-		)?)?;
-		let record: RecordId = format!("{class}:one").parse()?;
-		tx.create_atom(record.clone(), PropertyMap::from_iter([(value, number)]))?;
-		tx.attach_node(graph.id(), &record, None, None)?;
+		tx.define_class(
+			ClassSchema::new(class, AtomKind::Node, [ClassField::new("v", ty.clone())]).assert_ok(),
+		)
+		.assert_ok();
+		tx.define_function(
+			SchemaFunction::new(
+				"fn",
+				"score",
+				vec![SchemaFunctionParameter::new("v", ty).assert_ok()],
+				Type::Int,
+				FunctionEffect::Pure,
+				false,
+				None,
+				format!("{{ RETURN {result}; }}"),
+			)
+			.assert_ok(),
+		)
+		.assert_ok();
+		let record: RecordId = format!("{class}:one").parse().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::from_iter([(value, number)])).assert_ok();
+		tx.attach_node(graph.id(), &record, None, None).assert_ok();
 	}
-	tx.commit()?;
+	tx.commit().assert_ok();
 	let projection = LiveProjection::Value(LiveExpr::Call {
 		name: "sum".into(),
 		arguments: vec![LiveExpr::Call {
 			name: "fn::score".into(),
-			arguments: vec![LiveExpr::field("v")?],
+			arguments: vec![LiveExpr::field("v").assert_ok()],
 		}],
 	});
 	for source in [
 		LiveSource::Graph(graph.clone()),
-		LiveSource::GraphExpr(Box::new(LiveExpr::Literal(graph.clone().into()))),
+		LiveSource::GraphExpr(Box::new(LiveExpr::Literal(graph.into()))),
 	] {
 		let query = LiveQuery::new(source).with_projection(projection.clone());
 		let result = evaluate_query(
@@ -1061,7 +1182,8 @@ fn live_query_graph_aggregate_keeps_class_overloads() -> FerrosGrynnResult<()> {
 			&LiveOptions::default(),
 			std::env::temp_dir(),
 			&|_key| {},
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(
 			result.rows.get(&LiveIdentity::Aggregate(Vec::new())),
 			Some(&Value::from(11_i64))
@@ -1075,22 +1197,25 @@ fn live_query_graph_aggregate_keeps_class_overloads() -> FerrosGrynnResult<()> {
 			&LiveBindingOptions::default(),
 			std::env::temp_dir(),
 			&|_key| {},
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(result.value, Value::from(11_i64));
 		assert_eq!(result.functions.len(), 2);
 	}
-	Ok(())
 }
 
 /// Class layouts and row overloads survive a single shared grouping domain.
 #[test]
-fn live_query_group_union_keys_distinct_and_overloads() -> FerrosGrynnResult<()> {
-	use crate::datastore::{FunctionEffect, SchemaFunction, SchemaFunctionParameter};
+fn live_query_group_union_keys_distinct_and_overloads() {
+	use crate::{
+		datastore::{FunctionEffect, SchemaFunction, SchemaFunctionParameter},
+		test_assertions::AssertResult as _,
+	};
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Graph)?;
-	let key = tx.intern_property("k")?;
-	let value = tx.intern_property("v")?;
+	let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	let key = tx.intern_property("k").assert_ok();
+	let value = tx.intern_property("v").assert_ok();
 	for (class, ty, values, score) in [
 		("ints", Type::Int, vec![Value::from(1_i64), Value::from(2_i64)], 1),
 		("floats", Type::Float, vec![Value::from(1.0_f64)], 10),
@@ -1099,41 +1224,47 @@ fn live_query_group_union_keys_distinct_and_overloads() -> FerrosGrynnResult<()>
 		if class == "floats" {
 			fields.insert(0, ClassField::new("extra", Type::Any));
 		}
-		tx.define_class(ClassSchema::new(class, AtomKind::Node, fields)?)?;
-		tx.define_function(SchemaFunction::new(
-			"fn",
-			"score",
-			vec![SchemaFunctionParameter::new("v", ty)?],
-			Type::Int,
-			FunctionEffect::Pure,
-			false,
-			None,
-			format!("{{ RETURN {score}; }}"),
-		)?)?;
+		tx.define_class(ClassSchema::new(class, AtomKind::Node, fields).assert_ok()).assert_ok();
+		tx.define_function(
+			SchemaFunction::new(
+				"fn",
+				"score",
+				vec![SchemaFunctionParameter::new("v", ty).assert_ok()],
+				Type::Int,
+				FunctionEffect::Pure,
+				false,
+				None,
+				format!("{{ RETURN {score}; }}"),
+			)
+			.assert_ok(),
+		)
+		.assert_ok();
 		for (index, number) in values.into_iter().enumerate() {
-			let record: RecordId = format!("{class}:{index}").parse()?;
+			let record: RecordId = format!("{class}:{index}").parse().assert_ok();
 			let group = if class == "ints" {
 				Value::from(1_i64)
 			} else {
 				Value::from(1.0_f64)
 			};
-			tx.create_atom(
-				record.clone(),
-				PropertyMap::from_iter([(key, group), (value, number)]),
-			)?;
-			tx.attach_node(graph.id(), &record, None, None)?;
+			tx.create_atom(record.clone(), PropertyMap::from_iter([(key, group), (value, number)]))
+				.assert_ok();
+			tx.attach_node(graph.id(), &record, None, None).assert_ok();
 		}
 	}
-	tx.commit()?;
+	tx.commit().assert_ok();
 	let query = "SELECT properties.k AS bucket, count() AS n, avg(properties.v) AS average, \
 	             count(DISTINCT properties.v) AS distinct_values, properties.k + \
 	             sum(properties.v) AS mix, sum(fn::score(v)) AS score FROM {class} IN GRAPH scope \
 	             GROUP BY properties.k;";
 	let syntax = ["ints", "floats"].map(|class| query.replace("{class}", class)).join("\n");
-	let rows = evaluate_group_union(&store.inner.current_root(), &syntax, 100_000)?;
+	let rows = evaluate_group_union(&store.inner.current_root(), &syntax, 100_000).assert_ok();
 	assert_eq!(rows.len(), 1);
 	let Some(Value::Object(row)) = rows.get(&LiveIdentity::Aggregate(vec![1_i64.into()])) else {
-		return Err(FerrosGrynnError::invalid_argument("missing merged group"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("missing merged group"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(row.get("bucket"), Some(&Value::from(1_i64)));
 	assert_eq!(row.get("n"), Some(&Value::from(3_i64)));
@@ -1142,16 +1273,17 @@ fn live_query_group_union_keys_distinct_and_overloads() -> FerrosGrynnResult<()>
 	assert_eq!(row.get("score"), Some(&Value::from(12_i64)));
 	assert_eq!(row.get("average"), Some(&Value::from(4.0_f64 / 3.0_f64)));
 	assert!(evaluate_group_union(&store.inner.current_root(), &syntax, 1).is_err());
-	Ok(())
 }
 
 /// Group identities retain exact numeric comparison and distinct absence.
 #[test]
-fn live_query_group_union_exact_keys_and_empty() -> FerrosGrynnResult<()> {
+fn live_query_group_union_exact_keys_and_empty() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Graph)?;
-	let key = tx.intern_property("k")?;
+	let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	let key = tx.intern_property("k").assert_ok();
 	let keys = [
 		Value::None,
 		Value::Null,
@@ -1161,10 +1293,10 @@ fn live_query_group_union_exact_keys_and_empty() -> FerrosGrynnResult<()> {
 		Value::from(9_007_199_254_740_993_i64),
 	];
 	for class in ["left", "right"] {
-		tx.define_class(ClassSchema::new(class, AtomKind::Node, [ClassField::new(
-			"k",
-			Type::Any,
-		)])?)?;
+		tx.define_class(
+			ClassSchema::new(class, AtomKind::Node, [ClassField::new("k", Type::Any)]).assert_ok(),
+		)
+		.assert_ok();
 	}
 	for (index, value) in keys.into_iter().enumerate() {
 		let record: RecordId = format!(
@@ -1175,17 +1307,19 @@ fn live_query_group_union_exact_keys_and_empty() -> FerrosGrynnResult<()> {
 				"right"
 			}
 		)
-		.parse()?;
-		tx.create_atom(record.clone(), PropertyMap::from_iter([(key, value)]))?;
-		tx.attach_node(graph.id(), &record, None, None)?;
+		.parse()
+		.assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::from_iter([(key, value)])).assert_ok();
+		tx.attach_node(graph.id(), &record, None, None).assert_ok();
 	}
-	tx.commit()?;
+	tx.commit().assert_ok();
 	let syntax = "SELECT VALUE count() FROM left IN GRAPH scope GROUP BY properties.k; SELECT \
 	              VALUE count() FROM right IN GRAPH scope GROUP BY properties.k;";
-	let rows = evaluate_group_union(&store.inner.current_root(), syntax, 100_000)?;
+	let rows = evaluate_group_union(&store.inner.current_root(), syntax, 100_000).assert_ok();
 	assert_eq!(rows.len(), 5);
-	let query = LiveQuery::new(LiveSource::Graph(graph.clone()))
-		.with_group_by(vec![LiveExpr::field("k")?])?
+	let query = LiveQuery::new(LiveSource::Graph(graph))
+		.with_group_by(vec![LiveExpr::field("k").assert_ok()])
+		.assert_ok()
 		.with_projection(LiveProjection::Value(LiveExpr::Call {
 			name: "count".into(),
 			arguments: Vec::new(),
@@ -1200,8 +1334,10 @@ fn live_query_group_union_exact_keys_and_empty() -> FerrosGrynnResult<()> {
 			&|_key| {},
 		)
 	};
-	assert_eq!(evaluate(&query, &LiveOptions::default())?.rows, rows);
-	assert!(evaluate(&query, &LiveOptions::default().with_budgets(64, 100_000)?).is_err());
+	assert_eq!(evaluate(&query, &LiveOptions::default()).assert_ok().rows, rows);
+	assert!(
+		evaluate(&query, &LiveOptions::default().with_budgets(64, 100_000).assert_ok()).is_err()
+	);
 	let evaluate_nested = |expression: &LiveExpr| {
 		crate::gql::live_lowering::evaluate_binding(
 			&store.inner.current_root(),
@@ -1218,14 +1354,16 @@ fn live_query_group_union_exact_keys_and_empty() -> FerrosGrynnResult<()> {
 		evaluate_nested(
 			&LiveExpr::Literal(Value::from(2_i64))
 				.binary(LiveBinaryOperator::In, LiveExpr::Select(Box::new(query.clone())))
-		)?
+		)
+		.assert_ok()
 		.value,
 		Value::from(true)
 	);
 	let empty_query = query.with_filter(LiveExpr::Literal(Value::from(false)));
-	assert!(evaluate(&empty_query, &LiveOptions::default())?.rows.is_empty());
+	assert!(evaluate(&empty_query, &LiveOptions::default()).assert_ok().rows.is_empty());
 	assert_eq!(
-		evaluate(&empty_query.with_group_all(), &LiveOptions::default())?
+		evaluate(&empty_query.with_group_all(), &LiveOptions::default())
+			.assert_ok()
 			.rows
 			.get(&LiveIdentity::Aggregate(Vec::new())),
 		Some(&Value::from(0_i64))
@@ -1240,38 +1378,46 @@ fn live_query_group_union_exact_keys_and_empty() -> FerrosGrynnResult<()> {
 		assert_eq!(rows.get(&LiveIdentity::Aggregate(vec![key])), Some(&Value::from(count)));
 	}
 	let empty = syntax.replace("GROUP BY", "WHERE false GROUP BY");
-	assert!(evaluate_group_union(&store.inner.current_root(), &empty, 100_000)?.is_empty());
+	assert!(
+		evaluate_group_union(&store.inner.current_root(), &empty, 100_000).assert_ok().is_empty()
+	);
 	let all = "SELECT VALUE count() FROM left IN GRAPH scope WHERE false GROUP ALL; SELECT VALUE \
 	           count() FROM right IN GRAPH scope WHERE false GROUP ALL;";
 	assert_eq!(
-		evaluate_group_union(&store.inner.current_root(), all, 100_000)?
+		evaluate_group_union(&store.inner.current_root(), all, 100_000)
+			.assert_ok()
 			.get(&LiveIdentity::Aggregate(Vec::new())),
 		Some(&Value::from(0_i64))
 	);
-	Ok(())
 }
 
 /// Equal current values do not merge different lexical or reactive group keys.
 #[test]
-fn live_group_capture_provenance() -> FerrosGrynnResult<()> {
+fn live_group_capture_provenance() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let class =
-		setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-			"k",
-			Type::Int,
-		)])?)?;
-	let first = setup.define_live_binding(
-		LiveExpr::Literal(0.into()),
-		Object::new(),
-		LiveBindingOptions::default(),
-	)?;
-	let second = setup.define_live_binding(
-		LiveExpr::Literal(0.into()),
-		Object::new(),
-		LiveBindingOptions::default(),
-	)?;
-	setup.commit()?;
+	let class = setup
+		.define_class(
+			ClassSchema::new("item", AtomKind::Node, [ClassField::new("k", Type::Int)]).assert_ok(),
+		)
+		.assert_ok();
+	let first = setup
+		.define_live_binding(
+			LiveExpr::Literal(0.into()),
+			Object::new(),
+			LiveBindingOptions::default(),
+		)
+		.assert_ok();
+	let second = setup
+		.define_live_binding(
+			LiveExpr::Literal(0.into()),
+			Object::new(),
+			LiveBindingOptions::default(),
+		)
+		.assert_ok();
+	setup.commit().assert_ok();
 	let query = |projected: LiveExpr, grouped: LiveExpr| -> FerrosGrynnResult<LiveQuery> {
 		Ok(LiveQuery::new(LiveSource::Class(class))
 			.with_group_by(vec![LiveExpr::field("k")?.binary(LiveBinaryOperator::Add, grouped)])?
@@ -1283,52 +1429,57 @@ fn live_group_capture_provenance() -> FerrosGrynnResult<()> {
 	let mut tx = store.begin();
 	assert!(
 		tx.register_live(
-			query(LiveExpr::Binding(first), LiveExpr::Binding(second))?,
+			query(LiveExpr::Binding(first), LiveExpr::Binding(second)).assert_ok(),
 			LiveOptions::default(),
 		)
 		.is_err()
 	);
 	assert!(
 		tx.register_live(
-			query(LiveExpr::Parameter("left".into()), LiveExpr::Parameter("right".into()))?,
+			query(LiveExpr::Parameter("left".into()), LiveExpr::Parameter("right".into()))
+				.assert_ok(),
 			LiveOptions::default(),
 		)
 		.is_err()
 	);
 	tx.register_live(
-		query(LiveExpr::Binding(first), LiveExpr::Binding(first))?,
+		query(LiveExpr::Binding(first), LiveExpr::Binding(first)).assert_ok(),
 		LiveOptions::default(),
-	)?;
+	)
+	.assert_ok();
 	tx.register_live(
-		query(LiveExpr::Parameter("left".into()), LiveExpr::Parameter("left".into()))?,
+		query(LiveExpr::Parameter("left".into()), LiveExpr::Parameter("left".into())).assert_ok(),
 		LiveOptions::default(),
-	)?;
+	)
+	.assert_ok();
 	tx.register_live(
-		query(LiveExpr::Literal(0.into()), LiveExpr::Literal(0.into()))?,
+		query(LiveExpr::Literal(0.into()), LiveExpr::Literal(0.into())).assert_ok(),
 		LiveOptions::default(),
-	)?;
-	Ok(())
+	)
+	.assert_ok();
 }
 
 /// Interned immutable literals retain graph descriptor metadata in range
 /// bounds.
 #[test]
-fn live_group_literal_ranges_preserve_graph_metadata() -> FerrosGrynnResult<()> {
+fn live_group_literal_ranges_preserve_graph_metadata() {
 	use std::ops::Bound;
 
 	use crate::{
 		graph::{GraphRef, GraphStorageMode},
+		test_assertions::AssertResult as _,
 		values::Range,
 	};
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let original = tx.define_graph("scope", GraphKind::Graph)?;
-	tx.commit()?;
+	let original = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	tx.commit().assert_ok();
 	let alternate =
-		GraphRef::new(original.id(), "renamed", GraphKind::Graph, GraphStorageMode::Hybrid)?;
+		GraphRef::new(original.id(), "renamed", GraphKind::Graph, GraphStorageMode::Hybrid)
+			.assert_ok();
 	let expression = LiveExpr::Array(vec![
-		LiveExpr::Literal(Range::closed(original.clone(), original.clone())?.into()),
-		LiveExpr::Literal(Range::closed(alternate.clone(), alternate.clone())?.into()),
+		LiveExpr::Literal(Range::closed(original.clone(), original.clone()).assert_ok().into()),
+		LiveExpr::Literal(Range::closed(alternate.clone(), alternate.clone()).assert_ok().into()),
 	]);
 	let result = crate::gql::live_lowering::evaluate_binding(
 		&store.inner.current_root(),
@@ -1338,25 +1489,37 @@ fn live_group_literal_ranges_preserve_graph_metadata() -> FerrosGrynnResult<()> 
 		&LiveBindingOptions::default(),
 		std::env::temp_dir(),
 		&|_| {},
-	)?;
+	)
+	.assert_ok();
 	let Value::Array(values) = result.value else {
-		return Err(FerrosGrynnError::invalid_argument("range result array missing"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("range result array missing"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(values.len(), 2);
 	for (value, expected) in values.iter().zip([original, alternate]) {
 		let Value::Range(range) = value else {
-			return Err(FerrosGrynnError::invalid_argument("range result missing"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("range result missing"));
+				test_result.assert_ok();
+			};
 		};
 		for bound in [range.start(), range.end()] {
 			let Bound::Included(Value::GraphRef(graph)) = bound else {
-				return Err(FerrosGrynnError::invalid_argument("range graph endpoint missing"));
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("range graph endpoint missing"));
+					test_result.assert_ok();
+				};
 			};
 			assert_eq!(graph.id(), expected.id());
 			assert_eq!(graph.name(), expected.name());
 			assert_eq!(graph.storage_mode(), expected.storage_mode());
 		}
 	}
-	Ok(())
 }
 
 /// Exercises typed ordinary SELECT plans before adding owned clause recipes.
@@ -1365,6 +1528,8 @@ fn evaluate_group_union(
 	syntax: &str,
 	work_limit: u64,
 ) -> FerrosGrynnResult<BTreeMap<LiveIdentity, Value>> {
+	use crate::test_assertions::AssertCondition as _;
+
 	let cache =
 		Arc::new(crate::gql::closure::LanguageClosureState::bounded_with_work(16 << 20, 100_000));
 	let control = crate::gql::ExecutionControl::with_runtime(
@@ -1401,7 +1566,7 @@ fn evaluate_group_union(
 		&slots,
 		&control,
 		|id, value| {
-			assert!(rows.insert(id, value).is_none());
+			(rows.insert(id, value).is_none()).assert_true();
 			Ok(())
 		},
 	)?;
@@ -1410,16 +1575,19 @@ fn evaluate_group_union(
 
 /// An empty graph performs the same static output-path preflight as a class.
 #[test]
-fn live_query_empty_graph_rejects_overlapping_aliases() -> FerrosGrynnResult<()> {
+fn live_query_empty_graph_rejects_overlapping_aliases() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("empty", GraphKind::Graph)?;
+	let graph = tx.define_graph("empty", GraphKind::Graph).assert_ok();
 	for segments in [vec!["a".into()], vec!["a".into(), "b".into()]] {
 		let query = LiveQuery::new(LiveSource::Graph(graph.clone())).with_projection(
 			LiveProjection::Fields(vec![
-				LiveField::new(LiveExpr::Literal(1_i64.into())).with_alias(LivePath::field("a")?),
+				LiveField::new(LiveExpr::Literal(1_i64.into()))
+					.with_alias(LivePath::field("a").assert_ok()),
 				LiveField::new(LiveExpr::Literal(2_i64.into()))
-					.with_alias(LivePath::new(segments)?),
+					.with_alias(LivePath::new(segments).assert_ok()),
 			]),
 		);
 		assert!(tx.register_live(query, LiveOptions::default()).is_err());
@@ -1427,34 +1595,38 @@ fn live_query_empty_graph_rejects_overlapping_aliases() -> FerrosGrynnResult<()>
 	let query =
 		LiveQuery::new(LiveSource::Graph(graph)).with_projection(LiveProjection::Fields(vec![
 			LiveField::new(LiveExpr::Literal(1_i64.into()))
-				.with_alias(LivePath::new(vec!["a".into(), "b".into()])?),
+				.with_alias(LivePath::new(vec!["a".into(), "b".into()]).assert_ok()),
 			LiveField::new(LiveExpr::Literal(2_i64.into()))
-				.with_alias(LivePath::new(vec!["a".into(), "c".into()])?),
+				.with_alias(LivePath::new(vec!["a".into(), "c".into()]).assert_ok()),
 		]));
-	tx.register_live(query, LiveOptions::default())?;
-	Ok(())
+	tx.register_live(query, LiveOptions::default()).assert_ok();
 }
 
 /// Repeated argumentless counts charge every visited row before reduction.
 #[test]
-fn live_query_repeated_counts_obey_work_budget() -> FerrosGrynnResult<()> {
+fn live_query_repeated_counts_obey_work_budget() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let class = tx.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-		"v",
-		Type::Int,
-	)])?)?;
-	let key = tx.intern_property("v")?;
+	let class = tx
+		.define_class(
+			ClassSchema::new("item", AtomKind::Node, [ClassField::new("v", Type::Int)]).assert_ok(),
+		)
+		.assert_ok();
+	let key = tx.intern_property("v").assert_ok();
 	for index in 0..100 {
 		tx.create_atom(
-			format!("item:{index}").parse()?,
+			format!("item:{index}").parse().assert_ok(),
 			PropertyMap::from_iter([(key, 0_i64.into())]),
-		)?;
+		)
+		.assert_ok();
 	}
-	tx.commit()?;
+	tx.commit().assert_ok();
 	let query = LiveQuery::new(LiveSource::Class(class))
 		.with_filter(
-			LiveExpr::field("v")?
+			LiveExpr::field("v")
+				.assert_ok()
 				.binary(LiveBinaryOperator::GreaterOrEqual, LiveExpr::Literal(0_i64.into())),
 		)
 		.with_projection(LiveProjection::Fields(
@@ -1466,7 +1638,8 @@ fn live_query_repeated_counts_obey_work_budget() -> FerrosGrynnResult<()> {
 					})
 					.with_alias(LivePath::field(format!("count{index}"))?))
 				})
-				.collect::<FerrosGrynnResult<_>>()?,
+				.collect::<FerrosGrynnResult<_>>()
+				.assert_ok(),
 		));
 	let evaluate = |options: &LiveOptions| {
 		evaluate_query(
@@ -1478,21 +1651,21 @@ fn live_query_repeated_counts_obey_work_budget() -> FerrosGrynnResult<()> {
 			&|_key| {},
 		)
 	};
-	let unlimited = evaluate(&LiveOptions::default())?;
+	let unlimited = evaluate(&LiveOptions::default()).assert_ok();
 	assert!(unlimited.work_used > 10_000);
-	let limited =
-		evaluate(&LiveOptions::default().with_budgets(64 << 20, unlimited.work_used - 1)?);
+	let limited = evaluate(
+		&LiveOptions::default().with_budgets(64 << 20, unlimited.work_used - 1).assert_ok(),
+	);
 	assert!(limited.is_err(), "all reduction visits must share the cap");
-	Ok(())
 }
 
 /// Nested graph scalars share zero-domain and multi-class aggregate kernels.
 #[test]
-fn live_query_nested_graph_scalars_and_outer_aggregate() -> FerrosGrynnResult<()> {
-	use crate::{live::LiveBindingOptions, values::Object};
+fn live_query_nested_graph_scalars_and_outer_aggregate() {
+	use crate::{live::LiveBindingOptions, test_assertions::AssertResult as _, values::Object};
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Metagraph)?;
+	let graph = tx.define_graph("scope", GraphKind::Metagraph).assert_ok();
 	let count = || LiveExpr::Call {
 		name: "count".into(),
 		arguments: Vec::new(),
@@ -1501,21 +1674,24 @@ fn live_query_nested_graph_scalars_and_outer_aggregate() -> FerrosGrynnResult<()
 		LiveQuery::new(LiveSource::Graph(graph.clone()))
 			.with_projection(LiveProjection::Value(count())),
 	));
-	let binding =
-		tx.define_live_binding(graph_count.clone(), Object::new(), LiveBindingOptions::default())?;
-	assert_eq!(tx.live_binding_value(binding)?, Value::from(0_i64));
-	tx.commit()?;
+	let binding = tx
+		.define_live_binding(graph_count.clone(), Object::new(), LiveBindingOptions::default())
+		.assert_ok();
+	assert_eq!(tx.live_binding_value(binding).assert_ok(), Value::from(0_i64));
+	tx.commit().assert_ok();
 	let mut tx = store.begin();
-	let marker = tx.define_class(ClassSchema::new("marker", AtomKind::Node, [])?)?;
-	let item = tx.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-	tx.create_atom("marker:one".parse()?, PropertyMap::new())?;
+	let marker =
+		tx.define_class(ClassSchema::new("marker", AtomKind::Node, []).assert_ok()).assert_ok();
+	let item =
+		tx.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
+	tx.create_atom("marker:one".parse().assert_ok(), PropertyMap::new()).assert_ok();
 	for index in 0..3 {
-		let record: RecordId = format!("item:{index}").parse()?;
-		tx.create_atom(record.clone(), PropertyMap::new())?;
-		tx.attach_node(graph.id(), &record, None, None)?;
+		let record: RecordId = format!("item:{index}").parse().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		tx.attach_node(graph.id(), &record, None, None).assert_ok();
 	}
-	tx.commit()?;
-	assert_eq!(store.begin().live_binding_value(binding)?, Value::from(3_i64));
+	tx.commit().assert_ok();
+	assert_eq!(store.begin().live_binding_value(binding).assert_ok(), Value::from(3_i64));
 	let evaluate = |query: &LiveQuery| {
 		evaluate_query(
 			&store.inner.current_root(),
@@ -1529,7 +1705,10 @@ fn live_query_nested_graph_scalars_and_outer_aggregate() -> FerrosGrynnResult<()
 	let nested = LiveQuery::new(LiveSource::Class(marker))
 		.with_projection(LiveProjection::Value(graph_count));
 	assert_eq!(
-		evaluate(&nested)?.rows.get(&LiveIdentity::Record("marker:one".parse()?)),
+		evaluate(&nested)
+			.assert_ok()
+			.rows
+			.get(&LiveIdentity::Record("marker:one".parse().assert_ok())),
 		Some(&Value::from(3_i64))
 	);
 	let projection = LiveProjection::Value(
@@ -1544,46 +1723,49 @@ fn live_query_nested_graph_scalars_and_outer_aggregate() -> FerrosGrynnResult<()
 	let graph_query = LiveQuery::new(LiveSource::Graph(graph)).with_projection(projection.clone());
 	let class_query = LiveQuery::new(LiveSource::Class(item)).with_projection(projection);
 	assert_eq!(
-		evaluate(&graph_query)?.rows.get(&LiveIdentity::Aggregate(Vec::new())),
+		evaluate(&graph_query).assert_ok().rows.get(&LiveIdentity::Aggregate(Vec::new())),
 		Some(&Value::from(4_i64))
 	);
-	assert_eq!(evaluate(&graph_query)?.rows, evaluate(&class_query)?.rows);
-	Ok(())
+	assert_eq!(evaluate(&graph_query).assert_ok().rows, evaluate(&class_query).assert_ok().rows);
 }
 
 /// Owned constructors reduce all graph classes together, with ordinary
 /// lazy branches and an independent class-domain oracle.
 #[test]
-fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
+fn live_query_aggregate_constructors() {
 	use std::ops::Bound;
 
-	use crate::values::Range;
+	use crate::{test_assertions::AssertResult as _, values::Range};
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Graph)?;
-	let property = tx.intern_property("v")?;
+	let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	let property = tx.intern_property("v").assert_ok();
 	let mut oracle = None;
 	for (name, ty, values) in [
 		("left", Type::Int, vec![Value::from(1_i64)]),
 		("right", Type::Float, vec![Value::from(2.0_f64), Value::from(1.0_f64)]),
 		("oracle", Type::Any, vec![Value::from(1_i64), Value::from(2.0_f64), Value::from(1.0_f64)]),
 	] {
-		let class =
-			tx.define_class(ClassSchema::new(name, AtomKind::Node, [ClassField::new("v", ty)])?)?;
+		let class = tx
+			.define_class(
+				ClassSchema::new(name, AtomKind::Node, [ClassField::new("v", ty)]).assert_ok(),
+			)
+			.assert_ok();
 		if name == "oracle" {
 			oracle = Some(class);
 		}
 		for (ordinal, value) in values.into_iter().enumerate() {
-			let record: RecordId = format!("{name}:{ordinal}").parse()?;
-			tx.create_atom(record.clone(), PropertyMap::from_iter([(property, value)]))?;
+			let record: RecordId = format!("{name}:{ordinal}").parse().assert_ok();
+			tx.create_atom(record.clone(), PropertyMap::from_iter([(property, value)])).assert_ok();
 			if name != "oracle" {
-				tx.attach_node(graph.id(), &record, None, None)?;
+				tx.attach_node(graph.id(), &record, None, None).assert_ok();
 			}
 		}
 	}
-	tx.commit()?;
-	let oracle =
-		oracle.ok_or_else(|| FerrosGrynnError::invalid_argument("oracle class missing"))?;
+	tx.commit().assert_ok();
+	let oracle = oracle
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("oracle class missing"))
+		.assert_ok();
 	let count = || LiveExpr::Call {
 		name: "count".into(),
 		arguments: Vec::new(),
@@ -1599,7 +1781,7 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 	let cases = [
 		(
 			"array",
-			LiveExpr::Array(vec![count(), sum()?]),
+			LiveExpr::Array(vec![count(), sum().assert_ok()]),
 			Value::Array([3_i64.into(), 4_i64.into()].into_iter().collect()),
 		),
 		(
@@ -1616,7 +1798,7 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 			"conditional",
 			LiveExpr::Conditional {
 				condition: Box::new(count().binary(LiveBinaryOperator::Greater, literal(0_i64))),
-				then_value: Box::new(sum()?),
+				then_value: Box::new(sum().assert_ok()),
 				else_value: Box::new(divide_by_zero()),
 			},
 			4_i64.into(),
@@ -1627,7 +1809,7 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 				operand: None,
 				branches: vec![(
 					count().binary(LiveBinaryOperator::Greater, literal(0_i64)),
-					sum()?,
+					sum().assert_ok(),
 				)],
 				else_value: Some(Box::new(divide_by_zero())),
 			},
@@ -1637,7 +1819,10 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 			"simple_case",
 			LiveExpr::Case {
 				operand: Some(Box::new(count())),
-				branches: vec![(literal(0_i64), divide_by_zero()), (literal(3_i64), sum()?)],
+				branches: vec![
+					(literal(0_i64), divide_by_zero()),
+					(literal(3_i64), sum().assert_ok()),
+				],
 				else_value: None,
 			},
 			4_i64.into(),
@@ -1679,7 +1864,7 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 		(
 			"index",
 			LiveExpr::Index {
-				base: Box::new(LiveExpr::Array(vec![count(), sum()?])),
+				base: Box::new(LiveExpr::Array(vec![count(), sum().assert_ok()])),
 				index: Box::new(literal(1_i64)),
 			},
 			4_i64.into(),
@@ -1688,7 +1873,7 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 			"cast",
 			LiveExpr::Cast {
 				target: "int".into(),
-				value: Box::new(sum()?),
+				value: Box::new(sum().assert_ok()),
 			},
 			4_i64.into(),
 		),
@@ -1696,10 +1881,10 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 			"closed_range",
 			LiveExpr::Range {
 				start: Some(Box::new(count())),
-				end: Some(Box::new(sum()?)),
+				end: Some(Box::new(sum().assert_ok())),
 				inclusive_end: true,
 			},
-			Value::Range(Range::closed(3_i64, 4_i64)?),
+			Value::Range(Range::closed(3_i64, 4_i64).assert_ok()),
 		),
 		(
 			"open_range",
@@ -1708,7 +1893,7 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 				end: Some(Box::new(count())),
 				inclusive_end: false,
 			},
-			Value::Range(Range::new(Bound::Unbounded, Bound::Excluded(3_i64.into()))?),
+			Value::Range(Range::new(Bound::Unbounded, Bound::Excluded(3_i64.into())).assert_ok()),
 		),
 	];
 	let root = store.inner.current_root();
@@ -1730,31 +1915,37 @@ fn live_query_aggregate_constructors() -> FerrosGrynnResult<()> {
 		let class_query =
 			LiveQuery::new(LiveSource::Class(oracle)).with_projection(projection).with_group_all();
 		let actual = evaluate(&graph_query, &LiveOptions::default())
-			.map_err(|error| FerrosGrynnError::invalid_argument(format!("{name}: {error}")))?;
-		assert_eq!(actual.rows, evaluate(&class_query, &LiveOptions::default())?.rows, "{name}");
+			.map_err(|error| FerrosGrynnError::invalid_argument(format!("{name}: {error}")))
+			.assert_ok();
+		assert_eq!(
+			actual.rows,
+			evaluate(&class_query, &LiveOptions::default()).assert_ok().rows,
+			"{name}"
+		);
 		assert_eq!(
 			actual.rows.get(&LiveIdentity::Aggregate(Vec::new())),
 			Some(&expected),
 			"{name}"
 		);
-		let limited = LiveOptions::default().with_budgets(256 << 20, 1)?;
+		let limited = LiveOptions::default().with_budgets(256 << 20, 1).assert_ok();
 		assert!(evaluate(&graph_query, &limited).is_err(), "{name}");
-		let limited = LiveOptions::default().with_budgets(128, 100_000)?;
+		let limited = LiveOptions::default().with_budgets(128, 100_000).assert_ok();
 		assert!(evaluate(&graph_query, &limited).is_err(), "{name}");
 	}
-	Ok(())
 }
 
 /// Constructor descriptors cannot silently select the first class's
 /// operation when the typed outer shapes differ, including empty inputs.
 #[test]
-fn live_query_aggregate_constructors_reject_mismatches() -> FerrosGrynnResult<()> {
+fn live_query_aggregate_constructors_reject_mismatches() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
 	for class in ["left", "right"] {
-		tx.define_class(ClassSchema::new(class, AtomKind::Node, [])?)?;
+		tx.define_class(ClassSchema::new(class, AtomKind::Node, []).assert_ok()).assert_ok();
 	}
-	tx.commit()?;
+	tx.commit().assert_ok();
 	for (left, right) in [
 		("[count()]", "[count(), count()]"),
 		("{first: count()}", "{second: count()}"),
@@ -1770,31 +1961,33 @@ fn live_query_aggregate_constructors_reject_mismatches() -> FerrosGrynnResult<()
 		let syntax = format!("SELECT VALUE {left} FROM left; SELECT VALUE {right} FROM right;");
 		let error = evaluate_group_union(&store.inner.current_root(), &syntax, 100_000)
 			.err()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("constructor mismatch accepted"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("constructor mismatch accepted"))
+			.assert_ok();
 		assert!(
 			error.to_string().contains("incompatible outer typed expressions"),
 			"{left} / {right}: {error}"
 		);
 	}
-	Ok(())
 }
 
 /// Zero-class sources preserve graph reads and validation through both
 /// ordinary pull and nested aggregate paths.
 #[test]
-fn live_query_empty_scope_is_read_and_validated() -> FerrosGrynnResult<()> {
+fn live_query_empty_scope_is_read_and_validated() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Graph)?;
-	let removed = tx.define_graph("removed", GraphKind::Graph)?;
-	tx.commit()?;
+	let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	let removed = tx.define_graph("removed", GraphKind::Graph).assert_ok();
+	tx.commit().assert_ok();
 	let mut tx = store.begin();
-	tx.remove_graph("removed")?;
-	tx.commit()?;
+	tx.remove_graph("removed").assert_ok();
+	tx.commit().assert_ok();
 	let root = store.inner.current_root();
 	for nested in [false, true] {
 		for aggregate in [false, true] {
-			let input = empty_scope_syntax(aggregate, nested)?;
+			let input = empty_scope_syntax(aggregate, nested).assert_ok();
 			let expected = if aggregate {
 				vec![Value::from(0_i64)]
 			} else if nested {
@@ -1806,7 +1999,8 @@ fn live_query_empty_scope_is_read_and_validated() -> FerrosGrynnResult<()> {
 				let reads = RefCell::new(Vec::new());
 				let values = evaluate_empty_scope(&root, &input, scope, 100_000, &|key| {
 					reads.borrow_mut().push(key);
-				})?;
+				})
+				.assert_ok();
 				assert_eq!(values, expected);
 				assert!(reads.borrow().contains(&ConflictKey::GraphDefinition(graph.id())));
 			}
@@ -1820,23 +2014,29 @@ fn live_query_empty_scope_is_read_and_validated() -> FerrosGrynnResult<()> {
 			}
 		}
 	}
-	Ok(())
 }
 
 /// Empty relations cannot hide effect validation or escape bounded runtime
 /// evaluation merely because there is no row to pull.
 #[test]
-fn live_query_empty_scope_effect_and_budgets() -> FerrosGrynnResult<()> {
+fn live_query_empty_scope_effect_and_budgets() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	let graph = tx.define_graph("scope", GraphKind::Graph)?;
-	tx.commit()?;
+	let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
+	tx.commit().assert_ok();
 	let root = store.inner.current_root();
 	for nested in [false, true] {
-		let mut input = empty_scope_syntax(true, nested)?;
-		let call = crate::gql::parse("time::now();", crate::syn::ParserSettings::default())?;
+		let mut input = empty_scope_syntax(true, nested).assert_ok();
+		let call =
+			crate::gql::parse("time::now();", crate::syn::ParserSettings::default()).assert_ok();
 		let StatementKind::Expression(call) = &call.statements[0].kind else {
-			return Err(FerrosGrynnError::invalid_argument("empty fixture call missing"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("empty fixture call missing"));
+				test_result.assert_ok();
+			};
 		};
 		let select = match &mut input.statements[0].kind {
 			StatementKind::Select(select) => select,
@@ -1844,19 +2044,25 @@ fn live_query_empty_scope_effect_and_budgets() -> FerrosGrynnResult<()> {
 				kind: crate::syn::ExprKind::Subquery(select),
 				..
 			}) => select,
-			_ => return Err(FerrosGrynnError::invalid_argument("empty fixture source missing")),
+			_ => {
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("empty fixture source missing"));
+					test_result.assert_ok();
+				};
+			}
 		};
 		select.source.graph = Some(call.clone());
 		let error = evaluate_empty_scope(&root, &input, Value::Null, 100_000, &|_| {})
 			.err()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("impure scope was admitted"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("impure scope was admitted"))
+			.assert_ok();
 		assert!(error.to_string().contains("impure"), "{error}");
-		let input = empty_scope_syntax(true, nested)?;
+		let input = empty_scope_syntax(true, nested).assert_ok();
 		assert!(
 			evaluate_empty_scope(&root, &input, Value::from(graph.clone()), 0, &|_| {}).is_err()
 		);
 	}
-	Ok(())
 }
 
 /// Synthesizes the real zero-class relation used by SDK lowering; the rest
@@ -1947,35 +2153,44 @@ fn evaluate_empty_scope(
 /// Class ranges cover only their base rows; point, FETCH and scoped reads stay
 /// exact.
 #[test]
-fn live_class_dependency_ranges_preserve_external_reads() -> FerrosGrynnResult<()> {
+fn live_class_dependency_ranges_preserve_external_reads() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let class =
-		setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-			"manager",
-			Type::Record,
-		)])?)?;
-	setup.define_class(ClassSchema::new("policy", AtomKind::Node, [ClassField::new(
-		"score",
-		Type::Int,
-	)])?)?;
-	let manager = setup.intern_property("manager")?;
-	let score = setup.intern_property("score")?;
-	let item: RecordId = "item:one".parse()?;
-	let policy: RecordId = "policy:one".parse()?;
-	setup.create_atom(policy.clone(), PropertyMap::from_iter([(score, 41.into())]))?;
-	setup.create_atom(item.clone(), PropertyMap::from_iter([(manager, policy.clone().into())]))?;
-	let graph = setup.define_graph("scope", GraphKind::Graph)?;
-	setup.attach_node(graph.id(), &item, None, None)?;
-	setup.commit()?;
+	let class = setup
+		.define_class(
+			ClassSchema::new("item", AtomKind::Node, [ClassField::new("manager", Type::Record)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	setup
+		.define_class(
+			ClassSchema::new("policy", AtomKind::Node, [ClassField::new("score", Type::Int)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	let manager = setup.intern_property("manager").assert_ok();
+	let score = setup.intern_property("score").assert_ok();
+	let item: RecordId = "item:one".parse().assert_ok();
+	let policy: RecordId = "policy:one".parse().assert_ok();
+	setup.create_atom(policy.clone(), PropertyMap::from_iter([(score, 41.into())])).assert_ok();
+	setup
+		.create_atom(item.clone(), PropertyMap::from_iter([(manager, policy.clone().into())]))
+		.assert_ok();
+	let graph = setup.define_graph("scope", GraphKind::Graph).assert_ok();
+	setup.attach_node(graph.id(), &item, None, None).assert_ok();
+	setup.commit().assert_ok();
 	let root = store.inner.current_root();
 	let item_id = root
 		.atom_by_record(&item)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("item missing"))?
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("item missing"))
+		.assert_ok()
 		.id();
 	let policy_id = root
 		.atom_by_record(&policy)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("policy missing"))?
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("policy missing"))
+		.assert_ok()
 		.id();
 	let evaluate = |source| {
 		let observed = RefCell::new(BTreeSet::new());
@@ -1992,73 +2207,92 @@ fn live_class_dependency_ranges_preserve_external_reads() -> FerrosGrynnResult<(
 		assert_eq!(observed.into_inner(), result.reads.iter().copied().collect());
 		Ok::<_, FerrosGrynnError>(result)
 	};
-	let class_result = evaluate(LiveSource::Class(class))?;
+	let class_result = evaluate(LiveSource::Class(class)).assert_ok();
 	assert_eq!(class_result.rows.len(), 1);
 	assert!(class_result.reads.contains(&ConflictKey::BaseClassRange(class)));
 	assert!(!class_result.reads.contains(&ConflictKey::BaseAtom(item_id)));
 	assert!(class_result.reads.contains(&ConflictKey::BaseAtom(policy_id)));
 	assert!(class_result.reads.contains(&ConflictKey::SchemaClass(class)));
 	assert!(class_result.reads.contains(&ConflictKey::PropertyDictionary));
-	let point_result = evaluate(LiveSource::Record(item))?;
+	let point_result = evaluate(LiveSource::Record(item)).assert_ok();
 	assert!(point_result.reads.contains(&ConflictKey::BaseAtom(item_id)));
 	let scoped_result = evaluate(LiveSource::GraphClass {
 		graph: graph.clone(),
 		class,
-	})?;
+	})
+	.assert_ok();
 	assert!(scoped_result.reads.contains(&ConflictKey::BaseAtom(item_id)));
 	assert!(scoped_result.reads.contains(&ConflictKey::GraphClassRange(graph.id(), class)));
-	Ok(())
 }
 
 /// Concurrent changes to rejected rows still invalidate serializable
 /// registration.
 #[test]
-fn live_class_range_registration_preserves_ssi() -> FerrosGrynnResult<()> {
-	use crate::datastore::{IsolationLevel, TransactionAccess, TransactionOptions};
+fn live_class_range_registration_preserves_ssi() {
+	use crate::{
+		datastore::{IsolationLevel, TransactionAccess, TransactionOptions},
+		test_assertions::AssertResult as _,
+	};
 	for mutation in 0..4 {
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [
-			ClassField::new("keep", Type::Bool),
-			ClassField::new("score", Type::Int),
-		])?)?;
-		let keep = setup.intern_property("keep")?;
-		let score = setup.intern_property("score")?;
-		let record: RecordId = "item:rejected".parse()?;
-		setup.create_atom(
-			record.clone(),
-			PropertyMap::from_iter([(keep, false.into()), (score, 1.into())]),
-		)?;
-		setup.commit()?;
+		let class = setup
+			.define_class(
+				ClassSchema::new("item", AtomKind::Node, [
+					ClassField::new("keep", Type::Bool),
+					ClassField::new("score", Type::Int),
+				])
+				.assert_ok(),
+			)
+			.assert_ok();
+		let keep = setup.intern_property("keep").assert_ok();
+		let score = setup.intern_property("score").assert_ok();
+		let record: RecordId = "item:rejected".parse().assert_ok();
+		setup
+			.create_atom(
+				record.clone(),
+				PropertyMap::from_iter([(keep, false.into()), (score, 1.into())]),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut registration = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Serializable,
 			TransactionAccess::ReadWrite,
 		));
-		let id = registration.register_live(
-			LiveQuery::new(LiveSource::Class(class)).with_filter(LiveExpr::field("keep")?),
-			LiveOptions::default(),
-		)?;
+		let id = registration
+			.register_live(
+				LiveQuery::new(LiveSource::Class(class))
+					.with_filter(LiveExpr::field("keep").assert_ok()),
+				LiveOptions::default(),
+			)
+			.assert_ok();
 		let mut writer = store.begin();
 		match mutation {
 			0 => {
-				writer.set_base_property(&record, score, 2.into())?;
+				writer.set_base_property(&record, score, 2.into()).assert_ok();
 			}
 			1 => {
-				writer.remove_base_property(&record, score)?;
+				writer.remove_base_property(&record, score).assert_ok();
 			}
 			2 => {
-				writer.delete_atom(&record)?;
+				writer.delete_atom(&record).assert_ok();
 			}
 			_ => {
-				writer.create_atom(
-					"item:new".parse()?,
-					PropertyMap::from_iter([(keep, true.into()), (score, 3.into())]),
-				)?;
+				writer
+					.create_atom(
+						"item:new".parse().assert_ok(),
+						PropertyMap::from_iter([(keep, true.into()), (score, 3.into())]),
+					)
+					.assert_ok();
 			}
 		}
-		writer.commit()?;
+		writer.commit().assert_ok();
 		let Err(error) = registration.commit() else {
-			return Err(FerrosGrynnError::invalid_argument("concurrent class change was accepted"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("concurrent class change was accepted"));
+				test_result.assert_ok();
+			};
 		};
 		assert!(matches!(
 			error.status().status(),
@@ -2066,5 +2300,4 @@ fn live_class_range_registration_preserves_ssi() -> FerrosGrynnResult<()> {
 		));
 		assert!(store.begin().live_info(id).is_err());
 	}
-	Ok(())
 }

@@ -84,11 +84,13 @@ fn unavailable() -> FerrosGrynnError {
 }
 
 impl AtomFieldRead for Operands<'_> {
+	/// Returns live binding for `Operands<'_>`.
 	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
 		self.control.check()?;
 		self.bindings.ok_or_else(unavailable)?(id)
 	}
 
+	/// Returns live binding value for `Operands<'_>`.
 	fn live_binding_value(
 		&self,
 		id: crate::live::LiveBindingId,
@@ -98,14 +100,17 @@ impl AtomFieldRead for Operands<'_> {
 		self.copy_value(self.live_binding(id)?)
 	}
 
+	/// Reports whether the bounded condition holds for `Operands<'_>`.
 	fn bounded(&self) -> bool {
 		true
 	}
 
+	/// Admits value for `Operands<'_>`.
 	fn admit_value(&self, value: &Value) -> FerrosGrynnResult<()> {
 		self.admit(images::operand_bytes(value, &|work| self.work(work))?)
 	}
 
+	/// Returns admit for `Operands<'_>`.
 	fn admit(&self, bytes: usize) -> FerrosGrynnResult<()> {
 		self.control.check()?;
 		let maximum = self.control.barrier_memory_limit();
@@ -121,6 +126,7 @@ impl AtomFieldRead for Operands<'_> {
 		Ok(())
 	}
 
+	/// Returns work for `Operands<'_>`.
 	fn work(&self, operations: u64) -> FerrosGrynnResult<()> {
 		self.control.check()?;
 		let work = self
@@ -140,10 +146,12 @@ impl AtomFieldRead for Operands<'_> {
 		Ok(())
 	}
 
+	/// Returns field for `Operands<'_>`.
 	fn field(&self, _atom: BoundAtom, _field: &str) -> FerrosGrynnResult<Value> {
 		Err(unavailable())
 	}
 
+	/// Returns occurrence field for `Operands<'_>`.
 	fn occurrence_field(
 		&self,
 		_occurrence: &AtomOccurrenceRef,
@@ -152,14 +160,17 @@ impl AtomFieldRead for Operands<'_> {
 		Err(unavailable())
 	}
 
+	/// Returns inner graph for `Operands<'_>`.
 	fn inner_graph(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		Err(unavailable())
 	}
 
+	/// Returns level path for `Operands<'_>`.
 	fn level_path(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		Err(unavailable())
 	}
 
+	/// Records field for `Operands<'_>`.
 	fn record_field(
 		&self,
 		_record: &RecordId,

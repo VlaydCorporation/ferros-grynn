@@ -92,12 +92,22 @@ use crate::{
 	},
 };
 
+/// Generation index alternatives.
 enum GenerationIndex {
-	Buffered(BuiltPrimaryIndex),
-	Prewritten(StreamedIndex),
+	/// Buffered case of generation index.
+	Buffered(
+		/// Buffered case of generation index.
+		BuiltPrimaryIndex,
+	),
+	/// Prewritten case of generation index.
+	Prewritten(
+		/// Prewritten case of generation index.
+		StreamedIndex,
+	),
 }
 
 impl GenerationIndex {
+	/// Returns the root result.
 	const fn root(&self) -> PageNo {
 		match self {
 			Self::Buffered(index) => index.root,
@@ -110,12 +120,19 @@ impl GenerationIndex {
 pub(super) struct BuiltGeneration {
 	/// Removes unpublished mapping files unless publication retains them.
 	pub(super) mapping_cleanup: Option<UnpublishedGeneration>,
+	/// File catalog associated with this built generation.
 	pub(super) file_catalog: FileCatalog,
+	/// Database catalog associated with this built generation.
 	pub(super) database_catalog: DatabaseCatalog,
+	/// Bindings associated with this built generation.
 	pub(super) bindings: GenerationBindings,
+	/// Files associated with this built generation.
 	pub(super) files: Vec<FileImage>,
+	/// Atom superblock associated with this built generation.
 	pub(super) atom_superblock: AtomStoreSuperblock,
+	/// Graph superblocks associated with this built generation.
 	pub(super) graph_superblocks: BTreeMap<crate::graph::GraphId, GraphSuperblock>,
+	/// Index timings associated with this built generation.
 	pub(super) index_timings: BTreeMap<IndexId, Duration>,
 }
 
@@ -171,6 +188,7 @@ impl BuiltGeneration {
 	}
 }
 
+/// Returns the map atom primary result.
 fn map_atom_primary<Primary>(
 	image: DurableAtomStoreImage<Primary>,
 	map: impl FnOnce(Primary) -> FerrosGrynnResult<GenerationIndex>,
@@ -196,6 +214,7 @@ fn map_atom_primary<Primary>(
 	})
 }
 
+/// Returns the map graph membership result.
 fn map_graph_membership<Membership>(
 	image: BuiltGraphImage<Membership>,
 	map: impl FnOnce(Membership) -> FerrosGrynnResult<GenerationIndex>,
@@ -346,6 +365,7 @@ pub(super) fn build_import_generation(
 	Ok((built, unpublished))
 }
 
+/// Builds generation inner.
 fn build_generation_inner(
 	database: &DatabaseRoot,
 	next_file_instance_id: u64,
@@ -731,14 +751,21 @@ fn build_generation_inner(
 	})
 }
 
+/// Raw graph binding state.
 struct RawGraphBinding {
+	/// Identifier of the graph owning this state.
 	graph_id: crate::graph::GraphId,
+	/// Membership associated with this raw graph binding.
 	membership: PhysicalIndexBinding,
+	/// Edge endpoint associated with this raw graph binding.
 	edge_endpoint: Option<PhysicalIndexBinding>,
+	/// Arena associated with this raw graph binding.
 	arena: crate::storage::graph_pages::GraphArenaBindings,
+	/// Superblock associated with this raw graph binding.
 	superblock: GraphSuperblock,
 }
 
+/// Returns the add graph result.
 fn add_graph(
 	layout: &mut LayoutBuilder,
 	prefix: &str,
@@ -1038,6 +1065,7 @@ fn add_graph_artifacts(
 	Ok(())
 }
 
+/// Returns the add generation index result.
 fn add_generation_index(
 	layout: &mut LayoutBuilder,
 	space: DataSpaceId,
@@ -1063,6 +1091,7 @@ fn add_generation_index(
 	}
 }
 
+/// Returns the add atom superblock result.
 fn add_atom_superblock(
 	layout: &mut LayoutBuilder,
 	prefix: &str,
@@ -1079,6 +1108,7 @@ fn add_atom_superblock(
 	Ok(())
 }
 
+/// Returns the add graph superblock result.
 fn add_graph_superblock(
 	layout: &mut LayoutBuilder,
 	space: DataSpaceId,
@@ -1096,6 +1126,7 @@ fn add_graph_superblock(
 	Ok(())
 }
 
+/// Returns the add freelist result.
 fn add_freelist(
 	layout: &mut LayoutBuilder,
 	space: DataSpaceId,
@@ -1106,6 +1137,7 @@ fn add_freelist(
 	Ok(())
 }
 
+/// Returns the add graph file result.
 fn add_graph_file(
 	layout: &mut LayoutBuilder,
 	space: DataSpaceId,
@@ -1117,6 +1149,7 @@ fn add_graph_file(
 	layout.add(space, kind, DataFileRole::WalBackfilled, format!("{prefix}/{name}"), None, pages)
 }
 
+/// Returns the add graph statistics result.
 fn add_graph_statistics(
 	layout: &mut LayoutBuilder,
 	prefix: &str,
@@ -1165,6 +1198,7 @@ fn add_graph_statistics(
 	Ok(())
 }
 
+/// Returns the add base statistics result.
 fn add_base_statistics(
 	layout: &mut LayoutBuilder,
 	prefix: &str,
@@ -1190,6 +1224,7 @@ fn add_base_statistics(
 	Ok(())
 }
 
+/// Returns the add scoped indexes result.
 fn add_scoped_indexes(
 	layout: &mut LayoutBuilder,
 	space: DataSpaceId,
@@ -1225,6 +1260,7 @@ fn add_scoped_indexes(
 	Ok(())
 }
 
+/// Returns the add reused indexes result.
 fn add_reused_indexes(
 	layout: &mut LayoutBuilder,
 	generation: &str,
@@ -1295,6 +1331,7 @@ fn add_reused_indexes(
 	Ok(())
 }
 
+/// Returns the add streamed scoped indexes result.
 fn add_streamed_scoped_indexes(
 	layout: &mut LayoutBuilder,
 	indexes: Vec<StreamedScopedIndexFile>,
@@ -1333,6 +1370,7 @@ fn add_streamed_scoped_indexes(
 	Ok(())
 }
 
+/// Merges streamed images.
 fn merge_streamed_images(
 	target: &mut StreamedScopedIndexImages,
 	mut source: StreamedScopedIndexImages,
@@ -1349,6 +1387,7 @@ fn merge_streamed_images(
 	Ok(())
 }
 
+/// Appends catalog pages.
 pub(super) fn append_catalog_pages(
 	files: &mut Vec<FileImage>,
 	file_catalog: &FileCatalog,
@@ -1385,6 +1424,7 @@ pub(super) fn append_catalog_pages(
 	Ok(())
 }
 
+/// Returns the prime value context result.
 pub(super) fn prime_value_context(
 	database: &DatabaseRoot,
 	context: &mut EncodeContext,
@@ -1414,6 +1454,7 @@ pub(super) fn prime_value_context(
 	Ok(())
 }
 
+/// Returns the freelist page result.
 fn freelist_page() -> FerrosGrynnResult<AlignedPage> {
 	let mut page =
 		AlignedPage::new(PageType::Freelist, PageFlags::empty(), PageLsn::ZERO, PageNo::new(0));

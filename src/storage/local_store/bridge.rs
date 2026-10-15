@@ -196,12 +196,10 @@ pub(super) fn recover(
 			graph,
 			..
 		} = &mapping.subject
+			&& (database.membership(*graph, atom.id()).is_none()
+				|| atom.kind() != crate::graph::AtomKind::Edge)
 		{
-			if database.membership(*graph, atom.id()).is_none()
-				|| atom.kind() != crate::graph::AtomKind::Edge
-			{
-				return Err(invalid("mapping edge occurrence is absent"));
-			}
+			return Err(invalid("mapping edge occurrence is absent"));
 		}
 	}
 	database.bridges = Arc::new(mappings);

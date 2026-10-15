@@ -60,18 +60,19 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			}
 			Ok(Value::None)
 		}
-		LogicalGraphDmlStatement::Relate {
-			bridge,
-			atom_endpoints,
-			source: source_target,
-			edge,
-			target,
-			graph,
-			label,
-			direction,
-			weight,
-			keep_levelpath,
-		} => {
+		LogicalGraphDmlStatement::Relate(relate) => {
+			let crate::gql::ir::LogicalRelate {
+				bridge,
+				atom_endpoints,
+				source: source_target,
+				edge,
+				target,
+				graph,
+				label,
+				direction,
+				weight,
+				keep_levelpath,
+			} = relate.as_ref();
 			if let Some(alias) = bridge.as_deref() {
 				let scope = control.bridge_scope.as_ref().ok_or_else(|| {
 					FerrosGrynnError::bridge_operation_error(
@@ -79,7 +80,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 					)
 				})?;
 				let (database, capabilities) = scope.resolve(alias)?;
-				if !capabilities.mirror {
+				if !capabilities.mirror() {
 					return Err(FerrosGrynnError::bridge_operation_error(
 						"adapter cannot mirror relations",
 					));
@@ -115,7 +116,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 						)
 					})?;
 					let (database, capabilities) = scope.resolve(alias)?;
-					if !capabilities.mirror {
+					if !capabilities.mirror() {
 						return Err(FerrosGrynnError::bridge_operation_error(
 							"adapter cannot mirror relations",
 						));
@@ -203,7 +204,8 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 					));
 				}
 			} else {
-				transaction.create_atom(edge_record.clone(), Default::default())?;
+				transaction
+					.create_atom(edge_record.clone(), crate::values::PropertyMap::default())?;
 			}
 			let topology = topology(*direction, source_local, target_local);
 			let weight = weight
@@ -314,6 +316,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 	}
 }
 
+/// Returns the transaction class result.
 fn transaction_class(
 	transaction: &mut Transaction,
 	_snapshot: &QuerySnapshot,
@@ -323,6 +326,7 @@ fn transaction_class(
 	transaction.query_class(&current, class)
 }
 
+/// Records id.
 fn record_id(
 	transaction: &Transaction,
 	snapshot: &QuerySnapshot,
@@ -394,6 +398,7 @@ fn relate_endpoint(
 	}
 }
 
+/// Ensures endpoint.
 fn ensure_endpoint(
 	transaction: &mut Transaction,
 	graph: &GraphRef,
@@ -436,6 +441,7 @@ fn topology(
 	}
 }
 
+/// Returns the numeric weight result.
 fn numeric_weight(value: Value) -> FerrosGrynnResult<Number> {
 	match value {
 		Value::Number(value) => Ok(value),
@@ -446,6 +452,7 @@ fn numeric_weight(value: Value) -> FerrosGrynnResult<Number> {
 	}
 }
 
+/// Returns the candidate from atom result.
 fn candidate_from_atom(
 	atom: &AtomSnapshot,
 	schema: &Schema,
@@ -478,6 +485,7 @@ fn candidate_from_atom(
 	})
 }
 
+/// Returns the graph result result.
 fn graph_result(
 	transaction: &mut Transaction,
 	graph: Option<&GraphRef>,

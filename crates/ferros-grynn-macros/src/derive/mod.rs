@@ -1,18 +1,12 @@
-use syn::{Attribute, Field, Token, parse::Parse, punctuated::Punctuated};
+use syn::{Attribute, Token, parse::Parse, punctuated::Punctuated};
 
+/// Heap-measurement derive parsing and code generation.
 pub mod measurable;
 
-pub fn field_has_attribute(ident: &str, field: &Field) -> bool {
-	has_attribute(ident, &field.attrs)
-}
-
-pub fn has_attribute<'a>(ident: &str, it: impl IntoIterator<Item = &'a Attribute>) -> bool {
-	it.into_iter().any(|attr| attr.path().is_ident(ident))
-}
-
-pub fn get_metadata_inner<'a, T: Parse>(
+/// Generates metadata accessors from the annotated type definition.
+pub fn get_metadata_inner<'a, T: Parse, ItArg: IntoIterator<Item = &'a Attribute>>(
 	ident: &str,
-	it: impl IntoIterator<Item = &'a Attribute>,
+	it: ItArg,
 ) -> syn::Result<Vec<T>> {
 	it.into_iter().filter(|attr| attr.path().is_ident(ident)).try_fold(
 		Vec::new(),

@@ -21,8 +21,8 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - `ir.rs` — typed logical plan, не storage plan;
 - `optimizer/` — единственный crate-private rule/CBO optimizer, physical plans,
   fixed-point estimates/costs, deterministic plan encoding и EXPLAIN projection;
-- `execution/adapter.rs` — единственная граница к transaction snapshot;
-- `execution/cursor.rs` — pull-based relational cursors;
+- `execution/adapter/mod.rs` — единственная граница к transaction snapshot;
+- `execution/cursor/mod.rs` — pull-based relational cursors;
 - `execution/eval.rs` — вычисление typed expressions;
 - `execution/mod.rs` — orchestration и statement results;
 - `analysis/event.rs` — EVENT DDL и source-preserving effect validation;
@@ -400,8 +400,12 @@ Transient encoding/hash accounts освобождаются до execution; owne
 SELECT graph terminal — cold owned payload в AST/IR. Его Box shell допускается
 analyzer до allocation и учитывается отдельно при копировании typed SELECT;
 уменьшение `size_of::<LogicalSelect>()` не освобождает от pointee accounting.
-MATCH/TRAVERSE/standalone RETURN GRAPH сохраняют свои прежние layouts и общий
-graph assembler. Typed IR не является durable representation.
+MATCH terminal, WITHIN owner, LET BUILD GRAPH и RELATE также хранят cold payload
+в Box. Analyzer допускает новые оболочки до allocation; MATCH/TRAVERSE/closure
+удерживают их суммарный размер для допуска реальных deep copies. Вложенные
+analyzers объединяют уже допущенные размеры без повторного начисления. Нулевые
+SDK spans не отменяют этот учёт. Общий graph assembler сохранён; typed IR
+не является durable representation.
 
 Direct root SELECT Class callback удерживает transient BarrierAccount от cursor.next
 до завершения projection/visitor. Retained results до insertion отдельно учитывают

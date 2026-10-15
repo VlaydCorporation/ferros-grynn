@@ -9,10 +9,15 @@ use std::{
 	time::{Duration, Instant},
 };
 
-pub(crate) const DEFAULT_BARRIER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// Configured default barrier memory bytes value.
+pub const DEFAULT_BARRIER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// Shared next statement nonce value.
 static NEXT_STATEMENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// Returns the next statement nonce.
 fn next_statement_nonce() -> u64 {
+	// The nonce distinguishes statement identity; it does not publish execution
+	// state.
 	NEXT_STATEMENT_NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -35,7 +40,10 @@ use crate::{
 
 /// Cooperative cancellation handle shared with one or more query executions.
 #[derive(Debug, Clone, Default)]
-pub struct QueryCancellation(Arc<AtomicBool>);
+pub struct QueryCancellation(
+	/// Shared cancellation flag observed by query resource checks.
+	Arc<AtomicBool>,
+);
 
 /// Owned interruption boundary shared with a private bounded compiler scope.
 #[derive(Debug, Clone)]
@@ -106,15 +114,13 @@ impl QueryCancellation {
 }
 
 /// Parser and bounded-runtime settings for one `execute` call.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct QueryExecutionOptions {
-	/// Explicit bridge orchestration shares the ordinary statement pool.
-	pub(crate) bridge_memory: Option<Arc<Mutex<BarrierAccount>>>,
-	/// Runtime adapters are never part of a durable query recipe.
-	pub(crate) bridge_scope: Option<Arc<crate::bridge::BridgeQueryScope>>,
-	/// Sources cannot promote transaction access or transitive UDF effects.
-	pub(crate) bridge_read_only: bool,
+	/// Opaque runtime authority carried between a bridge and its queries.
+	/// Applications normally retain the default context; adapters obtain the
+	/// shared context through `BridgeContext::options`.
+	pub context: QueryExecutionContext,
 	/// Parser nesting and object-depth limits.
 	pub parser_settings: ParserSettings,
 	/// Default per-statement timeout, overridden only by an earlier clause
@@ -146,12 +152,52 @@ pub struct QueryExecutionOptions {
 	pub deterministic_seed: u64,
 }
 
+/// Runtime-owned bridge authority carried by execution options.
+///
+/// Cloning options preserves the shared admission account, dispatcher and
+/// source-side effect ceiling. Adapters executing options obtained from
+/// `BridgeContext::options` must retain this context when changing ordinary
+/// settings. The default context represents a query without a bridge.
+#[derive(Debug, Clone, Default)]
+pub struct QueryExecutionContext {
+	/// Admission account shared by source and receiving queries.
+	pub(crate) bridge_memory: Option<Arc<Mutex<BarrierAccount>>>,
+	/// Query-local dispatcher, never persisted in a durable recipe.
+	pub(crate) bridge_scope: Option<Arc<crate::bridge::BridgeQueryScope>>,
+	/// Source-side effect ceiling inherited by nested function calls.
+	pub(crate) bridge_read_only: bool,
+}
+
+impl std::fmt::Debug for QueryExecutionOptions {
+	/// Formats `QueryExecutionOptions` using the requested formatter.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// Keep the existing diagnostic representation after encapsulating
+		// state.
+		f.debug_struct("QueryExecutionOptions")
+			.field("bridge_memory", &self.context.bridge_memory)
+			.field("bridge_scope", &self.context.bridge_scope)
+			.field("bridge_read_only", &self.context.bridge_read_only)
+			.field("parser_settings", &self.parser_settings)
+			.field("statement_timeout", &self.statement_timeout)
+			.field("max_control_depth", &self.max_control_depth)
+			.field("max_loop_iterations", &self.max_loop_iterations)
+			.field("max_path_expansions", &self.max_path_expansions)
+			.field("graph_algorithm_limits", &self.graph_algorithm_limits)
+			.field("max_graph_nodes", &self.max_graph_nodes)
+			.field("max_graph_edges", &self.max_graph_edges)
+			.field("cancellation", &self.cancellation)
+			.field("barrier_memory_bytes", &self.barrier_memory_bytes)
+			.field("temporary_directory", &self.temporary_directory)
+			.field("deterministic_seed", &self.deterministic_seed)
+			.finish()
+	}
+}
+
 impl Default for QueryExecutionOptions {
+	/// Constructs the default initial state of `QueryExecutionOptions`.
 	fn default() -> Self {
 		Self {
-			bridge_memory: None,
-			bridge_scope: None,
-			bridge_read_only: false,
+			context: QueryExecutionContext::default(),
 			parser_settings: ParserSettings::default(),
 			statement_timeout: None,
 			max_control_depth: 20,
@@ -170,6 +216,7 @@ impl Default for QueryExecutionOptions {
 }
 
 impl QueryExecutionOptions {
+	/// Validates query execution options.
 	pub(crate) fn validate(&self) -> FerrosGrynnResult<()> {
 		let limits = self.graph_algorithm_limits;
 		if limits.memory_bytes == 0
@@ -211,7 +258,7 @@ struct LiveAttachmentScope {
 
 /// Statement-local deadline and cancellation state.
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutionControl {
+pub struct ExecutionControl {
 	/// Query-scoped async port used by the synchronous executor.
 	pub(crate) bridge_scope: Option<Arc<crate::bridge::BridgeQueryScope>>,
 	/// Only an implicit session transaction may infer write access from typed
@@ -224,35 +271,59 @@ pub(crate) struct ExecutionControl {
 	live_attachments: Option<Arc<LiveAttachmentScope>>,
 	/// Clause deadlines include analysis and snapshot setup time.
 	started: Instant,
+	/// Absolute deadline used for cooperative timeout checks.
 	deadline: Option<Instant>,
+	/// Timeout ms associated with this execution control.
 	timeout_ms: u64,
+	/// Shared token observed by cooperative cancellation checks.
 	cancellation: Option<QueryCancellation>,
 	/// Optional cooperative check supplied by an embedding maintenance worker.
 	cooperative_check: Option<fn() -> FerrosGrynnResult<()>>,
+	/// Notifications associated with this execution control.
 	notifications: Arc<Mutex<Vec<Status>>>,
+	/// Max control depth associated with this execution control.
 	pub(crate) max_control_depth: u32,
+	/// Max loop iterations associated with this execution control.
 	pub(crate) max_loop_iterations: u64,
+	/// Max path expansions associated with this execution control.
 	max_path_expansions: u64,
 	/// Shared caps for exact tensor and analytical operations.
 	graph_algorithm_limits: crate::graph::tensor::GraphAlgorithmLimits,
+	/// Max graph nodes associated with this execution control.
 	max_graph_nodes: u64,
+	/// Max graph edges associated with this execution control.
 	max_graph_edges: u64,
+	/// Path expansions associated with this execution control.
 	path_expansions: Arc<AtomicU64>,
+	/// Match metrics associated with this execution control.
 	match_metrics: Arc<MatchMetrics>,
+	/// Graph assembly metrics associated with this execution control.
 	graph_assembly_metrics: Arc<GraphAssemblyMetrics>,
+	/// Barrier memory associated with this execution control.
 	barrier_memory: Arc<BarrierMemory>,
+	/// Temporary directory associated with this execution control.
 	pub(crate) temporary_directory: Option<PathBuf>,
+	/// Cursors associated with this execution control.
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
+	/// Continuation associated with this execution control.
 	continuation: Arc<Mutex<Option<QueryCursor>>>,
+	/// Pending index seek associated with this execution control.
 	pending_index_seek: Arc<Mutex<Option<QueryCursor>>>,
+	/// Closure registry associated with this execution control.
 	closure_registry: Arc<LanguageClosureState>,
 	/// One shared execution gas/depth authority for nested calls and handlers.
 	runtime_budget: Arc<RuntimeBudget>,
+	/// Execution mode associated with this execution control.
 	execution_mode: ExecutionMode,
+	/// User seed associated with this execution control.
 	user_seed: u64,
+	/// Parameter fingerprint associated with this execution control.
 	parameter_fingerprint: u64,
+	/// Statement nonce associated with this execution control.
 	statement_nonce: u64,
+	/// Publication deferred associated with this execution control.
 	publication_deferred: bool,
+	/// Instrumentation associated with this execution control.
 	instrumentation: bool,
 	/// Optional counters scoped to one ANALYZE execution and its child
 	/// controls.
@@ -284,6 +355,7 @@ impl RuntimeBudget {
 }
 
 #[derive(Debug, Default)]
+/// Match metrics state.
 struct MatchMetrics {
 	/// Actual graph-kernel work, shared by nested statement controls.
 	algorithm_work: AtomicU64,
@@ -307,38 +379,62 @@ struct MatchMetrics {
 	landmark_fallbacks: AtomicU64,
 	/// Generation bytes admitted once per bound source-target search.
 	landmark_artifact_bytes: AtomicU64,
+	/// Seeds associated with this match metrics.
 	seeds: AtomicU64,
+	/// Frontier peak associated with this match metrics.
 	frontier_peak: AtomicU64,
+	/// Trace nodes associated with this match metrics.
 	trace_nodes: AtomicU64,
+	/// Graph opens associated with this match metrics.
 	graph_opens: AtomicU64,
+	/// Containment links associated with this match metrics.
 	containment_links: AtomicU64,
+	/// Hyper assignments associated with this match metrics.
 	hyper_assignments: AtomicU64,
+	/// Cancellation checks associated with this match metrics.
 	cancellation_checks: AtomicU64,
+	/// Physical windows associated with this match metrics.
 	physical_windows: AtomicU64,
+	/// Physical resident pages associated with this match metrics.
 	physical_resident_pages: AtomicU64,
+	/// Physical wal pages associated with this match metrics.
 	physical_wal_pages: AtomicU64,
+	/// Physical sync pages associated with this match metrics.
 	physical_sync_pages: AtomicU64,
+	/// Physical ioring pages associated with this match metrics.
 	physical_ioring_pages: AtomicU64,
 }
 
 #[derive(Debug, Default)]
+/// Graph assembly metrics state.
 struct GraphAssemblyMetrics {
+	/// Source rows associated with this graph assembly metrics.
 	source_rows: AtomicU64,
+	/// Selected nodes associated with this graph assembly metrics.
 	selected_nodes: AtomicU64,
+	/// Selected edges associated with this graph assembly metrics.
 	selected_edges: AtomicU64,
+	/// Closure nodes associated with this graph assembly metrics.
 	closure_nodes: AtomicU64,
+	/// Closure edges associated with this graph assembly metrics.
 	closure_edges: AtomicU64,
+	/// Deduplicated values associated with this graph assembly metrics.
 	deduplicated_values: AtomicU64,
+	/// Final nodes associated with this graph assembly metrics.
 	final_nodes: AtomicU64,
+	/// Final edges associated with this graph assembly metrics.
 	final_edges: AtomicU64,
+	/// Child graphs associated with this graph assembly metrics.
 	child_graphs: AtomicU64,
+	/// Scope slots associated with this graph assembly metrics.
 	scope_slots: AtomicU64,
+	/// Validation ns associated with this graph assembly metrics.
 	validation_ns: AtomicU64,
 }
 
 /// Snapshot of MATCH-specific counters collected by `EXPLAIN ANALYZE`.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct MatchMetricsSnapshot {
+pub struct MatchMetricsSnapshot {
 	/// Shared graph-kernel work admission, including retained failed work.
 	pub(crate) algorithm_work: u64,
 	/// Complete logical paths charged against the statement cap.
@@ -361,17 +457,29 @@ pub(crate) struct MatchMetricsSnapshot {
 	pub(crate) landmark_fallbacks: u64,
 	/// Generation bytes admitted once per bound source-target search.
 	pub(crate) landmark_artifact_bytes: u64,
+	/// Seeds associated with this match metrics snapshot.
 	pub(crate) seeds: u64,
+	/// Frontier peak associated with this match metrics snapshot.
 	pub(crate) frontier_peak: u64,
+	/// Trace nodes associated with this match metrics snapshot.
 	pub(crate) trace_nodes: u64,
+	/// Graph opens associated with this match metrics snapshot.
 	pub(crate) graph_opens: u64,
+	/// Containment links associated with this match metrics snapshot.
 	pub(crate) containment_links: u64,
+	/// Hyper assignments associated with this match metrics snapshot.
 	pub(crate) hyper_assignments: u64,
+	/// Cancellation checks associated with this match metrics snapshot.
 	pub(crate) cancellation_checks: u64,
+	/// Physical windows associated with this match metrics snapshot.
 	pub(crate) physical_windows: u64,
+	/// Physical resident pages associated with this match metrics snapshot.
 	pub(crate) physical_resident_pages: u64,
+	/// Physical wal pages associated with this match metrics snapshot.
 	pub(crate) physical_wal_pages: u64,
+	/// Physical sync pages associated with this match metrics snapshot.
 	pub(crate) physical_sync_pages: u64,
+	/// Physical ioring pages associated with this match metrics snapshot.
 	pub(crate) physical_ioring_pages: u64,
 }
 
@@ -420,17 +528,29 @@ impl MatchMetricsSnapshot {
 
 /// Snapshot of owned graph assembly counters collected by `EXPLAIN ANALYZE`.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct GraphAssemblyMetricsSnapshot {
+pub struct GraphAssemblyMetricsSnapshot {
+	/// Source rows associated with this graph assembly metrics snapshot.
 	pub(crate) source_rows: u64,
+	/// Selected nodes associated with this graph assembly metrics snapshot.
 	pub(crate) selected_nodes: u64,
+	/// Selected edges associated with this graph assembly metrics snapshot.
 	pub(crate) selected_edges: u64,
+	/// Closure nodes associated with this graph assembly metrics snapshot.
 	pub(crate) closure_nodes: u64,
+	/// Closure edges associated with this graph assembly metrics snapshot.
 	pub(crate) closure_edges: u64,
+	/// Deduplicated values associated with this graph assembly metrics
+	/// snapshot.
 	pub(crate) deduplicated_values: u64,
+	/// Final nodes associated with this graph assembly metrics snapshot.
 	pub(crate) final_nodes: u64,
+	/// Final edges associated with this graph assembly metrics snapshot.
 	pub(crate) final_edges: u64,
+	/// Child graphs associated with this graph assembly metrics snapshot.
 	pub(crate) child_graphs: u64,
+	/// Scope slots associated with this graph assembly metrics snapshot.
 	pub(crate) scope_slots: u64,
+	/// Validation ns associated with this graph assembly metrics snapshot.
 	pub(crate) validation_ns: u64,
 }
 
@@ -456,12 +576,19 @@ impl GraphAssemblyMetricsSnapshot {
 }
 
 #[derive(Debug)]
+/// Barrier memory state.
 struct BarrierMemory {
+	/// Limit associated with this barrier memory.
 	limit: usize,
+	/// Used associated with this barrier memory.
 	used: AtomicUsize,
+	/// Peak associated with this barrier memory.
 	peak: AtomicUsize,
+	/// Spill bytes associated with this barrier memory.
 	spill_bytes: AtomicU64,
+	/// Spill runs associated with this barrier memory.
 	spill_runs: AtomicU64,
+	/// Row pulls associated with this barrier memory.
 	row_pulls: AtomicU64,
 	/// Checked work for ordinary reads of reactive lexical values.
 	reactive_work: AtomicU64,
@@ -503,20 +630,15 @@ impl BarrierMemory {
 
 /// Bytes retained by one in-memory SELECT barrier.
 #[derive(Debug)]
-pub(crate) struct BarrierAccount {
+pub struct BarrierAccount {
+	/// Memory associated with this barrier account.
 	memory: Arc<BarrierMemory>,
+	/// Bytes associated with this barrier account.
 	bytes: usize,
 }
 
 impl BarrierAccount {
-	/// Creates another owner charged to this same bounded allocation pool.
-	pub(crate) fn shared(&self) -> Self {
-		Self {
-			memory: self.memory.clone(),
-			bytes: 0,
-		}
-	}
-
+	/// Creates a new `BarrierAccount` value.
 	pub(crate) fn new(limit: usize) -> Self {
 		Self {
 			memory: Arc::new(BarrierMemory {
@@ -538,6 +660,7 @@ impl BarrierAccount {
 		}
 	}
 
+	/// Reserves barrier account.
 	pub(crate) fn reserve(&mut self, bytes: usize) -> bool {
 		if !self.memory.reserve(bytes) {
 			return false;
@@ -546,6 +669,7 @@ impl BarrierAccount {
 		true
 	}
 
+	/// Releases all.
 	pub(crate) fn release_all(&mut self) {
 		if self.bytes != 0 {
 			self.memory.used.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -553,6 +677,7 @@ impl BarrierAccount {
 		}
 	}
 
+	/// Releases barrier account.
 	pub(crate) fn release(&mut self, bytes: usize) {
 		let bytes = bytes.min(self.bytes);
 		if bytes != 0 {
@@ -561,6 +686,7 @@ impl BarrierAccount {
 		}
 	}
 
+	/// Records spill.
 	pub(crate) fn record_spill(&self, bytes: u64) {
 		self.memory.spill_bytes.fetch_add(bytes, Ordering::Relaxed);
 		self.memory.spill_runs.fetch_add(1, Ordering::Relaxed);
@@ -568,16 +694,19 @@ impl BarrierAccount {
 }
 
 impl Drop for BarrierAccount {
+	/// Runs cleanup for this `BarrierAccount` before its fields are released.
 	fn drop(&mut self) {
 		self.release_all();
 	}
 }
 
 impl ExecutionControl {
+	/// Creates a new `ExecutionControl` value.
 	pub(crate) fn new(options: &QueryExecutionOptions, timeout: Option<Duration>) -> Self {
 		Self::with_cursors(options, timeout, None)
 	}
 
+	/// Configures cursors.
 	pub(crate) fn with_cursors(
 		options: &QueryExecutionOptions,
 		timeout: Option<Duration>,
@@ -586,6 +715,7 @@ impl ExecutionControl {
 		Self::with_runtime(options, timeout, cursors, Arc::new(LanguageClosureState::default()))
 	}
 
+	/// Configures runtime.
 	pub(crate) fn with_runtime(
 		options: &QueryExecutionOptions,
 		timeout: Option<Duration>,
@@ -625,7 +755,7 @@ impl ExecutionControl {
 		let started = origin.unwrap_or_else(Instant::now);
 		Self {
 			started,
-			bridge_scope: options.bridge_scope.clone(),
+			bridge_scope: options.context.bridge_scope.clone(),
 			deadline: timeout.and_then(|value| started.checked_add(value)),
 			infer_write_access: false,
 			effect_ceiling: ClosureEffect::SchemaMutation,
@@ -645,7 +775,7 @@ impl ExecutionControl {
 			path_expansions: Arc::new(AtomicU64::new(0)),
 			match_metrics: Arc::new(MatchMetrics::default()),
 			graph_assembly_metrics: Arc::new(GraphAssemblyMetrics::default()),
-			barrier_memory: options.bridge_memory.as_ref().map_or_else(
+			barrier_memory: options.context.bridge_memory.as_ref().map_or_else(
 				|| {
 					Arc::new(BarrierMemory {
 						limit: options.barrier_memory_bytes.get(),
@@ -681,6 +811,7 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Configures execution mode.
 	pub(crate) fn with_execution_mode(
 		mut self,
 		execution_mode: ExecutionMode,
@@ -757,6 +888,7 @@ impl ExecutionControl {
 			})
 	}
 
+	/// Creates closure.
 	pub(in crate::gql) fn create_closure(
 		&self,
 		plan: &LogicalClosure,
@@ -765,14 +897,17 @@ impl ExecutionControl {
 		self.closure_registry.register(plan, slots, self.statement_nonce)
 	}
 
+	/// Returns the function cache result.
 	pub(in crate::gql) fn function_cache(&self) -> &LanguageClosureState {
 		&self.closure_registry
 	}
 
+	/// Returns the statement nonce result.
 	pub(crate) const fn statement_nonce(&self) -> u64 {
 		self.statement_nonce
 	}
 
+	/// Resolves closure.
 	pub(in crate::gql) fn resolve_closure(
 		&self,
 		closure: &Closure,
@@ -780,6 +915,7 @@ impl ExecutionControl {
 		self.closure_registry.resolve(closure)
 	}
 
+	/// Resolves named function.
 	pub(in crate::gql) fn resolve_named_function(
 		&self,
 		function: NamedFunctionKey,
@@ -787,6 +923,7 @@ impl ExecutionControl {
 		self.closure_registry.resolve_named(function)
 	}
 
+	/// Returns the enter named function result.
 	pub(in crate::gql) fn enter_named_function(
 		&self,
 		function: NamedFunctionKey,
@@ -815,6 +952,7 @@ impl ExecutionControl {
 		})
 	}
 
+	/// Returns whether the deterministic condition holds.
 	pub(crate) const fn deterministic(&self) -> bool {
 		matches!(self.execution_mode, ExecutionMode::Deterministic)
 	}
@@ -838,10 +976,12 @@ impl ExecutionControl {
 		self
 	}
 
+	/// Returns whether the fast condition holds.
 	pub(crate) const fn fast(&self) -> bool {
 		matches!(self.execution_mode, ExecutionMode::Fast)
 	}
 
+	/// Configures publication deferred.
 	pub(crate) const fn with_publication_deferred(mut self, deferred: bool) -> Self {
 		self.publication_deferred = deferred;
 		self
@@ -854,10 +994,12 @@ impl ExecutionControl {
 		self
 	}
 
+	/// Returns whether the publication deferred condition holds.
 	pub(crate) const fn publication_deferred(&self) -> bool {
 		self.publication_deferred
 	}
 
+	/// Returns the statement seed result.
 	pub(crate) fn statement_seed(&self, query_fingerprint: u64, snapshot: u64) -> u64 {
 		let replay = (
 			query_fingerprint,
@@ -902,6 +1044,7 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Checks execution control.
 	pub(crate) fn check(&self) -> FerrosGrynnResult<()> {
 		if let Some(scope) = &self.bridge_scope {
 			scope.context.check()?;
@@ -926,6 +1069,7 @@ impl ExecutionControl {
 		self
 	}
 
+	/// Returns the child result.
 	pub(crate) fn child(&self, timeout: Option<Duration>) -> Self {
 		let child_deadline = timeout.and_then(|value| Instant::now().checked_add(value));
 		self.child_at(timeout, child_deadline)
@@ -1016,10 +1160,12 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Returns the cursors result.
 	pub(crate) fn cursors(&self) -> Option<&Arc<Mutex<CursorRuntime>>> {
 		self.cursors.as_ref()
 	}
 
+	/// Returns the barrier account result.
 	pub(crate) fn barrier_account(&self) -> BarrierAccount {
 		BarrierAccount {
 			memory: self.barrier_memory.clone(),
@@ -1233,10 +1379,12 @@ impl ExecutionControl {
 		self.max_graph_edges
 	}
 
+	/// Returns the barrier memory peak result.
 	pub(crate) fn barrier_memory_peak(&self) -> usize {
 		self.barrier_memory.peak.load(Ordering::Acquire)
 	}
 
+	/// Returns the spill metrics result.
 	pub(crate) fn spill_metrics(&self) -> (u64, u64) {
 		(
 			self.barrier_memory.spill_bytes.load(Ordering::Acquire),
@@ -1244,10 +1392,12 @@ impl ExecutionControl {
 		)
 	}
 
+	/// Returns the row pulls result.
 	pub(crate) fn row_pulls(&self) -> u64 {
 		self.barrier_memory.row_pulls.load(Ordering::Acquire)
 	}
 
+	/// Records pull.
 	pub(crate) fn record_pull(&self) {
 		if self.instrumentation {
 			self.barrier_memory.row_pulls.fetch_add(1, Ordering::Relaxed);
@@ -1469,12 +1619,14 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Records graph source row.
 	pub(crate) fn record_graph_source_row(&self) {
 		if self.instrumentation {
 			self.graph_assembly_metrics.source_rows.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
+	/// Records graph selected atom.
 	pub(crate) fn record_graph_selected_atom(&self, kind: crate::graph::AtomKind) {
 		if !self.instrumentation {
 			return;
@@ -1489,6 +1641,7 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Records graph selected counts.
 	pub(crate) fn record_graph_selected_counts(&self, nodes: usize, edges: usize) {
 		if !self.instrumentation {
 			return;
@@ -1501,6 +1654,7 @@ impl ExecutionControl {
 			.fetch_add(u64::try_from(edges).unwrap_or(u64::MAX), Ordering::Relaxed);
 	}
 
+	/// Records graph closure atom.
 	pub(crate) fn record_graph_closure_atom(&self, kind: crate::graph::AtomKind) {
 		if !self.instrumentation {
 			return;
@@ -1515,12 +1669,14 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Records graph deduplicated value.
 	pub(crate) fn record_graph_deduplicated_value(&self) {
 		if self.instrumentation {
 			self.graph_assembly_metrics.deduplicated_values.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
+	/// Records graph scope slots.
 	pub(crate) fn record_graph_scope_slots(&self, slots: usize) {
 		if self.instrumentation {
 			self.graph_assembly_metrics
@@ -1529,6 +1685,7 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Records graph assembly result.
 	pub(crate) fn record_graph_assembly_result(
 		&self,
 		nodes: usize,
@@ -1549,6 +1706,7 @@ impl ExecutionControl {
 			.fetch_add(u64::try_from(child_graphs).unwrap_or(u64::MAX), Ordering::Relaxed);
 	}
 
+	/// Records graph validation.
 	pub(crate) fn record_graph_validation(&self, validation: Duration) {
 		if !self.instrumentation {
 			return;
@@ -1558,6 +1716,7 @@ impl ExecutionControl {
 			.fetch_add(u64::try_from(validation.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
 	}
 
+	/// Returns the graph assembly metrics result.
 	pub(crate) fn graph_assembly_metrics(&self) -> GraphAssemblyMetricsSnapshot {
 		GraphAssemblyMetricsSnapshot {
 			source_rows: self.graph_assembly_metrics.source_rows.load(Ordering::Acquire),
@@ -1577,6 +1736,7 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Sets continuation.
 	pub(crate) fn set_continuation(&self, cursor: QueryCursor) {
 		*self.continuation.lock() = Some(cursor);
 	}
@@ -1592,10 +1752,12 @@ impl ExecutionControl {
 		self.barrier_memory.used.load(Ordering::Relaxed)
 	}
 
+	/// Sets pending index seek.
 	pub(crate) fn set_pending_index_seek(&self, cursor: QueryCursor) {
 		*self.pending_index_seek.lock() = Some(cursor);
 	}
 
+	/// Attaches pending index seek.
 	pub(crate) fn attach_pending_index_seek(
 		&self,
 		transaction: Transaction,
@@ -1615,11 +1777,13 @@ impl ExecutionControl {
 		Ok(None)
 	}
 
+	/// Takes continuation.
 	pub(crate) fn take_continuation(&self) -> Option<QueryCursor> {
 		self.cursors.as_ref()?;
 		self.continuation.lock().take()
 	}
 
+	/// Performs the discard cursor operation.
 	pub(crate) fn discard_cursor(&self, cursor: QueryCursor) {
 		let mut pending = self.pending_index_seek.lock();
 		if pending.as_ref() == Some(&cursor) {
@@ -1631,16 +1795,19 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Performs the discard continuation operation.
 	pub(crate) fn discard_continuation(&self) {
 		if let Some(cursor) = self.take_continuation() {
 			self.discard_cursor(cursor);
 		}
 	}
 
+	/// Performs the notify operation.
 	pub(crate) fn notify(&self, status: Status) {
 		self.notifications.lock().push(status);
 	}
 
+	/// Returns the outcome result.
 	pub(crate) fn outcome(&self, value: Value) -> FerrosGrynnResult<Outcome<Value>> {
 		let mut statuses = StatusReport::successful();
 		for status in self.notifications.lock().drain(..) {
@@ -1654,13 +1821,17 @@ impl ExecutionControl {
 	}
 }
 
+/// Named function frame state.
 pub(in crate::gql) struct NamedFunctionFrame {
 	/// The shared recursion authority released when the invocation frame exits.
 	depths: Option<Arc<RuntimeBudget>>,
+	/// Function associated with this named function frame.
 	function: FunctionId,
 }
 
 impl Drop for NamedFunctionFrame {
+	/// Runs cleanup for this `NamedFunctionFrame` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		let Some(depths) = &self.depths else {
 			return;
@@ -1675,7 +1846,8 @@ impl Drop for NamedFunctionFrame {
 	}
 }
 
-pub(crate) fn resolve_duration(
+/// Resolves duration.
+pub fn resolve_duration(
 	value: &TimeoutValue,
 	bindings: &Object,
 	subject: &str,
@@ -1716,12 +1888,13 @@ pub(in crate::gql) fn parameter_duration(
 	if nanoseconds < 0 {
 		return Err(FerrosGrynnError::invalid_argument(format!("{subject} cannot be negative.")));
 	}
-	let nanoseconds = u64::try_from(nanoseconds).map_err(|_| {
+	let nanoseconds = u64::try_from(nanoseconds).map_err(|_conversion_error| {
 		FerrosGrynnError::invalid_argument(format!("{subject} is too large for this platform."))
 	})?;
 	Ok(Duration::from_nanos(nanoseconds))
 }
 
+/// Parses fixed duration.
 fn parse_fixed_duration(value: &str, subject: &str) -> FerrosGrynnResult<Duration> {
 	let split = value
 		.char_indices()
@@ -1754,10 +1927,13 @@ fn parse_fixed_duration(value: &str, subject: &str) -> FerrosGrynnResult<Duratio
 }
 
 #[cfg(test)]
+/// Regression tests for options behavior.
 mod tests {
 	use std::num::NonZeroUsize;
 
 	use super::{ExecutionControl, QueryExecutionOptions, parse_fixed_duration};
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::{
 		gql::ExecutionMode,
 		values::{Object, Value},
@@ -1784,6 +1960,7 @@ mod tests {
 		assert!(checks.check().is_err());
 	}
 
+	/// Verifies duration at rounded u64 boundary is rejected without panicking.
 	#[test]
 	fn duration_at_rounded_u64_boundary_is_rejected_without_panicking() {
 		assert!(parse_fixed_duration("18446744073709551615s", "TIMEOUT").is_err());
@@ -1792,19 +1969,21 @@ mod tests {
 	/// Untimed reuse does not anchor nested or subsequently resolved deadlines
 	/// early.
 	#[test]
-	fn session_untimed_origin_preserves_timed_and_nested_deadlines()
-	-> crate::gql_status::FerrosGrynnResult<()> {
+	fn session_untimed_origin_preserves_timed_and_nested_deadlines() {
 		use std::{
 			sync::Arc,
 			time::{Duration, Instant},
 		};
 
-		use crate::gql_status::FerrosGrynnError;
+		use crate::{gql_status::FerrosGrynnError, test_assertions::AssertResult as _};
 
 		let now = Instant::now();
-		let old = now.checked_sub(Duration::from_secs(1)).ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("clock fixture cannot subtract one second")
-		})?;
+		let old = now
+			.checked_sub(Duration::from_secs(1))
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("clock fixture cannot subtract one second")
+			})
+			.assert_ok();
 		let construct = |options: &QueryExecutionOptions, statement_timed| {
 			ExecutionControl::with_session_runtime(
 				options,
@@ -1818,14 +1997,14 @@ mod tests {
 		assert_eq!(untimed.started, old);
 		assert!(untimed.deadline().is_none());
 		let invoked = Instant::now();
-		let child = untimed.checked_child(Some(Duration::from_secs(1)))?;
+		let child = untimed.checked_child(Some(Duration::from_secs(1))).assert_ok();
 		assert!(child.deadline().is_some_and(|deadline| {
 			invoked.checked_add(Duration::from_secs(1)).is_some_and(|minimum| deadline >= minimum)
 		}));
 		let mut timed = construct(&QueryExecutionOptions::default(), true);
 		assert!(timed.started >= now);
 		let origin = timed.started;
-		timed.restrict_timeout(Duration::from_secs(1))?;
+		timed.restrict_timeout(Duration::from_secs(1)).assert_ok();
 		assert_eq!(timed.deadline(), origin.checked_add(Duration::from_secs(1)));
 		let configured = construct(
 			&QueryExecutionOptions {
@@ -1836,19 +2015,19 @@ mod tests {
 		);
 		assert!(configured.started >= now);
 		assert_eq!(configured.deadline(), configured.started.checked_add(Duration::from_secs(1)));
-		Ok(())
 	}
 
 	/// Resolution after analysis cannot renew a top-level timeout.
 	#[test]
-	fn duration_top_level_clock_anchor_and_default_minimum()
-	-> crate::gql_status::FerrosGrynnResult<()> {
+	fn duration_top_level_clock_anchor_and_default_minimum() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut control = ExecutionControl::new(&QueryExecutionOptions::default(), None);
 		let origin = control.started;
-		control.restrict_timeout(std::time::Duration::from_secs(1))?;
+		control.restrict_timeout(std::time::Duration::from_secs(1)).assert_ok();
 		assert_eq!(control.deadline(), origin.checked_add(std::time::Duration::from_secs(1)));
 		let mut copy = control.clone();
-		copy.restrict_timeout(std::time::Duration::from_secs(2))?;
+		copy.restrict_timeout(std::time::Duration::from_secs(2)).assert_ok();
 		assert_eq!(copy.deadline(), control.deadline());
 		assert_eq!(copy.started, origin);
 		assert_eq!(control.child(None).started, origin);
@@ -1860,12 +2039,12 @@ mod tests {
 			None,
 		);
 		let default = earlier.deadline();
-		earlier.restrict_timeout(std::time::Duration::from_secs(1))?;
+		earlier.restrict_timeout(std::time::Duration::from_secs(1)).assert_ok();
 		assert_eq!(earlier.deadline(), default);
 		assert!(earlier.restrict_timeout(std::time::Duration::MAX).is_err());
-		Ok(())
 	}
 
+	/// Verifies child controls share one barrier budget.
 	#[test]
 	fn child_controls_share_one_barrier_budget() {
 		let options = QueryExecutionOptions {
@@ -1886,6 +2065,7 @@ mod tests {
 		assert!(replacement.reserve(48));
 	}
 
+	/// Verifies deterministic statement seed covers parameters and user seed.
 	#[test]
 	fn deterministic_statement_seed_covers_parameters_and_user_seed() {
 		let mut parameters = Object::new();
@@ -1909,6 +2089,7 @@ mod tests {
 		assert_ne!(first, changed);
 	}
 
+	/// Verifies path expansion budget is positive and shared by children.
 	#[test]
 	fn path_expansion_budget_is_positive_and_shared_by_children() {
 		let invalid = QueryExecutionOptions {
@@ -1927,26 +2108,30 @@ mod tests {
 		assert!(child.record_path_expansion().is_err());
 	}
 
+	/// Verifies graph work admission is shared and only complete work is
+	/// refunded.
 	#[test]
 	fn graph_work_admission_is_shared_and_only_complete_work_is_refunded() {
 		let mut options = QueryExecutionOptions::default();
 		options.graph_algorithm_limits.max_work = 100;
 		let control = ExecutionControl::new(&options, None);
 		let child = control.child(None);
-		control.record_graph_work(100).unwrap();
+		control.record_graph_work(100).assert_ok();
 		assert!(child.record_graph_work(1).is_err());
 		control.release_graph_work(70);
 		assert_eq!(child.graph_algorithm_limits().max_work, 70);
-		child.record_graph_work(70).unwrap();
+		child.record_graph_work(70).assert_ok();
 		assert!(control.record_graph_work(1).is_err());
 	}
 
+	/// Verifies exhausted path quota does not reject non enumerating graph
+	/// work.
 	#[test]
 	fn exhausted_path_quota_does_not_reject_non_enumerating_graph_work() {
 		let mut options = QueryExecutionOptions::default();
 		options.graph_algorithm_limits.max_paths = 1;
 		let control = ExecutionControl::new(&options, None);
-		control.record_graph_paths(1).unwrap();
+		control.record_graph_paths(1).assert_ok();
 		let remaining = control.graph_algorithm_limits();
 		assert_eq!(remaining.max_paths, 0);
 		assert!(crate::graph::tensor::control::Control::new(remaining, &mut || Ok(())).is_ok());

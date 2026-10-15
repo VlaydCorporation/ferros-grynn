@@ -47,7 +47,9 @@ use crate::{
 	},
 };
 
+/// Configured encoding native value.
 const ENCODING_NATIVE: &str = "native";
+/// Configured encoding dense union value.
 const ENCODING_DENSE_UNION: &str = "dense_union";
 
 impl PropertyBatch {
@@ -57,6 +59,10 @@ impl PropertyBatch {
 	/// supported scalar kinds use a dense union without coercion.
 	/// StorageValue-backed fallback for nested values is introduced with the
 	/// storage codec stage.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn from_rows(
 		rows: &[PropertyMap],
 		dictionary: &PropertyDictionary,
@@ -98,6 +104,7 @@ impl PropertyBatch {
 	}
 }
 
+/// Decodes rows.
 pub(super) fn decode_rows(batch: &PropertyBatch) -> FerrosGrynnResult<Vec<PropertyMap>> {
 	let mut rows = vec![PropertyMap::new(); batch.num_rows()];
 	let schema = batch.record_batch.schema();
@@ -107,6 +114,8 @@ pub(super) fn decode_rows(batch: &PropertyBatch) -> FerrosGrynnResult<Vec<Proper
 		let array = batch.record_batch.column(field_index);
 		let logical_nulls = array.logical_nulls();
 		for (row_index, row) in rows.iter_mut().enumerate() {
+			// Presence must win over validity: an absent property is not an
+			// explicit null.
 			if !batch.presence[field_index].value(row_index) {
 				continue;
 			}
@@ -126,6 +135,7 @@ pub(super) fn decode_rows(batch: &PropertyBatch) -> FerrosGrynnResult<Vec<Proper
 	clippy::missing_panics_doc,
 	reason = "one kind must have a first element"
 )]
+/// Encodes column.
 fn encode_column(
 	key: PropertyKeyId,
 	values: &[Option<&Value>],
@@ -148,9 +158,9 @@ fn encode_column(
 #[allow(
 	clippy::expect_used,
 	clippy::missing_panics_doc,
-	unwrap_in_result,
 	reason = "non-sentinel has a kind & kind was collected from the same values"
 )]
+/// Encodes union.
 fn encode_union(
 	key: PropertyKeyId,
 	values: &[Option<&Value>],
@@ -170,8 +180,16 @@ fn encode_union(
 	for value in values {
 		let child = match value {
 			Some(value) if !value.is_none() && !value.is_null() => {
-				let kind = ColumnKind::of_value(key, value)?.expect("non-sentinel has a kind");
-				kinds.binary_search(&kind).expect("kind was collected from the same values")
+				// Sentinel values are excluded above; the immutable kind set
+				// was collected from these same values before
+				// encoding any union children.
+				let Some(kind) = ColumnKind::of_value(key, value)? else {
+					unreachable!("non-sentinel has a kind");
+				};
+				let Ok(child) = kinds.binary_search(&kind) else {
+					unreachable!("kind was collected from the same values");
+				};
+				child
 			}
 			_ => 0,
 		};
@@ -205,6 +223,7 @@ fn encode_union(
 	Ok((Arc::new(array), "union", ENCODING_DENSE_UNION))
 }
 
+/// Builds array.
 fn build_array(kind: ColumnKind, values: &[Option<&Value>]) -> FerrosGrynnResult<ArrayRef> {
 	let array: ArrayRef = match kind {
 		ColumnKind::Bool => Arc::new(BooleanArray::from(
@@ -280,6 +299,7 @@ fn build_array(kind: ColumnKind, values: &[Option<&Value>]) -> FerrosGrynnResult
 	Ok(array)
 }
 
+/// Decodes value.
 fn decode_value(array: &dyn Array, field: &Field, index: usize) -> FerrosGrynnResult<Value> {
 	if let Some(union) = array.as_any().downcast_ref::<UnionArray>() {
 		let type_id = union.type_id(index);
@@ -328,6 +348,7 @@ fn decode_value(array: &dyn Array, field: &Field, index: usize) -> FerrosGrynnRe
 	}
 }
 
+/// Returns the fixed 16 result.
 fn fixed_16(array: &dyn Array, field: &Field, index: usize) -> FerrosGrynnResult<[u8; 16]> {
 	downcast::<FixedSizeBinaryArray>(array, field)?
 		.value(index)
@@ -335,6 +356,7 @@ fn fixed_16(array: &dyn Array, field: &Field, index: usize) -> FerrosGrynnResult
 		.map_err(|_err| invalid_batch(format!("Arrow field {} is not 16 bytes wide", field.name())))
 }
 
+/// Returns the downcast result.
 fn downcast<'a, T: Array + 'static>(
 	array: &'a dyn Array,
 	field: &Field,
@@ -348,6 +370,7 @@ fn downcast<'a, T: Array + 'static>(
 	})
 }
 
+/// Returns the property field result.
 fn property_field(
 	key: PropertyKeyId,
 	name: &Text,
@@ -363,18 +386,31 @@ fn property_field(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Column kind alternatives.
 enum ColumnKind {
+	/// Bool case of column kind.
 	Bool,
+	/// Int case of column kind.
 	Int,
+	/// Float case of column kind.
 	Float,
-	Decimal(u32),
+	/// Decimal case of column kind.
+	Decimal(
+		/// Decimal case of column kind.
+		u32,
+	),
+	/// Text case of column kind.
 	Text,
+	/// Bytes case of column kind.
 	Bytes,
+	/// Uuid case of column kind.
 	Uuid,
+	/// Ulid case of column kind.
 	Ulid,
 }
 
 impl ColumnKind {
+	/// Returns the of value result.
 	fn of_value(key: PropertyKeyId, value: &Value) -> FerrosGrynnResult<Option<Self>> {
 		let kind = match value {
 			Value::None | Value::Null => return Ok(None),
@@ -396,6 +432,7 @@ impl ColumnKind {
 		Ok(Some(kind))
 	}
 
+	/// Returns the metadata name result.
 	fn metadata_name(self) -> &'static str {
 		match self {
 			Self::Bool => "bool",
@@ -440,31 +477,37 @@ impl ColumnKind {
 		}
 	}
 
+	/// Returns the field name result.
 	fn field_name(self) -> &'static str {
 		self.metadata_name()
 	}
 }
 
+/// Returns the arrow failure result.
 fn arrow_failure(operation: impl Into<String>, source: ArrowError) -> FerrosGrynnError {
 	FerrosGrynnError::arrow_property_batch_failure(operation).with_technical_source(source)
 }
 
 #[cfg(test)]
+/// Regression tests for arrow behavior.
 mod tests {
 	use rust_decimal::Decimal;
 
 	use super::PropertyBatch;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::values::runtime::{Bytes, PropertyDictionary, PropertyMap, Ulid, Uuid, Value};
 
+	/// Verifies arrow round trip preserves none null and native scalars.
 	#[test]
 	fn arrow_round_trip_preserves_none_null_and_native_scalars() {
 		let mut dictionary = PropertyDictionary::new();
-		let active = dictionary.intern("active").unwrap();
-		let score = dictionary.intern("score").unwrap();
-		let label = dictionary.intern("label").unwrap();
-		let payload = dictionary.intern("payload").unwrap();
-		let ratio = dictionary.intern("ratio").unwrap();
-		let external = dictionary.intern("external").unwrap();
+		let active = dictionary.intern("active").assert_ok();
+		let score = dictionary.intern("score").assert_ok();
+		let label = dictionary.intern("label").assert_ok();
+		let payload = dictionary.intern("payload").assert_ok();
+		let ratio = dictionary.intern("ratio").assert_ok();
+		let external = dictionary.intern("external").assert_ok();
 
 		let uuid = Uuid::new_v4();
 		let mut rows = vec![PropertyMap::new(); 4];
@@ -479,63 +522,67 @@ mod tests {
 		rows[2].insert(score, 30_i64);
 		rows[3].insert(active, false);
 
-		let batch = PropertyBatch::from_rows(&rows, &dictionary).unwrap();
+		let batch = PropertyBatch::from_rows(&rows, &dictionary).assert_ok();
 		let rebuilt =
 			PropertyBatch::try_from_arrow(batch.record_batch().clone(), batch.presence.clone())
-				.unwrap();
+				.assert_ok();
 		let mut normalized = rows.clone();
 		normalized[1].remove(score);
-		assert_eq!(rebuilt.to_rows().unwrap(), normalized);
-		assert!(!batch.presence(score).unwrap().value(1));
-		assert!(batch.presence(active).unwrap().value(1));
+		assert_eq!(rebuilt.to_rows().assert_ok(), normalized);
+		assert!(!batch.presence(score).assert_some().value(1));
+		assert!(batch.presence(active).assert_some().value(1));
 	}
 
+	/// Verifies incompatible scalar kinds use dense union without coercion.
 	#[test]
 	fn incompatible_scalar_kinds_use_dense_union_without_coercion() {
 		let mut dictionary = PropertyDictionary::new();
-		let mixed = dictionary.intern("mixed").unwrap();
+		let mixed = dictionary.intern("mixed").assert_ok();
 		let mut rows = vec![PropertyMap::new(); 5];
 		rows[0].insert(mixed, 9_i64);
 		rows[1].insert(mixed, "nine");
 		rows[2].insert(mixed, Value::Null);
 		rows[3].insert(mixed, true);
 
-		let batch = PropertyBatch::from_rows(&rows, &dictionary).unwrap();
+		let batch = PropertyBatch::from_rows(&rows, &dictionary).assert_ok();
 		assert!(matches!(
 			batch.record_batch().column(0).data_type(),
 			::arrow::datatypes::DataType::Union(..)
 		));
-		assert_eq!(batch.to_rows().unwrap(), rows);
+		assert_eq!(batch.to_rows().assert_ok(), rows);
 	}
 
+	/// Verifies unsupported nested value has domain status.
 	#[test]
 	fn unsupported_nested_value_has_domain_status() {
 		let mut dictionary = PropertyDictionary::new();
-		let key = dictionary.intern("nested").unwrap();
+		let key = dictionary.intern("nested").assert_ok();
 		let mut row = PropertyMap::new();
 		row.insert(key, Value::Array(vec![Value::from(1_i64)].into()));
 
-		let error = PropertyBatch::from_rows(&[row], &dictionary).unwrap_err();
+		let error = PropertyBatch::from_rows(&[row], &dictionary).assert_err();
 		assert_eq!(error.status().code().to_string(), "FG-22F17");
 	}
 
+	/// Verifies empty and explicit none rows keep row count without columns.
 	#[test]
 	fn empty_and_explicit_none_rows_keep_row_count_without_columns() {
 		let mut dictionary = PropertyDictionary::new();
-		let ignored = dictionary.intern("ignored").unwrap();
+		let ignored = dictionary.intern("ignored").assert_ok();
 		let mut rows = vec![PropertyMap::new(); 3];
 		rows[1].insert(ignored, Value::None);
 
-		let batch = PropertyBatch::from_rows(&rows, &dictionary).unwrap();
+		let batch = PropertyBatch::from_rows(&rows, &dictionary).assert_ok();
 		assert_eq!(batch.num_rows(), 3);
 		assert_eq!(batch.num_columns(), 0);
-		assert_eq!(batch.to_rows().unwrap(), vec![PropertyMap::new(); 3]);
+		assert_eq!(batch.to_rows().assert_ok(), vec![PropertyMap::new(); 3]);
 	}
 
+	/// Verifies union preserves float decimal scales and ulid.
 	#[test]
 	fn union_preserves_float_decimal_scales_and_ulid() {
 		let mut dictionary = PropertyDictionary::new();
-		let key = dictionary.intern("variant").unwrap();
+		let key = dictionary.intern("variant").assert_ok();
 		let ulid = Ulid::new();
 		let mut rows = vec![PropertyMap::new(); 4];
 		rows[0].insert(key, Decimal::new(12, 1));
@@ -543,7 +590,7 @@ mod tests {
 		rows[2].insert(key, 1.5_f64);
 		rows[3].insert(key, ulid);
 
-		let batch = PropertyBatch::from_rows(&rows, &dictionary).unwrap();
-		assert_eq!(batch.to_rows().unwrap(), rows);
+		let batch = PropertyBatch::from_rows(&rows, &dictionary).assert_ok();
+		assert_eq!(batch.to_rows().assert_ok(), rows);
 	}
 }

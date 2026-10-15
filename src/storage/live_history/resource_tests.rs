@@ -38,14 +38,19 @@ fn fault() -> FerrosGrynnError {
 
 /// A key one byte over the canonical text cap must fail before output growth.
 #[test]
-fn live_history_object_name_cap_is_symmetric() -> FerrosGrynnResult<()> {
-	let mut original = batch()?;
+fn live_history_object_name_cap_is_symmetric() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut original = batch().assert_ok();
 	let mut object = Object::new();
 	object.insert("x".repeat(16 * 1024 * 1024 + 1), Value::None);
 	original.events[0].after = Some(Value::Object(object));
 	let payload = LivePayload::Batch(original);
 	let LivePayload::Batch(batch) = &payload else {
-		return Err(invalid("fixture batch"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture batch"));
+			test_result.assert_ok();
+		};
 	};
 	assert!(
 		encode(
@@ -58,26 +63,28 @@ fn live_history_object_name_cap_is_symmetric() -> FerrosGrynnResult<()> {
 		)
 		.is_err()
 	);
-	Ok(())
 }
 
 /// Encoded logical depth is checked even when the runtime value is
 /// constructible.
 #[test]
-fn live_history_value_depth_is_bounded() -> FerrosGrynnResult<()> {
-	let mut original = batch()?;
+fn live_history_value_depth_is_bounded() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut original = batch().assert_ok();
 	let mut value = Value::None;
 	for _ in 0..65 {
 		value = Value::Array(Array::from(vec![value]));
 	}
 	original.events[0].after = Some(value);
 	assert!(bytes(&original).is_err());
-	Ok(())
 }
 
 /// Even an empty map adds a depth level; both directions use the same bound.
 #[test]
-fn live_history_diagnostic_map_depth_is_symmetric() -> FerrosGrynnResult<()> {
+fn live_history_diagnostic_map_depth_is_symmetric() {
+	use crate::test_assertions::AssertResult as _;
+
 	for depth in [14, 15] {
 		let mut value = DiagnosticValue::Map(std::collections::BTreeMap::new());
 		for _ in 0..depth {
@@ -87,18 +94,22 @@ fn live_history_diagnostic_map_depth_is_symmetric() -> FerrosGrynnResult<()> {
 		if depth == 15 {
 			assert!(encoded.is_err(), "the empty map still exceeds depth 16");
 		} else {
-			let encoded = encoded?;
-			assert!(matches!(decode(&encoded, 8 * 1024 * 1024)?, LivePayload::Fault { .. }));
+			let encoded = encoded.assert_ok();
+			assert!(matches!(
+				decode(&encoded, 8 * 1024 * 1024).assert_ok(),
+				LivePayload::Fault { .. }
+			));
 		}
 	}
-	Ok(())
 }
 
 /// Publicly constructible invalid coordinates must fail before publication.
 #[test]
-fn live_history_invalid_diagnostic_location_is_rejected() -> FerrosGrynnResult<()> {
+fn live_history_invalid_diagnostic_location_is_rejected() {
+	use crate::test_assertions::AssertResult as _;
+
 	let one = std::num::NonZeroU32::MIN;
-	let two = std::num::NonZeroU32::new(2).ok_or_else(|| invalid("fixture coordinate"))?;
+	let two = std::num::NonZeroU32::new(2).ok_or_else(|| invalid("fixture coordinate")).assert_ok();
 	let start = LineColumn::new(one, one);
 	let end = LineColumn::new(two, one);
 	for location in [
@@ -107,13 +118,14 @@ fn live_history_invalid_diagnostic_location_is_rejected() -> FerrosGrynnResult<(
 	] {
 		assert!(fault_bytes(fault().with_location(location)).is_err());
 	}
-	Ok(())
 }
 
 /// Large extension trees move into the status; constrained readers reject the
 /// whole control without a partial diagnostic.
 #[test]
-fn live_history_diagnostic_extensions_and_related_locations_are_bounded() -> FerrosGrynnResult<()> {
+fn live_history_diagnostic_extensions_and_related_locations_are_bounded() {
+	use crate::test_assertions::AssertResult as _;
+
 	let one = std::num::NonZeroU32::MIN;
 	let point = LineColumn::new(one, one);
 	let location = Location::from_parts(None, TextSpan::new(0, 0), point, point);
@@ -126,13 +138,16 @@ fn live_history_diagnostic_extensions_and_related_locations_are_bounded() -> Fer
 		error = error.with_extension(format!("list{index}"), DiagnosticValue::List(items));
 	}
 	let expected = error.to_wire();
-	let encoded = fault_bytes(error)?;
+	let encoded = fault_bytes(error).assert_ok();
 	let LivePayload::Fault {
 		diagnostic,
 		..
-	} = decode(&encoded, 8 * 1024 * 1024)?
+	} = decode(&encoded, 8 * 1024 * 1024).assert_ok()
 	else {
-		return Err(invalid("fixture fault kind"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture fault kind"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(diagnostic.to_wire(), expected);
 	assert!(decode(&encoded, encoded.len() + 1024).is_err());
@@ -140,21 +155,24 @@ fn live_history_diagnostic_extensions_and_related_locations_are_bounded() -> Fer
 		decode_delivery(&encoded, 8 * 1024 * 1024).is_err(),
 		"a valid oversized diagnostic cannot use prepaid consumer storage"
 	);
-	Ok(())
 }
 
 /// The binary contract preserves pre-epoch time independently of JSON display.
 #[test]
-fn live_history_diagnostic_pre_epoch_time_is_exact() -> FerrosGrynnResult<()> {
+fn live_history_diagnostic_pre_epoch_time_is_exact() {
+	use crate::test_assertions::AssertResult as _;
+
 	let timestamp = std::time::UNIX_EPOCH - std::time::Duration::new(3, 1);
-	let encoded = fault_bytes(fault().with_timestamp(timestamp))?;
+	let encoded = fault_bytes(fault().with_timestamp(timestamp)).assert_ok();
 	let LivePayload::Fault {
 		diagnostic,
 		..
-	} = decode(&encoded, 8 * 1024 * 1024)?
+	} = decode(&encoded, 8 * 1024 * 1024).assert_ok()
 	else {
-		return Err(invalid("fixture fault kind"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture fault kind"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(diagnostic.status().diagnostic().timestamp(), Some(timestamp));
-	Ok(())
 }

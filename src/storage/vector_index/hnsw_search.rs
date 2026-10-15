@@ -17,12 +17,16 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
+/// Candidate state.
 struct Candidate {
+	/// Distance associated with this candidate.
 	distance: f64,
+	/// Ordinal associated with this candidate.
 	ordinal: u32,
 }
 
 impl PartialEq for Candidate {
+	/// Compares this `Candidate` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -31,12 +35,15 @@ impl PartialEq for Candidate {
 impl Eq for Candidate {}
 
 impl PartialOrd for Candidate {
+	/// Compares this `Candidate` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Candidate {
+	/// Compares this `Candidate` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.distance.total_cmp(&other.distance).then_with(|| self.ordinal.cmp(&other.ordinal))
 	}
@@ -44,13 +51,15 @@ impl Ord for Candidate {
 
 /// Searches resident HNSW topology while the caller supplies vectors from a
 /// process-wide bounded cache or the immutable side-file.
-pub(crate) fn search_cached_hnsw_with_distance(
+pub fn search_cached_hnsw_with_distance<
+	LoadVectorArg: FnMut(u32) -> FerrosGrynnResult<Arc<Vector>>,
+>(
 	index: &DecodedHnswIndex,
 	delta: Option<&DecodedVectorDelta>,
 	query: &Vector,
 	k: usize,
 	breadth: usize,
-	load_vector: &mut impl FnMut(u32) -> FerrosGrynnResult<Arc<Vector>>,
+	load_vector: &mut LoadVectorArg,
 	distance_function: &mut dyn FnMut(
 		crate::datastore::FunctionId,
 		crate::datastore::SchemaVersion,
@@ -67,10 +76,10 @@ pub(crate) fn search_cached_hnsw_with_distance(
 		));
 	}
 	validate_vector(index.spec, query)?;
-	if let Some(delta) = delta {
-		if delta.spec.base != index.spec {
-			return Err(invalid("vector delta definition disagrees with its HNSW base"));
-		}
+	if let Some(delta) = delta
+		&& delta.spec.base != index.spec
+	{
+		return Err(invalid("vector delta definition disagrees with its HNSW base"));
 	}
 	let shadowed = delta
 		.into_iter()
@@ -115,6 +124,7 @@ pub(crate) fn search_cached_hnsw_with_distance(
 	Ok(hits)
 }
 
+/// Returns the greedy upper levels result.
 fn greedy_upper_levels(
 	index: &DecodedHnswIndex,
 	query: &Vector,
@@ -152,6 +162,7 @@ fn greedy_upper_levels(
 	Ok(current)
 }
 
+/// Returns the bounded level zero result.
 fn bounded_level_zero(
 	index: &DecodedHnswIndex,
 	query: &Vector,
@@ -206,6 +217,7 @@ fn bounded_level_zero(
 		.collect()
 }
 
+/// Returns the rerank result.
 fn rerank(
 	index: &DecodedHnswIndex,
 	query: &Vector,
@@ -236,6 +248,7 @@ fn rerank(
 	Ok(hits)
 }
 
+/// Appends delta.
 fn append_delta(
 	index: &DecodedHnswIndex,
 	delta: Option<&DecodedVectorDelta>,
@@ -263,6 +276,7 @@ fn append_delta(
 	Ok(())
 }
 
+/// Returns the distance to result.
 fn distance_to(
 	index: &DecodedHnswIndex,
 	query: &Vector,
@@ -279,6 +293,7 @@ fn distance_to(
 	vector_distance(index, query, &vector, distance_function)
 }
 
+/// Returns the vector distance result.
 fn vector_distance(
 	index: &DecodedHnswIndex,
 	left: &Vector,
@@ -299,6 +314,7 @@ fn vector_distance(
 	}
 }
 
+/// Returns the node result.
 fn node(index: &DecodedHnswIndex, ordinal: u32) -> FerrosGrynnResult<&super::codec::HnswGraphNode> {
 	index
 		.nodes
@@ -306,6 +322,7 @@ fn node(index: &DecodedHnswIndex, ordinal: u32) -> FerrosGrynnResult<&super::cod
 		.ok_or_else(|| invalid("HNSW ordinal lies outside its resident graph"))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

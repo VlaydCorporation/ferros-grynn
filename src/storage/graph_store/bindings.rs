@@ -73,6 +73,7 @@ impl GraphFileSet {
 	}
 
 	/// Returns WAL-backfilled files in the graph generation.
+	#[cfg(test)]
 	pub(in crate::storage) const fn regular_files(self) -> [DataFileId; 8] {
 		[
 			self.nodes,
@@ -147,6 +148,7 @@ fn validate_index_binding(
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

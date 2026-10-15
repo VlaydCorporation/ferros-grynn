@@ -30,6 +30,7 @@ use crate::{
 	},
 };
 
+/// Returns canonicalize set for this module.
 pub(in crate::values::storage) fn canonicalize_set(
 	values: &mut Vec<StorageValue>,
 ) -> FerrosGrynnResult<()> {
@@ -46,6 +47,7 @@ pub(in crate::values::storage) fn canonicalize_set(
 	Ok(())
 }
 
+/// Encodes value for this module.
 pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> FerrosGrynnResult<()> {
 	match value {
 		StorageValue::None => output.push(TypeTag::None.byte()),
@@ -164,6 +166,7 @@ pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> Ferros
 	Ok(())
 }
 
+/// Encodes duration for this module.
 fn encode_duration(output: &mut Vec<u8>, value: &StorageDuration) -> FerrosGrynnResult<()> {
 	let mut header = if value.negative {
 		DURATION_SIGN
@@ -189,6 +192,7 @@ fn encode_duration(output: &mut Vec<u8>, value: &StorageDuration) -> FerrosGrynn
 	Ok(())
 }
 
+/// Encodes record id for this module.
 fn encode_record_id(output: &mut Vec<u8>, value: &StorageRecordId) -> FerrosGrynnResult<()> {
 	output.push(TypeTag::RecordId.byte());
 	output.extend_from_slice(&value.class_id.to_le_bytes());
@@ -224,6 +228,7 @@ fn encode_record_id(output: &mut Vec<u8>, value: &StorageRecordId) -> FerrosGryn
 	Ok(())
 }
 
+/// Encodes record value for this module.
 fn encode_record_value(output: &mut Vec<u8>, value: &StorageRecordValue) -> FerrosGrynnResult<()> {
 	match value {
 		StorageRecordValue::Int(value) => {
@@ -257,6 +262,7 @@ fn encode_record_value(output: &mut Vec<u8>, value: &StorageRecordValue) -> Ferr
 	Ok(())
 }
 
+/// Encodes record object for this module.
 fn encode_record_object(
 	output: &mut Vec<u8>,
 	values: &[(Text, StorageRecordValue)],
@@ -278,6 +284,7 @@ fn encode_record_object(
 	Ok(())
 }
 
+/// Encodes range for this module.
 fn encode_range(output: &mut Vec<u8>, value: &StorageRange) -> FerrosGrynnResult<()> {
 	output.push(TypeTag::Range.byte());
 	let mut flags = 0;
@@ -301,6 +308,7 @@ fn encode_range(output: &mut Vec<u8>, value: &StorageRange) -> FerrosGrynnResult
 	Ok(())
 }
 
+/// Encodes geometry for this module.
 fn encode_geometry(output: &mut Vec<u8>, value: &Geometry) -> FerrosGrynnResult<()> {
 	match value {
 		Geometry::Point(value) => {
@@ -344,6 +352,7 @@ fn encode_geometry(output: &mut Vec<u8>, value: &Geometry) -> FerrosGrynnResult<
 	Ok(())
 }
 
+/// Encodes polygon body for this module.
 fn encode_polygon_body(output: &mut Vec<u8>, rings: &[Vec<Position>]) -> FerrosGrynnResult<()> {
 	write_u32_count(output, rings.len())?;
 	for ring in rings {
@@ -352,6 +361,7 @@ fn encode_polygon_body(output: &mut Vec<u8>, rings: &[Vec<Position>]) -> FerrosG
 	Ok(())
 }
 
+/// Encodes positions for this module.
 fn encode_positions(output: &mut Vec<u8>, values: &[Position]) -> FerrosGrynnResult<()> {
 	write_u32_count(output, values.len())?;
 	for value in values {
@@ -360,12 +370,14 @@ fn encode_positions(output: &mut Vec<u8>, values: &[Position]) -> FerrosGrynnRes
 	Ok(())
 }
 
+/// Encodes position for this module.
 fn encode_position(output: &mut Vec<u8>, value: &Position) {
 	for coordinate in value.as_slice() {
 		output.extend_from_slice(&canonical_f64(*coordinate).to_le_bytes());
 	}
 }
 
+/// Encodes vector for this module.
 fn encode_vector(output: &mut Vec<u8>, value: &Vector) -> FerrosGrynnResult<()> {
 	let dimension = u16::try_from(value.len())
 		.map_err(|_err| invalid(output.len(), "vector dimension exceeds u16"))?;
@@ -400,6 +412,7 @@ fn encode_vector(output: &mut Vec<u8>, value: &Vector) -> FerrosGrynnResult<()> 
 	Ok(())
 }
 
+/// Returns canonical f16 for this module.
 fn canonical_f16(value: half::f16) -> u16 {
 	if value.is_nan() {
 		half::f16::NAN.to_bits()
@@ -410,14 +423,19 @@ fn canonical_f16(value: half::f16) -> u16 {
 	}
 }
 
+/// Scalar value that can append its canonical little-endian bytes.
 trait LittleEndianElement {
+	/// Appends le for `LittleEndianElement`.
 	fn append_le(&self, output: &mut Vec<u8>);
 }
 
+/// Implements canonical little-endian byte output for primitive numeric
+/// elements.
 macro_rules! impl_little_endian_element {
 	($($type:ty),* $(,)?) => {
 		$(
 			impl LittleEndianElement for $type {
+				/// Appends the scalar value in little-endian byte order.
 				fn append_le(&self, output: &mut Vec<u8>) {
 					output.extend_from_slice(&self.to_le_bytes());
 				}
@@ -428,6 +446,7 @@ macro_rules! impl_little_endian_element {
 
 impl_little_endian_element!(i8, i16, i32, i64, u8);
 
+/// Encodes fixed vector for this module.
 fn encode_fixed_vector<T: LittleEndianElement>(
 	output: &mut Vec<u8>,
 	tag: TypeTag,
@@ -441,12 +460,14 @@ fn encode_fixed_vector<T: LittleEndianElement>(
 	}
 }
 
+/// Writes count for this module.
 fn write_count(output: &mut Vec<u8>, count: usize) -> FerrosGrynnResult<()> {
 	let count = u64::try_from(count).map_err(|_err| invalid(output.len(), "length exceeds u64"))?;
 	write_uleb(output, count);
 	Ok(())
 }
 
+/// Writes u32 count for this module.
 fn write_u32_count(output: &mut Vec<u8>, count: usize) -> FerrosGrynnResult<()> {
 	let count =
 		u32::try_from(count).map_err(|_err| invalid(output.len(), "geometry count exceeds u32"))?;
@@ -454,11 +475,13 @@ fn write_u32_count(output: &mut Vec<u8>, count: usize) -> FerrosGrynnResult<()> 
 	Ok(())
 }
 
+/// Writes bytes for this module.
 fn write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
 	write_uleb(output, bytes.len() as u64);
 	output.extend_from_slice(bytes);
 }
 
+/// Writes uleb for this module.
 fn write_uleb(output: &mut Vec<u8>, mut value: u64) {
 	loop {
 		let mut byte = (value & 0x7F) as u8;
@@ -473,10 +496,12 @@ fn write_uleb(output: &mut Vec<u8>, mut value: u64) {
 	}
 }
 
+/// Returns zigzag encode for this module.
 const fn zigzag_encode(value: i64) -> u64 {
 	((value as u64) << 1) ^ ((value >> 63) as u64)
 }
 
+/// Returns zigzag decode for this module.
 pub(super) const fn zigzag_decode(value: u64) -> i64 {
 	((value >> 1) as i64) ^ -((value & 1) as i64)
 }

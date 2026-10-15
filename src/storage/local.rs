@@ -11,6 +11,7 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 /// Process-lifetime exclusive ownership of one local database directory.
 pub(super) struct DatabaseLock {
 	#[cfg(windows)]
+	/// File associated with this database lock.
 	_file: fs::File,
 }
 
@@ -71,27 +72,33 @@ pub(super) fn write_database_superblock(
 	write_checkpoint_page(path, &value.encode()?)
 }
 
+/// Returns the io failure result.
 fn io_failure(operation: impl Into<String>, source: io::Error) -> FerrosGrynnError {
 	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
 }
 
 #[cfg(test)]
+/// Regression tests for local behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies database lock is exclusive.
 	#[cfg(windows)]
 	#[test]
-	fn database_lock_is_exclusive() -> FerrosGrynnResult<()> {
+	fn database_lock_is_exclusive() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::temp_dir().join(format!(
 			"fg-lock-{:016x}",
 			crate::values::Uuid::now_v7().as_inner().as_u128() as u64
 		));
-		fs::create_dir(&root).map_err(|source| io_failure("create lock test directory", source))?;
-		let first = DatabaseLock::acquire(&root)?;
+		fs::create_dir(&root)
+			.map_err(|source| io_failure("create lock test directory", source))
+			.assert_ok();
+		let first = DatabaseLock::acquire(&root).assert_ok();
 		assert!(DatabaseLock::acquire(&root).is_err());
 		drop(first);
 		assert!(DatabaseLock::acquire(&root).is_ok());
 		drop(fs::remove_dir_all(root));
-		Ok(())
 	}
 }

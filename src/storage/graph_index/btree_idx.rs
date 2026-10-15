@@ -2,11 +2,15 @@
 use super::*;
 
 #[derive(Clone)]
+/// Child page state.
 pub(super) struct ChildPage {
+	/// Page no associated with this child page.
 	pub(super) page_no: PageNo,
+	/// Min key associated with this child page.
 	pub(super) min_key: Vec<u8>,
 }
 
+/// Validates primary entries.
 pub(super) fn validate_primary_entries<Address: PrimaryAddress>(
 	entries: &[PrimaryIndexEntry<Address>],
 ) -> FerrosGrynnResult<()> {
@@ -21,6 +25,7 @@ pub(super) fn validate_primary_entries<Address: PrimaryAddress>(
 	Ok(())
 }
 
+/// Validates scalar entries.
 pub(super) fn validate_scalar_entries<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
 	mode: ScalarIndexMode,
@@ -45,17 +50,20 @@ pub(super) fn validate_scalar_entries<Address: PrimaryAddress + Ord>(
 	Ok(())
 }
 
+/// Returns the partition standard leaf entries result.
+#[cfg(test)]
 pub(super) fn partition_standard_leaf_entries<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
 ) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry<Address>]>> {
 	partition_standard_leaf_entries_with_limit(entries, PAGE_SIZE)
 }
 
+/// Returns the partition standard leaf entries with limit result.
 pub(super) fn partition_standard_leaf_entries_with_limit<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
 	maximum_bytes: usize,
 ) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry<Address>]>> {
-	if maximum_bytes > PAGE_SIZE || maximum_bytes < LEAF_OFFSETS_OFFSET {
+	if !(LEAF_OFFSETS_OFFSET..=PAGE_SIZE).contains(&maximum_bytes) {
 		return Err(invalid_index("scalar leaf fill limit is outside page bounds"));
 	}
 	if entries.is_empty() {
@@ -101,6 +109,7 @@ pub(super) fn partition_standard_leaf_entries_with_limit<Address: PrimaryAddress
 	Ok(groups)
 }
 
+/// Encodes standard leaf.
 pub(super) fn encode_standard_leaf<Address: PrimaryAddress + Ord>(
 	page: &mut AlignedPage,
 	page_no: PageNo,
@@ -123,9 +132,13 @@ pub(super) fn encode_standard_leaf<Address: PrimaryAddress + Ord>(
 
 /// Borrowed bounded data required to encode one standard scalar leaf entry.
 pub(super) struct ScalarLeafEntry<'entry, Address> {
+	/// Key associated with this scalar leaf entry.
 	pub(super) key: &'entry [u8],
+	/// Inline atoms associated with this scalar leaf entry.
 	pub(super) inline_atoms: &'entry [Address],
+	/// Total count associated with this scalar leaf entry.
 	pub(super) total_count: usize,
+	/// Posting root associated with this scalar leaf entry.
 	pub(super) posting_root: Option<PageNo>,
 }
 
@@ -165,7 +178,7 @@ pub(super) fn encode_standard_leaf_parts<Address: PrimaryAddress>(
 				.map_err(|_error| invalid_index("scalar leaf offset exceeds u16"))?,
 		);
 		let start = data_start + area_offset;
-		page.as_bytes_mut()[start..start + entry.key.len()].copy_from_slice(&entry.key);
+		page.as_bytes_mut()[start..start + entry.key.len()].copy_from_slice(entry.key);
 		let mut offset = start + entry.key.len();
 		for atom in entry.inline_atoms {
 			write_u64(page.as_bytes_mut(), offset, atom.raw());
@@ -199,6 +212,7 @@ pub(super) fn encode_standard_leaf_parts<Address: PrimaryAddress>(
 	page.seal()
 }
 
+/// Encodes posting page.
 pub(super) fn encode_posting_page<Address: PrimaryAddress>(
 	page: &mut AlignedPage,
 	page_no: PageNo,
@@ -226,6 +240,7 @@ pub(super) fn encode_posting_page<Address: PrimaryAddress>(
 	page.seal()
 }
 
+/// Returns the descend to leaf result.
 pub(super) fn descend_to_leaf(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
@@ -249,6 +264,8 @@ pub(super) fn descend_to_leaf(
 	Err(invalid_index("scalar B+tree exceeds its maximum depth"))
 }
 
+/// Looks up standard leaf.
+#[cfg(test)]
 pub(super) fn lookup_standard_leaf<Address: PrimaryAddress + Ord>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	page: &AlignedPage,
@@ -269,6 +286,7 @@ pub(super) fn lookup_standard_leaf<Address: PrimaryAddress + Ord>(
 	Ok(Vec::new())
 }
 
+/// Decodes standard leaf entries.
 pub(super) fn decode_standard_leaf_entries<Address: PrimaryAddress + Ord>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	page: &AlignedPage,
@@ -285,13 +303,19 @@ pub(super) fn decode_standard_leaf_entries<Address: PrimaryAddress + Ord>(
 	Ok(entries)
 }
 
+/// Standard leaf entry state.
 pub(super) struct StandardLeafEntry<'a> {
+	/// Key associated with this standard leaf entry.
 	key: &'a [u8],
+	/// Inline associated with this standard leaf entry.
 	inline: &'a [u8],
+	/// Total count associated with this standard leaf entry.
 	total_count: usize,
+	/// Posting associated with this standard leaf entry.
 	posting: PageNo,
 }
 
+/// Returns the standard leaf entry result.
 pub(super) fn standard_leaf_entry(
 	bytes: &[u8; PAGE_SIZE],
 	area_start: usize,
@@ -332,6 +356,7 @@ pub(super) fn standard_leaf_entry(
 	})
 }
 
+/// Validates standard leaf layout.
 pub(super) fn validate_standard_leaf_layout(
 	page: &AlignedPage,
 ) -> FerrosGrynnResult<(usize, usize)> {
@@ -353,13 +378,16 @@ pub(super) fn validate_standard_leaf_layout(
 	Ok((count, area_start))
 }
 
+/// Decodes scalar atoms.
 pub(super) fn decode_scalar_atoms<Address: PrimaryAddress + Ord>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	entry: StandardLeafEntry<'_>,
 ) -> FerrosGrynnResult<Vec<Address>> {
 	let mut atoms = entry
 		.inline
-		.chunks_exact(DISK_ATOM_REF_BYTES)
+		.as_chunks::<DISK_ATOM_REF_BYTES>()
+		.0
+		.iter()
 		.map(|bytes| Address::from_raw(read_u64(bytes, 0)))
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let mut page_no = entry.posting;
@@ -401,6 +429,8 @@ pub(super) fn decode_scalar_atoms<Address: PrimaryAddress + Ord>(
 	Ok(atoms)
 }
 
+/// Returns whether the invalid bounds condition holds.
+#[cfg(test)]
 pub(super) fn invalid_bounds(lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
 	match (lower, upper) {
 		(Bound::Included(lower), Bound::Included(upper)) => lower > upper,
@@ -410,6 +440,7 @@ pub(super) fn invalid_bounds(lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool
 	}
 }
 
+/// Returns whether the key in bounds condition holds.
 pub(super) fn key_in_bounds(key: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
 	let lower = match lower {
 		Bound::Included(lower) => key >= *lower,
@@ -419,6 +450,7 @@ pub(super) fn key_in_bounds(key: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8
 	lower && !upper_exceeded(key, upper)
 }
 
+/// Returns whether the upper exceeded condition holds.
 pub(super) fn upper_exceeded(key: &[u8], upper: &Bound<&[u8]>) -> bool {
 	match upper {
 		Bound::Included(upper) => key > *upper,
@@ -427,17 +459,20 @@ pub(super) fn upper_exceeded(key: &[u8], upper: &Bound<&[u8]>) -> bool {
 	}
 }
 
+/// Returns the partition leaf entries result.
+#[cfg(test)]
 pub(super) fn partition_leaf_entries<Address: PrimaryAddress>(
 	entries: &[PrimaryIndexEntry<Address>],
 ) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry<Address>]>> {
 	partition_leaf_entries_with_limit(entries, PAGE_SIZE)
 }
 
+/// Returns the partition leaf entries with limit result.
 pub(super) fn partition_leaf_entries_with_limit<Address: PrimaryAddress>(
 	entries: &[PrimaryIndexEntry<Address>],
 	maximum_bytes: usize,
 ) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry<Address>]>> {
-	if maximum_bytes > PAGE_SIZE || maximum_bytes < LEAF_OFFSETS_OFFSET {
+	if !(LEAF_OFFSETS_OFFSET..=PAGE_SIZE).contains(&maximum_bytes) {
 		return Err(invalid_index("primary leaf fill limit is outside page bounds"));
 	}
 	if entries.is_empty() {
@@ -481,6 +516,7 @@ pub(super) fn partition_leaf_entries_with_limit<Address: PrimaryAddress>(
 	Ok(groups)
 }
 
+/// Encodes unique leaf.
 pub(super) fn encode_unique_leaf<Address: PrimaryAddress>(
 	page: &mut AlignedPage,
 	page_no: PageNo,
@@ -488,7 +524,14 @@ pub(super) fn encode_unique_leaf<Address: PrimaryAddress>(
 	next: Option<PageNo>,
 	entries: &[PrimaryIndexEntry<Address>],
 ) -> FerrosGrynnResult<()> {
-	encode_unique_leaf_with_type(page, page_no, page_lsn, next, entries, PageType::IndexUniqueBtreeLeaf)
+	encode_unique_leaf_with_type(
+		page,
+		page_no,
+		page_lsn,
+		next,
+		entries,
+		PageType::IndexUniqueBtreeLeaf,
+	)
 }
 
 /// Reuses the unique leaf codec for the engine-owned endpoint access path.
@@ -535,6 +578,7 @@ pub(super) fn encode_unique_leaf_with_type<Address: PrimaryAddress>(
 	page.seal()
 }
 
+/// Returns the partition internal children result.
 pub(super) fn partition_internal_children(
 	children: &[ChildPage],
 ) -> FerrosGrynnResult<Vec<&[ChildPage]>> {
@@ -565,6 +609,7 @@ pub(super) fn partition_internal_children(
 	Ok(groups)
 }
 
+/// Encodes internal page.
 pub(super) fn encode_internal_page(
 	page: &mut AlignedPage,
 	page_no: PageNo,
@@ -651,6 +696,7 @@ pub(super) fn append_internal_levels(
 	Ok(level.first().map_or(PageNo::new(0), |child| child.page_no))
 }
 
+/// Looks up leaf.
 pub(super) fn lookup_leaf<Address: PrimaryAddress>(
 	page: &AlignedPage,
 	target: &[u8],
@@ -674,6 +720,7 @@ pub(super) fn lookup_leaf<Address: PrimaryAddress>(
 	Ok(None)
 }
 
+/// Validates leaf layout.
 pub(super) fn validate_leaf_layout(page: &AlignedPage) -> FerrosGrynnResult<(usize, usize)> {
 	let bytes = page.as_bytes();
 	if page.validate(PageNo::new(read_u64(bytes, PAGE_NO_OFFSET)))?.flags() != PageFlags::LEAF
@@ -691,6 +738,7 @@ pub(super) fn validate_leaf_layout(page: &AlignedPage) -> FerrosGrynnResult<(usi
 	Ok((count, area_start))
 }
 
+/// Returns the leaf entry result.
 pub(super) fn leaf_entry(
 	bytes: &[u8; PAGE_SIZE],
 	area_start: usize,
@@ -710,6 +758,7 @@ pub(super) fn leaf_entry(
 	Ok((&bytes[start..atom_offset], read_u64(bytes, atom_offset)))
 }
 
+/// Returns the select internal child result.
 pub(super) fn select_internal_child(
 	page: &AlignedPage,
 	target: &[u8],
@@ -752,6 +801,7 @@ pub(super) fn select_internal_child(
 	Ok(PageNo::new(read_u64(bytes, child_area + child * size_of::<u64>())))
 }
 
+/// Validates zero.
 pub(super) fn validate_zero(bytes: &[u8], field: &str) -> FerrosGrynnResult<()> {
 	if bytes.iter().any(|byte| *byte != 0) {
 		return Err(invalid_index(format!("{field} are non-zero")));
@@ -759,14 +809,17 @@ pub(super) fn validate_zero(bytes: &[u8], field: &str) -> FerrosGrynnResult<()> 
 	Ok(())
 }
 
+/// Reads u16.
 pub(super) fn read_u16(bytes: &[u8], offset: usize) -> u16 {
 	u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
+/// Reads u32.
 pub(super) fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 	u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
 }
 
+/// Reads u64.
 pub(super) fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 	u64::from_le_bytes([
 		bytes[offset],
@@ -780,18 +833,22 @@ pub(super) fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 	])
 }
 
+/// Writes u16.
 pub(super) fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 	bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32.
 pub(super) fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64.
 pub(super) fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 	bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Returns the invalid index result.
 pub(super) fn invalid_index(message: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(message)
 }

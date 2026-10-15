@@ -6,6 +6,7 @@ use ferros_grynn::{
 
 use crate::support::{create_person, execute, people, record, value};
 
+/// Verifies parameterized dml and ordered pagination return owned record ids.
 #[test]
 fn parameterized_dml_and_ordered_pagination_return_owned_record_ids() {
 	let db = database();
@@ -27,6 +28,8 @@ fn parameterized_dml_and_ordered_pagination_return_owned_record_ids() {
 	});
 }
 
+/// Verifies gql session keeps private writes until commit and cancel rolls them
+/// back.
 #[test]
 fn gql_session_keeps_private_writes_until_commit_and_cancel_rolls_them_back() {
 	let db = database();
@@ -55,6 +58,8 @@ fn gql_session_keeps_private_writes_until_commit_and_cancel_rolls_them_back() {
 	});
 }
 
+/// Verifies sdk query results own parameters after the database and input are
+/// dropped.
 #[test]
 fn sdk_query_results_own_parameters_after_the_database_and_input_are_dropped() {
 	let db = database();
@@ -69,6 +74,7 @@ fn sdk_query_results_own_parameters_after_the_database_and_input_are_dropped() {
 	assert_eq!(result, payload);
 }
 
+/// Verifies parser reports source span and sdk statement errors are typed.
 #[test]
 fn parser_reports_source_span_and_sdk_statement_errors_are_typed() {
 	let error = parse("RETURN (", ParserSettings::default()).unwrap_err();

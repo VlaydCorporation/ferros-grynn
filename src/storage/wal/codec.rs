@@ -8,7 +8,10 @@ use super::*;
 /// Typed marker at the start of every frame-WAL record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(in crate::storage::wal) struct WalMagic([u8; 4]);
+pub(in crate::storage::wal) struct WalMagic(
+	/// Four-byte discriminator identifying the WAL frame format.
+	[u8; 4],
+);
 
 impl WalMagic {
 	/// Unreleased stage-3a marker whose payload identity is incompatible.
@@ -196,6 +199,7 @@ pub(in crate::storage::wal) fn decode_page_key(payload: &[u8]) -> FerrosGrynnRes
 }
 
 /// Encodes one fixed PageInit allocation marker.
+#[cfg(test)]
 pub(in crate::storage::wal) fn encode_page_init(
 	key: PageKey,
 	page_type: PageType,

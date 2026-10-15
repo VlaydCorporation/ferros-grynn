@@ -12,16 +12,26 @@ use super::{Regex, RuntimeId, Text};
 /// Stateful regular-expression cursor shared by cloned runtime values.
 #[derive(Clone)]
 pub struct Matcher {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: RuntimeId,
+	/// State associated with this matcher.
 	state: Arc<Mutex<MatcherState>>,
 }
 
+/// Regex search input, byte and scalar cursors, and the most recently observed
+/// match.
 struct MatcherState {
+	/// Text associated with this matcher state.
 	text: Text,
+	/// Pattern associated with this matcher state.
 	pattern: Regex,
+	/// Byte cursor associated with this matcher state.
 	byte_cursor: usize,
+	/// Scalar cursor associated with this matcher state.
 	scalar_cursor: usize,
+	/// Last associated with this matcher state.
 	last: Option<(usize, usize)>,
+	/// Exhausted associated with this matcher state.
 	exhausted: bool,
 }
 
@@ -90,6 +100,7 @@ impl Matcher {
 		self.state.lock().last.map(|(_, end)| end)
 	}
 
+	/// Returns the estimated heap bytes result.
 	pub(crate) fn estimated_heap_bytes(&self) -> usize {
 		let state = self.state.lock();
 		state.text.len().saturating_add(state.pattern.as_str().len())
@@ -97,17 +108,21 @@ impl Matcher {
 }
 
 impl Debug for Matcher {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		formatter
-			.debug_struct("Matcher")
+	/// Formats `Matcher` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		let last = self.state.lock().last;
+		f.debug_struct("Matcher")
 			.field("id", &self.id)
-			.field("start", &self.start())
-			.field("end", &self.end())
+			.field("start", &last.map(|(start, _)| start))
+			.field("end", &last.map(|(_, end)| end))
 			.finish()
 	}
 }
 
+// Cursor mutation must not move an existing map key: equality, ordering and
+// hashing use only id.
 impl PartialEq for Matcher {
+	/// Compares this `Matcher` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.id == other.id
 	}
@@ -116,31 +131,39 @@ impl PartialEq for Matcher {
 impl Eq for Matcher {}
 
 impl PartialOrd for Matcher {
+	/// Compares this `Matcher` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Matcher {
+	/// Compares this `Matcher` with another value using its ordering contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.id.cmp(&other.id)
 	}
 }
 
 impl Hash for Matcher {
+	/// Feeds this `Matcher` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.id.hash(state);
 	}
 }
 
 #[cfg(test)]
+/// Regression tests for matcher behavior.
 mod tests {
 	use super::Matcher;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::values::{Regex, Text, Value};
 
+	/// Verifies clones share unicode offsets and zero length patterns
+	/// terminate.
 	#[test]
 	fn clones_share_unicode_offsets_and_zero_length_patterns_terminate() {
-		let matcher = Matcher::new(Text::from("åβ"), Regex::new("").unwrap());
+		let matcher = Matcher::new(Text::from("åβ"), Regex::new("").assert_ok());
 		assert!(!Value::Matcher(matcher.clone()).is_storable());
 		let clone = matcher.clone();
 		assert!(matcher.advance());

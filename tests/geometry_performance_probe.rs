@@ -1,7 +1,11 @@
+#![cfg(test)]
 #![allow(
 	clippy::unwrap_used,
 	reason = "Ignored paired probe stops immediately on invalid fixture or output"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::{
 	hint::black_box,
@@ -16,9 +20,14 @@ use ferros_grynn::{
 };
 
 /// Removes the isolated probe database after native handles have been dropped.
-struct Directory(PathBuf);
+struct Directory(
+	/// Removes the isolated probe database after native handles have been
+	/// dropped.
+	PathBuf,
+);
 
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}

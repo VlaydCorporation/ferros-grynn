@@ -35,7 +35,6 @@ mod delta;
 mod resident;
 #[cfg(test)]
 mod tests;
-pub(in crate::storage) use delta::scoped_index_value;
 pub(crate) use delta::{
 	DecodedGeometryDelta,
 	GeometryDeltaRecord,
@@ -43,11 +42,11 @@ pub(crate) use delta::{
 	decode_geometry_delta,
 	geometry_delta_records,
 };
-pub(crate) use resident::{ResidentGeometryIndex, build_resident_geometry_indexes};
+pub use resident::{ResidentGeometryIndex, build_resident_geometry_indexes};
 
 /// Exact candidates and physical work of one admitted tree walk.
 #[derive(Default)]
-pub(crate) struct GeometryCandidates {
+pub struct GeometryCandidates {
 	/// Stable storage addresses, mapped to RecordId at the datastore boundary.
 	pub(crate) atoms: Vec<DiskAtomRef>,
 	/// Tree node pages actually read, including resident hits.
@@ -241,68 +240,69 @@ pub(in crate::storage) fn stream_geometry_index(
 		let mut bounds = None;
 		let mut parent_count = 0_u64;
 		let mut stripe = None;
-		let mut flush = |page: &mut AlignedPage,
-		                 count: &mut usize,
-		                 bounds: &mut Option<[f64; 4]>|
-		 -> FerrosGrynnResult<()> {
-			if *count == 0 {
-				return Ok(());
-			}
-			page.as_bytes_mut()[32..34].copy_from_slice(&(*count as u16).to_le_bytes());
-			page.seal()?;
-			write(PageNo::new(next_page.get()), page)?;
-			let entry = GeometryEntry {
-				mbr: bounds.take().ok_or_else(|| invalid("STR node has no MBR"))?,
-				identity: next_page.get(),
-			};
-			parents.push_raw(x_key(entry), entry.identity)?;
-			root = PageNo::new(next_page.get());
-			next_page.set(
-				next_page
-					.get()
-					.checked_add(1)
-					.ok_or_else(|| invalid("STR page count overflows"))?,
-			);
-			parent_count += 1;
-			*count = 0;
-			Ok(())
-		};
-		y.finish()?.visit_raw(|bytes, identity| {
-			let current_stripe = number(bytes, 0)?;
-			if count == FILL || stripe.is_some_and(|stripe| stripe != current_stripe) {
-				flush(&mut page, &mut count, &mut bounds)?;
-			}
-			stripe = Some(current_stripe);
-			if count == 0 {
-				page.reset(
-					if height == 0 {
-						PageType::IndexGeometryRtreeLeaf
-					} else {
-						PageType::IndexGeometryRtreeInternal
-					},
-					if height == 0 {
-						PageFlags::LEAF
-					} else {
-						PageFlags::empty()
-					},
-					PageLsn::ZERO,
-					PageNo::new(next_page.get()),
+		{
+			let mut flush = |page: &mut AlignedPage,
+			                 count: &mut usize,
+			                 bounds: &mut Option<[f64; 4]>|
+			 -> FerrosGrynnResult<()> {
+				if *count == 0 {
+					return Ok(());
+				}
+				page.as_bytes_mut()[32..34].copy_from_slice(&(*count as u16).to_le_bytes());
+				page.seal()?;
+				write(PageNo::new(next_page.get()), page)?;
+				let entry = GeometryEntry {
+					mbr: bounds.take().ok_or_else(|| invalid("STR node has no MBR"))?,
+					identity: next_page.get(),
+				};
+				parents.push_raw(x_key(entry), entry.identity)?;
+				root = PageNo::new(next_page.get());
+				next_page.set(
+					next_page
+						.get()
+						.checked_add(1)
+						.ok_or_else(|| invalid("STR page count overflows"))?,
 				);
-				page.as_bytes_mut()[34..36].copy_from_slice(&height.to_le_bytes());
-			}
-			let entry = entry_from_key(bytes, identity)?;
-			let offset = (if height == 0 {
-				40
-			} else {
-				48
-			}) + count * RECORD_BYTES;
-			encode_entry(&mut page.as_bytes_mut()[offset..offset + RECORD_BYTES], entry);
-			bounds = Some(bounds.map_or(entry.mbr, |previous| union(previous, entry.mbr)));
-			count += 1;
-			Ok(())
-		})?;
-		flush(&mut page, &mut count, &mut bounds)?;
-		drop(flush);
+				parent_count += 1;
+				*count = 0;
+				Ok(())
+			};
+			y.finish()?.visit_raw(|bytes, identity| {
+				let current_stripe = number(bytes, 0)?;
+				if count == FILL || stripe.is_some_and(|stripe| stripe != current_stripe) {
+					flush(&mut page, &mut count, &mut bounds)?;
+				}
+				stripe = Some(current_stripe);
+				if count == 0 {
+					page.reset(
+						if height == 0 {
+							PageType::IndexGeometryRtreeLeaf
+						} else {
+							PageType::IndexGeometryRtreeInternal
+						},
+						if height == 0 {
+							PageFlags::LEAF
+						} else {
+							PageFlags::empty()
+						},
+						PageLsn::ZERO,
+						PageNo::new(next_page.get()),
+					);
+					page.as_bytes_mut()[34..36].copy_from_slice(&height.to_le_bytes());
+				}
+				let entry = entry_from_key(bytes, identity)?;
+				let offset = (if height == 0 {
+					40
+				} else {
+					48
+				}) + count * RECORD_BYTES;
+				encode_entry(&mut page.as_bytes_mut()[offset..offset + RECORD_BYTES], entry);
+				bounds = Some(bounds.map_or(entry.mbr, |previous| union(previous, entry.mbr)));
+				count += 1;
+				Ok(())
+			})?;
+			flush(&mut page, &mut count, &mut bounds)?;
+		}
 		height = height
 			.checked_add(1)
 			.filter(|height| *height <= 64)
@@ -479,7 +479,7 @@ pub(crate) fn search_geometry(
 		{
 			return Err(invalid("invalid R-tree node count or reserved bytes"));
 		}
-		for record in bytes[start..start + count * RECORD_BYTES].chunks_exact(RECORD_BYTES) {
+		for record in bytes[start..start + count * RECORD_BYTES].as_chunks::<RECORD_BYTES>().0 {
 			let entry = decode_entry(record)?;
 			if leaf {
 				DiskAtomRef::from_raw(entry.identity)?;
@@ -557,7 +557,7 @@ fn entry_from_key(bytes: &[u8], identity: u64) -> FerrosGrynnResult<GeometryEntr
 }
 /// Writes the exact 40-byte node record.
 fn encode_entry(output: &mut [u8], entry: GeometryEntry) {
-	for (slot, value) in output[..32].chunks_exact_mut(8).zip(entry.mbr) {
+	for (slot, value) in output[..32].as_chunks_mut::<8>().0.iter_mut().zip(entry.mbr) {
 		slot.copy_from_slice(&value.to_le_bytes());
 	}
 	output[32..40].copy_from_slice(&entry.identity.to_le_bytes());

@@ -148,14 +148,20 @@ impl ProjectedRelation {
 	/// # Errors
 	/// Returns resource/cancellation errors before exceeding scratch admission,
 	/// or a structural error for missing or repeated local vertices.
-	pub fn build<'a>(
-		vertices: impl Iterator<Item = AtomId> + Clone,
-		topologies: impl Iterator<Item = (AtomId, &'a EdgeTopology)>,
+	pub fn build<
+		'a,
+		VerticesArg: Iterator<Item = AtomId> + Clone,
+		TopologiesArg: Iterator<Item = (AtomId, &'a EdgeTopology)>,
+		CanonicalKeyArg: FnMut(AtomId) -> FerrosGrynnResult<u64>,
+		CheckArg: FnMut() -> FerrosGrynnResult<()>,
+	>(
+		vertices: VerticesArg,
+		topologies: TopologiesArg,
 		mode: TraversalSemantics,
 		direction: TraversalDirection,
 		scratch_bytes: usize,
-		mut canonical_key: impl FnMut(AtomId) -> FerrosGrynnResult<u64>,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		mut canonical_key: CanonicalKeyArg,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<Self> {
 		let count = vertices
 			.clone()
@@ -242,10 +248,10 @@ impl ProjectedRelation {
 	/// # Errors
 	/// Propagates scratch/cancellation errors and rejects inconsistent
 	/// relations.
-	pub fn condensation(
+	pub fn condensation<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		&self,
 		scratch_bytes: usize,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<ProjectedCondensation> {
 		admit(self.vertices.len(), self.forward.targets.len(), scratch_bytes)?;
 		let mut components = strong_components_with_steps(
@@ -316,12 +322,12 @@ impl ProjectedCondensation {
 	/// # Errors
 	/// Rejects malformed references, noncanonical CSR, cycles or scratch limits
 	/// before exposing the relation to reachability labels.
-	pub fn from_csr(
+	pub fn from_csr<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		component_by_vertex: Vec<usize>,
 		representatives: Vec<AtomId>,
 		forward: RelationCsr,
 		scratch_bytes: usize,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<Self> {
 		let count = representatives.len();
 		admit(count, forward.targets.len(), scratch_bytes)?;

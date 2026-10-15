@@ -24,7 +24,7 @@ use crate::{
 		DatabaseRoot,
 		GraphOccurrence,
 		GraphRoot,
-		OccurrenceState,
+		OccurrenceStateRef,
 		OverlayValue,
 		index_context,
 	},
@@ -42,46 +42,68 @@ use crate::{
 };
 
 #[derive(Default, Clone, Copy)]
+/// Degree counts state.
 struct DegreeCounts {
+	/// Out associated with this degree counts.
 	out: u64,
+	/// Incoming associated with this degree counts.
 	incoming: u64,
+	/// Undirected associated with this degree counts.
 	undirected: u64,
 }
 
+/// Property accumulator state.
 struct PropertyAccumulator {
+	/// Ordinal associated with this property accumulator.
 	ordinal: u32,
+	/// Property key associated with this property accumulator.
 	property_key: PropertyKeyId,
+	/// Value type associated with this property accumulator.
 	value_type: Type,
+	/// Type tag associated with this property accumulator.
 	type_tag: u8,
+	/// Row count associated with this property accumulator.
 	row_count: u64,
+	/// Null count associated with this property accumulator.
 	null_count: u64,
+	/// Value count associated with this property accumulator.
 	value_count: usize,
+	/// Valid associated with this property accumulator.
 	valid: bool,
+	/// Sampled rows associated with this property accumulator.
 	sampled_rows: u32,
+	/// Sampled nulls associated with this property accumulator.
 	sampled_nulls: u32,
+	/// Hll associated with this property accumulator.
 	hll: Option<HyperLogLog>,
+	/// Geometry sample associated with this property accumulator.
 	geometry_sample: BTreeMap<(u64, u64), [f64; 4]>,
+	/// Geometry population associated with this property accumulator.
 	geometry_population: u64,
 }
 
 /// Histogram construction policy selected by public `ANALYZE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AnalyzeMethod {
+pub enum AnalyzeMethod {
+	/// Full case of analyze method.
 	Full,
+	/// Approximate case of analyze method.
 	Approximate {
+		/// Sample count associated with this analyze method.
 		sample_count: NonZeroU32,
 	},
 }
 
 /// Performs one exact full scan shared by RAM and durable rebuilds.
-pub(crate) fn analyze_database(database: &DatabaseRoot) -> FerrosGrynnResult<StatisticsStore> {
+#[cfg(test)]
+pub fn analyze_database(database: &DatabaseRoot) -> FerrosGrynnResult<StatisticsStore> {
 	let scratch_root = std::env::temp_dir().join("ferros-grynn-statistics");
 	analyze_database_at(database, &scratch_root)
 }
 
 /// Performs the same full scan with one shared 256 MiB external-sort budget
 /// for all property histograms in each scope.
-pub(crate) fn analyze_database_at(
+pub fn analyze_database_at(
 	database: &DatabaseRoot,
 	scratch_root: &Path,
 ) -> FerrosGrynnResult<StatisticsStore> {
@@ -90,7 +112,7 @@ pub(crate) fn analyze_database_at(
 
 /// Performs a full statistics scan while selecting exact or sampled property
 /// distributions.
-pub(crate) fn analyze_database_with_method_at(
+pub fn analyze_database_with_method_at(
 	database: &DatabaseRoot,
 	scratch_root: &Path,
 	method: AnalyzeMethod,
@@ -110,7 +132,7 @@ pub(crate) fn analyze_database_with_method_at(
 
 /// Rebuilds the complete Base statistics scope while preserving graph-local
 /// scopes in the caller-owned store.
-pub(crate) fn analyze_base_with_method_at(
+pub fn analyze_base_with_method_at(
 	database: &DatabaseRoot,
 	scratch_root: &Path,
 	method: AnalyzeMethod,
@@ -121,7 +143,7 @@ pub(crate) fn analyze_base_with_method_at(
 }
 
 /// Rebuilds one complete graph-effective statistics scope.
-pub(crate) fn analyze_graph_with_method_at(
+pub fn analyze_graph_with_method_at(
 	database: &DatabaseRoot,
 	graph: GraphId,
 	scratch_root: &Path,
@@ -132,6 +154,7 @@ pub(crate) fn analyze_graph_with_method_at(
 	analyze_graph(database, graph, &fields, &mut context, scratch_root, method)
 }
 
+/// Analyzes base.
 fn analyze_base(
 	database: &DatabaseRoot,
 	fields: &[StatisticField<'_>],
@@ -169,6 +192,7 @@ fn analyze_base(
 	Ok(statistics)
 }
 
+/// Analyzes graph.
 fn analyze_graph(
 	database: &DatabaseRoot,
 	graph_id: GraphId,
@@ -217,14 +241,14 @@ fn analyze_graph(
 				"label property count",
 			)?;
 		}
-		match occurrence.state() {
-			OccurrenceState::Node {
+		match occurrence.state().view() {
+			OccurrenceStateRef::Node {
 				..
 			} => {
 				increment(&mut statistics.node_count, 1, "node count")?;
 				degrees.insert(occurrence.local_id(), DegreeCounts::default());
 			}
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				..
 			} => increment(&mut statistics.edge_count, 1, "edge count")?,
 		}
@@ -239,10 +263,10 @@ fn analyze_graph(
 		)?;
 	}
 	for occurrence in graph.occurrences() {
-		if let OccurrenceState::Edge {
+		if let OccurrenceStateRef::Edge {
 			topology,
 			..
-		} = occurrence.state()
+		} = occurrence.state().view()
 		{
 			record_topology(&mut degrees, topology)?;
 		}
@@ -253,6 +277,7 @@ fn analyze_graph(
 	Ok(statistics)
 }
 
+/// Returns the statistic fields result.
 fn statistic_fields(database: &DatabaseRoot) -> FerrosGrynnResult<Vec<StatisticField<'_>>> {
 	let mut result = Vec::new();
 	for class in database.schema.classes() {
@@ -274,6 +299,7 @@ fn statistic_fields(database: &DatabaseRoot) -> FerrosGrynnResult<Vec<StatisticF
 	Ok(result)
 }
 
+/// Returns the property accumulators result.
 fn property_accumulators(
 	fields: &[StatisticField<'_>],
 	scope: StatisticsScope,
@@ -318,6 +344,7 @@ fn property_accumulators(
 		.collect()
 }
 
+/// Records properties.
 fn record_properties<'value>(
 	properties: &mut BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
 	class: crate::datastore::ClassId,
@@ -338,7 +365,7 @@ fn record_properties<'value>(
 		if accumulator.type_tag == 0x27 {
 			match value(accumulator.property_key) {
 				None | Some(Value::None | Value::Null) => {
-					increment(&mut accumulator.null_count, 1, "geometry null count")?
+					increment(&mut accumulator.null_count, 1, "geometry null count")?;
 				}
 				Some(Value::Geometry(geometry)) => {
 					if let Some(mbr) = geometry.mbr()? {
@@ -422,6 +449,7 @@ fn record_properties<'value>(
 	Ok(())
 }
 
+/// Finishes properties.
 fn finish_properties(
 	mut properties: BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
 	records: SortedIndexRecords,
@@ -454,8 +482,9 @@ fn finish_properties(
 			result.insert(key, PropertyHistogram {
 				type_tag: 0x27,
 				method: HistogramMethod::Exact,
-				sample_count: u32::try_from(accumulator.row_count)
-					.map_err(|_| invalid("geometry histogram population exceeds u32"))?,
+				sample_count: u32::try_from(accumulator.row_count).map_err(
+					|_conversion_error| invalid("geometry histogram population exceeds u32"),
+				)?,
 				distinct_count: 0,
 				null_fraction: fraction(accumulator.null_count, accumulator.row_count),
 				buckets: Vec::new(),
@@ -502,6 +531,7 @@ fn finish_properties(
 	Ok(result)
 }
 
+/// Returns the select property sample result.
 fn select_property_sample(
 	properties: &mut BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
 	records: &SortedIndexRecords,
@@ -556,6 +586,7 @@ fn select_property_sample(
 	sampled.finish()
 }
 
+/// Returns the fraction result.
 fn fraction(numerator: u64, denominator: u64) -> f32 {
 	if denominator == 0 {
 		0.0
@@ -564,6 +595,7 @@ fn fraction(numerator: u64, denominator: u64) -> f32 {
 	}
 }
 
+/// Returns the effective property count result.
 fn effective_property_count(
 	base: &PropertyMap,
 	occurrence: &GraphOccurrence,
@@ -583,6 +615,7 @@ fn effective_property_count(
 		.ok_or_else(|| invalid("effective property count overflows usize"))
 }
 
+/// Records topology.
 fn record_topology(
 	degrees: &mut BTreeMap<AtomId, DegreeCounts>,
 	topology: &EdgeTopology,
@@ -619,6 +652,7 @@ fn record_topology(
 	Ok(())
 }
 
+/// Returns the increment degree result.
 fn increment_degree(
 	degrees: &mut BTreeMap<AtomId, DegreeCounts>,
 	endpoint: &EdgeEndpoint,
@@ -638,6 +672,7 @@ fn increment_degree(
 	increment(target, 1, "node degree")
 }
 
+/// Finishes degrees.
 fn finish_degrees(
 	statistics: &mut GraphStatistics,
 	degrees: &BTreeMap<AtomId, DegreeCounts>,
@@ -683,6 +718,7 @@ fn finish_degrees(
 	Ok(())
 }
 
+/// Inserts degree.
 fn insert_degree(
 	statistics: &mut GraphStatistics,
 	label: Option<LabelStatisticKey>,
@@ -716,6 +752,7 @@ fn insert_degree(
 	Ok(())
 }
 
+/// Returns the equi depth ranges result.
 fn equi_depth_ranges(length: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
 	let buckets = length.min(HISTOGRAM_BUCKETS);
 	let size = length / buckets.max(1);
@@ -727,6 +764,7 @@ fn equi_depth_ranges(length: usize) -> impl Iterator<Item = std::ops::Range<usiz
 	})
 }
 
+/// Returns the histogram type tag result.
 fn histogram_type_tag(value_type: &Type) -> Option<u8> {
 	let tag = match value_type {
 		Type::None => TypeTag::None,
@@ -762,6 +800,7 @@ fn histogram_type_tag(value_type: &Type) -> Option<u8> {
 	Some(tag.byte())
 }
 
+/// Returns the direction result.
 fn direction(index: usize) -> FerrosGrynnResult<DegreeDirection> {
 	match index {
 		0 => Ok(DegreeDirection::Out),
@@ -771,10 +810,12 @@ fn direction(index: usize) -> FerrosGrynnResult<DegreeDirection> {
 	}
 }
 
+/// Returns the u32 degree result.
 fn u32_degree(value: u64) -> FerrosGrynnResult<u32> {
 	u32::try_from(value).map_err(|_error| invalid("degree exceeds u32"))
 }
 
+/// Returns the increment result.
 fn increment(target: &mut u64, amount: u64, name: &str) -> FerrosGrynnResult<()> {
 	*target = target
 		.checked_add(amount)
@@ -782,6 +823,7 @@ fn increment(target: &mut u64, amount: u64, name: &str) -> FerrosGrynnResult<()>
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

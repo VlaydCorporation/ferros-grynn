@@ -38,12 +38,23 @@ pub struct NeighbourhoodLists {
 #[derive(Debug)]
 pub enum NeighbourhoodLabels {
 	/// Exact sets for all vertices and radii.
-	Exact(NeighbourhoodLists),
+	Exact(
+		/// Exact sets for all vertices and radii.
+		NeighbourhoodLists,
+	),
 	/// Radius-major, then vertex-major sketches with the same ordinal hash
 	/// domain.
-	Sketch(Vec<HyperLogLog>),
+	Sketch(
+		/// Radius-major, then vertex-major sketches with the same ordinal hash
+		/// domain.
+		Vec<HyperLogLog>,
+	),
 	/// Exact sets for deterministic landmarks, completed by bounded traversal.
-	Landmark(NeighbourhoodLists),
+	Landmark(
+		/// Exact sets for deterministic landmarks, completed by bounded
+		/// traversal.
+		NeighbourhoodLists,
+	),
 	/// Adjacency, a large radius or AUTO rejected materialization.
 	OnDemand,
 }

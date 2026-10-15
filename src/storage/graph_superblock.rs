@@ -10,27 +10,49 @@ use crate::{
 	graph::GraphId,
 };
 
+/// Configured superblock page no value.
 const SUPERBLOCK_PAGE_NO: PageNo = PageNo::new(0);
+/// Format version for format.
 const FORMAT_VERSION: u32 = STORAGE_FORMAT_VERSION as u32;
+/// Byte offset of data space in its encoded layout.
 const DATA_SPACE_OFFSET: usize = 32;
+/// Byte offset of format version in its encoded layout.
 const FORMAT_VERSION_OFFSET: usize = 40;
+/// Byte offset of back compat version in its encoded layout.
 const BACK_COMPAT_VERSION_OFFSET: usize = 44;
+/// Byte offset of checkpoint generation in its encoded layout.
 const CHECKPOINT_GENERATION_OFFSET: usize = 48;
+/// Byte offset of backfilled lsn in its encoded layout.
 const BACKFILLED_LSN_OFFSET: usize = 56;
+/// Byte offset of checkpoint record lsn in its encoded layout.
 const CHECKPOINT_RECORD_LSN_OFFSET: usize = 64;
+/// Byte offset of node capacity in its encoded layout.
 const NODE_CAPACITY_OFFSET: usize = 72;
+/// Byte offset of edge capacity in its encoded layout.
 const EDGE_CAPACITY_OFFSET: usize = 80;
+/// Byte offset of node count in its encoded layout.
 const NODE_COUNT_OFFSET: usize = 88;
+/// Byte offset of edge count in its encoded layout.
 const EDGE_COUNT_OFFSET: usize = 96;
+/// Byte offset of subgraph capacity in its encoded layout.
 const SUBGRAPH_CAPACITY_OFFSET: usize = 104;
+/// Byte offset of subgraph count in its encoded layout.
 const SUBGRAPH_COUNT_OFFSET: usize = 112;
+/// Byte offset of node hot pages in its encoded layout.
 const NODE_HOT_PAGES_OFFSET: usize = 120;
+/// Byte offset of edge hot pages in its encoded layout.
 const EDGE_HOT_PAGES_OFFSET: usize = 128;
+/// Byte offset of adjacency pages in its encoded layout.
 const ADJACENCY_PAGES_OFFSET: usize = 136;
+/// Byte offset of cross level pages in its encoded layout.
 const CROSS_LEVEL_PAGES_OFFSET: usize = 144;
+/// Byte offset of overlays pages in its encoded layout.
 const OVERLAYS_PAGES_OFFSET: usize = 152;
+/// Byte offset of subgraphs pages in its encoded layout.
 const SUBGRAPHS_PAGES_OFFSET: usize = 160;
+/// Byte offset of labels pages in its encoded layout.
 const LABELS_PAGES_OFFSET: usize = 168;
+/// Byte offset of reserved in its encoded layout.
 const RESERVED_OFFSET: usize = 176;
 
 /// Complete logical metadata for one graph data space.
@@ -172,18 +194,7 @@ impl GraphSuperblock {
 		Ok(self)
 	}
 
-	/// Compares transaction-visible metadata independently of its WAL frame
-	/// LSN.
-	pub(super) fn same_logical_metadata(self, other: Self) -> bool {
-		Self {
-			page_lsn: PageLsn::ZERO,
-			..self
-		} == Self {
-			page_lsn: PageLsn::ZERO,
-			..other
-		}
-	}
-
+	/// Validates semantics.
 	fn validate_semantics(self) -> FerrosGrynnResult<()> {
 		if self.node_count > self.node_capacity
 			|| self.edge_count > self.edge_capacity
@@ -216,38 +227,47 @@ impl GraphSuperblock {
 	}
 }
 
+/// Writes u32.
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64.
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 	bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Reads u32.
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 	let mut value = [0; 4];
 	value.copy_from_slice(&bytes[offset..offset + 4]);
 	u32::from_le_bytes(value)
 }
 
+/// Reads u64.
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 	let mut value = [0; 8];
 	value.copy_from_slice(&bytes[offset..offset + 8]);
 	u64::from_le_bytes(value)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for graph superblock behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 
+	/// Builds the fixture fixture used by nearby scenarios.
 	fn fixture() -> GraphSuperblock {
 		GraphSuperblock {
 			page_lsn: PageLsn::new(13),
-			graph_id: GraphId::new(7).unwrap(),
+			graph_id: GraphId::new(7).assert_some(),
 			checkpoint_generation: CheckpointGeneration::new(3),
 			backfilled_lsn: Lsn::new(17),
 			checkpoint_record_lsn: Lsn::new(19),
@@ -267,30 +287,34 @@ mod tests {
 		}
 	}
 
+	/// Verifies exact layout round trips.
 	#[test]
-	fn exact_layout_round_trips() -> FerrosGrynnResult<()> {
+	fn exact_layout_round_trips() {
+		use crate::test_assertions::AssertResult as _;
+
 		let expected = fixture();
-		let page = expected.encode()?;
+		let page = expected.encode().assert_ok();
 		assert_eq!(read_u64(page.as_bytes(), DATA_SPACE_OFFSET), 7);
 		assert_eq!(read_u64(page.as_bytes(), NODE_CAPACITY_OFFSET), 103);
 		assert_eq!(read_u64(page.as_bytes(), LABELS_PAGES_OFFSET), 1);
-		assert_eq!(GraphSuperblock::decode(&page)?, expected);
-		Ok(())
+		assert_eq!(GraphSuperblock::decode(&page).assert_ok(), expected);
 	}
 
+	/// Verifies rejects zero space reserved bytes and invalid ceilings.
 	#[test]
-	fn rejects_zero_space_reserved_bytes_and_invalid_ceilings() -> FerrosGrynnResult<()> {
-		let mut page = fixture().encode()?;
+	fn rejects_zero_space_reserved_bytes_and_invalid_ceilings() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut page = fixture().encode().assert_ok();
 		write_u64(page.as_bytes_mut(), DATA_SPACE_OFFSET, 0);
-		page.seal()?;
+		page.seal().assert_ok();
 		assert!(GraphSuperblock::decode(&page).is_err());
-		let mut page = fixture().encode()?;
+		let mut page = fixture().encode().assert_ok();
 		page.as_bytes_mut()[RESERVED_OFFSET] = 1;
-		page.seal()?;
+		page.seal().assert_ok();
 		assert!(GraphSuperblock::decode(&page).is_err());
 		let mut invalid = fixture();
 		invalid.node_hot_pages = 1;
 		assert!(invalid.encode().is_err());
-		Ok(())
 	}
 }

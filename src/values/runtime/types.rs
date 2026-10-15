@@ -2,49 +2,121 @@ use std::fmt::{self, Display, Formatter};
 
 use super::{AtomKind, GraphKind, Number, Text, Value, VectorKind};
 
+/// Runtime value-type constraint, including collections, graph values and
+/// callable signatures.
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub enum Type {
+	/// Type constraint accepting an unconstrained value.
 	Any,
+	/// Type constraint accepting an absent value.
 	None,
+	/// Type constraint accepting an explicit null value.
 	Null,
+	/// Type constraint accepting a Boolean value.
 	Bool,
+	/// Type constraint accepting a numeric value.
 	Number,
+	/// Type constraint accepting a signed integer.
 	Int,
+	/// Type constraint accepting a floating-point number.
 	Float,
+	/// Type constraint accepting a decimal number.
 	Decimal,
+	/// Type constraint accepting text.
 	String,
+	/// Type constraint accepting a duration.
 	Duration,
+	/// Type constraint accepting a time-zone-aware timestamp.
 	DateTime,
+	/// Type constraint accepting a ULID.
 	Ulid,
+	/// Type constraint accepting a UUID.
 	Uuid,
-	Array(Box<Type>),
-	Set(Box<Type>),
+	/// Type constraint accepting an ordered sequence of values.
+	Array(
+		/// Type constraint accepting an ordered sequence of values.
+		Box<Type>,
+	),
+	/// Type constraint accepting an ordered set of distinct values.
+	Set(
+		/// Type constraint accepting an ordered set of distinct values.
+		Box<Type>,
+	),
+	/// Type constraint accepting a text-keyed value map.
 	Object,
+	/// Type constraint accepting a geometry value.
 	Geometry,
-	Vector(VectorKind),
+	/// Type constraint accepting a numeric vector.
+	Vector(
+		/// Type constraint accepting a numeric vector.
+		VectorKind,
+	),
+	/// Type constraint accepting binary bytes.
 	Bytes,
-	GraphRef(GraphKind),
+	/// Type constraint accepting a stable graph reference.
+	GraphRef(
+		/// Type constraint accepting a stable graph reference.
+		GraphKind,
+	),
+	/// Type constraint accepting a class-qualified record identity.
 	Record,
+	/// Type constraint accepting a compiled regular expression.
 	Regex,
+	/// Type constraint accepting a runtime matcher.
 	Matcher,
-	Range(Box<Type>),
-	Atom(AtomKind),
-	AtomOccurrence(AtomKind),
+	/// Type constraint accepting a bounded or unbounded value interval.
+	Range(
+		/// Type constraint accepting a bounded or unbounded value interval.
+		Box<Type>,
+	),
+	/// Type constraint accepting a stable atom reference.
+	Atom(
+		/// Type constraint accepting a stable atom reference.
+		AtomKind,
+	),
+	/// Type constraint accepting a stable graph-qualified atom occurrence.
+	AtomOccurrence(
+		/// Type constraint accepting a stable graph-qualified atom occurrence.
+		AtomKind,
+	),
+	/// Type constraint accepting a snapshot-qualified path.
 	Path,
-	Graph(GraphKind),
-	Option(Box<Type>),
-	Union(Vec<Type>),
-	RecordShape(Vec<(Text, Type)>),
+	/// Type constraint accepting a materialized graph family.
+	Graph(
+		/// Type constraint accepting a materialized graph family.
+		GraphKind,
+	),
+	/// Type constraint accepting an optional value.
+	Option(
+		/// Type constraint accepting an optional value.
+		Box<Type>,
+	),
+	/// Type constraint accepting a union of accepted value types.
+	Union(
+		/// Type constraint accepting a union of accepted value types.
+		Vec<Type>,
+	),
+	/// Type constraint accepting a structured record constraint.
+	RecordShape(
+		/// Type constraint accepting a structured record constraint.
+		Vec<(Text, Type)>,
+	),
+	/// Type constraint accepting a runtime callable.
 	Closure {
+		/// Declared parameters or bound values supplied to this operation.
 		parameters: Vec<Type>,
+		/// Declared result type of the callable signature.
 		result: Box<Type>,
 	},
+	/// Type constraint accepting a runtime error value.
 	Error,
+	/// Type constraint accepting a runtime query cursor.
 	Cursor,
 }
 
 impl Type {
+	/// Returns of for `Type`.
 	pub fn of(value: &Value) -> Self {
 		match value {
 			Value::None => Self::None,
@@ -81,6 +153,7 @@ impl Type {
 }
 
 impl Display for Type {
+	/// Formats `Type` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Any => f.write_str("any"),
@@ -151,15 +224,18 @@ impl Display for Type {
 }
 
 #[cfg(test)]
+/// Regression tests for types behavior.
 mod tests {
 	use super::Type;
 
+	/// Verifies option is static only.
 	#[test]
 	fn option_is_static_only() {
 		let value_type = Type::Option(Box::new(Type::String));
 		assert_eq!(value_type.to_string(), "option<string>");
 	}
 
+	/// Verifies formats nested types.
 	#[test]
 	fn formats_nested_types() {
 		let value_type = Type::Array(Box::new(Type::Set(Box::new(Type::Int))));

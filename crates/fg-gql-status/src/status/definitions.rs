@@ -1535,6 +1535,7 @@ define_status_codes!(
 );
 
 impl Display for Status {
+	/// Formats the value using the corresponding text representation.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		self.fmt_message(f)
 	}

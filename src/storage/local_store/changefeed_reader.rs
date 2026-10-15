@@ -31,7 +31,12 @@ use crate::{
 
 /// Constant-size history pin; constructing it never scans graph/index bindings.
 #[derive(Clone)]
-pub struct LocalChangefeedSnapshot(Arc<ChangefeedSnapshotInner>, Arc<ReadObservation>);
+pub struct LocalChangefeedSnapshot(
+	/// Shared WAL visibility pin and immutable changefeed file handles.
+	Arc<ChangefeedSnapshotInner>,
+	/// Per-reader page-attempt and scratch high-water observations.
+	Arc<ReadObservation>,
+);
 
 /// Per-reader counters; the durable pin remains shared independently.
 #[derive(Default)]

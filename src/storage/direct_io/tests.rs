@@ -14,7 +14,10 @@ use crate::storage::page::{PAGE_HEADER_SIZE, PageFlags, PageLsn, PageType};
 static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
 /// Temporary test path removed even when a test assertion unwinds.
-struct TestPath(PathBuf);
+struct TestPath(
+	/// Temporary test path removed even when a test assertion unwinds.
+	PathBuf,
+);
 
 impl TestPath {
 	/// Allocates a unique path in the current workspace directory.
@@ -31,11 +34,13 @@ impl TestPath {
 }
 
 impl Drop for TestPath {
+	/// Runs cleanup for this `TestPath` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_file(&self.0));
 	}
 }
 
+/// Verifies direct file round trips concurrent positional pages.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn direct_file_round_trips_concurrent_positional_pages() -> Result<(), Box<dyn Error>> {
@@ -89,6 +94,7 @@ fn direct_file_round_trips_concurrent_positional_pages() -> Result<(), Box<dyn E
 	Ok(())
 }
 
+/// Verifies direct file tracks page count after append.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn direct_file_tracks_page_count_after_append() -> Result<(), Box<dyn Error>> {
@@ -105,6 +111,7 @@ fn direct_file_tracks_page_count_after_append() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies direct file reads and validates one contiguous extent.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn direct_file_reads_and_validates_one_contiguous_extent() -> Result<(), Box<dyn Error>> {
@@ -136,6 +143,7 @@ fn direct_file_reads_and_validates_one_contiguous_extent() -> Result<(), Box<dyn
 	Ok(())
 }
 
+/// Verifies direct file writes one contiguous extent without a gap.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn direct_file_writes_one_contiguous_extent_without_a_gap() -> Result<(), Box<dyn Error>> {
@@ -163,6 +171,7 @@ fn direct_file_writes_one_contiguous_extent_without_a_gap() -> Result<(), Box<dy
 	Ok(())
 }
 
+/// Verifies direct file batch rejects range and page corruption.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn direct_file_batch_rejects_range_and_page_corruption() -> Result<(), Box<dyn Error>> {
@@ -201,6 +210,7 @@ fn direct_file_batch_rejects_range_and_page_corruption() -> Result<(), Box<dyn E
 	Ok(())
 }
 
+/// Verifies direct file sets o direct on native descriptor.
 #[cfg(target_os = "linux")]
 #[test]
 fn direct_file_sets_o_direct_on_native_descriptor() -> Result<(), Box<dyn Error>> {
@@ -219,6 +229,7 @@ fn direct_file_sets_o_direct_on_native_descriptor() -> Result<(), Box<dyn Error>
 	Ok(())
 }
 
+/// Verifies direct file rejects unaligned io.
 #[cfg(windows)]
 #[test]
 fn direct_file_rejects_unaligned_io() -> Result<(), Box<dyn Error>> {
@@ -235,6 +246,7 @@ fn direct_file_rejects_unaligned_io() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies direct file rejects non page multiple length.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn direct_file_rejects_non_page_multiple_length() -> Result<(), Box<dyn Error>> {
@@ -248,6 +260,7 @@ fn direct_file_rejects_non_page_multiple_length() -> Result<(), Box<dyn Error>> 
 	Ok(())
 }
 
+/// Verifies exact positional read rejects short input.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn exact_positional_read_rejects_short_input() -> Result<(), Box<dyn Error>> {
@@ -263,6 +276,7 @@ fn exact_positional_read_rejects_short_input() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies exact extent read rejects short input.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn exact_extent_read_rejects_short_input() -> Result<(), Box<dyn Error>> {
@@ -278,6 +292,7 @@ fn exact_extent_read_rejects_short_input() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies page offset rejects overflow.
 #[test]
 fn page_offset_rejects_overflow() {
 	let error = checked_page_offset(PageNo::NULL);
@@ -288,6 +303,7 @@ fn page_offset_rejects_overflow() {
 	assert!(checked_page_extent(PageNo::NULL, 1, u64::MAX).is_err());
 }
 
+/// Verifies create new never overwrites existing file.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn create_new_never_overwrites_existing_file() -> Result<(), Box<dyn Error>> {
@@ -299,6 +315,7 @@ fn create_new_never_overwrites_existing_file() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies unsupported target returns typed direct io status.
 #[cfg(not(any(target_os = "linux", windows)))]
 #[test]
 fn unsupported_target_returns_typed_direct_io_status() -> Result<(), Box<dyn Error>> {

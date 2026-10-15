@@ -314,6 +314,7 @@ fn compile_event_source(
 }
 
 #[cfg(test)]
+/// Regression tests for event behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -322,29 +323,44 @@ mod tests {
 		values::{Object, PropertyMap, RecordId},
 	};
 
+	/// Verifies event frozen functions survive remove and read current data.
 	#[test]
-	fn event_frozen_functions_survive_remove_and_read_current_data() -> FerrosGrynnResult<()> {
+	fn event_frozen_functions_survive_remove_and_read_current_data() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [
-			crate::datastore::ClassField::new("value", crate::values::Type::Int),
-		])?)?;
-		setup.define_class(ClassSchema::new("audit", AtomKind::Node, [])?)?;
-		let value = setup.intern_property("value")?;
-		let record: RecordId = "item:a".parse()?;
-		setup.create_atom(record.clone(), PropertyMap::from_iter([(value, Value::from(1))]))?;
-		for result in setup.execute(
-			"DEFINE STABLE FUNCTION fn::read() -> int { RETURN <int>item:a.value; };",
-			&Object::new(),
-		)? {
-			let _value = result.result?;
+		let class = setup
+			.define_class(
+				ClassSchema::new("item", AtomKind::Node, [crate::datastore::ClassField::new(
+					"value",
+					crate::values::Type::Int,
+				)])
+				.assert_ok(),
+			)
+			.assert_ok();
+		setup.define_class(ClassSchema::new("audit", AtomKind::Node, []).assert_ok()).assert_ok();
+		let value = setup.intern_property("value").assert_ok();
+		let record: RecordId = "item:a".parse().assert_ok();
+		setup
+			.create_atom(record.clone(), PropertyMap::from_iter([(value, Value::from(1))]))
+			.assert_ok();
+		for result in setup
+			.execute(
+				"DEFINE STABLE FUNCTION fn::read() -> int { RETURN <int>item:a.value; };",
+				&Object::new(),
+			)
+			.assert_ok()
+		{
+			let _value = result.result.assert_ok();
 		}
 		let event = EventDefinition::new(
 			"frozen",
 			EventTarget::Class(class),
 			"true",
 			"{ CREATE audit:frozen CONTENT { value: fn::read() }; }",
-		)?;
+		)
+		.assert_ok();
 		let cache = LanguageClosureState::bounded_with_work(16 * 1024 * 1024, 1_000_000);
 		let (_source, _plan, functions) = compile_event_source(
 			&mut setup,
@@ -353,21 +369,24 @@ mod tests {
 			&cache,
 			None,
 			None,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(functions.len(), 1);
 		let id = functions[0]
 			.id()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("captured function identity"))?;
-		setup.commit()?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("captured function identity"))
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut changed = store.begin();
-		changed.remove_function(id)?;
+		changed.remove_function(id).assert_ok();
 		for result in changed
-			.execute("DEFINE STABLE FUNCTION fn::read() -> int { RETURN 100; };", &Object::new())?
+			.execute("DEFINE STABLE FUNCTION fn::read() -> int { RETURN 100; };", &Object::new())
+			.assert_ok()
 		{
-			let _value = result.result?;
+			let _value = result.result.assert_ok();
 		}
-		changed.set_base_property(&record, value, Value::from(9))?;
-		changed.commit()?;
+		changed.set_base_property(&record, value, Value::from(9)).assert_ok();
+		changed.commit().assert_ok();
 		let mut attempt = store.begin();
 		let control =
 			crate::gql::ExecutionControl::new(&crate::gql::QueryExecutionOptions::default(), None);
@@ -377,17 +396,20 @@ mod tests {
 			&[Value::None, Value::None, Value::None, Value::None, Value::None],
 			&control,
 			Some(&functions),
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(
 			attempt
-				.atom(&"audit:frozen".parse()?)?
+				.atom(&"audit:frozen".parse().assert_ok())
+				.assert_ok()
 				.and_then(|atom| atom.properties().get(value).cloned()),
 			Some(Value::from(9))
 		);
-		attempt.commit()?;
-		Ok(())
+		attempt.commit().assert_ok();
 	}
 
+	/// Verifies event false predicate does not compile retired handler
+	/// function.
 	#[test]
 	fn event_false_predicate_does_not_compile_retired_handler_function() -> FerrosGrynnResult<()> {
 		let store = Datastore::in_memory();
@@ -418,19 +440,30 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies event compiler snapshot copy uses handler scratch limit.
 	#[test]
-	fn event_compiler_snapshot_copy_uses_handler_scratch_limit() -> FerrosGrynnResult<()> {
+	fn event_compiler_snapshot_copy_uses_handler_scratch_limit() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+		let class = setup
+			.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok())
+			.assert_ok();
 		for index in 0..2000 {
-			setup.define_graph(format!("scope_{index}"), crate::graph::GraphKind::Graph)?;
+			setup
+				.define_graph(format!("scope_{index}"), crate::graph::GraphKind::Graph)
+				.assert_ok();
 		}
-		setup.commit()?;
-		let event = EventDefinition::new("small", EventTarget::Class(class), "true", "1")?;
-		let mut options = crate::gql::QueryExecutionOptions::default();
-		options.barrier_memory_bytes = std::num::NonZeroUsize::new(32 * 1024)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("scratch limit"))?;
+		setup.commit().assert_ok();
+		let event =
+			EventDefinition::new("small", EventTarget::Class(class), "true", "1").assert_ok();
+		let options = crate::gql::QueryExecutionOptions {
+			barrier_memory_bytes: std::num::NonZeroUsize::new(32 * 1024)
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("scratch limit"))
+				.assert_ok(),
+			..Default::default()
+		};
 		let control = crate::gql::ExecutionControl::new(&options, None);
 		let mut attempt = store.begin();
 		let error = execute_event_handler(
@@ -443,8 +476,8 @@ mod tests {
 		.err()
 		.ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("graph-map copy bypassed handler scratch")
-		})?;
+		})
+		.assert_ok();
 		assert!(error.to_string().contains("compiler scratch"));
-		Ok(())
 	}
 }

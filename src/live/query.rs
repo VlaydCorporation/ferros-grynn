@@ -9,7 +9,11 @@ use crate::{
 
 /// Checked field path; each segment is literal, including dots inside a name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LivePath(Vec<Text>);
+pub struct LivePath(
+	/// Checked field path; each segment is literal, including dots inside a
+	/// name.
+	Vec<Text>,
+);
 
 impl LivePath {
 	/// Checks a nonempty path with at most 64 nonempty segments.
@@ -113,11 +117,20 @@ impl LivePath {
 #[non_exhaustive]
 pub enum LiveSource {
 	/// All database-global records of one class identity.
-	Class(ClassId),
+	Class(
+		/// All database-global records of one class identity.
+		ClassId,
+	),
 	/// One global record, including a dependency on its absence.
-	Record(RecordId),
+	Record(
+		/// One global record, including a dependency on its absence.
+		RecordId,
+	),
 	/// All qualified occurrences of one graph.
-	Graph(GraphRef),
+	Graph(
+		/// All qualified occurrences of one graph.
+		GraphRef,
+	),
 	/// Occurrences of one class in one graph, with effective properties.
 	GraphClass {
 		/// Selected graph identity and origin.
@@ -150,7 +163,13 @@ pub enum LiveSource {
 	/// All qualified occurrences in a graph selected once by a read-only
 	/// expression. Includes every class in the snapshot, without recursively
 	/// expanding containment. The expression must yield a GraphRef or name.
-	GraphExpr(Box<LiveExpr>),
+	GraphExpr(
+		/// All qualified occurrences in a graph selected once by a read-only
+		/// expression. Includes every class in the snapshot, without
+		/// recursively expanding containment. The expression must yield a
+		/// GraphRef or name.
+		Box<LiveExpr>,
+	),
 }
 
 impl LiveSource {
@@ -387,16 +406,34 @@ pub enum LiveBinaryOperator {
 )]
 pub enum LiveExpr {
 	/// Frozen literal. Runtime-only values are rejected during registration.
-	Literal(Value),
+	Literal(
+		/// Frozen literal. Runtime-only values are rejected during
+		/// registration.
+		Value,
+	),
 	/// Read a source row path. A class prefix qualifies only when no declared
 	/// property has that name; declared nested properties retain precedence.
-	Field(LivePath),
+	Field(
+		/// Read a source row path. A class prefix qualifies only when no
+		/// declared property has that name; declared nested properties retain
+		/// precedence.
+		LivePath,
+	),
 	/// Ordinary LET or execute parameter, frozen by value at registration.
-	Parameter(Text),
+	Parameter(
+		/// Ordinary LET or execute parameter, frozen by value at registration.
+		Text,
+	),
 	/// Reactive binding identity, independent of lexical spelling.
-	Binding(LiveBindingId),
+	Binding(
+		/// Reactive binding identity, independent of lexical spelling.
+		LiveBindingId,
+	),
 	/// Boolean negation using the shared evaluator.
-	Not(Box<Self>),
+	Not(
+		/// Boolean negation using the shared evaluator.
+		Box<Self>,
+	),
 	/// Shared analyzer/evaluator binary operation.
 	Binary {
 		/// Left operand.
@@ -425,19 +462,41 @@ pub enum LiveExpr {
 		arguments: Vec<(Option<Text>, Self)>,
 	},
 	/// Read-only SELECT expression, including data-dependent LIVE LET values.
-	Select(Box<LiveQuery>),
+	Select(
+		/// Read-only SELECT expression, including data-dependent LIVE LET
+		/// values.
+		Box<LiveQuery>,
+	),
 	/// Ordered array construction using the shared evaluator.
-	Array(Vec<Self>),
+	Array(
+		/// Ordered array construction using the shared evaluator.
+		Vec<Self>,
+	),
 	/// Set construction with ordinary Value equality and canonical ordering.
 	/// Every input is captured and evaluated before duplicate elimination.
-	Set(Vec<Self>),
+	Set(
+		/// Set construction with ordinary Value equality and canonical
+		/// ordering. Every input is captured and evaluated before duplicate
+		/// elimination.
+		Vec<Self>,
+	),
 	/// Ordered object construction; duplicate keys follow ordinary SELECT
 	/// rules.
-	Object(Vec<(Text, Self)>),
+	Object(
+		/// Ordered object construction; duplicate keys follow ordinary SELECT
+		/// rules.
+		Vec<(Text, Self)>,
+	),
 	/// Numeric negation using exact runtime Number semantics.
-	Negate(Box<Self>),
+	Negate(
+		/// Numeric negation using exact runtime Number semantics.
+		Box<Self>,
+	),
 	/// Numeric unary plus, including ordinary type validation.
-	Positive(Box<Self>),
+	Positive(
+		/// Numeric unary plus, including ordinary type validation.
+		Box<Self>,
+	),
 	/// Literal field access on an expression, including qualified records.
 	Access {
 		/// Object, record or qualified occurrence expression.
@@ -624,9 +683,15 @@ pub enum LiveProjection {
 	#[default]
 	Records,
 	/// Ordered projected expressions.
-	Fields(Vec<LiveField>),
+	Fields(
+		/// Ordered projected expressions.
+		Vec<LiveField>,
+	),
 	/// SELECT VALUE result, including scalar results.
-	Value(LiveExpr),
+	Value(
+		/// SELECT VALUE result, including scalar results.
+		LiveExpr,
+	),
 }
 
 /// Formatting of result changes, independent of the logical projection.
@@ -901,7 +966,7 @@ impl LiveQuery {
 	}
 
 	/// Adds a terminal graph projection using ordinary SELECT result aliases.
-	#[must_use]
+	#[must_use = "the updated LIVE query must be submitted"]
 	pub fn with_graph_result(mut self, result: super::LiveGraphResult) -> Self {
 		self.graph_result = Some(result);
 		self

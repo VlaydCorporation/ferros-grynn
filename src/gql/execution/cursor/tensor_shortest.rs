@@ -257,13 +257,15 @@ impl<'a, Read: QueryRead> TensorShortestPathCursor<'a, Read> {
 			for label in &self.labels {
 				control.admit(label.len().checked_add(128).ok_or_else(overflow)?)?;
 			}
-			let mut selection = ProjectionOptions::default();
-			selection.mode = self.semantics;
-			selection.labels = self.labels.clone();
-			selection.direction = match self.expand.direction {
-				crate::syn::MatchDirection::Forward => TraversalDirection::Forward,
-				crate::syn::MatchDirection::Backward => TraversalDirection::Backward,
-				_ => TraversalDirection::Both,
+			let selection = ProjectionOptions {
+				mode: self.semantics,
+				labels: self.labels.clone(),
+				direction: match self.expand.direction {
+					crate::syn::MatchDirection::Forward => TraversalDirection::Forward,
+					crate::syn::MatchDirection::Backward => TraversalDirection::Backward,
+					_ => TraversalDirection::Both,
+				},
+				..Default::default()
 			};
 			let weighted =
 				self.expand.objective.is_some_and(crate::syn::MatchPathObjective::is_weighted);
@@ -539,6 +541,8 @@ impl<'a, Read: QueryRead> TensorShortestPathCursor<'a, Read> {
 }
 
 impl<Read: QueryRead> RowCursor for TensorShortestPathCursor<'_, Read> {
+	/// Advances this `TensorShortestPathCursor<'_, Read>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			if let Some(row) = self.rows.pop_front() {
@@ -615,19 +619,27 @@ fn reserve_phase(
 }
 
 #[cfg(test)]
+/// Regression tests for tensor shortest behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies tensor probe admission covers wide row clones and quadratic
+	/// scans.
 	#[test]
 	fn tensor_probe_admission_covers_wide_row_clones_and_quadratic_scans() {
 		let row = Row::bindings(4096);
-		let mut limits = crate::graph::tensor::GraphAlgorithmLimits::default();
-		limits.memory_bytes = row.estimated_heap_bytes() * 3;
+		let limits = crate::graph::tensor::GraphAlgorithmLimits {
+			memory_bytes: row.estimated_heap_bytes() * 3,
+			..Default::default()
+		};
 		let mut check = || Ok(());
-		let mut control = Control::new(limits, &mut check).unwrap();
-		assert!(control.admit(probe_bytes(&row, 1).unwrap()).is_err());
+		let mut control = Control::new(limits, &mut check).assert_ok();
+		assert!(control.admit(probe_bytes(&row, 1).assert_ok()).is_err());
 		assert!(
-			terminal_probe_work(&row, 100).unwrap() >= (row.estimated_heap_bytes() + 20_100) as u64
+			terminal_probe_work(&row, 100).assert_ok()
+				>= (row.estimated_heap_bytes() + 20_100) as u64
 		);
 		assert!(probe_bytes(&row, usize::MAX).is_err());
 		assert!(terminal_probe_work(&row, usize::MAX).is_err());

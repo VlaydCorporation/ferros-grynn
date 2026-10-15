@@ -200,6 +200,7 @@ pub(in crate::storage) fn count_property_entries(
 	decode_property_entries(record, limits).map(|values| values.len())
 }
 
+/// Decodes property entries for this module.
 fn decode_property_entries(
 	record: &[u8],
 	limits: DecodeLimits,

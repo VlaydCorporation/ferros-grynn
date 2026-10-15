@@ -10,15 +10,19 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 /// by the storage layer.
 #[derive(Debug, Default, Clone)]
 pub struct PropertyDictionary {
+	/// Ids associated with this property dictionary.
 	ids: RapidHashMap<Text, PropertyKeyId>,
+	/// Names associated with this property dictionary.
 	names: Vec<Text>,
 }
 
 impl PropertyDictionary {
+	/// Constructs `PropertyDictionary` from the supplied initial state.
 	pub fn new() -> Self {
 		Self::default()
 	}
 
+	/// Creates an empty collection with the requested initial capacity.
 	pub fn with_capacity(capacity: usize) -> Self {
 		Self {
 			ids: RapidHashMap::with_capacity(capacity),
@@ -26,22 +30,32 @@ impl PropertyDictionary {
 		}
 	}
 
+	/// Returns the logical element count of this `PropertyDictionary`.
 	pub const fn len(&self) -> usize {
 		self.names.len()
 	}
 
+	/// Reports whether this `PropertyDictionary` contains no logical elements.
 	pub const fn is_empty(&self) -> bool {
 		self.names.is_empty()
 	}
 
+	/// Looks up the requested entry without modifying the collection.
 	pub fn get(&self, name: &str) -> Option<PropertyKeyId> {
 		self.ids.get(name).copied()
 	}
 
+	/// Returns resolve for `PropertyDictionary`.
 	pub fn resolve(&self, id: PropertyKeyId) -> Option<&Text> {
 		self.names.get(id.get() as usize)
 	}
 
+	/// Returns intern for `PropertyDictionary`.
+	///
+	/// # Errors
+	///
+	/// Returns `property_dictionary_capacity_exceeded` diagnostics and
+	/// propagates failures from called operations.
 	pub fn intern<IntoText: Into<Text>>(
 		&mut self,
 		name: IntoText,
@@ -82,20 +96,25 @@ impl PropertyDictionary {
 		Ok(())
 	}
 
+	/// Borrows the elements of this `PropertyDictionary` for iteration.
 	pub fn iter(&self) -> impl ExactSizeIterator<Item = (PropertyKeyId, &Text)> {
 		self.names.iter().enumerate().map(|(id, name)| (PropertyKeyId::new(id as u32), name))
 	}
 }
 
 #[cfg(test)]
+/// Regression tests for property dictionary behavior.
 mod tests {
 	use super::PropertyDictionary;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies assigns dense ids and resolves both directions.
 	#[test]
 	fn assigns_dense_ids_and_resolves_both_directions() {
 		let mut dictionary = PropertyDictionary::new();
-		let name = dictionary.intern("name").unwrap();
-		let age = dictionary.intern("age").unwrap();
+		let name = dictionary.intern("name").assert_ok();
+		let age = dictionary.intern("age").assert_ok();
 
 		assert_eq!(name.get(), 0);
 		assert_eq!(age.get(), 1);
@@ -104,12 +123,13 @@ mod tests {
 		assert_eq!(dictionary.resolve(2_u32.into()), None);
 	}
 
+	/// Verifies interning is idempotent and iteration uses id order.
 	#[test]
 	fn interning_is_idempotent_and_iteration_uses_id_order() {
 		let mut dictionary = PropertyDictionary::new();
-		let first = dictionary.intern("weight").unwrap();
-		let second = dictionary.intern(String::from("weight")).unwrap();
-		dictionary.intern("color").unwrap();
+		let first = dictionary.intern("weight").assert_ok();
+		let second = dictionary.intern(String::from("weight")).assert_ok();
+		dictionary.intern("color").assert_ok();
 
 		assert_eq!(first, second);
 		assert_eq!(dictionary.len(), 2);

@@ -18,6 +18,7 @@ use crate::{
 	values::storage::DiskAtomRef,
 };
 
+/// Returns the copy page result.
 pub(super) fn copy_page(
 	pages: &[AlignedPage],
 	page_no: PageNo,
@@ -33,6 +34,7 @@ pub(super) fn copy_page(
 	Ok(())
 }
 
+/// Returns the local chain result.
 pub(super) fn local_chain(
 	pages: &[AlignedPage],
 	first: Option<PageNo>,
@@ -52,6 +54,7 @@ pub(super) fn local_chain(
 	Ok(result)
 }
 
+/// Returns the qualified chain result.
 pub(super) fn qualified_chain(
 	pages: &[AlignedPage],
 	first: Option<PageNo>,
@@ -75,6 +78,7 @@ pub(super) fn qualified_chain(
 	Ok(result)
 }
 
+/// Returns the subgraph entries result.
 pub(super) fn subgraph_entries(pages: &[AlignedPage]) -> FerrosGrynnResult<Vec<SubgraphEntry>> {
 	if pages.is_empty() {
 		return Err(invalid("subgraph directory has no root page"));
@@ -97,6 +101,7 @@ pub(super) fn subgraph_entries(pages: &[AlignedPage]) -> FerrosGrynnResult<Vec<S
 	Ok(result)
 }
 
+/// Returns the page at result.
 fn page_at<'pages>(
 	pages: &'pages [AlignedPage],
 	page_no: PageNo,
@@ -107,6 +112,7 @@ fn page_at<'pages>(
 	pages.get(index).ok_or_else(|| invalid(format!("{family} page reference exceeds its file")))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

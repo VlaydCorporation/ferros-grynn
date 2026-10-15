@@ -15,38 +15,71 @@ use crate::{
 	values::Uuid,
 };
 
+/// Revision-bound ancestor table accelerating lowest-common-ancestor queries.
 #[derive(Debug, Clone)]
 pub struct BinaryLiftingIndex {
+	/// Identity associated with this binary lifting index.
 	identity: Uuid,
+	/// Revision identifying this version of the data.
 	revision: u64,
+	/// Nodes associated with this binary lifting index.
 	nodes: Box<[AtomId]>,
+	/// Positions associated with this binary lifting index.
 	positions: RapidHashMap<AtomId, usize>,
+	/// Depths associated with this binary lifting index.
 	depths: Box<[usize]>,
+	/// Roots associated with this binary lifting index.
 	roots: Box<[usize]>,
+	/// Ancestors associated with this binary lifting index.
 	ancestors: Box<[Box<[Option<usize>]>]>,
 }
 
 impl BinaryLiftingIndex {
+	/// Constructs from forest for `BinaryLiftingIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn from_forest<State>(forest: &Forest<State>) -> FerrosGrynnResult<Self> {
 		Self::build(forest, |id| forest.parent(id))
 	}
 
+	/// Constructs from tree for `BinaryLiftingIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn from_tree<State>(tree: &Tree<State>) -> FerrosGrynnResult<Self> {
 		Self::build(tree, |id| tree.parent(id))
 	}
 
+	/// Constructs from rooted tree for `BinaryLiftingIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	pub fn from_rooted_tree<State>(tree: &RootedTree<State>) -> FerrosGrynnResult<Self> {
 		Self::build(tree, |id| tree.parent(id))
 	}
 
+	/// Returns the stored identity of this `BinaryLiftingIndex`.
 	pub const fn identity(&self) -> Uuid {
 		self.identity
 	}
 
+	/// Returns the stored revision of this `BinaryLiftingIndex`.
 	pub const fn revision(&self) -> u64 {
 		self.revision
 	}
 
+	/// Returns validate for `BinaryLiftingIndex`.
+	///
+	/// # Errors
+	///
+	/// Returns `graph_identity_mismatch`, `graph_workspace_stale` diagnostics.
 	pub fn validate<R: GraphRead>(&self, graph: &R) -> FerrosGrynnResult<()> {
 		if graph.identity() != self.identity {
 			return Err(FerrosGrynnError::graph_identity_mismatch(
@@ -65,11 +98,21 @@ impl BinaryLiftingIndex {
 		Ok(())
 	}
 
+	/// Returns depth for `BinaryLiftingIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn depth(&self, atom: AtomId) -> FerrosGrynnResult<usize> {
 		let index = self.position(atom)?;
 		Ok(self.depths[index])
 	}
 
+	/// Returns lowest common ancestor for `BinaryLiftingIndex`.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn lowest_common_ancestor(
 		&self,
 		left: AtomId,
@@ -109,6 +152,7 @@ impl BinaryLiftingIndex {
 		Ok(self.ancestors[0][left].map(|index| self.nodes[index]))
 	}
 
+	/// Builds binary lifting index.
 	fn build<R: GraphRead>(
 		graph: &R,
 		mut parent_of: impl FnMut(AtomId) -> Option<AtomId>,
@@ -219,6 +263,7 @@ impl BinaryLiftingIndex {
 		})
 	}
 
+	/// Returns the position result.
 	pub(super) fn position(&self, atom: AtomId) -> FerrosGrynnResult<usize> {
 		if atom.kind() != Some(AtomKind::Node) {
 			return Err(atom_kind_mismatch(atom, AtomKind::Node));

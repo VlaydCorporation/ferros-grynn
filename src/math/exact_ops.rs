@@ -6,9 +6,17 @@ use crate::{
 	values::Number,
 };
 
+/// Shared bounds for checked arithmetic helpers.
 pub trait ExactArithmetic: AddExact + SubtractExact + CheckedMul {}
 
+/// Fallible addition reporting overflow through the project status system.
 pub trait AddExact: CheckedAdd {
+	/// Returns add exact for `AddExact`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	fn add_exact(&self, b: &Self) -> FerrosGrynnResult<Self>
 	where
 		Self: Sized,
@@ -17,7 +25,14 @@ pub trait AddExact: CheckedAdd {
 	}
 }
 
+/// Fallible subtraction reporting overflow through the project status system.
 pub trait SubtractExact: CheckedSub {
+	/// Returns subtract exact for `SubtractExact`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	fn subtract_exact(&self, b: &Self) -> FerrosGrynnResult<Self>
 	where
 		Self: Sized,
@@ -26,7 +41,15 @@ pub trait SubtractExact: CheckedSub {
 	}
 }
 
+/// Fallible multiplication reporting overflow through the project status
+/// system.
 pub trait MultiplyExact: CheckedMul {
+	/// Returns multiply exact for `MultiplyExact`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	fn multiply_exact(&self, b: &Self) -> FerrosGrynnResult<Self>
 	where
 		Self: Sized,
@@ -35,7 +58,14 @@ pub trait MultiplyExact: CheckedMul {
 	}
 }
 
+/// Checked division helper for primitive integer operands.
 pub trait DivideExact: PrimInt {
+	/// Returns divide exact for `DivideExact`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	fn divide_exact(&self, b: &Self) -> FerrosGrynnResult<Self>
 	where
 		Self: Sized,
@@ -44,7 +74,14 @@ pub trait DivideExact: PrimInt {
 	}
 }
 
+/// Checked division helper for signed primitive integer operands.
 pub trait DivideSignedExact: PrimInt + Signed {
+	/// Returns divide signed exact for `DivideSignedExact`.
+	///
+	/// # Errors
+	///
+	/// Propagates validation or execution failures from the underlying
+	/// operation.
 	fn divide_signed_exact(&self, b: &Self) -> FerrosGrynnResult<Self>
 	where
 		Self: Sized,
@@ -53,6 +90,7 @@ pub trait DivideSignedExact: PrimInt + Signed {
 	}
 }
 
+/// Expands the impl exact declarations used by this module.
 macro_rules! impl_exact {
     ($($ident:ident),*) => {
         $(
@@ -64,6 +102,7 @@ macro_rules! impl_exact {
     };
 }
 
+/// Expands the impl div declarations used by this module.
 macro_rules! impl_div {
     ($($ident:ident),*) => {
         $(
@@ -82,6 +121,11 @@ impl_exact!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 impl_div!(u8, u16, u32, u64, u128, usize);
 impl_div!(sig: i8, i16, i32, i64, i128, isize);
 
+/// Returns add exact for this module.
+///
+/// # Errors
+///
+/// Returns `operation_overflow` diagnostics.
 pub fn add_exact<T>(a: &T, b: &T) -> FerrosGrynnResult<T>
 where
 	T: CheckedAdd,
@@ -89,6 +133,11 @@ where
 	a.checked_add(b).ok_or(FerrosGrynnError::operation_overflow("+"))
 }
 
+/// Returns subtract exact for this module.
+///
+/// # Errors
+///
+/// Returns `operation_overflow` diagnostics.
 pub fn subtract_exact<T>(a: &T, b: &T) -> FerrosGrynnResult<T>
 where
 	T: CheckedSub,
@@ -96,6 +145,11 @@ where
 	a.checked_sub(b).ok_or(FerrosGrynnError::operation_overflow("-"))
 }
 
+/// Returns multiply exact for this module.
+///
+/// # Errors
+///
+/// Returns `operation_overflow` diagnostics.
 pub fn multiply_exact<T>(a: &T, b: &T) -> FerrosGrynnResult<T>
 where
 	T: CheckedMul,
@@ -103,6 +157,11 @@ where
 	a.checked_mul(b).ok_or(FerrosGrynnError::operation_overflow("*"))
 }
 
+/// Returns divide exact for this module.
+///
+/// # Errors
+///
+/// Returns `division_by_zero` diagnostics.
 pub fn divide_exact<T>(a: &T, b: &T) -> FerrosGrynnResult<T>
 where
 	T: PrimInt,
@@ -120,6 +179,12 @@ where
 	Ok(a / b)
 }
 
+/// Returns divide signed exact for this module.
+///
+/// # Errors
+///
+/// Returns `division_by_zero`, `operation_overflow`, `non_exact_division`
+/// diagnostics.
 pub fn divide_signed_exact<T>(a: &T, b: &T) -> FerrosGrynnResult<T>
 where
 	T: PrimInt + Signed,
@@ -169,6 +234,7 @@ pub fn add_numbers(left: Number, right: Number) -> FerrosGrynnResult<Number> {
 	}
 }
 
+/// Returns the finite sum result.
 fn finite_sum(left: f64, right: f64) -> FerrosGrynnResult<Number> {
 	let value = left + right;
 	if value.is_nan() {
@@ -182,6 +248,7 @@ fn finite_sum(left: f64, right: f64) -> FerrosGrynnResult<Number> {
 	Ok(Number::Float(value))
 }
 
+/// Returns the decimal sum result.
 fn decimal_sum(left: Decimal, right: Decimal) -> FerrosGrynnResult<Number> {
 	left.checked_add(right)
 		.map(Number::Decimal)

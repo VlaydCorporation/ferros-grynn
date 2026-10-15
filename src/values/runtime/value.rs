@@ -41,37 +41,140 @@ use super::{
 };
 use crate::gql_status::FerrosGrynnError;
 
+/// Owned runtime value used by the Rust SDK and query execution.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub enum Value {
+	/// Runtime representation of an absent value.
 	#[default]
 	None,
+	/// Runtime representation of an explicit null value.
 	Null,
-	Bool(bool),
-	Number(Number),
-	String(Text),
-	Duration(Duration),
-	DateTime(DateTime),
-	Ulid(Ulid),
-	Uuid(Uuid),
-	Array(Array),
-	Set(Set),
-	Object(Object),
-	Geometry(Geometry),
-	Vector(Vector),
-	Bytes(Bytes),
-	GraphRef(Box<GraphRef>),
-	Record(Box<RecordId>),
-	Regex(Regex),
-	Matcher(Matcher),
-	Range(Range),
-	Atom(Box<AtomRef>),
-	AtomOccurrence(Box<AtomOccurrenceRef>),
-	Path(Box<Path>),
-	Graph(Box<MaterializedGraph>),
-	Closure(Box<Closure>),
-	Error(Box<ErrorValue>),
-	Cursor(QueryCursor),
+	/// Runtime representation of a Boolean value.
+	Bool(
+		/// Runtime representation of a Boolean value.
+		bool,
+	),
+	/// Runtime representation of a numeric value.
+	Number(
+		/// Runtime representation of a numeric value.
+		Number,
+	),
+	/// Runtime representation of text.
+	String(
+		/// Runtime representation of text.
+		Text,
+	),
+	/// Runtime representation of a duration.
+	Duration(
+		/// Runtime representation of a duration.
+		Duration,
+	),
+	/// Runtime representation of a time-zone-aware timestamp.
+	DateTime(
+		/// Runtime representation of a time-zone-aware timestamp.
+		DateTime,
+	),
+	/// Runtime representation of a ULID.
+	Ulid(
+		/// Runtime representation of a ULID.
+		Ulid,
+	),
+	/// Runtime representation of a UUID.
+	Uuid(
+		/// Runtime representation of a UUID.
+		Uuid,
+	),
+	/// Runtime representation of an ordered sequence of values.
+	Array(
+		/// Runtime representation of an ordered sequence of values.
+		Array,
+	),
+	/// Runtime representation of an ordered set of distinct values.
+	Set(
+		/// Runtime representation of an ordered set of distinct values.
+		Set,
+	),
+	/// Runtime representation of a text-keyed value map.
+	Object(
+		/// Runtime representation of a text-keyed value map.
+		Object,
+	),
+	/// Runtime representation of a geometry value.
+	Geometry(
+		/// Runtime representation of a geometry value.
+		Geometry,
+	),
+	/// Runtime representation of a numeric vector.
+	Vector(
+		/// Runtime representation of a numeric vector.
+		Vector,
+	),
+	/// Runtime representation of binary bytes.
+	Bytes(
+		/// Runtime representation of binary bytes.
+		Bytes,
+	),
+	/// Runtime representation of a stable graph reference.
+	GraphRef(
+		/// Runtime representation of a stable graph reference.
+		Box<GraphRef>,
+	),
+	/// Runtime representation of a class-qualified record identity.
+	Record(
+		/// Runtime representation of a class-qualified record identity.
+		Box<RecordId>,
+	),
+	/// Runtime representation of a compiled regular expression.
+	Regex(
+		/// Runtime representation of a compiled regular expression.
+		Regex,
+	),
+	/// Runtime representation of a runtime matcher.
+	Matcher(
+		/// Runtime representation of a runtime matcher.
+		Matcher,
+	),
+	/// Runtime representation of a bounded or unbounded value interval.
+	Range(
+		/// Runtime representation of a bounded or unbounded value interval.
+		Range,
+	),
+	/// Runtime representation of a stable atom reference.
+	Atom(
+		/// Runtime representation of a stable atom reference.
+		Box<AtomRef>,
+	),
+	/// Runtime representation of a stable graph-qualified atom occurrence.
+	AtomOccurrence(
+		/// Runtime representation of a stable graph-qualified atom occurrence.
+		Box<AtomOccurrenceRef>,
+	),
+	/// Runtime representation of a snapshot-qualified path.
+	Path(
+		/// Runtime representation of a snapshot-qualified path.
+		Box<Path>,
+	),
+	/// Runtime representation of a materialized graph family.
+	Graph(
+		/// Runtime representation of a materialized graph family.
+		Box<MaterializedGraph>,
+	),
+	/// Runtime representation of a runtime callable.
+	Closure(
+		/// Runtime representation of a runtime callable.
+		Box<Closure>,
+	),
+	/// Runtime representation of a runtime error value.
+	Error(
+		/// Runtime representation of a runtime error value.
+		Box<ErrorValue>,
+	),
+	/// Runtime representation of a runtime query cursor.
+	Cursor(
+		/// Runtime representation of a runtime query cursor.
+		QueryCursor,
+	),
 }
 
 impl Value {
@@ -127,6 +230,7 @@ impl Value {
 		}
 	}
 
+	/// Returns kind for `Value`.
 	pub fn kind(&self) -> ValueKind {
 		match self {
 			Self::None => ValueKind::None,
@@ -213,18 +317,22 @@ impl Value {
 		}
 	}
 
+	/// Returns value type for `Value`.
 	pub fn value_type(&self) -> Type {
 		Type::of(self)
 	}
 
+	/// Reports whether the value is none for `Value`.
 	pub const fn is_none(&self) -> bool {
 		matches!(self, Self::None)
 	}
 
+	/// Reports whether the value is null for `Value`.
 	pub const fn is_null(&self) -> bool {
 		matches!(self, Self::Null)
 	}
 
+	/// Reports whether the value is truthy for `Value`.
 	pub fn is_truthy(&self) -> bool {
 		match self {
 			Self::None | Self::Null => false,
@@ -255,6 +363,7 @@ impl Value {
 		}
 	}
 
+	/// Returns the bool payload when this value has the matching variant.
 	pub const fn as_bool(&self) -> Option<bool> {
 		match self {
 			Self::Bool(value) => Some(*value),
@@ -262,6 +371,7 @@ impl Value {
 		}
 	}
 
+	/// Returns the number payload when this value has the matching variant.
 	pub const fn as_number(&self) -> Option<Number> {
 		match self {
 			Self::Number(value) => Some(*value),
@@ -269,10 +379,12 @@ impl Value {
 		}
 	}
 
+	/// Borrows str for `Value`.
 	pub fn as_str(&self) -> Option<&str> {
 		self.as_text().map(Text::as_str)
 	}
 
+	/// Borrows text for `Value`.
 	pub const fn as_text(&self) -> Option<&Text> {
 		match self {
 			Self::String(value) => Some(value),
@@ -280,6 +392,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows array for `Value`.
 	pub const fn as_array(&self) -> Option<&Array> {
 		match self {
 			Self::Array(value) => Some(value),
@@ -287,6 +400,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows set for `Value`.
 	pub const fn as_set(&self) -> Option<&Set> {
 		match self {
 			Self::Set(value) => Some(value),
@@ -294,6 +408,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows object for `Value`.
 	pub const fn as_object(&self) -> Option<&Object> {
 		match self {
 			Self::Object(value) => Some(value),
@@ -301,6 +416,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows duration for `Value`.
 	pub const fn as_duration(&self) -> Option<&Duration> {
 		match self {
 			Self::Duration(value) => Some(value),
@@ -308,6 +424,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows datetime for `Value`.
 	pub const fn as_datetime(&self) -> Option<&DateTime> {
 		match self {
 			Self::DateTime(value) => Some(value),
@@ -315,6 +432,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows ulid for `Value`.
 	pub const fn as_ulid(&self) -> Option<&Ulid> {
 		match self {
 			Self::Ulid(value) => Some(value),
@@ -322,6 +440,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows uuid for `Value`.
 	pub const fn as_uuid(&self) -> Option<&Uuid> {
 		match self {
 			Self::Uuid(value) => Some(value),
@@ -329,6 +448,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows geometry for `Value`.
 	pub const fn as_geometry(&self) -> Option<&Geometry> {
 		match self {
 			Self::Geometry(value) => Some(value),
@@ -336,6 +456,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows vector for `Value`.
 	pub const fn as_vector(&self) -> Option<&Vector> {
 		match self {
 			Self::Vector(value) => Some(value),
@@ -343,6 +464,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows bytes for `Value`.
 	pub const fn as_bytes(&self) -> Option<&Bytes> {
 		match self {
 			Self::Bytes(value) => Some(value),
@@ -350,6 +472,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows record for `Value`.
 	pub const fn as_record(&self) -> Option<&RecordId> {
 		match self {
 			Self::Record(value) => Some(value),
@@ -357,6 +480,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows graph ref for `Value`.
 	pub const fn as_graph_ref(&self) -> Option<&GraphRef> {
 		match self {
 			Self::GraphRef(value) => Some(value),
@@ -364,6 +488,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows regex for `Value`.
 	pub const fn as_regex(&self) -> Option<&Regex> {
 		match self {
 			Self::Regex(value) => Some(value),
@@ -371,6 +496,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows matcher for `Value`.
 	pub const fn as_matcher(&self) -> Option<&Matcher> {
 		match self {
 			Self::Matcher(value) => Some(value),
@@ -378,6 +504,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows range for `Value`.
 	pub const fn as_range(&self) -> Option<&Range> {
 		match self {
 			Self::Range(value) => Some(value),
@@ -385,6 +512,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows atom for `Value`.
 	pub fn as_atom(&self) -> Option<&AtomRef> {
 		match self {
 			Self::Atom(value) => Some(value),
@@ -392,6 +520,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows atom occurrence for `Value`.
 	pub fn as_atom_occurrence(&self) -> Option<&AtomOccurrenceRef> {
 		match self {
 			Self::AtomOccurrence(value) => Some(value),
@@ -399,6 +528,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows path for `Value`.
 	pub fn as_path(&self) -> Option<&Path> {
 		match self {
 			Self::Path(value) => Some(value),
@@ -406,6 +536,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows materialized graph for `Value`.
 	pub fn as_materialized_graph(&self) -> Option<&MaterializedGraph> {
 		match self {
 			Self::Graph(value) => Some(value),
@@ -413,10 +544,12 @@ impl Value {
 		}
 	}
 
+	/// Borrows graph for `Value`.
 	pub fn as_graph(&self) -> Option<&Graph<Frozen>> {
 		self.as_materialized_graph().and_then(MaterializedGraph::as_general)
 	}
 
+	/// Borrows closure for `Value`.
 	pub const fn as_closure(&self) -> Option<&Closure> {
 		match self {
 			Self::Closure(value) => Some(value),
@@ -424,6 +557,7 @@ impl Value {
 		}
 	}
 
+	/// Borrows error for `Value`.
 	pub const fn as_error(&self) -> Option<&ErrorValue> {
 		match self {
 			Self::Error(value) => Some(value),
@@ -431,6 +565,7 @@ impl Value {
 		}
 	}
 
+	/// Returns the cursor payload when this value has the matching variant.
 	pub const fn as_cursor(&self) -> Option<QueryCursor> {
 		match self {
 			Self::Cursor(value) => Some(*value),
@@ -438,6 +573,7 @@ impl Value {
 		}
 	}
 
+	/// Reports whether the value is storable for `Value`.
 	pub fn is_storable(&self) -> bool {
 		match self {
 			Self::Array(values) => values.iter().all(Self::is_storable),
@@ -470,6 +606,11 @@ impl Value {
 		}
 	}
 
+	/// Ensures storable for `Value`.
+	///
+	/// # Errors
+	///
+	/// Returns `conversion_error` diagnostics.
 	pub fn ensure_storable(&self) -> Result<(), FerrosGrynnError> {
 		self.is_storable()
 			.then_some(())
@@ -477,6 +618,7 @@ impl Value {
 	}
 }
 
+/// Returns the bound value result.
 fn bound_value(bound: Bound<&Value>) -> Option<&Value> {
 	match bound {
 		Bound::Included(value) | Bound::Excluded(value) => Some(value),
@@ -484,6 +626,7 @@ fn bound_value(bound: Bound<&Value>) -> Option<&Value> {
 	}
 }
 
+/// Returns the estimated values heap bytes result.
 fn estimated_values_heap_bytes<'a>(
 	values: impl Iterator<Item = &'a Value>,
 	length: usize,
@@ -493,10 +636,12 @@ fn estimated_values_heap_bytes<'a>(
 	)
 }
 
-pub(crate) fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
+/// Returns the estimated record id heap bytes result.
+pub fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
 	record.class().len().saturating_add(estimated_record_part_heap_bytes(record.id()))
 }
 
+/// Returns the estimated record part heap bytes result.
 fn estimated_record_part_heap_bytes(part: &RecordIdPart) -> usize {
 	match part {
 		RecordIdPart::Int(_) | RecordIdPart::Uuid(_) | RecordIdPart::Ulid(_) => 0,
@@ -513,6 +658,7 @@ fn estimated_record_part_heap_bytes(part: &RecordIdPart) -> usize {
 	}
 }
 
+/// Returns the estimated bound heap bytes result.
 fn estimated_bound_heap_bytes(bound: Bound<&Value>) -> usize {
 	match bound {
 		Bound::Included(value) | Bound::Excluded(value) => {
@@ -522,16 +668,19 @@ fn estimated_bound_heap_bytes(bound: Bound<&Value>) -> usize {
 	}
 }
 
+/// Returns the estimated position heap bytes result.
 fn estimated_position_heap_bytes(position: &Position) -> usize {
 	position.as_slice().len().saturating_mul(size_of::<f64>())
 }
 
+/// Returns the estimated positions heap bytes result.
 fn estimated_positions_heap_bytes(positions: &[Position]) -> usize {
 	positions.len().saturating_mul(size_of::<Position>()).saturating_add(
 		positions.iter().map(estimated_position_heap_bytes).fold(0_usize, usize::saturating_add),
 	)
 }
 
+/// Returns the estimated geometry heap bytes result.
 pub(super) fn estimated_geometry_heap_bytes(geometry: &Geometry) -> usize {
 	match geometry {
 		Geometry::Point(position) => estimated_position_heap_bytes(position),
@@ -558,6 +707,7 @@ pub(super) fn estimated_geometry_heap_bytes(geometry: &Geometry) -> usize {
 	}
 }
 
+/// Returns the estimated vector heap bytes result.
 fn estimated_vector_heap_bytes(vector: &Vector) -> usize {
 	match vector {
 		Vector::F32(values) => values.len().saturating_mul(size_of::<f32>()),
@@ -572,6 +722,7 @@ fn estimated_vector_heap_bytes(vector: &Vector) -> usize {
 }
 
 impl PartialEq for Value {
+	/// Compares this `Value` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -580,12 +731,14 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 impl PartialOrd for Value {
+	/// Compares this `Value` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Value {
+	/// Compares this `Value` with another value using its ordering contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.kind().stable_rank().cmp(&other.kind().stable_rank()).then_with(|| {
 			match (self, other) {
@@ -622,6 +775,7 @@ impl Ord for Value {
 }
 
 impl Hash for Value {
+	/// Feeds this `Value` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.kind().stable_rank().hash(state);
 		match self {

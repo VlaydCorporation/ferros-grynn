@@ -19,13 +19,13 @@ impl FerrosBridge {
 }
 
 impl Bridge for FerrosBridge {
+	/// Returns capabilities for `FerrosBridge`.
 	fn capabilities(&self) -> BridgeCapabilities {
-		BridgeCapabilities {
-			internal_queries: true,
-			..BridgeCapabilities::READ_ONLY
-		}
+		BridgeCapabilities::READ_ONLY.union(BridgeCapabilities::INTERNAL_QUERIES)
 	}
 
+	/// Executes a read-only local GQL query, rejecting other bridge operation
+	/// variants.
 	fn execute(&self, operation: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_> {
 		Box::pin(async move {
 			context.check()?;

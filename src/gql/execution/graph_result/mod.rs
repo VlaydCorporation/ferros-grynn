@@ -10,7 +10,38 @@ mod hierarchy;
 
 use hierarchy::{materialize_hierarchy, resolve_root};
 
-use super::*;
+use super::{
+	AtomId,
+	AtomKind,
+	BarrierAccount,
+	ControlRuntime,
+	EdgeEndpoint,
+	ExecutionControl,
+	FerrosGrynnError,
+	FerrosGrynnResult,
+	GraphRead,
+	GraphRef,
+	Instant,
+	LogicalSelect,
+	LogicalSelectSourceKind,
+	Object,
+	PropertyMap,
+	QueryRead,
+	RecordFields,
+	RecordId,
+	RootRead,
+	Row,
+	Snapshot,
+	TypedExpr,
+	Value,
+	eval,
+	eval_query_expression,
+	eval_usize,
+	resolve_match_graph,
+	select,
+	traversal,
+	visit_match_with_environment,
+};
 use crate::{
 	gql::ir::{
 		LogicalBuildGraph,
@@ -19,43 +50,45 @@ use crate::{
 		LogicalReturnGraph,
 		Schema,
 	},
-	graph::{
-		Dag,
-		Forest,
-		Graph,
-		GraphId,
-		Hypergraph,
-		MaterializedGraph,
-		Metagraph,
-		Mutable,
-		QueryMaterialize,
-		RootedTree,
-		Subgraph,
-		Tree,
-		validate_topology_constraints,
-	},
+	graph::{Graph, GraphId, MaterializedGraph, Mutable, QueryMaterialize},
 };
 
 #[derive(Clone, Default)]
+/// Graph selection state.
 struct GraphSelection {
+	/// Nodes associated with this graph selection.
 	nodes: BTreeSet<crate::graph::AtomRef>,
+	/// Edges associated with this graph selection.
 	edges: BTreeSet<crate::graph::AtomRef>,
+	/// Records associated with this graph selection.
 	records: BTreeSet<RecordId>,
+	/// All nodes associated with this graph selection.
 	all_nodes: bool,
+	/// All edges associated with this graph selection.
 	all_edges: bool,
 }
 
 /// One statement-local, non-spilling owned graph builder.
 pub(in crate::gql) struct GraphAssemblyAccumulator<'a> {
+	/// Root hint associated with this graph assembly accumulator.
 	root_hint: Option<GraphRef>,
+	/// Graphs associated with this graph assembly accumulator.
 	graphs: BTreeMap<GraphId, GraphRef>,
+	/// Selections associated with this graph assembly accumulator.
 	selections: BTreeMap<GraphId, GraphSelection>,
+	/// Graphless nodes associated with this graph assembly accumulator.
 	graphless_nodes: BTreeSet<RecordId>,
+	/// Direct associated with this graph assembly accumulator.
 	direct: Option<MaterializedGraph>,
+	/// Root values associated with this graph assembly accumulator.
 	root_values: BTreeSet<Value>,
+	/// Node limit associated with this graph assembly accumulator.
 	node_limit: u64,
+	/// Edge limit associated with this graph assembly accumulator.
 	edge_limit: u64,
+	/// Memory associated with this graph assembly accumulator.
 	memory: BarrierAccount,
+	/// Control associated with this graph assembly accumulator.
 	control: &'a ExecutionControl,
 }
 
@@ -154,6 +187,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		)
 	}
 
+	/// Creates a new `GraphAssemblyAccumulator<'a>` value.
 	pub(super) fn new(
 		root_hint: Option<GraphRef>,
 		node_limit: Option<u64>,
@@ -180,6 +214,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		}
 	}
 
+	/// Returns the add root result.
 	pub(super) fn add_root(&mut self, value: Value) -> FerrosGrynnResult<()> {
 		if matches!(value, Value::None) {
 			return Err(invalid("ROOT must resolve to one node occurrence"));
@@ -193,6 +228,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		Ok(())
 	}
 
+	/// Records source row.
 	pub(super) fn record_source_row(&self) {
 		self.control.record_graph_source_row();
 	}
@@ -217,18 +253,22 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		Ok(())
 	}
 
+	/// Returns the add nodes result.
 	pub(super) fn add_nodes(&mut self, value: Value) -> FerrosGrynnResult<()> {
 		self.add(value, Some(AtomKind::Node), false)
 	}
 
+	/// Returns the add edges result.
 	pub(super) fn add_edges(&mut self, value: Value) -> FerrosGrynnResult<()> {
 		self.add(value, Some(AtomKind::Edge), false)
 	}
 
+	/// Returns the add auto result.
 	pub(super) fn add_auto(&mut self, value: Value) -> FerrosGrynnResult<()> {
 		self.add(value, None, true)
 	}
 
+	/// Returns the add result.
 	fn add(
 		&mut self,
 		value: Value,
@@ -351,6 +391,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		}
 	}
 
+	/// Returns the add atom result.
 	fn add_atom(
 		&mut self,
 		atom: crate::graph::AtomRef,
@@ -396,6 +437,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		Ok(())
 	}
 
+	/// Returns the add record result.
 	fn add_record(&mut self, record: RecordId, graph: GraphRef) -> FerrosGrynnResult<()> {
 		let graph = self.selection(graph)?;
 		if self.selections.get(&graph).is_some_and(|selection| selection.records.contains(&record))
@@ -412,6 +454,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		Ok(())
 	}
 
+	/// Returns the selection result.
 	fn selection(&mut self, graph: GraphRef) -> FerrosGrynnResult<GraphId> {
 		let id = graph.id();
 		if !self.graphs.contains_key(&id) {
@@ -429,6 +472,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		Ok(id)
 	}
 
+	/// Inserts graphless.
 	fn insert_graphless(&mut self, record: RecordId) -> FerrosGrynnResult<()> {
 		if self.graphless_nodes.contains(&record) {
 			self.control.record_graph_deduplicated_value();
@@ -440,6 +484,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		Ok(())
 	}
 
+	/// Returns the full graph reference result.
 	fn full_graph_reference(&self) -> Option<GraphRef> {
 		if !self.graphless_nodes.is_empty() || self.selections.len() != 1 {
 			return None;
@@ -457,6 +502,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		self.graphs.get(id).cloned()
 	}
 
+	/// Reserves graph assembly accumulator<'a>.
 	fn reserve(&mut self, bytes: usize) -> FerrosGrynnResult<()> {
 		if self.memory.reserve(bytes) {
 			return Ok(());
@@ -467,11 +513,13 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 		))
 	}
 
+	/// Returns the enforce result memory result.
 	fn enforce_result_memory(&mut self, graph: &MaterializedGraph) -> FerrosGrynnResult<()> {
 		self.memory.release_all();
 		self.reserve(graph.estimated_heap_bytes())
 	}
 
+	/// Finishes graph assembly accumulator<'a>.
 	pub(super) fn finish<Read: QueryRead>(
 		mut self,
 		read: &Read,
@@ -590,6 +638,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 	}
 }
 
+/// Executes return graph.
 pub(super) fn execute_return_graph<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -712,6 +761,7 @@ fn execute_select_graph_from_root<Read: QueryRead>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "BUILD GRAPH reuses every existing query executor")]
+/// Executes build graph.
 pub(super) fn execute_build_graph<Read: QueryRead>(
 	read: &mut Read,
 	snapshot: Snapshot,
@@ -972,6 +1022,7 @@ fn result_row(value: Value, schema: &Schema, value_mode: bool) -> FerrosGrynnRes
 	Err(invalid("query-source graph assembly requires an object row or one VALUE column"))
 }
 
+/// Finishes family.
 fn finish_family(
 	mut graph: Graph<Mutable>,
 	contract: LogicalGraphContract,
@@ -999,6 +1050,7 @@ fn finish_family(
 	)
 }
 
+/// Returns the root record result.
 fn root_record(
 	values: BTreeSet<Value>,
 	root_scope: Option<GraphId>,
@@ -1021,6 +1073,7 @@ fn root_record(
 	}
 }
 
+/// Ensures kind.
 fn ensure_kind(actual: AtomKind, expected: Option<AtomKind>) -> FerrosGrynnResult<()> {
 	if expected.is_some_and(|expected| expected != actual) {
 		return Err(invalid("graph selector atom kind does not match its target"));
@@ -1028,6 +1081,7 @@ fn ensure_kind(actual: AtomKind, expected: Option<AtomKind>) -> FerrosGrynnResul
 	Ok(())
 }
 
+/// Reserves accounted.
 fn reserve_accounted(
 	memory: &mut BarrierAccount,
 	control: &ExecutionControl,
@@ -1042,6 +1096,7 @@ fn reserve_accounted(
 	))
 }
 
+/// Checks limit.
 fn check_limit(actual: usize, limit: u64, subject: &str) -> FerrosGrynnResult<()> {
 	if u64::try_from(actual).unwrap_or(u64::MAX) > limit {
 		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
@@ -1052,10 +1107,12 @@ fn check_limit(actual: usize, limit: u64, subject: &str) -> FerrosGrynnResult<()
 	Ok(())
 }
 
+/// Returns the missing result.
 fn missing(atom: &crate::graph::AtomRef) -> FerrosGrynnError {
 	FerrosGrynnError::atom_does_not_exist(atom.kind().to_string(), atom.id().to_string())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::graph_constraint_violation("graph assembly", reason.into())
 }

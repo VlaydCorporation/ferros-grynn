@@ -1,32 +1,57 @@
+/// Owned ordered runtime arrays.
 mod array;
+/// Owned binary byte values.
 mod bytes;
+/// Runtime-only language closure values.
 mod closure;
+/// Conversions into and between runtime values.
 mod conversions;
+/// Owned error values exposed by the language.
 mod error_value;
+/// Runtime value presentation.
 mod formatting;
+/// Owned validated geometry values.
 mod geometry;
+/// Runtime identities and identity generation.
 mod id;
+/// Stable value-kind classification.
 mod kind;
+/// Runtime pattern-matching values.
 mod matcher;
+/// Exact integer, decimal and floating-point value semantics.
 mod number;
+/// Canonical object values and field access.
 mod object;
+/// Bidirectional property-name interning.
 mod property_dictionary;
+/// Compact property maps keyed by interned property identities.
 mod property_map;
+/// Owned query continuation values.
 mod query_cursor;
+/// Runtime range values and bounds.
 mod range;
+/// Stable class-qualified record identifiers.
 mod record_id;
+/// Owned regular-expression values.
 mod regex;
 /// Durable images compare exact runtime representations without changing Eq.
 mod representation;
 pub(crate) use representation::{same_number, same_object, same_value};
+/// Canonical set values.
 mod set;
+/// Temporal values and their canonical representation.
 mod temporal;
+/// Owned UTF-8 text values.
 mod text;
+/// Runtime type descriptions and validation.
 mod types;
+/// The owned runtime value enum and common operations.
 mod value;
+/// Typed owned vector values.
 mod vector;
 
 #[cfg(test)]
+/// Cross-type equality, ordering and hashing laws for runtime values.
 mod laws;
 
 pub use array::Array;
@@ -72,6 +97,7 @@ pub use vector::{Vector, VectorKind};
 pub use crate::graph;
 
 #[cfg(test)]
+/// Regression tests for runtime behavior.
 mod tests {
 	use std::{
 		collections::{BTreeSet, HashSet},
@@ -81,6 +107,8 @@ mod tests {
 	use rust_decimal::Decimal;
 
 	use super::{Number, Text, Type, Value, ValueKind};
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::values::runtime::graph::{
 		AtomKind,
 		AtomOccurrenceRef,
@@ -98,6 +126,7 @@ mod tests {
 		TreeOrientation,
 	};
 
+	/// Verifies sentinel semantics are two valued.
 	#[test]
 	fn sentinel_semantics_are_two_valued() {
 		assert_eq!(Value::None, Value::None);
@@ -108,8 +137,12 @@ mod tests {
 		assert!(!Value::Null.is_truthy());
 	}
 
+	/// Verifies uses explicit stable variant order.
 	#[test]
-	#[allow(clippy::mutable_key_type)]
+	#[allow(
+		clippy::mutable_key_type,
+		reason = "Value keys compare immutable data or stable runtime identities"
+	)]
 	fn uses_explicit_stable_variant_order() {
 		let values = BTreeSet::from([
 			Value::from("string"),
@@ -127,8 +160,12 @@ mod tests {
 		],);
 	}
 
+	/// Verifies eq ord and hash agree for cross number values.
 	#[test]
-	#[allow(clippy::mutable_key_type)]
+	#[allow(
+		clippy::mutable_key_type,
+		reason = "Value keys compare immutable data or stable runtime identities"
+	)]
 	fn eq_ord_and_hash_agree_for_cross_number_values() {
 		let values = HashSet::from([
 			Value::from(Number::Int(1)),
@@ -138,6 +175,7 @@ mod tests {
 		assert_eq!(values.len(), 1);
 	}
 
+	/// Verifies reports concrete kind and static type.
 	#[test]
 	fn reports_concrete_kind_and_static_type() {
 		let value = Value::from(1.5_f64);
@@ -145,12 +183,14 @@ mod tests {
 		assert_eq!(value.value_type(), Type::Float);
 	}
 
+	/// Verifies display is deterministic and escapes strings.
 	#[test]
 	fn display_is_deterministic_and_escapes_strings() {
 		let value = Value::from("a\0\nb");
 		assert_eq!(value.to_string(), r#""a\u0000\nb""#);
 	}
 
+	/// Verifies runtime only values are explicitly non storable.
 	#[test]
 	fn runtime_only_values_are_explicitly_non_storable() {
 		let closure = super::Closure::new(None, vec![], Type::None, |_| Ok(Value::None));
@@ -159,17 +199,19 @@ mod tests {
 		assert!(value.ensure_storable().is_err());
 	}
 
+	/// Verifies value conversions never default or truncate.
 	#[test]
 	fn value_conversions_never_default_or_truncate() {
-		assert_eq!(i64::try_from(Value::from(42_i64)).unwrap(), 42);
+		assert_eq!(i64::try_from(Value::from(42_i64)).assert_ok(), 42);
 		assert!(i64::try_from(Value::from(42.5_f64)).is_err());
 		assert!(bool::try_from(Value::Null).is_err());
 
 		let value = Value::from("graph");
 		assert_eq!(value.as_text(), Some(&Text::from("graph")));
-		assert_eq!(Text::try_from(value).unwrap(), "graph");
+		assert_eq!(Text::try_from(value).assert_ok(), "graph");
 	}
 
+	/// Verifies value respects runtime size budget.
 	#[test]
 	fn value_respects_runtime_size_budget() {
 		let size = std::mem::size_of::<Value>();
@@ -183,11 +225,12 @@ mod tests {
 		);
 	}
 
+	/// Verifies graph transport preserves exact type and typed conversion.
 	#[test]
 	fn graph_transport_preserves_exact_type_and_typed_conversion() {
 		let tree =
 			Tree::<Mutable>::new(TreeOrientation::OutArborescence, None, super::PropertyMap::new())
-				.unwrap()
+				.assert_ok()
 				.freeze();
 		let value = Value::from(tree);
 		assert_eq!(value.kind(), ValueKind::Graph);
@@ -202,50 +245,52 @@ mod tests {
 		assert_eq!(subgraph.value_type(), Type::Graph(GraphKind::Subgraph));
 	}
 
+	/// Verifies atom and path have distinct value contracts.
 	#[test]
 	fn atom_and_path_have_distinct_value_contracts() {
-		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().unwrap());
+		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().assert_ok());
 		let atom_value = Value::from(atom.clone());
 		assert_eq!(atom_value.kind(), ValueKind::Atom);
 		assert_eq!(atom_value.value_type(), Type::Atom(AtomKind::Node));
-		assert_eq!(AtomRef::try_from(atom_value).unwrap(), atom);
+		assert_eq!(AtomRef::try_from(atom_value).assert_ok(), atom);
 
 		let path = Path::new(super::Uuid::default(), SnapshotId::new(7, 11), Vec::new(), None);
 		let path_value = Value::from(path.clone());
 		assert_eq!(path_value.kind(), ValueKind::Path);
 		assert_eq!(path_value.value_type(), Type::Path);
-		assert_eq!(Path::try_from(path_value).unwrap(), path);
+		assert_eq!(Path::try_from(path_value).assert_ok(), path);
 	}
 
+	/// Verifies occurrence identity uses graph id and atom identity.
 	#[test]
 	fn occurrence_identity_uses_graph_id_and_atom_identity() {
-		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().unwrap());
+		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().assert_ok());
 		let graph = Arc::new(
 			GraphRef::new(
-				GraphId::new(7).unwrap(),
+				GraphId::new(7).assert_some(),
 				"first",
 				GraphKind::Graph,
 				GraphStorageMode::InMemory,
 			)
-			.unwrap(),
+			.assert_ok(),
 		);
 		let renamed = Arc::new(
 			GraphRef::new(
-				GraphId::new(7).unwrap(),
+				GraphId::new(7).assert_some(),
 				"renamed",
 				GraphKind::Dag,
 				GraphStorageMode::DiskBacked,
 			)
-			.unwrap(),
+			.assert_ok(),
 		);
 		let other = Arc::new(
 			GraphRef::new(
-				GraphId::new(8).unwrap(),
+				GraphId::new(8).assert_some(),
 				"other",
 				GraphKind::Graph,
 				GraphStorageMode::InMemory,
 			)
-			.unwrap(),
+			.assert_ok(),
 		);
 
 		let first = AtomOccurrenceRef::new(atom.clone(), graph);

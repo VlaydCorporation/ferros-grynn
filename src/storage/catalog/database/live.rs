@@ -422,19 +422,18 @@ pub(super) fn validate_entries(catalog: &super::DatabaseCatalog) -> FerrosGrynnR
 		return Err(invalid("LIVE catalog identities are not canonical sorted distinct"));
 	}
 	for entry in &catalog.live_queries {
-		if let Some(segment) = entry.graph_checkpoint {
-			if entry.query.graph_result().is_none()
+		if let Some(segment) = entry.graph_checkpoint
+			&& (entry.query.graph_result().is_none()
 				|| segment.owner() != crate::storage::HistoryOwner::Live(entry.id)
 				|| segment.header.database != catalog.database_uuid
 				|| segment.header.commits != 1
 				|| segment.header.first_stamp != segment.header.last_stamp
 				|| segment.header.first_time != segment.header.last_time
-				|| segment.header.first_stamp < entry.defined_at
-			{
-				return Err(invalid(
-					"LIVE graph checkpoint reference has inconsistent ownership/bounds",
-				));
-			}
+				|| segment.header.first_stamp < entry.defined_at)
+		{
+			return Err(invalid(
+				"LIVE graph checkpoint reference has inconsistent ownership/bounds",
+			));
 		}
 		let names = crate::live::dependencies::query_record_names(
 			&entry.query,

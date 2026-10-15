@@ -13,17 +13,29 @@ use crate::{
 	},
 };
 
+/// Configured magic value.
 const MAGIC: [u8; 4] = *b"FGC1";
+/// Configured version value.
 const VERSION: u8 = 1;
+/// Byte offset of kind in its encoded layout.
 const KIND_OFFSET: usize = PAGE_HEADER_SIZE + MAGIC.len();
+/// Byte offset of version in its encoded layout.
 const VERSION_OFFSET: usize = KIND_OFFSET + 1;
+/// Byte offset of reserved a in its encoded layout.
 const RESERVED_A_OFFSET: usize = VERSION_OFFSET + 1;
+/// Byte offset of next page in its encoded layout.
 const NEXT_PAGE_OFFSET: usize = RESERVED_A_OFFSET + 2;
+/// Byte offset of chunk len in its encoded layout.
 const CHUNK_LEN_OFFSET: usize = NEXT_PAGE_OFFSET + 8;
+/// Byte offset of total len in its encoded layout.
 const TOTAL_LEN_OFFSET: usize = CHUNK_LEN_OFFSET + 4;
+/// Byte offset of reserved b in its encoded layout.
 const RESERVED_B_OFFSET: usize = TOTAL_LEN_OFFSET + 4;
+/// Byte offset of payload in its encoded layout.
 const PAYLOAD_OFFSET: usize = RESERVED_B_OFFSET + 8;
+/// Configured payload bytes value.
 const PAYLOAD_BYTES: usize = PAGE_SIZE - PAYLOAD_OFFSET;
+/// Configured max catalog bytes value.
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
 /// Logical catalog carried by a `SystemCatalog` page chain.
@@ -37,6 +49,7 @@ pub(in crate::storage) enum CatalogKind {
 }
 
 impl CatalogKind {
+	/// Creates from raw.
 	const fn from_raw(value: u8) -> Option<Self> {
 		match value {
 			1 => Some(Self::Database),
@@ -163,6 +176,7 @@ pub(in crate::storage) fn decode_page_chain(
 	Ok(output)
 }
 
+/// Returns the checked page result.
 fn checked_page(start: PageNo, offset: u64) -> FerrosGrynnResult<PageNo> {
 	start
 		.get()
@@ -171,6 +185,7 @@ fn checked_page(start: PageNo, offset: u64) -> FerrosGrynnResult<PageNo> {
 		.ok_or_else(|| invalid("catalog continuation page number overflows u64"))
 }
 
+/// Validates size.
 fn validate_size(length: usize) -> FerrosGrynnResult<()> {
 	if length > MAX_CATALOG_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -182,6 +197,7 @@ fn validate_size(length: usize) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Returns the expect zero result.
 fn expect_zero(bytes: &[u8], field: &str) -> FerrosGrynnResult<()> {
 	if bytes.iter().any(|byte| *byte != 0) {
 		return Err(invalid(format!("{field} are non-zero")));
@@ -189,28 +205,35 @@ fn expect_zero(bytes: &[u8], field: &str) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Reads u32.
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 	let mut value = [0; 4];
 	value.copy_from_slice(&bytes[offset..offset + 4]);
 	u32::from_le_bytes(value)
 }
 
+/// Reads u64.
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 	let mut value = [0; 8];
 	value.copy_from_slice(&bytes[offset..offset + 8]);
 	u64::from_le_bytes(value)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for page chain behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies exact header and multi page round trip.
 	#[test]
-	fn exact_header_and_multi_page_round_trip() -> FerrosGrynnResult<()> {
+	fn exact_header_and_multi_page_round_trip() {
+		use crate::test_assertions::AssertResult as _;
+
 		let payload = vec![0x5a; PAYLOAD_BYTES + 7];
 		let (page_numbers, pages) = encode_page_chain(
 			CatalogKind::Database,
@@ -218,7 +241,8 @@ mod tests {
 			PageNo::new(9),
 			&payload,
 			PageLsn::ZERO,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(pages.len(), 2);
 		let first = pages[0].as_bytes();
 		assert_eq!(&first[PAGE_HEADER_SIZE..KIND_OFFSET], b"FGC1");
@@ -242,23 +266,27 @@ mod tests {
 			},
 			PageNo::new(3),
 			CatalogKind::Database,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(decoded, payload);
-		Ok(())
 	}
 
+	/// Verifies rejects non zero trailing bytes.
 	#[test]
-	fn rejects_non_zero_trailing_bytes() -> FerrosGrynnResult<()> {
+	fn rejects_non_zero_trailing_bytes() {
+		use crate::test_assertions::AssertResult as _;
+
 		let (_page_numbers, mut pages) = encode_page_chain(
 			CatalogKind::Files,
 			PageNo::new(0),
 			PageNo::new(1),
 			b"payload",
 			PageLsn::ZERO,
-		)?;
+		)
+		.assert_ok();
 		let page = &mut pages[0];
 		page.as_bytes_mut()[PAYLOAD_OFFSET + 7] = 1;
-		page.seal()?;
+		page.seal().assert_ok();
 		assert!(
 			decode_page_chain(
 				&mut |_page_no, destination| {
@@ -270,6 +298,5 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 }

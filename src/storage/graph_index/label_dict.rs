@@ -4,45 +4,88 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rapidhash::v3::{DEFAULT_RAPID_SECRETS, rapidhash_v3_seeded};
 
-use super::*;
+use super::{
+	AlignedPage,
+	FerrosGrynnResult,
+	PAGE_SIZE,
+	PageFlags,
+	PageLsn,
+	PageNo,
+	PageType,
+	invalid_index,
+	read_u16,
+	read_u32,
+	read_u64,
+	write_u16,
+	write_u32,
+	write_u64,
+};
 
+/// Configured root page value.
 const ROOT_PAGE: PageNo = PageNo::new(0);
+/// Byte offset of node count in its encoded layout.
 const NODE_COUNT_OFFSET: usize = 32;
+/// Byte offset of edge count in its encoded layout.
 const EDGE_COUNT_OFFSET: usize = 36;
+/// Byte offset of node first in its encoded layout.
 const NODE_FIRST_OFFSET: usize = 40;
+/// Byte offset of node last in its encoded layout.
 const NODE_LAST_OFFSET: usize = 48;
+/// Byte offset of edge first in its encoded layout.
 const EDGE_FIRST_OFFSET: usize = 56;
+/// Byte offset of edge last in its encoded layout.
 const EDGE_LAST_OFFSET: usize = 64;
+/// Byte offset of hash first in its encoded layout.
 const HASH_FIRST_OFFSET: usize = 72;
+/// Byte offset of hash page count in its encoded layout.
 const HASH_PAGE_COUNT_OFFSET: usize = 80;
+/// Byte offset of hash capacity in its encoded layout.
 const HASH_CAPACITY_OFFSET: usize = 84;
+/// Byte offset of root reserved in its encoded layout.
 const ROOT_RESERVED_OFFSET: usize = 88;
 
+/// Byte offset of entry next in its encoded layout.
 const ENTRY_NEXT_OFFSET: usize = 32;
+/// Byte offset of entry first id in its encoded layout.
 const ENTRY_FIRST_ID_OFFSET: usize = 40;
+/// Byte offset of entry count in its encoded layout.
 const ENTRY_COUNT_OFFSET: usize = 44;
+/// Byte offset of entry used in its encoded layout.
 const ENTRY_USED_OFFSET: usize = 46;
+/// Byte offset of entry kind in its encoded layout.
 const ENTRY_KIND_OFFSET: usize = 48;
+/// Byte offset of entry reserved in its encoded layout.
 const ENTRY_RESERVED_OFFSET: usize = 49;
+/// Byte offset of entry data in its encoded layout.
 const ENTRY_DATA_OFFSET: usize = 56;
 
+/// Byte offset of hash next in its encoded layout.
 const HASH_NEXT_OFFSET: usize = 32;
+/// Byte offset of hash used in its encoded layout.
 const HASH_USED_OFFSET: usize = 40;
+/// Byte offset of hash capacity page in its encoded layout.
 const HASH_CAPACITY_PAGE_OFFSET: usize = 44;
+/// Byte offset of hash data in its encoded layout.
 const HASH_DATA_OFFSET: usize = 48;
+/// Configured hash bucket bytes value.
 const HASH_BUCKET_BYTES: usize = 20;
+/// Configured hash buckets per page value.
 const HASH_BUCKETS_PER_PAGE: usize = (PAGE_SIZE - HASH_DATA_OFFSET) / HASH_BUCKET_BYTES;
+/// Byte offset of hash tail in its encoded layout.
 const HASH_TAIL_OFFSET: usize = HASH_DATA_OFFSET + HASH_BUCKETS_PER_PAGE * HASH_BUCKET_BYTES;
 
 /// Namespace encoded in every label entry page and hash key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub(in crate::storage) enum LabelKind {
+	/// Label associated with node atoms.
 	Node = 0,
+	/// Label associated with edge atoms.
 	Edge = 1,
 }
 
 impl LabelKind {
+	/// Creates from raw.
 	fn from_raw(raw: u8) -> FerrosGrynnResult<Self> {
 		match raw {
 			0 => Ok(Self::Node),
@@ -55,7 +98,9 @@ impl LabelKind {
 /// Dense graph-local label namespaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::storage) struct LabelDictionary {
+	/// Node labels associated with this label dictionary.
 	pub(in crate::storage) node_labels: Vec<String>,
+	/// Edge labels associated with this label dictionary.
 	pub(in crate::storage) edge_labels: Vec<String>,
 }
 
@@ -96,6 +141,7 @@ impl LabelDictionary {
 		usize::try_from(id).ok().and_then(|id| self.labels(kind).get(id)).map(String::as_str)
 	}
 
+	/// Returns the labels result.
 	fn labels(&self, kind: LabelKind) -> &[String] {
 		match kind {
 			LabelKind::Node => &self.node_labels,
@@ -105,21 +151,31 @@ impl LabelDictionary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Name location state.
 struct NameLocation {
+	/// Page associated with this name location.
 	page: PageNo,
+	/// Position relative to the beginning of the associated buffer.
 	offset: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Label binding state.
 struct LabelBinding {
+	/// Kind associated with this label binding.
 	kind: LabelKind,
+	/// Identifier used to locate this value within its owning subsystem.
 	id: u32,
+	/// Location associated with this label binding.
 	location: NameLocation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Hash bucket state.
 struct HashBucket {
+	/// Hash associated with this hash bucket.
 	hash: u32,
+	/// Binding associated with this hash bucket.
 	binding: LabelBinding,
 }
 
@@ -198,6 +254,7 @@ pub(in crate::storage) fn decode_label_dictionary(
 	Ok(dictionary)
 }
 
+/// Appends entries.
 fn append_entries(
 	pages: &mut Vec<AlignedPage>,
 	kind: LabelKind,
@@ -249,18 +306,19 @@ fn append_entries(
 	}
 	let last_index = pages.len() - 1;
 	let last = page_no(last_index)?;
-	for index in first_index..=last_index {
+	for (index, page) in pages.iter_mut().enumerate().take(last_index + 1).skip(first_index) {
 		let next = if index == last_index {
 			PageNo::NULL
 		} else {
 			page_no(index + 1)?
 		};
-		write_u64(pages[index].as_bytes_mut(), ENTRY_NEXT_OFFSET, next.get());
-		pages[index].seal()?;
+		write_u64(page.as_bytes_mut(), ENTRY_NEXT_OFFSET, next.get());
+		page.seal()?;
 	}
 	Ok((first, last, locations))
 }
 
+/// Decodes entries.
 fn decode_entries(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	kind: LabelKind,
@@ -355,6 +413,7 @@ fn decode_entries(
 	Ok((labels, locations))
 }
 
+/// Returns the bindings result.
 fn bindings(
 	nodes: Vec<NameLocation>,
 	edges: Vec<NameLocation>,
@@ -372,6 +431,7 @@ fn bindings(
 	Ok(result)
 }
 
+/// Appends hash.
 fn append_hash(
 	pages: &mut Vec<AlignedPage>,
 	dictionary: &LabelDictionary,
@@ -430,6 +490,7 @@ fn append_hash(
 	Ok((first, u32_len(page_count)?, u32_len(capacity)?))
 }
 
+/// Decodes hash.
 fn decode_hash(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	dictionary: &LabelDictionary,
@@ -511,6 +572,7 @@ fn decode_hash(
 	Ok(())
 }
 
+/// Returns the label hash result.
 fn label_hash(kind: LabelKind, name: &str) -> FerrosGrynnResult<u32> {
 	let mut key = Vec::with_capacity(3 + name.len());
 	key.push(kind as u8);
@@ -519,6 +581,7 @@ fn label_hash(kind: LabelKind, name: &str) -> FerrosGrynnResult<u32> {
 	Ok(rapidhash_v3_seeded(&key, &DEFAULT_RAPID_SECRETS) as u32)
 }
 
+/// Returns the place bucket result.
 fn place_bucket(buckets: &mut [Option<HashBucket>], bucket: HashBucket) -> FerrosGrynnResult<()> {
 	let start = bucket.hash as usize % buckets.len();
 	for distance in 0..buckets.len() {
@@ -531,6 +594,7 @@ fn place_bucket(buckets: &mut [Option<HashBucket>], bucket: HashBucket) -> Ferro
 	Err(invalid_index("label hash range has no free bucket"))
 }
 
+/// Writes bucket.
 fn write_bucket(bytes: &mut [u8], slot: usize, bucket: HashBucket) -> FerrosGrynnResult<()> {
 	let offset = hash_offset(slot)?;
 	write_u32(bytes, offset, bucket.hash);
@@ -540,6 +604,7 @@ fn write_bucket(bytes: &mut [u8], slot: usize, bucket: HashBucket) -> FerrosGryn
 	Ok(())
 }
 
+/// Reads bucket.
 fn read_bucket(bytes: &[u8], slot: usize) -> FerrosGrynnResult<Option<HashBucket>> {
 	let offset = hash_offset(slot)?;
 	let hash = read_u32(bytes, offset);
@@ -566,6 +631,7 @@ fn read_bucket(bytes: &[u8], slot: usize) -> FerrosGrynnResult<Option<HashBucket
 	}))
 }
 
+/// Returns the hash offset result.
 fn hash_offset(slot: usize) -> FerrosGrynnResult<usize> {
 	if slot >= HASH_BUCKETS_PER_PAGE {
 		return Err(invalid_index("label hash slot exceeds its page"));
@@ -573,6 +639,7 @@ fn hash_offset(slot: usize) -> FerrosGrynnResult<usize> {
 	Ok(HASH_DATA_OFFSET + slot * HASH_BUCKET_BYTES)
 }
 
+/// Validates dictionary.
 fn validate_dictionary(dictionary: &LabelDictionary) -> FerrosGrynnResult<()> {
 	for labels in [&dictionary.node_labels, &dictionary.edge_labels] {
 		let mut previous: Option<&str> = None;
@@ -587,6 +654,7 @@ fn validate_dictionary(dictionary: &LabelDictionary) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Validates name.
 fn validate_name(name: &str) -> FerrosGrynnResult<()> {
 	if name.is_empty() || name.contains('\0') || name.len() > usize::from(u16::MAX) {
 		return Err(invalid_index("label is empty, contains NUL, or exceeds u16"));
@@ -594,6 +662,7 @@ fn validate_name(name: &str) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Validates zero.
 fn validate_zero(bytes: &[u8], field: &str) -> FerrosGrynnResult<()> {
 	if bytes.iter().any(|byte| *byte != 0) {
 		return Err(invalid_index(format!("{field} are non-zero")));
@@ -601,36 +670,45 @@ fn validate_zero(bytes: &[u8], field: &str) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Returns the page no result.
 fn page_no(index: usize) -> FerrosGrynnResult<PageNo> {
 	u64::try_from(index)
 		.map(PageNo::new)
 		.map_err(|_error| invalid_index("label dictionary page number exceeds u64"))
 }
 
+/// Returns the u16 len result.
 fn u16_len(value: usize) -> FerrosGrynnResult<u16> {
 	u16::try_from(value).map_err(|_error| invalid_index("label dictionary value exceeds u16"))
 }
 
+/// Returns the u32 len result.
 fn u32_len(value: usize) -> FerrosGrynnResult<u32> {
 	u32::try_from(value).map_err(|_error| invalid_index("label dictionary value exceeds u32"))
 }
 
+/// Returns the usize len result.
 fn usize_len(value: u32) -> FerrosGrynnResult<usize> {
 	usize::try_from(value).map_err(|_error| invalid_index("label dictionary value exceeds usize"))
 }
 
 #[cfg(test)]
+/// Regression tests for label dict behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies exact two namespace dictionary round trips and hashes kind.
 	#[test]
-	fn exact_two_namespace_dictionary_round_trips_and_hashes_kind() -> FerrosGrynnResult<()> {
+	fn exact_two_namespace_dictionary_round_trips_and_hashes_kind() {
+		use crate::test_assertions::AssertResult as _;
+
 		let dictionary = LabelDictionary::from_labels([
 			(LabelKind::Node, "shared"),
 			(LabelKind::Edge, "shared"),
 			(LabelKind::Node, "person"),
-		])?;
-		let pages = encode_label_dictionary(&dictionary, PageLsn::new(7))?;
+		])
+		.assert_ok();
+		let pages = encode_label_dictionary(&dictionary, PageLsn::new(7)).assert_ok();
 		let decoded = decode_label_dictionary(|number, output| {
 			let index = usize::try_from(number.get())
 				.map_err(|_error| invalid_index("test page exceeds usize"))?;
@@ -641,10 +719,10 @@ mod tests {
 					.as_bytes(),
 			);
 			Ok(())
-		})?;
+		})
+		.assert_ok();
 		assert_eq!(decoded, dictionary);
 		assert_eq!(decoded.id(LabelKind::Node, "shared"), Some(1));
 		assert_eq!(decoded.id(LabelKind::Edge, "shared"), Some(0));
-		Ok(())
 	}
 }

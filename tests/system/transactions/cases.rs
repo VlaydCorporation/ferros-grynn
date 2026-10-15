@@ -5,6 +5,8 @@ use ferros_grynn::{
 
 use crate::support::{create_person, people, record};
 
+/// Verifies snapshot is stable while read committed refreshes between sdk
+/// calls.
 #[test]
 fn snapshot_is_stable_while_read_committed_refreshes_between_sdk_calls() {
 	let db = database();
@@ -42,6 +44,8 @@ fn snapshot_is_stable_while_read_committed_refreshes_between_sdk_calls() {
 	});
 }
 
+/// Verifies first committer wins and rejected commit publishes no partial
+/// writes.
 #[test]
 fn first_committer_wins_and_rejected_commit_publishes_no_partial_writes() {
 	let db = database();
@@ -70,6 +74,7 @@ fn first_committer_wins_and_rejected_commit_publishes_no_partial_writes() {
 	});
 }
 
+/// Verifies disjoint snapshot writes merge instead of losing a commit.
 #[test]
 fn disjoint_snapshot_writes_merge_instead_of_losing_a_commit() {
 	let db = database();
@@ -94,6 +99,7 @@ fn disjoint_snapshot_writes_merge_instead_of_losing_a_commit() {
 	});
 }
 
+/// Verifies serializable rejects a write based on a changed read.
 #[test]
 fn serializable_rejects_a_write_based_on_a_changed_read() {
 	let db = database();
@@ -118,6 +124,7 @@ fn serializable_rejects_a_write_based_on_a_changed_read() {
 	});
 }
 
+/// Verifies read only sdk transaction rejects mutation.
 #[test]
 fn read_only_sdk_transaction_rejects_mutation() {
 	let db = database();

@@ -18,23 +18,33 @@ use crate::{
 	values::{Object, PropertyMap, RecordId, Value},
 };
 
+/// In-memory bridge test double recording requests and controlling commit
+/// outcomes.
 #[derive(Clone)]
 struct Fake {
+	/// Database identity or retained database state used by the operation.
 	database: BridgeDatabaseRef,
+	/// Rows retained for keyed lookup or sequential output.
 	rows: Arc<Mutex<BTreeMap<RecordId, Value>>>,
+	/// Shared counter recording mirrors observed by the test fixture.
 	mirrors: Arc<AtomicUsize>,
+	/// Flag selecting an unknown commit outcome in the bridge test double.
 	unknown: Arc<AtomicBool>,
+	/// Shared counter recording batches observed by the test fixture.
 	batches: Arc<AtomicUsize>,
 }
 impl Bridge for Fake {
+	/// Returns the fixture database descriptor.
 	fn database(&self) -> Option<BridgeDatabaseRef> {
 		Some(self.database)
 	}
 
+	/// Enables all operation kinds for the in-memory adapter fixture.
 	fn capabilities(&self) -> BridgeCapabilities {
 		BridgeCapabilities::FULL
 	}
 
+	/// Serves exact fixture records or records a controlled mirror outcome.
 	fn execute(&self, operation: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_> {
 		Box::pin(async move {
 			context.check()?;
@@ -79,6 +89,8 @@ impl Bridge for Fake {
 		})
 	}
 }
+/// Builds a local class and matching external records for bridge operator
+/// tests.
 fn fixture() -> FerrosGrynnResult<(Datastore, Fake)> {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
@@ -120,15 +132,19 @@ fn fixture() -> FerrosGrynnResult<(Datastore, Fake)> {
 	store.attach_bridge(database, fake.clone())?;
 	Ok((store, fake))
 }
+/// Returns runtime for this module.
 fn runtime() -> FerrosGrynnResult<tokio::runtime::Runtime> {
 	tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| {
 		FerrosGrynnError::bridge_operation_error("test runtime failed").with_technical_source(error)
 	})
 }
 
+/// Verifies bridge fetch precedes order and pagination.
 #[test]
-fn bridge_fetch_precedes_order_and_pagination() -> FerrosGrynnResult<()> {
-	runtime()?.block_on(async {
+fn bridge_fetch_precedes_order_and_pagination() {
+	use crate::test_assertions::AssertResult as _;
+
+	let test_result: FerrosGrynnResult<()> = runtime().assert_ok().block_on(async {
 		let (store, _) = fixture()?;
 		let result = store
 			.query(
@@ -163,12 +179,16 @@ fn bridge_fetch_precedes_order_and_pagination() -> FerrosGrynnResult<()> {
 				.is_err()
 		);
 		Ok(())
-	})
+	});
+	test_result.assert_ok();
 }
 
+/// Verifies bridge nested fetch reuses cache and merges database namespaces.
 #[test]
-fn bridge_nested_fetch_reuses_cache_and_merges_database_namespaces() -> FerrosGrynnResult<()> {
-	runtime()?.block_on(async {
+fn bridge_nested_fetch_reuses_cache_and_merges_database_namespaces() {
+	use crate::test_assertions::AssertResult as _;
+
+	let test_result: FerrosGrynnResult<()> = runtime().assert_ok().block_on(async {
 		let (store, fake) = fixture()?;
 		let mut tx = store.begin();
 		let database = tx.register_bridge_database(
@@ -234,19 +254,24 @@ fn bridge_nested_fetch_reuses_cache_and_merges_database_namespaces() -> FerrosGr
 			.await?;
 		assert!(bad.results[0].result.is_err());
 		Ok(())
-	})
+	});
+	test_result.assert_ok();
 }
 
+/// Verifies bridge relate partial commit resume and cancel.
 #[test]
-fn bridge_relate_partial_commit_resume_and_cancel() -> FerrosGrynnResult<()> {
-	tokio::runtime::Builder::new_current_thread()
+fn bridge_relate_partial_commit_resume_and_cancel() {
+	use crate::test_assertions::AssertResult as _;
+
+	let test_result: FerrosGrynnResult<()> = tokio::runtime::Builder::new_current_thread()
 		.enable_all()
 		.max_blocking_threads(1)
 		.build()
 		.map_err(|error| {
 			FerrosGrynnError::bridge_operation_error("test runtime failed")
 				.with_technical_source(error)
-		})?
+		})
+		.assert_ok()
 		.block_on(async {
 			let (store, fake) = fixture()?;
 			let query = "RELATE (person:a)-[link:r]->(person:b) IN GRAPH g WITH BRIDGE sdb;";
@@ -351,19 +376,30 @@ fn bridge_relate_partial_commit_resume_and_cancel() -> FerrosGrynnResult<()> {
 				Some(BridgeMappingState::Ready)
 			);
 			Ok(())
-		})
+		});
+	test_result.assert_ok();
 }
 
+/// Bridge test double exposing when an operation starts and when it is
+/// cancelled.
 struct Waiting {
+	/// Database identity or retained database state used by the operation.
 	database: BridgeDatabaseRef,
+	/// Shared observation of whether the asynchronous test operation has
+	/// started.
 	started: Arc<AtomicBool>,
+	/// Shared observation of whether the asynchronous test operation was
+	/// dropped.
 	dropped: Arc<AtomicBool>,
 }
 
+/// Verifies bridge graph recipes validate loops duplicates and atomic
+/// publication.
 #[test]
-fn bridge_graph_recipes_validate_loops_duplicates_and_atomic_publication() -> FerrosGrynnResult<()>
-{
-	runtime()?.block_on(async {
+fn bridge_graph_recipes_validate_loops_duplicates_and_atomic_publication() {
+	use crate::test_assertions::AssertResult as _;
+
+	let test_result: FerrosGrynnResult<()> = runtime().assert_ok().block_on(async {
 		let (store, fake) = fixture()?;
 		let result = store
 			.query("RELATE (person:a)-[link:loop]->(person:a) IN GRAPH g WITH BRIDGE sdb")
@@ -423,23 +459,32 @@ fn bridge_graph_recipes_validate_loops_duplicates_and_atomic_publication() -> Fe
 		assert!(result.results[0].result.is_err());
 		assert!(store.begin().named_graph("rejected")?.is_none());
 		Ok(())
-	})
+	});
+	test_result.assert_ok();
 }
-struct DropProbe(Arc<AtomicBool>);
+/// Test guard recording destruction through shared observation state.
+struct DropProbe(
+	/// Shared flag set when the cancellation test guard is destroyed.
+	Arc<AtomicBool>,
+);
 impl Drop for DropProbe {
+	/// Runs cleanup for this `DropProbe` before its fields are released.
 	fn drop(&mut self) {
 		self.0.store(true, Ordering::Release);
 	}
 }
 impl Bridge for Waiting {
+	/// Returns the database descriptor used by the pending-operation fixture.
 	fn database(&self) -> Option<BridgeDatabaseRef> {
 		Some(self.database)
 	}
 
+	/// Enables all operation kinds so cancellation reaches the adapter.
 	fn capabilities(&self) -> BridgeCapabilities {
 		BridgeCapabilities::FULL
 	}
 
+	/// Starts a pending operation whose guard records cancellation on drop.
 	fn execute(&self, _operation: BridgeOperation, _context: BridgeContext) -> BridgeFuture<'_> {
 		Box::pin(async move {
 			let _probe = DropProbe(self.dropped.clone());
@@ -449,9 +494,12 @@ impl Bridge for Waiting {
 	}
 }
 
+/// Verifies bridge deadline and drop release the dispatcher.
 #[test]
-fn bridge_deadline_and_drop_release_the_dispatcher() -> FerrosGrynnResult<()> {
-	runtime()?.block_on(async {
+fn bridge_deadline_and_drop_release_the_dispatcher() {
+	use crate::test_assertions::AssertResult as _;
+
+	let test_result: FerrosGrynnResult<()> = runtime().assert_ok().block_on(async {
 		let (store, fake) = fixture()?;
 		let started = Arc::new(AtomicBool::new(false));
 		let dropped = Arc::new(AtomicBool::new(false));
@@ -460,23 +508,59 @@ fn bridge_deadline_and_drop_release_the_dispatcher() -> FerrosGrynnResult<()> {
 			started: started.clone(),
 			dropped: dropped.clone(),
 		})?;
-		let mut options = crate::gql::QueryExecutionOptions::default();
-		options.statement_timeout = Some(std::time::Duration::from_millis(30));
-		let result = store
-			.query("SELECT id AS p FROM person FETCH p WITH BRIDGE sdb")
-			.options(options)
-			.execute()
-			.await?;
-		assert!(result.results[0].result.is_err());
-		assert!(started.load(Ordering::Acquire));
-		assert!(dropped.load(Ordering::Acquire));
+		for timeout in [std::time::Duration::from_millis(30), std::time::Duration::ZERO] {
+			started.store(false, Ordering::Release);
+			dropped.store(false, Ordering::Release);
+			let options = crate::gql::QueryExecutionOptions {
+				statement_timeout: Some(timeout),
+				..Default::default()
+			};
+			let result = store
+				.query("SELECT id AS p FROM person FETCH p WITH BRIDGE sdb")
+				.options(options)
+				.execute()
+				.await;
+			// The absolute deadline may expire during preflight or before the
+			// blocking worker reaches IO. Both boundaries must return the
+			// timeout.
+			let error = match result {
+				Err(error) => error,
+				Ok(mut result) => {
+					assert_eq!(result.results.len(), 1);
+					result.results.remove(0).result.assert_err()
+				}
+			};
+			assert_eq!(error.status().code().to_string(), "FG-50F04");
+			assert_eq!(started.load(Ordering::Acquire), dropped.load(Ordering::Acquire));
+			if timeout.is_zero() {
+				assert!(!started.load(Ordering::Acquire));
+			}
+		}
 		started.store(false, Ordering::Release);
 		dropped.store(false, Ordering::Release);
-		let result = tokio::time::timeout(
-			std::time::Duration::from_millis(30),
-			store.query("SELECT id AS p FROM person FETCH p WITH BRIDGE sdb").execute(),
-		)
-		.await;
+
+		// Establish a pending adapter operation before starting the independent
+		// cancellation timer. The driver already registers its channel/worker
+		// wakers.
+		let mut query =
+			Box::pin(store.query("SELECT id AS p FROM person FETCH p WITH BRIDGE sdb").execute());
+		std::future::poll_fn(|cx| match std::future::Future::poll(query.as_mut(), cx) {
+			std::task::Poll::Pending if started.load(Ordering::Acquire) => {
+				std::task::Poll::Ready(Ok(()))
+			}
+			std::task::Poll::Pending => std::task::Poll::Pending,
+			std::task::Poll::Ready(result) => {
+				std::task::Poll::Ready(Err(FerrosGrynnError::invalid_argument(format!(
+					"bridge query completed before pending IO was established: {result:?}"
+				))))
+			}
+		})
+		.await?;
+		assert!(started.load(Ordering::Acquire));
+		assert!(!dropped.load(Ordering::Acquire));
+		// Timeout owns the pinned future, so its expiry drops the dispatcher
+		// and the pending adapter future rather than only a temporary borrow.
+		let result = tokio::time::timeout(std::time::Duration::from_millis(30), query).await;
 		assert!(result.is_err());
 		assert!(started.load(Ordering::Acquire));
 		assert!(dropped.load(Ordering::Acquire));
@@ -485,5 +569,6 @@ fn bridge_deadline_and_drop_release_the_dispatcher() -> FerrosGrynnResult<()> {
 			store.query("SELECT id AS p FROM person FETCH p WITH BRIDGE sdb").execute().await?;
 		result.results[0].result.clone()?;
 		Ok(())
-	})
+	});
+	test_result.assert_ok();
 }

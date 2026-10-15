@@ -3,58 +3,97 @@
 use super::*;
 
 #[derive(Clone)]
+/// Resolved match selector alternatives.
 pub(in crate::gql::execution) enum ResolvedMatchSelector {
+	/// Any case of resolved match selector.
 	Any,
-	Class(Box<str>),
-	Record(RecordId),
+	/// Class case of resolved match selector.
+	Class(
+		/// Class case of resolved match selector.
+		Box<str>,
+	),
+	/// Record case of resolved match selector.
+	Record(
+		/// Record case of resolved match selector.
+		RecordId,
+	),
 }
 
 #[derive(Clone)]
+/// Resolved match binding state.
 pub(in crate::gql::execution) struct ResolvedMatchBinding {
+	/// Domain associated with this resolved match binding.
 	pub(in crate::gql::execution) domain: EndpointDomain,
+	/// Selector associated with this resolved match binding.
 	pub(in crate::gql::execution) selector: ResolvedMatchSelector,
+	/// Column associated with this resolved match binding.
 	pub(in crate::gql::execution) column: Option<usize>,
+	/// Label associated with this resolved match binding.
 	pub(in crate::gql::execution) label: Option<Box<str>>,
+	/// Properties associated with this resolved match binding.
 	pub(in crate::gql::execution) properties: Vec<(Box<str>, TypedExpr)>,
+	/// Predicate associated with this resolved match binding.
 	pub(in crate::gql::execution) predicate: Option<TypedExpr>,
+	/// Meta associated with this resolved match binding.
 	pub(in crate::gql::execution) meta: bool,
 }
 
 /// Statement-local evaluator used by inline MATCH constraints.
 #[derive(Clone, Copy)]
 pub(in crate::gql::execution) struct MatchPredicateContext<'a> {
+	/// Slots associated with this match predicate context.
 	pub(in crate::gql::execution) slots: &'a [Value],
+	/// Source associated with this match predicate context.
 	pub(in crate::gql::execution) source: &'a str,
+	/// Fields associated with this match predicate context.
 	pub(in crate::gql::execution) fields: &'a dyn AtomFieldRead,
 }
 
 #[derive(Clone)]
+/// Resolved expand state.
 pub(in crate::gql::execution) struct ResolvedExpand {
+	/// Edge associated with this resolved expand.
 	pub(in crate::gql::execution) edge: ResolvedMatchBinding,
+	/// Target associated with this resolved expand.
 	pub(in crate::gql::execution) target: ResolvedMatchBinding,
+	/// Direction associated with this resolved expand.
 	pub(in crate::gql::execution) direction: crate::syn::MatchDirection,
+	/// Mode associated with this resolved expand.
 	pub(in crate::gql::execution) mode: crate::syn::MatchMode,
 	/// Versioned contribution shared by local and scoped fixed expansion.
 	pub(in crate::gql::execution) custom_cost: Option<crate::gql::ir::LogicalPathCost>,
+	/// Filters associated with this resolved expand.
 	pub(in crate::gql::execution) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
 #[derive(Clone)]
+/// Resolved path expand state.
 pub(in crate::gql::execution) struct ResolvedPathExpand {
+	/// Edge associated with this resolved path expand.
 	pub(in crate::gql::execution) edge: ResolvedMatchBinding,
+	/// Target associated with this resolved path expand.
 	pub(in crate::gql::execution) target: ResolvedMatchBinding,
+	/// Direction associated with this resolved path expand.
 	pub(in crate::gql::execution) direction: crate::syn::MatchDirection,
+	/// Min associated with this resolved path expand.
 	pub(in crate::gql::execution) min: u32,
+	/// Max associated with this resolved path expand.
 	pub(in crate::gql::execution) max: u32,
+	/// Path column associated with this resolved path expand.
 	pub(in crate::gql::execution) path_column: Option<usize>,
+	/// Match mode associated with this resolved path expand.
 	pub(in crate::gql::execution) match_mode: crate::syn::MatchMode,
+	/// Path mode associated with this resolved path expand.
 	pub(in crate::gql::execution) path_mode: crate::syn::MatchPathMode,
+	/// Objective associated with this resolved path expand.
 	pub(in crate::gql::execution) objective: Option<crate::syn::MatchPathObjective>,
 	/// Captured cost plan used by every exact path consumer.
 	pub(in crate::gql::execution) custom_cost: Option<crate::gql::ir::LogicalPathCost>,
+	/// Filters associated with this resolved path expand.
 	pub(in crate::gql::execution) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
+/// Resolves match binding.
 pub(in crate::gql::execution) fn resolve_match_binding(
 	binding: &MatchBinding,
 	predicate: MatchPredicateContext<'_>,
@@ -88,6 +127,7 @@ pub(in crate::gql::execution) fn resolve_match_binding(
 	})
 }
 
+/// Resolves expand.
 pub(in crate::gql::execution) fn resolve_expand(
 	expand: &Expand,
 	predicate: MatchPredicateContext<'_>,
@@ -104,6 +144,7 @@ pub(in crate::gql::execution) fn resolve_expand(
 	})
 }
 
+/// Resolves path expand.
 pub(in crate::gql::execution) fn resolve_path_expand(
 	expand: &PathExpand,
 	predicate: MatchPredicateContext<'_>,
@@ -128,19 +169,30 @@ pub(in crate::gql::execution) fn resolve_path_expand(
 
 /// Pull cursor that binds the first endpoint of a pattern.
 pub(in crate::gql::execution) struct SeedCursor<'a, Graph> {
+	/// Input associated with this seed cursor.
 	input: Box<dyn RowCursor + 'a>,
+	/// Graph associated with this seed cursor.
 	graph: Rc<Graph>,
+	/// Graph ref associated with this seed cursor.
 	graph_ref: Arc<GraphRef>,
+	/// Binding associated with this seed cursor.
 	binding: ResolvedMatchBinding,
+	/// Mode associated with this seed cursor.
 	mode: crate::syn::MatchMode,
+	/// Predicate associated with this seed cursor.
 	predicate: MatchPredicateContext<'a>,
+	/// Ids associated with this seed cursor.
 	ids: Vec<AtomId>,
+	/// Row associated with this seed cursor.
 	row: Option<Row>,
+	/// Bound associated with this seed cursor.
 	bound: Option<BoundAtom>,
+	/// Next id associated with this seed cursor.
 	next_id: usize,
 }
 
 impl<'a, Graph> SeedCursor<'a, Graph> {
+	/// Creates a new `SeedCursor<'a, Graph>` value.
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
@@ -166,6 +218,8 @@ impl<'a, Graph> SeedCursor<'a, Graph> {
 }
 
 impl<Graph: GraphRead> RowCursor for SeedCursor<'_, Graph> {
+	/// Advances this `SeedCursor<'_, Graph>` and returns its next element, if
+	/// any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -286,6 +340,7 @@ pub(in crate::gql::execution) fn bind_match_position<Graph: GraphRead>(
 	Ok(true)
 }
 
+/// Returns the atom matches result.
 pub(in crate::gql::execution) fn atom_matches<Graph: GraphRead>(
 	graph: &Graph,
 	atom: AtomId,
@@ -339,6 +394,7 @@ pub(in crate::gql::execution) fn atom_matches<Graph: GraphRead>(
 	}
 }
 
+/// Binds atom.
 pub(in crate::gql::execution) fn bind_atom<Graph: GraphRead>(
 	row: &mut Row,
 	binding: &ResolvedMatchBinding,

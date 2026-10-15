@@ -1,38 +1,44 @@
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{ClassSchema, Datastore, Transaction},
 	graph::{AtomKind, EdgeTopology, GraphKind},
 	values::{Object, PropertyMap, RecordId},
 };
 
+/// Returns row count for this module.
 fn row_count(transaction: &mut Transaction, source: &str) -> usize {
-	transaction.execute(source, &Object::new()).unwrap()[0]
+	transaction.execute(source, &Object::new()).assert_ok()[0]
 		.result
 		.as_ref()
-		.unwrap()
+		.assert_ok()
 		.value()
 		.as_array()
-		.unwrap()
+		.assert_some()
 		.len()
 }
 
+/// Verifies hyper match distinguishes arity sides and undirected endpoints.
 #[test]
 fn hyper_match_distinguishes_arity_sides_and_undirected_endpoints() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("meeting", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("hyper_contract", GraphKind::Hypergraph).unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("meeting", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("hyper_contract", GraphKind::Hypergraph).assert_ok();
 	let people =
-		["person:a", "person:b", "person:c"].map(|value| value.parse::<RecordId>().unwrap());
+		["person:a", "person:b", "person:c"].map(|value| value.parse::<RecordId>().assert_ok());
 	let edges =
 		["meeting:binary", "meeting:directed", "meeting:bidirectional", "meeting:undirected"]
-			.map(|value| value.parse::<RecordId>().unwrap());
+			.map(|value| value.parse::<RecordId>().assert_ok());
 	for record in people.iter().chain(&edges) {
-		seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 	}
 	let local = people
 		.iter()
-		.map(|record| seed.attach_node(graph.id(), record, None, None).unwrap())
+		.map(|record| seed.attach_node(graph.id(), record, None, None).assert_ok())
 		.collect::<Vec<_>>();
 	for (edge, topology) in [
 		(&edges[0], EdgeTopology::directed([local[0]], [local[1]])),
@@ -40,9 +46,9 @@ fn hyper_match_distinguishes_arity_sides_and_undirected_endpoints() {
 		(&edges[2], EdgeTopology::bidirectional([local[0], local[1]], [local[2]])),
 		(&edges[3], EdgeTopology::undirected([local[0], local[1], local[2]])),
 	] {
-		seed.attach_edge(graph.id(), edge, None, topology, None, None).unwrap();
+		seed.attach_edge(graph.id(), edge, None, topology, None, None).assert_ok();
 	}
-	seed.commit().unwrap();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	assert_eq!(

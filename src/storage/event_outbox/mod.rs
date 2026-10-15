@@ -150,6 +150,7 @@ pub fn decode_payload(bytes: &[u8], maximum: usize) -> FerrosGrynnResult<EventPa
 }
 
 #[cfg(test)]
+/// Regression tests for event outbox behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -166,22 +167,27 @@ mod tests {
 		values::{Array, Object, Type},
 	};
 
+	/// Verifies event payload round trips frozen sources and qualified context.
 	#[test]
-	fn event_payload_round_trips_frozen_sources_and_qualified_context() -> FerrosGrynnResult<()> {
+	fn event_payload_round_trips_frozen_sources_and_qualified_context() {
+		use crate::test_assertions::AssertResult as _;
+
 		let graph = GraphRef::new(
-			GraphId::new(1).ok_or_else(|| invalid("fixture graph"))?,
+			GraphId::new(1).ok_or_else(|| invalid("fixture graph")).assert_ok(),
 			"scope",
 			GraphKind::Metagraph,
 			GraphStorageMode::InMemory,
-		)?;
+		)
+		.assert_ok();
 		let occurrence = AtomOccurrenceRef::new(
-			AtomRef::new(AtomKind::Edge, "link:e".parse()?),
+			AtomRef::new(AtomKind::Edge, "link:e".parse().assert_ok()),
 			Arc::new(graph.clone()),
 		);
 		let mut event =
-			EventDefinition::new("audit", EventTarget::Graph(graph.id()), "true", "fn::read()")?
-				.with_execution(EventExecution::Async(EventAsyncOptions::new(255, 16)?));
-		event.id = Some(EventId::from_storage(2)?);
+			EventDefinition::new("audit", EventTarget::Graph(graph.id()), "true", "fn::read()")
+				.assert_ok()
+				.with_execution(EventExecution::Async(EventAsyncOptions::new(255, 16).assert_ok()));
+		event.id = Some(EventId::from_storage(2).assert_ok());
 		let mut function = SchemaFunction::new(
 			"fn",
 			"read",
@@ -191,8 +197,9 @@ mod tests {
 			false,
 			None,
 			"{ RETURN 1; }",
-		)?;
-		function.id = Some(FunctionId::from_storage(3)?);
+		)
+		.assert_ok();
+		function.id = Some(FunctionId::from_storage(3).assert_ok());
 		let functions = vec![Arc::new(function)];
 		let arguments = [
 			Value::from("RELATE"),
@@ -204,9 +211,9 @@ mod tests {
 			])),
 			Value::from(Object::from_iter([("explicit", Value::from(7))])),
 		];
-		let bytes = encode_payload(&event, &arguments, &functions, 16 * 1024 * 1024)?;
+		let bytes = encode_payload(&event, &arguments, &functions, 16 * 1024 * 1024).assert_ok();
 		assert_eq!(&bytes[..8], b"FGEI\x01\x00\x00\x00");
-		let decoded = decode_payload(&bytes, 16 * 1024 * 1024)?;
+		let decoded = decode_payload(&bytes, 16 * 1024 * 1024).assert_ok();
 		assert_eq!(decoded.definition, event);
 		assert_eq!(decoded.arguments, arguments);
 		assert_eq!(decoded.functions, functions);
@@ -219,19 +226,22 @@ mod tests {
 			assert!(decode_payload(&invalid, 16 * 1024 * 1024).is_err());
 		}
 		assert!(decode_payload(&bytes, bytes.len()).is_err());
-		Ok(())
 	}
 
+	/// Verifies event payload function comments use owned decode bytes.
 	#[test]
-	fn event_payload_function_comments_use_owned_decode_bytes() -> FerrosGrynnResult<()> {
+	fn event_payload_function_comments_use_owned_decode_bytes() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut event = EventDefinition::new(
 			"commented",
-			EventTarget::Class(crate::datastore::ClassId::from_storage(1)?),
+			EventTarget::Class(crate::datastore::ClassId::from_storage(1).assert_ok()),
 			"true",
 			"1",
-		)?
+		)
+		.assert_ok()
 		.with_execution(EventExecution::Async(EventAsyncOptions::default()));
-		event.id = Some(EventId::from_storage(1000)?);
+		event.id = Some(EventId::from_storage(1000).assert_ok());
 		let mut functions = Vec::new();
 		for index in 2..=31 {
 			let mut function = SchemaFunction::new(
@@ -243,16 +253,16 @@ mod tests {
 				false,
 				None,
 				"{ RETURN 1; }",
-			)?
+			)
+			.assert_ok()
 			.with_comment("c".repeat(4096));
-			function.id = Some(FunctionId::from_storage(index)?);
+			function.id = Some(FunctionId::from_storage(index).assert_ok());
 			functions.push(Arc::new(function));
 		}
 		let arguments = [Value::from("CREATE"), Value::Null, Value::Null, Value::Null, Value::Null];
-		let bytes = encode_payload(&event, &arguments, &functions, 16 * 1024 * 1024)?;
-		let decoded = decode_payload(&bytes, 16 * 1024 * 1024)?;
+		let bytes = encode_payload(&event, &arguments, &functions, 16 * 1024 * 1024).assert_ok();
+		let decoded = decode_payload(&bytes, 16 * 1024 * 1024).assert_ok();
 		assert_eq!(decoded.functions, functions);
 		assert!(decode_payload(&bytes, bytes.len()).is_err());
-		Ok(())
 	}
 }

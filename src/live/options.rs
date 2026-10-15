@@ -17,11 +17,20 @@ pub enum LiveSince {
 	#[default]
 	Now,
 	/// Catch up after this complete commit; missing coverage is explicit.
-	Versionstamp(Versionstamp),
+	Versionstamp(
+		/// Catch up after this complete commit; missing coverage is explicit.
+		Versionstamp,
+	),
 	/// Catch up at or after the UTC timestamp, ordered by commit stamps.
-	Timestamp(DateTime),
+	Timestamp(
+		/// Catch up at or after the UTC timestamp, ordered by commit stamps.
+		DateTime,
+	),
 	/// Resume an existing incarnation from its confirmed watermark.
-	Cursor(LiveCursor),
+	Cursor(
+		/// Resume an existing incarnation from its confirmed watermark.
+		LiveCursor,
+	),
 }
 
 impl LiveSince {
@@ -71,6 +80,7 @@ pub struct LiveOptions {
 }
 
 impl Default for LiveOptions {
+	/// Constructs the default initial state of `LiveOptions`.
 	fn default() -> Self {
 		Self {
 			since: LiveSince::Now,
@@ -192,6 +202,7 @@ pub struct LiveBindingOptions {
 }
 
 impl Default for LiveBindingOptions {
+	/// Constructs the default initial state of `LiveBindingOptions`.
 	fn default() -> Self {
 		Self {
 			scratch_bytes: 256 * 1024 * 1024,
@@ -235,9 +246,11 @@ fn validate_evaluation_budgets(scratch_bytes: usize, work: u64) -> FerrosGrynnRe
 }
 
 #[cfg(test)]
+/// Regression tests for options behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies resource limits reject invalid admission.
 	#[test]
 	fn resource_limits_reject_invalid_admission() {
 		let options = LiveOptions::default();

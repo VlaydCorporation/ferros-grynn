@@ -1,3 +1,4 @@
+/// Checked arithmetic and exact integer division.
 mod exact_ops;
 mod hyper_log_log;
 

@@ -25,9 +25,15 @@ pub enum LiveGraphScopeId {
 	/// The result's top-level graph, including global-node selections.
 	Root,
 	/// One catalog child shared by all of its containment owners.
-	Source(GraphId),
+	Source(
+		/// One catalog child shared by all of its containment owners.
+		GraphId,
+	),
 	/// A computed child identified by its canonical owner route.
-	Derived(Vec<ChangeIdentity>),
+	Derived(
+		/// A computed child identified by its canonical owner route.
+		Vec<ChangeIdentity>,
+	),
 }
 
 impl LiveGraphScopeId {
@@ -279,12 +285,14 @@ impl LiveGraphImage {
 	/// Accounts each logical scope once, independently of shared runtime
 	/// layouts.
 	pub(crate) fn estimated_heap_bytes(&self) -> FerrosGrynnResult<usize> {
+		/// Returns add for `LiveGraphImage`.
 		fn add(bytes: &mut usize, amount: usize) -> FerrosGrynnResult<()> {
 			*bytes = bytes
 				.checked_add(amount)
 				.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE graph image bytes"))?;
 			Ok(())
 		}
+		/// Returns object for `LiveGraphImage`.
 		fn object(value: &Object) -> FerrosGrynnResult<usize> {
 			value.iter().try_fold(0usize, |bytes, (name, value)| {
 				bytes
@@ -296,6 +304,7 @@ impl LiveGraphImage {
 					})
 			})
 		}
+		/// Returns endpoint for `LiveGraphImage`.
 		fn endpoint(value: &LiveGraphEndpoint) -> FerrosGrynnResult<usize> {
 			value.owners.iter().chain(std::iter::once(&value.atom)).try_fold(
 				128usize,
@@ -311,7 +320,7 @@ impl LiveGraphImage {
 			)
 		}
 		let mut bytes = std::mem::size_of::<Self>();
-		for (name, _) in &self.property_keys {
+		for name in self.property_keys.keys() {
 			add(&mut bytes, 256)?;
 			add(&mut bytes, name.len())?;
 		}

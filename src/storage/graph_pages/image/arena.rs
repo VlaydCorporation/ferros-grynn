@@ -4,34 +4,47 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::{super::SubgraphEntry, GraphArenaBindings};
 use crate::{
-	datastore::{DatabaseRoot, OccurrenceState},
+	datastore::{DatabaseRoot, OccurrenceState, OccurrenceStateRef},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, GraphId, QualifiedAtomId},
 	values::storage::DiskAtomRef,
 };
 
 #[derive(Debug, Clone, Copy)]
+/// Child binding state.
 struct ChildBinding {
+	/// Graph associated with this child binding.
 	graph: GraphId,
+	/// Slot associated with this child binding.
 	slot: u32,
+	/// Container associated with this child binding.
 	container: AtomId,
 }
 
+/// Pending graph state.
 struct PendingGraph {
+	/// Graph associated with this pending graph.
 	graph: GraphId,
+	/// Slot associated with this pending graph.
 	slot: u32,
+	/// Ancestry associated with this pending graph.
 	ancestry: Vec<GraphId>,
 }
 
 /// Stable root-arena slots and direct parent bindings for one graph tree.
 pub(super) struct GraphArena<'database> {
+	/// Database associated with this graph arena.
 	database: &'database DatabaseRoot,
+	/// Root associated with this graph arena.
 	root: GraphId,
+	/// Children associated with this graph arena.
 	children: BTreeMap<u32, Vec<ChildBinding>>,
+	/// Bindings associated with this graph arena.
 	bindings: GraphArenaBindings,
 }
 
 impl<'database> GraphArena<'database> {
+	/// Builds graph arena<'database>.
 	pub(super) fn build(
 		database: &'database DatabaseRoot,
 		root: GraphId,
@@ -109,10 +122,12 @@ impl<'database> GraphArena<'database> {
 		})
 	}
 
+	/// Returns the bindings result.
 	pub(super) fn bindings(&self) -> GraphArenaBindings {
 		self.bindings.clone()
 	}
 
+	/// Returns the direct slot result.
 	pub(super) fn direct_slot(
 		&self,
 		parent_slot: u32,
@@ -126,6 +141,7 @@ impl<'database> GraphArena<'database> {
 			.map(|binding| binding.slot)
 	}
 
+	/// Returns the entries result.
 	pub(super) fn entries(&self, parent: GraphId) -> FerrosGrynnResult<Vec<SubgraphEntry>> {
 		if parent != self.root {
 			return Err(invalid("subgraph directory can only be built for the arena root"));
@@ -159,6 +175,7 @@ impl<'database> GraphArena<'database> {
 			.collect()
 	}
 
+	/// Returns the qualified result.
 	pub(super) fn qualified(
 		&self,
 		qualified: &QualifiedAtomId,
@@ -188,18 +205,20 @@ impl<'database> GraphArena<'database> {
 	}
 }
 
+/// Returns the child graph result.
 fn child_graph(state: &OccurrenceState) -> Option<GraphId> {
-	match state {
-		OccurrenceState::Node {
+	match state.view() {
+		OccurrenceStateRef::Node {
 			nested_graph,
 		} => *nested_graph,
-		OccurrenceState::Edge {
+		OccurrenceStateRef::Edge {
 			transition_graph,
 			..
 		} => *transition_graph,
 	}
 }
 
+/// Returns the disk ref result.
 fn disk_ref(id: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	DiskAtomRef::from_parts(
 		id.kind().ok_or_else(|| invalid("null atom cannot be a qualified endpoint"))?,
@@ -207,14 +226,17 @@ fn disk_ref(id: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	)
 }
 
+/// Returns the usize u32 result.
 fn usize_u32(value: usize) -> FerrosGrynnResult<u32> {
 	u32::try_from(value).map_err(|_error| invalid("subgraph count exceeds u32"))
 }
 
+/// Returns the usize u64 result.
 fn usize_u64(value: usize) -> FerrosGrynnResult<u64> {
 	u64::try_from(value).map_err(|_error| invalid("subgraph capacity exceeds u64"))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

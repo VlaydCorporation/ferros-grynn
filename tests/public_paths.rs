@@ -1,3 +1,8 @@
+#![cfg(test)]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
+
 use std::any::TypeId;
 
 use ferros_grynn::{
@@ -8,6 +13,7 @@ use ferros_grynn::{
 	values::Value,
 };
 
+/// Verifies public facades remain importable after internal moves.
 #[test]
 fn public_facades_remain_importable_after_internal_moves() {
 	let _store = Datastore::in_memory();

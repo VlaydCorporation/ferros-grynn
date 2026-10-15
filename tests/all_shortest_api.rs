@@ -1,5 +1,10 @@
+#![cfg(test)]
+
 //! Exact direct SDK path checks with independent bounded enumeration.
 #![allow(clippy::unwrap_used, reason = "Assertions fail on every unexpected SDK error")]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use ferros_grynn::{
 	graph::{
@@ -17,6 +22,7 @@ use ferros_grynn::{
 	},
 	values::{Number, PropertyMap},
 };
+use test_assertions::AssertOption as _;
 
 /// Selects one canonical node axis by its public RecordId.
 fn node(tensor: &EndpointTensor, ordinal: usize) -> TensorAtom {
@@ -28,6 +34,7 @@ fn node(tensor: &EndpointTensor, ordinal: usize) -> TensorAtom {
 		.clone()
 }
 
+/// Verifies all shortest api matches exhaustive bounded trails.
 #[test]
 fn all_shortest_api_matches_exhaustive_bounded_trails() {
 	for bits in 0..64_u64 {
@@ -97,9 +104,10 @@ fn all_shortest_api_matches_exhaustive_bounded_trails() {
 				.map(|path| {
 					(
 						match path.cost() {
-							Number::Int(n) => n,
-							_ => panic!("integer oracle"),
-						},
+							Number::Int(n) => Some(n),
+							_ => None,
+						}
+						.assert_some_with("integer oracle"),
 						path.steps()
 							.iter()
 							.filter_map(|s| {
@@ -154,6 +162,7 @@ fn walk(
 	}
 }
 
+/// Verifies all shortest api zero cycles modes and exact prefix callbacks.
 #[test]
 fn all_shortest_api_zero_cycles_modes_and_exact_prefix_callbacks() {
 	let mut graph = Graph::<Mutable>::new();
@@ -269,6 +278,8 @@ fn all_shortest_api_zero_cycles_modes_and_exact_prefix_callbacks() {
 	assert!(result[0].materialize_path(GraphAlgorithmLimits::default()).is_err());
 }
 
+/// Verifies all shortest api filters charge work before minimum and capture
+/// contributions.
 #[test]
 fn all_shortest_api_filters_charge_work_before_minimum_and_capture_contributions() {
 	let mut graph = Graph::<Mutable>::new();
@@ -334,6 +345,7 @@ fn all_shortest_api_filters_charge_work_before_minimum_and_capture_contributions
 	);
 }
 
+/// Verifies all shortest api costs do not reduce parallel adjacency strengths.
 #[test]
 fn all_shortest_api_costs_do_not_reduce_parallel_adjacency_strengths() {
 	let mut graph = Graph::<Mutable>::new();
@@ -413,6 +425,7 @@ fn all_shortest_api_costs_do_not_reduce_parallel_adjacency_strengths() {
 	assert_eq!(graph.node_count(), 2);
 }
 
+/// Verifies all shortest api materialization admits path length reduction.
 #[test]
 fn all_shortest_api_materialization_admits_path_length_reduction() {
 	use std::sync::Arc;
@@ -459,6 +472,7 @@ fn all_shortest_api_materialization_admits_path_length_reduction() {
 	assert!(materialized.resolve(&graph).is_ok());
 }
 
+/// Verifies all shortest api snapshot costs private writes and owned paths.
 #[test]
 fn all_shortest_api_snapshot_costs_private_writes_and_owned_paths() {
 	use std::sync::Arc;
@@ -576,6 +590,7 @@ fn all_shortest_api_snapshot_costs_private_writes_and_owned_paths() {
 	assert!(saved[0].steps().iter().all(|step| step.atom().graph().id() == graph.id()));
 }
 
+/// Verifies all shortest api named cost tracks external reads and hard limits.
 #[test]
 fn all_shortest_api_named_cost_tracks_external_reads_and_hard_limits() {
 	use std::sync::Arc;

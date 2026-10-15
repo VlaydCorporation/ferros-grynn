@@ -1,8 +1,13 @@
+#![cfg(test)]
 #![cfg(all(windows, feature = "native-async-io"))]
 #![allow(clippy::unwrap_used, reason = "Native backend contract stops on an unexpected error")]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::path::PathBuf;
 
+#[path = "common/people.rs"]
 mod common;
 
 use ferros_grynn::{
@@ -25,8 +30,12 @@ use ferros_grynn::{
 };
 
 /// Removes the isolated database after all native handles are released.
-struct Directory(PathBuf);
+struct Directory(
+	/// Removes the isolated database after all native handles are released.
+	PathBuf,
+);
 
+/// Verifies tensor cache native async sdk formats wal reopen and checkpoint.
 #[test]
 fn tensor_cache_native_async_sdk_formats_wal_reopen_and_checkpoint() {
 	use ferros_grynn::{
@@ -117,11 +126,100 @@ fn tensor_cache_native_async_sdk_formats_wal_reopen_and_checkpoint() {
 }
 
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Checks indexed TRAVERSE metrics and exact shortest-path costs after reopen.
+///
+/// # Panics
+/// Panics when a query fails, an expected result or metric is absent, or the
+/// observed path length, index use or cost differs from the fixture contract.
+fn assert_reopened_traversal_queries(reopened: &Datastore, traversal: &str) {
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
+
+	let rows = reopened.execute(traversal, &Object::new()).assert_ok();
+	let metrics = rows[0]
+		.result
+		.as_ref()
+		.assert_ok()
+		.value()
+		.as_object()
+		.assert_some()
+		.get("analyze")
+		.assert_some()
+		.as_object()
+		.assert_some();
+	assert!(metrics.get("landmark_lookups").assert_some() > &Value::from(0_u64));
+	let paths = reopened
+		.execute(&traversal.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
+		.assert_ok();
+	let path = paths[0]
+		.result
+		.as_ref()
+		.assert_ok()
+		.value()
+		.as_array()
+		.assert_some()
+		.get(0)
+		.assert_some()
+		.as_path()
+		.assert_some();
+	assert_eq!(path.steps().len(), 2);
+	assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(1)));
+	for (custom, method) in [
+		(false, "weightedShortestPath"),
+		(false, "distanceTo"),
+		(true, "weightedShortestPath"),
+		(true, "distanceTo"),
+	] {
+		let mut query = traversal.replace("shortestPath", method);
+		if custom {
+			query = query.replace("IN GRAPH @network", "IN GRAPH @network WITH COST fn::cost");
+		}
+		let expected_cost = if custom {
+			2
+		} else {
+			1
+		};
+		let rows = reopened.execute(&query, &Object::new()).assert_ok();
+		let metrics = rows[0]
+			.result
+			.as_ref()
+			.assert_ok()
+			.value()
+			.as_object()
+			.assert_some()
+			.get("analyze")
+			.assert_some()
+			.as_object()
+			.assert_some();
+		assert!(metrics.get("landmark_lookups").assert_some() > &Value::from(0_u64));
+		let rows = reopened
+			.execute(&query.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
+			.assert_ok();
+		let value = rows[0]
+			.result
+			.as_ref()
+			.assert_ok()
+			.value()
+			.as_array()
+			.assert_some()
+			.get(0)
+			.assert_some();
+		if let Some(path) = value.as_path() {
+			assert_eq!(path.steps().len(), 2);
+			assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(expected_cost)));
+		} else {
+			assert_eq!(value, &Value::from(expected_cost));
+		}
+	}
+}
+
+/// Verifies derived graph artifacts native async publication checkpoint and
+/// reopen.
 #[test]
 fn derived_graph_artifacts_native_async_publication_checkpoint_and_reopen() {
 	let directory = Directory(
@@ -328,74 +426,7 @@ fn derived_graph_artifacts_native_async_publication_checkpoint_and_reopen() {
 	drop(old);
 	drop(store);
 	let reopened = Datastore::open_local(&directory.0, options).unwrap();
-	let rows = reopened.execute(traversal, &Object::new()).unwrap();
-	let metrics = rows[0]
-		.result
-		.as_ref()
-		.unwrap()
-		.value()
-		.as_object()
-		.unwrap()
-		.get("analyze")
-		.unwrap()
-		.as_object()
-		.unwrap();
-	assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64));
-	let paths = reopened
-		.execute(&traversal.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
-		.unwrap();
-	let path = paths[0]
-		.result
-		.as_ref()
-		.unwrap()
-		.value()
-		.as_array()
-		.unwrap()
-		.get(0)
-		.unwrap()
-		.as_path()
-		.unwrap();
-	assert_eq!(path.steps().len(), 2);
-	assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(1)));
-	for (custom, method) in [
-		(false, "weightedShortestPath"),
-		(false, "distanceTo"),
-		(true, "weightedShortestPath"),
-		(true, "distanceTo"),
-	] {
-		let mut query = traversal.replace("shortestPath", method);
-		if custom {
-			query = query.replace("IN GRAPH @network", "IN GRAPH @network WITH COST fn::cost");
-		}
-		let expected_cost = if custom {
-			2
-		} else {
-			1
-		};
-		let rows = reopened.execute(&query, &Object::new()).unwrap();
-		let metrics = rows[0]
-			.result
-			.as_ref()
-			.unwrap()
-			.value()
-			.as_object()
-			.unwrap()
-			.get("analyze")
-			.unwrap()
-			.as_object()
-			.unwrap();
-		assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64));
-		let rows = reopened
-			.execute(&query.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
-			.unwrap();
-		let value = rows[0].result.as_ref().unwrap().value().as_array().unwrap().get(0).unwrap();
-		if let Some(path) = value.as_path() {
-			assert_eq!(path.steps().len(), 2);
-			assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(expected_cost)));
-		} else {
-			assert_eq!(value, &Value::from(expected_cost));
-		}
-	}
+	assert_reopened_traversal_queries(&reopened, traversal);
 	let costs = reopened.execute(&cost_query, &Object::new()).unwrap();
 	let row = costs[0]
 		.result
@@ -461,6 +492,7 @@ fn derived_graph_artifacts_native_async_publication_checkpoint_and_reopen() {
 	);
 }
 
+/// Verifies edge endpoint native async abort old snapshot rebuild and reopen.
 #[test]
 fn edge_endpoint_native_async_abort_old_snapshot_rebuild_and_reopen() {
 	let directory = Directory(

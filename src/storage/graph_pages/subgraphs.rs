@@ -4,11 +4,17 @@ use super::*;
 /// One nested-graph directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) struct SubgraphEntry {
+	/// Slot associated with this subgraph entry.
 	pub(in crate::storage) slot: u32,
+	/// Generation identifying this version of the data.
 	pub(in crate::storage) generation: u32,
+	/// Node capacity associated with this subgraph entry.
 	pub(in crate::storage) node_capacity: u64,
+	/// Edge capacity associated with this subgraph entry.
 	pub(in crate::storage) edge_capacity: u64,
+	/// Node count associated with this subgraph entry.
 	pub(in crate::storage) node_count: u32,
+	/// Edge count associated with this subgraph entry.
 	pub(in crate::storage) edge_count: u32,
 }
 

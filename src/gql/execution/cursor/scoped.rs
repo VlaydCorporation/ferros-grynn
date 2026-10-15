@@ -12,11 +12,17 @@ use super::*;
 /// graph occurrences.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::gql::execution) struct ScopedTraversalCandidate {
+	/// Target associated with this scoped traversal candidate.
 	pub(in crate::gql::execution) target: BoundAtom,
+	/// Edge associated with this scoped traversal candidate.
 	pub(in crate::gql::execution) edge: BoundAtom,
+	/// Direction associated with this scoped traversal candidate.
 	pub(in crate::gql::execution) direction: PathDirection,
+	/// Role associated with this scoped traversal candidate.
 	pub(in crate::gql::execution) role: EndpointRole,
+	/// Topology associated with this scoped traversal candidate.
 	pub(in crate::gql::execution) topology: EdgeDirection,
+	/// Cross level associated with this scoped traversal candidate.
 	pub(in crate::gql::execution) cross_level: bool,
 }
 
@@ -26,10 +32,15 @@ pub(in crate::gql::execution) struct ScopedTraversalCandidate {
 /// endpoint. It preserves reverse incidence, which cannot be recovered by
 /// scanning only the child graph that owns the current endpoint.
 pub(in crate::gql::execution) struct ScopedTraversalIndex {
+	/// Forward associated with this scoped traversal index.
 	forward: BTreeMap<BoundAtom, Vec<ScopedTraversalCandidate>>,
+	/// Backward associated with this scoped traversal index.
 	backward: BTreeMap<BoundAtom, Vec<ScopedTraversalCandidate>>,
+	/// Undirected associated with this scoped traversal index.
 	undirected: BTreeMap<BoundAtom, Vec<ScopedTraversalCandidate>>,
+	/// Memory admission account retained for the lifetime of this value.
 	_account: BarrierAccount,
+	/// Memory limit associated with this scoped traversal index.
 	memory_limit: usize,
 }
 
@@ -140,6 +151,7 @@ impl ScopedTraversalIndex {
 		clippy::too_many_arguments,
 		reason = "topology registration keeps snapshot and graph scope explicit"
 	)]
+	/// Registers topology.
 	fn register_topology<Read: QueryRead>(
 		&mut self,
 		read: &Read,
@@ -197,6 +209,7 @@ impl ScopedTraversalIndex {
 		Ok(())
 	}
 
+	/// Returns the connect sets result.
 	fn connect_sets(
 		&mut self,
 		edge: BoundAtom,
@@ -244,6 +257,7 @@ impl ScopedTraversalIndex {
 		clippy::too_many_arguments,
 		reason = "forward and reverse path metadata form one scoped incidence pair"
 	)]
+	/// Pushes directed.
 	fn push_directed(
 		&mut self,
 		from: BoundAtom,
@@ -277,6 +291,7 @@ impl ScopedTraversalIndex {
 		Ok(())
 	}
 
+	/// Pushes undirected.
 	fn push_undirected(
 		&mut self,
 		from: BoundAtom,
@@ -295,6 +310,7 @@ impl ScopedTraversalIndex {
 		Ok(())
 	}
 
+	/// Reserves candidate.
 	fn reserve_candidate(&mut self) -> FerrosGrynnResult<()> {
 		let bytes = size_of::<ScopedTraversalCandidate>()
 			.saturating_add(size_of::<BoundAtom>())
@@ -309,6 +325,7 @@ impl ScopedTraversalIndex {
 	}
 }
 
+/// Reserves graph scope.
 fn reserve_graph_scope(
 	account: &mut BarrierAccount,
 	control: &ExecutionControl,
@@ -358,6 +375,7 @@ pub(in crate::gql::execution) fn resolve_scoped_endpoint<Read: QueryRead>(
 	}
 }
 
+/// Returns whether the accepts scoped endpoint condition holds.
 fn accepts_scoped_endpoint(endpoint: BoundAtom, semantics: TraversalSemantics) -> bool {
 	semantics == TraversalSemantics::Atom || endpoint.atom.kind() == Some(AtomKind::Node)
 }

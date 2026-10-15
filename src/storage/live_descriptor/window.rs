@@ -123,6 +123,7 @@ pub(super) fn decode(
 }
 
 #[cfg(test)]
+/// Regression tests for window behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -134,10 +135,13 @@ mod tests {
 	/// Golden key headers and all flag combinations remain canonical and
 	/// bounded.
 	#[test]
-	fn live_window_descriptor_checks_flags_counts_and_names() -> FerrosGrynnResult<()> {
-		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?));
+	fn live_window_descriptor_checks_flags_counts_and_names() {
+		use crate::test_assertions::AssertResult as _;
+
+		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()));
 		for flags in 0_u8..16 {
-			let key = LiveOrder::by_name("k")?
+			let key = LiveOrder::by_name("k")
+				.assert_ok()
 				.with_direction(if flags & 1 == 0 {
 					LiveOrderDirection::Ascending
 				} else {
@@ -157,13 +161,14 @@ mod tests {
 				&mut bytes,
 				&query,
 				&mut context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					observe: None,
 					remaining: 1000,
 				},
 				0,
-			)?;
+			)
+			.assert_ok();
 			let mut golden = 1_u32.to_le_bytes().to_vec();
 			golden.extend_from_slice(&[1, flags, 0, 0]);
 			golden.extend_from_slice(&1_u64.to_le_bytes());
@@ -172,18 +177,19 @@ mod tests {
 			let decoded = decode(
 				&mut Decoder::new(&bytes),
 				&context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					observe: None,
 					remaining: 1000,
 				},
 				0,
-			)?;
+			)
+			.assert_ok();
 			assert_eq!(decoded.order, query.order());
 			assert!(decoded.limit.is_none() && decoded.start_offset.is_none());
 			let descriptor = LiveDescriptor::Query(query);
-			let frame = live_descriptor::encode(&descriptor, 1 << 20)?;
-			assert_eq!(live_descriptor::decode(&frame, 1 << 20)?, descriptor);
+			let frame = live_descriptor::encode(&descriptor, 1 << 20).assert_ok();
+			assert_eq!(live_descriptor::decode(&frame, 1 << 20).assert_ok(), descriptor);
 			for length in 0..frame.len() {
 				assert!(live_descriptor::decode(&frame[..length], 1 << 20).is_err());
 			}
@@ -206,7 +212,7 @@ mod tests {
 					decode(
 						&mut Decoder::new(&bad),
 						&context,
-						&mut CodecBudget::new(1 << 20, 0)?,
+						&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 						&mut Work {
 							observe: None,
 							remaining: 1000
@@ -221,7 +227,7 @@ mod tests {
 				decode(
 					&mut Decoder::new(&bytes),
 					&context,
-					&mut CodecBudget::new(1 << 20, 0)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: 0
@@ -234,7 +240,7 @@ mod tests {
 				decode(
 					&mut Decoder::new(&bytes),
 					&context,
-					&mut CodecBudget::new(8, 0)?,
+					&mut CodecBudget::new(8, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: 1000
@@ -256,6 +262,5 @@ mod tests {
 			live_descriptor::encode(&LiveDescriptor::Query(base.with_limit(value)), 1 << 20)
 				.is_err()
 		);
-		Ok(())
 	}
 }

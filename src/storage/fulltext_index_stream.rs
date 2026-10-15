@@ -17,11 +17,17 @@ use crate::{
 	values::storage::DiskAtomRef,
 };
 
+/// Configured document record prefix value.
 const DOCUMENT_RECORD_PREFIX: u8 = 0;
+/// Configured token record prefix value.
 const TOKEN_RECORD_PREFIX: u8 = 1;
+/// Configured document record bytes value.
 const DOCUMENT_RECORD_BYTES: usize = 16;
+/// Configured posting segment header bytes value.
 const POSTING_SEGMENT_HEADER_BYTES: usize = 16;
+/// Configured posting header bytes value.
 const POSTING_HEADER_BYTES: usize = 24;
+/// Configured dictionary fixed bytes value.
 const DICTIONARY_FIXED_BYTES: usize = 48;
 
 /// Builds one immutable Fulltext side-file without retaining source rows,
@@ -241,37 +247,62 @@ pub(in crate::storage) fn write_fulltext_index_stream(
 	})
 }
 
+/// Token record state.
 struct TokenRecord {
+	/// Term associated with this token record.
 	term: Vec<u8>,
+	/// Atom associated with this token record.
 	atom: DiskAtomRef,
+	/// Document length associated with this token record.
 	document_length: u32,
+	/// Start associated with this token record.
 	start: u32,
+	/// End associated with this token record.
 	end: u32,
 }
 
+/// Dictionary metadata state.
 struct DictionaryMetadata {
+	/// Term associated with this dictionary metadata.
 	term: Vec<u8>,
+	/// Posting offset associated with this dictionary metadata.
 	posting_offset: u64,
+	/// Posting length associated with this dictionary metadata.
 	posting_length: u64,
+	/// Document frequency associated with this dictionary metadata.
 	document_frequency: u32,
+	/// Total term frequency associated with this dictionary metadata.
 	total_term_frequency: u64,
 }
 
+/// Posting assembler state.
 struct PostingAssembler<'a> {
+	/// Writer associated with this posting assembler.
 	writer: ImmutableStreamWriter<'a>,
+	/// Highlights associated with this posting assembler.
 	highlights: bool,
+	/// Term associated with this posting assembler.
 	term: Vec<u8>,
+	/// Term offset associated with this posting assembler.
 	term_offset: u64,
+	/// Term document frequency associated with this posting assembler.
 	term_document_frequency: u32,
+	/// Term frequency associated with this posting assembler.
 	term_frequency: u64,
+	/// Atom associated with this posting assembler.
 	atom: Option<DiskAtomRef>,
+	/// Atom offset associated with this posting assembler.
 	atom_offset: u64,
+	/// Atom document length associated with this posting assembler.
 	atom_document_length: u32,
+	/// Atom frequency associated with this posting assembler.
 	atom_frequency: u32,
+	/// Term count associated with this posting assembler.
 	term_count: u64,
 }
 
 impl<'a> PostingAssembler<'a> {
+	/// Creates a new `PostingAssembler<'a>` value.
 	fn new(file: &'a DirectFile, highlights: bool) -> Self {
 		Self {
 			writer: ImmutableStreamWriter::new(file, PageType::IndexFulltextPosting),
@@ -288,6 +319,7 @@ impl<'a> PostingAssembler<'a> {
 		}
 	}
 
+	/// Pushes posting assembler<'a>.
 	fn push(
 		&mut self,
 		token: TokenRecord,
@@ -337,6 +369,7 @@ impl<'a> PostingAssembler<'a> {
 		Ok(())
 	}
 
+	/// Finishes posting assembler<'a>.
 	fn finish(
 		mut self,
 		metadata: &mut ExternalIndexSorter,
@@ -345,6 +378,7 @@ impl<'a> PostingAssembler<'a> {
 		Ok((self.writer.finish()?, self.term_count))
 	}
 
+	/// Finishes atom.
 	fn finish_atom(&mut self) -> FerrosGrynnResult<()> {
 		if self.atom.take().is_none() {
 			return Ok(());
@@ -360,6 +394,7 @@ impl<'a> PostingAssembler<'a> {
 		Ok(())
 	}
 
+	/// Finishes term.
 	fn finish_term(&mut self, metadata: &mut ExternalIndexSorter) -> FerrosGrynnResult<()> {
 		if self.term.is_empty() {
 			return Ok(());
@@ -391,6 +426,7 @@ impl<'a> PostingAssembler<'a> {
 	}
 }
 
+/// Returns the document key result.
 fn document_key(atom: DiskAtomRef) -> Vec<u8> {
 	let mut key = Vec::with_capacity(9);
 	key.push(DOCUMENT_RECORD_PREFIX);
@@ -398,6 +434,7 @@ fn document_key(atom: DiskAtomRef) -> Vec<u8> {
 	key
 }
 
+/// Returns the token key result.
 fn token_key(term: &[u8], atom: DiskAtomRef, start: u32, end: u32) -> FerrosGrynnResult<Vec<u8>> {
 	let mut key = Vec::with_capacity(term.len().saturating_add(18));
 	key.push(TOKEN_RECORD_PREFIX);
@@ -408,6 +445,7 @@ fn token_key(term: &[u8], atom: DiskAtomRef, start: u32, end: u32) -> FerrosGryn
 	Ok(key)
 }
 
+/// Decodes token key.
 fn decode_token_key(key: &[u8], document_length: u64) -> FerrosGrynnResult<TokenRecord> {
 	if key.first().copied() != Some(TOKEN_RECORD_PREFIX) {
 		return Err(invalid("Fulltext token record has the wrong prefix"));
@@ -444,6 +482,7 @@ fn decode_token_key(key: &[u8], document_length: u64) -> FerrosGrynnResult<Token
 	})
 }
 
+/// Returns the dictionary metadata key result.
 fn dictionary_metadata_key(
 	term: &[u8],
 	posting_offset: u64,
@@ -460,6 +499,7 @@ fn dictionary_metadata_key(
 	Ok(key)
 }
 
+/// Decodes dictionary metadata.
 fn decode_dictionary_metadata(key: &[u8]) -> FerrosGrynnResult<DictionaryMetadata> {
 	let (term, suffix) = decode_term(key)?;
 	if suffix.len() != 28 {
@@ -490,6 +530,7 @@ fn decode_dictionary_metadata(key: &[u8]) -> FerrosGrynnResult<DictionaryMetadat
 	})
 }
 
+/// Encodes term.
 fn encode_term(output: &mut Vec<u8>, term: &[u8]) -> FerrosGrynnResult<()> {
 	if term.is_empty() || std::str::from_utf8(term).is_err() {
 		return Err(invalid("Fulltext sort term is empty or invalid UTF-8"));
@@ -505,6 +546,7 @@ fn encode_term(output: &mut Vec<u8>, term: &[u8]) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Decodes term.
 fn decode_term(input: &[u8]) -> FerrosGrynnResult<(Vec<u8>, &[u8])> {
 	let mut term = Vec::new();
 	let mut cursor = 0_usize;
@@ -532,6 +574,7 @@ fn decode_term(input: &[u8]) -> FerrosGrynnResult<(Vec<u8>, &[u8])> {
 	Err(invalid("Fulltext escaped term has no terminator"))
 }
 
+/// Returns the location result.
 const fn location(location: ImmutableStreamLocation) -> StreamLocation {
 	StreamLocation {
 		first: location.first,
@@ -539,6 +582,7 @@ const fn location(location: ImmutableStreamLocation) -> StreamLocation {
 	}
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

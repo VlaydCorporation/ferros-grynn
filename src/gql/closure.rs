@@ -23,13 +23,18 @@ use crate::{
 	values::{Closure, RuntimeId, Value},
 };
 
+/// Fallback byte budget for retained closures and named-function plans
+/// when no scratch limit is supplied.
 const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 
 /// Session-owned closure registry with a lock-free empty fast path.
 #[derive(Debug, Default)]
 pub(crate) struct LanguageClosureState {
+	/// Retained closure registry or time spent restoring a startup registry.
 	registry: Mutex<LanguageClosureRegistry>,
+	/// Whether runtime closure state has been populated with retained entries.
 	populated: AtomicBool,
+	/// Whether compilation is subject to the configured scratch-memory limit.
 	compiler_bounded: bool,
 	/// Optional embedding work cap, charged before tokenization/analysis.
 	compiler_work: Option<AtomicU64>,
@@ -153,6 +158,7 @@ impl LanguageClosureState {
 		})
 	}
 
+	/// Reports whether the value has entries for `LanguageClosureState`.
 	pub(crate) fn has_entries(&self) -> bool {
 		self.populated.load(Ordering::Acquire)
 	}
@@ -167,6 +173,7 @@ impl LanguageClosureState {
 		self.compiler_work.as_ref().map(|work| work.load(Ordering::Acquire))
 	}
 
+	/// Returns register for `LanguageClosureState`.
 	pub(in crate::gql) fn register(
 		&self,
 		plan: &LogicalClosure,
@@ -178,6 +185,7 @@ impl LanguageClosureState {
 		Ok(closure)
 	}
 
+	/// Finishes statement for `LanguageClosureState`.
 	pub(crate) fn finish_statement<'a>(
 		&self,
 		statement_nonce: u64,
@@ -191,6 +199,7 @@ impl LanguageClosureState {
 		self.populated.store(!registry.entries.is_empty(), Ordering::Release);
 	}
 
+	/// Returns resolve for `LanguageClosureState`.
 	pub(in crate::gql) fn resolve(
 		&self,
 		closure: &Closure,
@@ -198,6 +207,7 @@ impl LanguageClosureState {
 		self.registry.lock().resolve(closure)
 	}
 
+	/// Resolves named for `LanguageClosureState`.
 	pub(in crate::gql) fn resolve_named(
 		&self,
 		function: NamedFunctionKey,
@@ -205,6 +215,7 @@ impl LanguageClosureState {
 		self.registry.lock().resolve_named(function)
 	}
 
+	/// Returns cached named for `LanguageClosureState`.
 	pub(in crate::gql) fn cached_named(
 		&self,
 		function: NamedFunctionKey,
@@ -212,6 +223,7 @@ impl LanguageClosureState {
 		self.registry.lock().named_entries.get(&function).cloned()
 	}
 
+	/// Returns cache named plan for `LanguageClosureState`.
 	pub(in crate::gql) fn cache_named_plan(&self, plan: &LogicalClosure) -> FerrosGrynnResult<()> {
 		if let Some(checks) = &self.compiler_checks {
 			checks.check()?;
@@ -263,11 +275,16 @@ impl LanguageClosureState {
 
 /// Releases a live compiler admission on success, error and cancellation.
 pub(in crate::gql) struct CompileReservation<'a> {
+	/// Compiler registry whose temporary admission is released when this guard
+	/// drops.
 	state: &'a LanguageClosureState,
+	/// Number of bytes retained by the compilation reservation.
 	bytes: usize,
 }
 
 impl Drop for CompileReservation<'_> {
+	/// Runs cleanup for this `CompileReservation<'_>` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		if self.bytes != 0 {
 			let mut registry = self.state.registry.lock();
@@ -276,53 +293,71 @@ impl Drop for CompileReservation<'_> {
 	}
 }
 
+/// Returns compiler resource for this module.
 fn compiler_resource(limit: usize) -> FerrosGrynnError {
 	FerrosGrynnError::traversal_resource_limit_exceeded("PURE compiler scratch", limit as u64)
 }
 
 #[cfg(test)]
+/// Regression tests for closure behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies compiler frames share the cap and release on error.
 	#[test]
-	fn compiler_frames_share_the_cap_and_release_on_error() -> FerrosGrynnResult<()> {
+	fn compiler_frames_share_the_cap_and_release_on_error() {
+		use crate::test_assertions::AssertResult as _;
+
 		let state = LanguageClosureState::bounded(65_536);
-		let parent = state.admit_compile(16)?;
+		let parent = state.admit_compile(16).assert_ok();
 		assert!(state.admit_compile(17).is_err());
-		let child = state.admit_compile(16)?;
+		let child = state.admit_compile(16).assert_ok();
 		assert!(state.admit_compile(0).is_err());
 		drop(child);
 		drop(parent);
 		assert_eq!(state.registry.lock().compiling_bytes, 0);
-		let _replacement = state.admit_compile(48)?;
+		let _replacement = state.admit_compile(48).assert_ok();
 		assert!(state.admit_compile(usize::MAX).is_err());
-		Ok(())
 	}
 }
 
 /// One immutable language closure and the lexical values captured at creation.
 #[derive(Debug, Clone)]
 pub(crate) struct LanguageClosureEntry {
+	/// Shared logical closure plan retained for runtime evaluation.
 	pub(in crate::gql) plan: Arc<LogicalClosure>,
+	/// Owned values captured from the creating lexical environment.
 	pub(in crate::gql) captures: Vec<(u32, Value)>,
+	/// Statement identity separating runtime entries from different executions.
 	statement_nonce: u64,
+	/// Bytes charged for owned values retained by this entry or registry.
 	retained_bytes: usize,
 }
 
 /// Concrete registry shared by executions of one persistent session.
 #[derive(Debug)]
 pub(crate) struct LanguageClosureRegistry {
+	/// Runtime owner identity separating the retained closure entries.
 	owner: RuntimeId,
+	/// Owned entries retained for keyed lookup or iteration.
 	entries: BTreeMap<RuntimeId, LanguageClosureEntry>,
+	/// Bytes charged for owned values retained by this entry or registry.
 	retained_bytes: usize,
+	/// Catalog epoch for which the named-function cache is valid.
 	named_epoch: Option<u64>,
+	/// Named-function plans cached by their resolved schema keys.
 	named_entries: BTreeMap<NamedFunctionKey, Arc<LogicalClosure>>,
+	/// Bytes retained by cached named-function plans.
 	named_bytes: usize,
+	/// Optional memory limit applied before retaining temporary compilation
+	/// state.
 	scratch_limit: Option<usize>,
+	/// Bytes currently reserved for closure compilation in progress.
 	compiling_bytes: usize,
 }
 
 impl Default for LanguageClosureRegistry {
+	/// Constructs the default initial state of `LanguageClosureRegistry`.
 	fn default() -> Self {
 		Self {
 			owner: RuntimeId::next(),
@@ -338,6 +373,7 @@ impl Default for LanguageClosureRegistry {
 }
 
 impl LanguageClosureRegistry {
+	/// Returns register for `LanguageClosureRegistry`.
 	pub(in crate::gql) fn register(
 		&mut self,
 		plan: &LogicalClosure,
@@ -390,6 +426,7 @@ impl LanguageClosureRegistry {
 		Ok(closure)
 	}
 
+	/// Returns cache named for `LanguageClosureRegistry`.
 	fn cache_named(&mut self, plan: &LogicalClosure) -> FerrosGrynnResult<()> {
 		let Some(function) = plan.named_function else {
 			return Ok(());
@@ -468,6 +505,7 @@ impl LanguageClosureRegistry {
 		}
 	}
 
+	/// Returns resolve for `LanguageClosureRegistry`.
 	pub(in crate::gql) fn resolve(
 		&self,
 		closure: &Closure,
@@ -488,6 +526,7 @@ impl LanguageClosureRegistry {
 			.ok_or_else(|| FerrosGrynnError::closure_expired(closure.id().get()))
 	}
 
+	/// Resolves named for `LanguageClosureRegistry`.
 	fn resolve_named(&self, function: NamedFunctionKey) -> FerrosGrynnResult<Arc<LogicalClosure>> {
 		self.named_entries.get(&function).cloned().ok_or_else(|| {
 			FerrosGrynnError::invalid_argument(
@@ -496,6 +535,7 @@ impl LanguageClosureRegistry {
 		})
 	}
 
+	/// Returns retained bytes for `LanguageClosureRegistry`.
 	fn retained_bytes(&self) -> usize {
 		self.retained_bytes.saturating_add(self.named_bytes)
 	}

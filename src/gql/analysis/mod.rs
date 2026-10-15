@@ -1,4 +1,5 @@
 use std::{
+	cell::Cell,
 	collections::{BTreeMap, BTreeSet},
 	num::NonZeroU16,
 	sync::Arc,
@@ -23,7 +24,7 @@ use super::{
 		LogicalDmlData,
 		LogicalDmlKind,
 		LogicalDmlReturn,
-		LogicalDmlReturnItem,
+		LogicalDmlReturnField,
 		LogicalDmlSelector,
 		LogicalDmlStatement,
 		LogicalDmlTarget,
@@ -48,6 +49,7 @@ use super::{
 		LogicalOrder,
 		LogicalProgram,
 		LogicalRecordTarget,
+		LogicalRelate,
 		LogicalRelateEdge,
 		LogicalRelateEndpoint,
 		LogicalRepeat,
@@ -90,6 +92,7 @@ use crate::{
 		ClassIndexState,
 		ClassSchemaMode,
 		DiskAnnIndexOptions,
+		FieldUpdate,
 		FulltextIndexOptions,
 		FunctionEffect,
 		FunctionId,
@@ -192,6 +195,7 @@ use crate::{
 /// Maximum finite path depth accepted by the MVP analyzer.
 const MAX_MATCH_WITHIN_DEPTH: u32 = 7;
 
+/// Operations required for query catalog.
 pub(super) trait QueryCatalog {
 	/// Bounded SDK analysis admits private relation metadata before copying it.
 	///
@@ -209,37 +213,47 @@ pub(super) trait QueryCatalog {
 	fn lexical_binding_is_reactive(&self, _name: &str) -> bool {
 		false
 	}
+	/// Returns the schema epoch result.
 	fn schema_epoch(&self) -> u64;
+	/// Returns the schema result.
 	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema>;
+	/// Returns the class definition result.
 	fn class_definition(
 		&self,
 		class: &str,
 	) -> FerrosGrynnResult<Arc<crate::datastore::ClassSchema>>;
+	/// Returns the schema mode result.
 	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<ClassSchemaMode>;
+	/// Returns the class kind result.
 	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind>;
 	/// Resolves a case-sensitive named graph.
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef>;
 	/// Resolves an optional named graph without turning absence into an error.
 	fn graph_if_exists(&self, name: &str) -> FerrosGrynnResult<Option<GraphRef>>;
+	/// Returns the functions result.
 	fn functions(
 		&self,
 		namespace: &str,
 		name: &str,
 	) -> FerrosGrynnResult<Vec<Arc<crate::datastore::SchemaFunction>>>;
+	/// Returns the function result.
 	fn function(
 		&self,
 		id: FunctionId,
 	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaFunction>>>;
+	/// Returns the analyzer result.
 	fn analyzer(
 		&self,
 		name: &str,
 	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>>;
+	/// Returns the analyzer by id result.
 	fn analyzer_by_id(
 		&self,
 		id: crate::datastore::AnalyzerId,
 	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>>;
 }
 
+/// Analyzes the current state.
 pub(super) fn analyze(
 	program: &Program,
 	source: &str,
@@ -286,6 +300,7 @@ pub(super) fn analyze_reactive_expression(
 	})
 }
 
+/// Analyzes statement.
 pub(super) fn analyze_statement(
 	statement: &crate::syn::Statement,
 	source: &str,
@@ -295,6 +310,7 @@ pub(super) fn analyze_statement(
 	Analyzer::new(source, catalog, variables, &BTreeSet::new()).single_statement(statement)
 }
 
+/// Analyzes statement with mutable.
 pub(super) fn analyze_statement_with_mutable(
 	statement: &crate::syn::Statement,
 	source: &str,
@@ -305,6 +321,7 @@ pub(super) fn analyze_statement_with_mutable(
 	Analyzer::new(source, catalog, variables, mutable_variables).single_statement(statement)
 }
 
+/// Analyzes statement with runtime.
 pub(super) fn analyze_statement_with_runtime(
 	statement: &crate::syn::Statement,
 	source: &str,
@@ -349,38 +366,62 @@ pub(super) fn analyze_import_with_runtime(
 	Ok((analyzer.program(program)?, timeouts))
 }
 
+/// Analyzer state.
 struct Analyzer<'a> {
+	/// Fixed layout bytes retained by lowered subtrees, independent of source
+	/// text.
+	layout_shell_bytes: Cell<usize>,
 	/// Optional registration-option slot usage; new closure locals lie outside
 	/// this mask.
 	slot_reads: Option<std::rc::Rc<std::cell::RefCell<Vec<bool>>>>,
+	/// Source associated with this analyzer.
 	source: &'a str,
+	/// Catalog associated with this analyzer.
 	catalog: &'a dyn QueryCatalog,
+	/// Slots associated with this analyzer.
 	slots: BTreeMap<Box<str>, Slot>,
+	/// Initial slots associated with this analyzer.
 	initial_slots: Vec<(Box<str>, u32, bool)>,
+	/// Next slot associated with this analyzer.
 	next_slot: u32,
+	/// Scopes associated with this analyzer.
 	scopes: Vec<Vec<(Box<str>, Option<Slot>)>>,
+	/// Variables associated with this analyzer.
 	variables: &'a Object,
+	/// Statement now associated with this analyzer.
 	statement_now: DateTime,
+	/// Function stack associated with this analyzer.
 	function_stack: Vec<FunctionId>,
+	/// Function overrides associated with this analyzer.
 	function_overrides: BTreeMap<FunctionId, Arc<SchemaFunction>>,
+	/// Function cache associated with this analyzer.
 	function_cache: Option<&'a LanguageClosureState>,
 	/// LIVE preflight uses a private compiler without retaining session checks.
 	live_checks: Option<super::options::ExecutionChecks>,
 	/// Registration analysis respects both the LIVE and caller scratch caps.
 	live_scratch: usize,
+	/// Current function associated with this analyzer.
 	current_function: Option<Arc<SchemaFunction>>,
+	/// Current function has explicit result associated with this analyzer.
 	current_function_has_explicit_result: bool,
 }
 
 /// Source-preserving event definition and lifecycle lowering.
 mod event;
+/// Regression coverage for fixed layout-shell admission.
+#[cfg(test)]
+mod layout_tests;
 /// Bounded LIVE syntax recipes share literal/source/type analysis.
 mod live;
 
 #[derive(Debug, Clone)]
+/// Slot state.
 struct Slot {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: u32,
+	/// Ty associated with this slot.
 	ty: Type,
+	/// Mutable associated with this slot.
 	mutable: bool,
 	/// The frame holds an identity whose value is resolved in the read
 	/// snapshot.
@@ -391,11 +432,15 @@ struct Slot {
 /// Semantic category assigned to a MATCH alias.
 enum MatchAliasKind {
 	/// An atom endpoint with a fixed domain.
-	Endpoint(EndpointDomain),
+	Endpoint(
+		/// An atom endpoint with a fixed domain.
+		EndpointDomain,
+	),
 	/// A public path value.
 	Path,
 }
 
+/// Returns the endpoint domain result.
 const fn endpoint_domain(kind: MatchEndpointKind) -> EndpointDomain {
 	match kind {
 		MatchEndpointKind::Node => EndpointDomain::Node,
@@ -403,6 +448,7 @@ const fn endpoint_domain(kind: MatchEndpointKind) -> EndpointDomain {
 	}
 }
 
+/// Matches meta required.
 const fn match_meta_required(scope: MatchMetaScope, domain: EndpointDomain) -> bool {
 	match scope {
 		MatchMetaScope::None => false,
@@ -421,7 +467,26 @@ struct MatchAlias {
 	kind: MatchAliasKind,
 }
 
+/// Graph-local mutation scope borrowed from one DML statement.
+struct DmlScope<'a> {
+	/// Optional graph in which the mutation changes an occurrence.
+	graph: Option<&'a crate::syn::Identifier>,
+	/// No label change, explicit removal, or a replacement label.
+	label: Option<&'a Option<crate::syn::Identifier>>,
+	/// Optional instruction to retain the occurrence's level path.
+	keep_levelpath: Option<&'a crate::syn::KeepLevelPathClause>,
+}
+
+/// Inline property and predicate constraints of one MATCH position.
+struct MatchInlineFilters<'a> {
+	/// Optional object of effective-property equality constraints.
+	properties: Option<&'a Expr>,
+	/// Optional predicate evaluated after the position is bound.
+	predicate: Option<&'a Expr>,
+}
+
 impl<'a> Analyzer<'a> {
+	/// Creates a new `Analyzer<'a>` value.
 	fn new(
 		source: &'a str,
 		catalog: &'a dyn QueryCatalog,
@@ -449,6 +514,7 @@ impl<'a> Analyzer<'a> {
 			));
 		}
 		Self {
+			layout_shell_bytes: Cell::new(0),
 			source,
 			catalog,
 			slots,
@@ -468,11 +534,45 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Admits new fixed bytes and merges already admitted child shells once.
+	///
+	/// # Errors
+	/// Returns the catalog limit error or a checked accounting overflow.
+	fn admit_layout_shell(&self, bytes: usize, inherited: usize) -> FerrosGrynnResult<usize> {
+		let retained = bytes
+			.checked_add(inherited)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("typed layout shell bytes"))?;
+		let total = self
+			.layout_shell_bytes
+			.get()
+			.checked_add(retained)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("typed layout shell bytes"))?;
+		// Nested analyzers share this catalog and have admitted inherited
+		// shells. Only fresh pointees and new accounting fields need a
+		// new charge here.
+		self.catalog.admit_analysis(bytes, 0)?;
+		self.layout_shell_bytes.set(total);
+		Ok(retained)
+	}
+
+	/// Reads the fixed-shell delta retained since entering one owned subtree.
+	///
+	/// # Errors
+	/// Returns an accounting overflow if an invalid scope start is supplied.
+	fn layout_shell_delta(&self, start: usize) -> FerrosGrynnResult<usize> {
+		self.layout_shell_bytes
+			.get()
+			.checked_sub(start)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("typed layout shell scope"))
+	}
+
+	/// Configures function cache.
 	fn with_function_cache(mut self, function_cache: &'a LanguageClosureState) -> Self {
 		self.function_cache = Some(function_cache);
 		self
 	}
 
+	/// Returns the program result.
 	fn program(mut self, program: &Program) -> FerrosGrynnResult<LogicalProgram> {
 		let mut statements = Vec::with_capacity(program.statements.len());
 		for statement in &program.statements {
@@ -486,6 +586,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the single statement result.
 	fn single_statement(
 		mut self,
 		statement: &crate::syn::Statement,
@@ -499,6 +600,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the statement result.
 	fn statement(
 		&mut self,
 		statement: &crate::syn::Statement,
@@ -542,10 +644,12 @@ impl<'a> Analyzer<'a> {
 			StatementKind::Create(statement) => LogicalStatement::Dml(self.dml(
 				LogicalDmlKind::Create,
 				&statement.targets,
-				None,
-				None,
+				DmlScope {
+					graph: None,
+					label: None,
+					keep_levelpath: None,
+				},
 				statement.data.as_ref(),
-				None,
 				None,
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
@@ -554,11 +658,13 @@ impl<'a> Analyzer<'a> {
 			StatementKind::Update(statement) => LogicalStatement::Dml(self.dml(
 				LogicalDmlKind::Update,
 				&statement.targets,
-				statement.graph.as_ref(),
-				statement.label.as_ref(),
+				DmlScope {
+					graph: statement.graph.as_ref(),
+					label: statement.label.as_ref(),
+					keep_levelpath: statement.keep_levelpath.as_ref(),
+				},
 				statement.data.as_ref(),
 				statement.filter.as_ref(),
-				statement.keep_levelpath.as_ref(),
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
 				false,
@@ -569,11 +675,13 @@ impl<'a> Analyzer<'a> {
 			StatementKind::Upsert(statement) => LogicalStatement::Dml(self.dml(
 				LogicalDmlKind::Upsert,
 				&statement.targets,
-				None,
-				None,
+				DmlScope {
+					graph: None,
+					label: None,
+					keep_levelpath: None,
+				},
 				statement.data.as_ref(),
 				statement.filter.as_ref(),
-				None,
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
 				false,
@@ -581,11 +689,13 @@ impl<'a> Analyzer<'a> {
 			StatementKind::Delete(statement) => LogicalStatement::Dml(self.dml(
 				LogicalDmlKind::Delete,
 				&statement.targets,
-				None,
-				None,
+				DmlScope {
+					graph: None,
+					label: None,
+					keep_levelpath: None,
+				},
 				None,
 				statement.filter.as_ref(),
-				None,
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
 				statement.cascade,
@@ -757,7 +867,8 @@ impl<'a> Analyzer<'a> {
 						} else {
 							Type::Graph(family)
 						};
-						(LogicalLetValue::BuildGraph(build), value_type)
+						self.admit_layout_shell(std::mem::size_of::<LogicalBuildGraph>(), 0)?;
+						(LogicalLetValue::BuildGraph(Box::new(build)), value_type)
 					}
 				};
 				let expected = if let Some(declared) = &binding.declared_type {
@@ -902,6 +1013,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the block result.
 	fn block(
 		&mut self,
 		block: &crate::syn::Block,
@@ -967,6 +1079,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Records target.
 	fn record_target(&self, target: &DmlTarget) -> FerrosGrynnResult<LogicalRecordTarget> {
 		let DmlTarget::Record {
 			class,
@@ -1018,6 +1131,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the relate result.
 	fn relate(
 		&self,
 		statement: &crate::syn::RelateStatement,
@@ -1072,7 +1186,7 @@ impl<'a> Analyzer<'a> {
 			statement.alias.as_ref(),
 			|message, span| self.semantic(message, span),
 		)?;
-		Ok(LogicalGraphDmlStatement::Relate {
+		let relate = LogicalRelate {
 			bridge: statement.bridge.as_ref().map(|clause| clause.alias.value.clone()),
 			atom_endpoints: statement.atom_endpoints,
 			source,
@@ -1102,22 +1216,29 @@ impl<'a> Analyzer<'a> {
 			direction: statement.direction,
 			weight,
 			keep_levelpath,
-		})
+		};
+		self.admit_layout_shell(std::mem::size_of::<LogicalRelate>(), 0)?;
+		Ok(LogicalGraphDmlStatement::Relate(Box::new(relate)))
 	}
 
+	/// Returns the dml result.
 	fn dml(
 		&self,
 		kind: LogicalDmlKind,
 		targets: &[DmlTarget],
-		graph: Option<&crate::syn::Identifier>,
-		label: Option<&Option<crate::syn::Identifier>>,
+		scope: DmlScope<'_>,
 		data: Option<&DmlData>,
 		filter: Option<&Expr>,
-		keep_levelpath: Option<&crate::syn::KeepLevelPathClause>,
 		returning: Option<&DmlReturn>,
 		expect: Option<&ExpectClause>,
 		cascade: bool,
 	) -> FerrosGrynnResult<LogicalDmlStatement> {
+		let DmlScope {
+			graph,
+			label,
+			keep_levelpath,
+		} = scope;
+
 		if keep_levelpath.is_some() && graph.is_none() {
 			return Err(self.semantic(
 				"KEEP LEVELPATH requires graph-scoped UPDATE.",
@@ -1162,13 +1283,18 @@ impl<'a> Analyzer<'a> {
 		Ok(LogicalDmlStatement {
 			kind,
 			graph: graph.map(|graph| self.catalog.graph(&graph.value)).transpose()?,
-			label: label.map(|label| label.as_ref().map(|label| Text::from(label.value.as_ref()))),
+			label: label.map(|label| {
+				FieldUpdate::from_optional(
+					label.as_ref().map(|label| Text::from(label.value.as_ref())),
+				)
+			}),
 			cascade,
 			keep_levelpath,
 			targets: plans,
 		})
 	}
 
+	/// Extends dml schema.
 	fn extend_dml_schema(
 		&self,
 		schema: &mut Schema,
@@ -1235,6 +1361,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Returns the dml data result.
 	fn dml_data(&self, data: &DmlData, schema: &Schema) -> FerrosGrynnResult<LogicalDmlData> {
 		let object = |value: &Expr| -> FerrosGrynnResult<TypedExpr> {
 			let value = self.expr(value, Some(schema))?;
@@ -1292,6 +1419,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the dml return result.
 	fn dml_return(
 		&self,
 		returning: Option<&DmlReturn>,
@@ -1315,16 +1443,16 @@ impl<'a> Analyzer<'a> {
 				.iter()
 				.enumerate()
 				.map(|(index, item)| match item {
-					DmlReturnItem::Wildcard(_) => Ok(LogicalDmlReturnItem::Wildcard),
+					DmlReturnItem::Wildcard(_) => Ok(None),
 					DmlReturnItem::Expr(expr) => {
 						let name = match &expr.kind {
 							ExprKind::Name(name) => name.value.clone(),
 							_ => format!("value_{index}").into_boxed_str(),
 						};
-						Ok(LogicalDmlReturnItem::Expr {
+						Ok(Some(LogicalDmlReturnField {
 							name,
 							value: self.expr(expr, Some(schema))?,
-						})
+						}))
 					}
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()
@@ -1332,6 +1460,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the expect result.
 	fn expect(&self, expect: &ExpectClause, schema: &Schema) -> FerrosGrynnResult<LogicalExpect> {
 		match expect {
 			ExpectClause::Exists {
@@ -1344,12 +1473,13 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the define graph result.
 	fn define_graph(
 		&self,
 		definition: &DefineGraphStatement,
 		span: TextSpan,
 	) -> FerrosGrynnResult<LogicalSchemaStatement> {
-		let contract = self.graph_contract(&definition.contract);
+		let contract = Self::graph_contract(&definition.contract);
 		let kind = contract.family.unwrap_or(GraphKind::Graph);
 		if definition.root.is_some() && kind != GraphKind::RootedTree {
 			return Err(self.semantic("ROOT is valid only for ROOTED_TREE.", span));
@@ -1382,7 +1512,8 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
-	fn graph_contract(&self, contract: &GraphContract) -> LogicalGraphContract {
+	/// Returns the graph contract result.
+	fn graph_contract(contract: &GraphContract) -> LogicalGraphContract {
 		let family = contract.family.map(|family| match family {
 			GraphFamilyName::Graph => GraphKind::Graph,
 			GraphFamilyName::Tree => GraphKind::Tree,
@@ -1417,6 +1548,7 @@ impl<'a> Analyzer<'a> {
 		self.return_graph(graph, Some(schema), span).map(Box::new)
 	}
 
+	/// Returns the return graph result.
 	fn return_graph(
 		&self,
 		graph: &ReturnGraph,
@@ -1428,7 +1560,7 @@ impl<'a> Analyzer<'a> {
 				family: None,
 				validators: GraphTopologyConstraints::empty(),
 			},
-			|contract| self.graph_contract(contract),
+			Self::graph_contract,
 		);
 		if graph.root.is_some() && contract.family != Some(GraphKind::RootedTree) {
 			return Err(self.semantic("RETURN GRAPH ROOT requires ROOTED_TREE.", span));
@@ -1442,6 +1574,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Builds graph.
 	fn build_graph(
 		&self,
 		build: &BuildGraphStatement,
@@ -1452,7 +1585,7 @@ impl<'a> Analyzer<'a> {
 				family: None,
 				validators: GraphTopologyConstraints::empty(),
 			},
-			|contract| self.graph_contract(contract),
+			Self::graph_contract,
 		);
 		if build.name.is_none() && build.mode != crate::syn::DefinitionMode::Normal {
 			return Err(self.semantic(
@@ -1516,6 +1649,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Updates graph.
 	fn update_graph(
 		&self,
 		statement: &UpdateGraphStatement,
@@ -1697,6 +1831,7 @@ impl<'a> Analyzer<'a> {
 		Ok(spelling)
 	}
 
+	/// Returns the define field result.
 	fn define_field(
 		&self,
 		definition: &DefineFieldStatement,
@@ -2009,6 +2144,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the define index result.
 	fn define_index(
 		&self,
 		definition: &DefineIndexStatement,
@@ -2148,6 +2284,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the nonzero index value result.
 	fn nonzero_index_value(
 		&self,
 		value: u16,
@@ -2158,6 +2295,7 @@ impl<'a> Analyzer<'a> {
 			.ok_or_else(|| self.semantic(&format!("{label} must be positive."), span))
 	}
 
+	/// Returns the vector distance result.
 	fn vector_distance(
 		&self,
 		distance: &VectorDistanceName,
@@ -2213,6 +2351,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the define parameter result.
 	fn define_parameter(
 		&self,
 		definition: &DefineParameterStatement,
@@ -2225,6 +2364,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the define analyzer result.
 	fn define_analyzer(
 		&self,
 		definition: &DefineAnalyzerStatement,
@@ -2251,6 +2391,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the analyzer filter result.
 	fn analyzer_filter(&self, filter: &AnalyzerFilterName) -> FerrosGrynnResult<AnalyzerFilter> {
 		Ok(match filter {
 			AnalyzerFilterName::Nfc => AnalyzerFilter::Nfc,
@@ -2307,6 +2448,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Resolves analyzer function.
 	fn resolve_analyzer_function(
 		&self,
 		function: &FunctionSignatureName,
@@ -2342,6 +2484,7 @@ impl<'a> Analyzer<'a> {
 		Ok((id, candidate.version()))
 	}
 
+	/// Returns the define function result.
 	fn define_function(
 		&self,
 		definition: &DefineFunctionStatement,
@@ -2384,6 +2527,7 @@ impl<'a> Analyzer<'a> {
 			body: crate::syn::ClosureBody::Block(definition.body.clone()),
 		};
 		let analyzer = Self {
+			layout_shell_bytes: Cell::new(0),
 			source: self.source,
 			catalog: self.catalog,
 			slots: BTreeMap::new(),
@@ -2437,6 +2581,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Removes analyzer<'a>.
 	fn remove(&self, target: &RemoveTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
 			RemoveTarget::Event {
@@ -2518,6 +2663,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the alter result.
 	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
 			AlterTarget::Event {
@@ -2577,7 +2723,8 @@ impl<'a> Analyzer<'a> {
 							.map(|function| self.resolve_analyzer_function(function))
 							.transpose()
 					})
-					.transpose()?,
+					.transpose()?
+					.map(FieldUpdate::from_optional),
 				tokenizers: tokenizers
 					.as_ref()
 					.map(|tokenizers| tokenizers.iter().copied().map(analyzer_tokenizer).collect()),
@@ -2593,9 +2740,9 @@ impl<'a> Analyzer<'a> {
 				comment: match comment {
 					ParameterCommentChange::Keep => None,
 					ParameterCommentChange::Set(comment) => {
-						Some(Some(Text::from(comment.as_ref())))
+						Some(FieldUpdate::Set(Text::from(comment.as_ref())))
 					}
-					ParameterCommentChange::Drop => Some(None),
+					ParameterCommentChange::Drop => Some(FieldUpdate::Clear),
 				},
 			}),
 			AlterTarget::Function {
@@ -2619,7 +2766,7 @@ impl<'a> Analyzer<'a> {
 						parameter_types.as_deref(),
 						effect.map(function_effect),
 						*cost,
-						*max_depth,
+						max_depth.as_ref(),
 						body.as_ref(),
 						signature.name.span,
 					)?;
@@ -2631,14 +2778,14 @@ impl<'a> Analyzer<'a> {
 					signature: parameter_types,
 					effect: effect.map(function_effect),
 					cost: *cost,
-					max_depth: *max_depth,
+					max_depth: max_depth.map(FieldUpdate::from_optional),
 					body,
 					comment: match comment {
 						ParameterCommentChange::Keep => None,
 						ParameterCommentChange::Set(comment) => {
-							Some(Some(Text::from(comment.as_ref())))
+							Some(FieldUpdate::Set(Text::from(comment.as_ref())))
 						}
-						ParameterCommentChange::Drop => Some(None),
+						ParameterCommentChange::Drop => Some(FieldUpdate::Clear),
 					},
 				})
 			}
@@ -2654,9 +2801,9 @@ impl<'a> Analyzer<'a> {
 				comment: match comment {
 					ParameterCommentChange::Keep => None,
 					ParameterCommentChange::Set(comment) => {
-						Some(Some(Text::from(comment.as_ref())))
+						Some(FieldUpdate::Set(Text::from(comment.as_ref())))
 					}
-					ParameterCommentChange::Drop => Some(None),
+					ParameterCommentChange::Drop => Some(FieldUpdate::Clear),
 				},
 			}),
 			AlterTarget::Class {
@@ -2695,6 +2842,7 @@ impl<'a> Analyzer<'a> {
 		clippy::too_many_arguments,
 		reason = "function-call analysis needs the complete typed call context"
 	)]
+	/// Validates altered function.
 	fn validate_altered_function(
 		&self,
 		namespace: &str,
@@ -2702,7 +2850,7 @@ impl<'a> Analyzer<'a> {
 		signature: Option<&[Type]>,
 		effect: Option<FunctionEffect>,
 		cost: Option<bool>,
-		max_depth: Option<Option<u8>>,
+		max_depth: Option<&Option<u8>>,
 		body: Option<&Text>,
 		span: TextSpan,
 	) -> FerrosGrynnResult<()> {
@@ -2734,7 +2882,7 @@ impl<'a> Analyzer<'a> {
 			existing.result().clone(),
 			effect.unwrap_or(existing.effect()),
 			cost.unwrap_or(existing.is_cost()),
-			max_depth.unwrap_or(existing.max_depth()),
+			max_depth.copied().unwrap_or(existing.max_depth()),
 			body.cloned().unwrap_or_else(|| existing.body().clone()),
 		)?;
 		replacement.id = existing.id();
@@ -2757,6 +2905,7 @@ impl<'a> Analyzer<'a> {
 		.map_err(|error| self.semantic(&format!("Altered function body is invalid: {error}"), span))
 	}
 
+	/// Returns the info result.
 	fn info(&self, target: &InfoTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		Ok(match target {
 			InfoTarget::Database => LogicalSchemaStatement::InfoDatabase,
@@ -2827,6 +2976,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the function signature result.
 	fn function_signature(
 		&self,
 		signature: &FunctionSignatureName,
@@ -2840,6 +2990,7 @@ impl<'a> Analyzer<'a> {
 			.transpose()
 	}
 
+	/// Returns the source slice result.
 	fn source_slice(&self, span: TextSpan) -> FerrosGrynnResult<&str> {
 		let start = span.offset as usize;
 		let end = span
@@ -2851,11 +3002,13 @@ impl<'a> Analyzer<'a> {
 			.ok_or_else(|| self.semantic("Function body source range is invalid.", span))
 	}
 
+	/// Returns the traverse result.
 	fn traverse(
 		&self,
 		statement: &TraverseStatement,
 		span: TextSpan,
 	) -> FerrosGrynnResult<LogicalTraverse> {
+		let layout_start = self.layout_shell_bytes.get();
 		let source = match &statement.source {
 			TraverseSource::Expression(expression) => {
 				LogicalTraverseSource::Expression(self.expr(expression, None)?)
@@ -2960,7 +3113,10 @@ impl<'a> Analyzer<'a> {
 			.as_ref()
 			.map(|graph| self.return_graph(graph, Some(&result), graph.span))
 			.transpose()?;
+		self.admit_layout_shell(std::mem::size_of::<usize>(), 0)?;
+		let boxed_layout_bytes = self.layout_shell_delta(layout_start)?;
 		Ok(LogicalTraverse {
+			boxed_layout_bytes,
 			atom: statement.atom,
 			constraints: statement.constraints.clone(),
 			source,
@@ -2973,6 +3129,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the pipeline expression result.
 	fn pipeline_expression(
 		&self,
 		expression: &Expr,
@@ -2986,6 +3143,7 @@ impl<'a> Analyzer<'a> {
 				self.unsupported("traversal pipeline inside row expression", expression.span)
 			);
 		}
+		let layout_start = self.layout_shell_bytes.get();
 		let mut step_expressions = Vec::new();
 		let source = pipeline_parts(expression, &mut step_expressions);
 		let source = self.expr_context(
@@ -3002,8 +3160,11 @@ impl<'a> Analyzer<'a> {
 			current_type = traverse_step_output_type(&analyzed, current_type);
 			steps.push(analyzed);
 		}
+		self.admit_layout_shell(std::mem::size_of::<usize>(), 0)?;
+		let boxed_layout_bytes = self.layout_shell_delta(layout_start)?;
 		Ok(TypedExpr {
 			kind: TypedExprKind::Traversal(Box::new(LogicalTraverse {
+				boxed_layout_bytes,
 				atom: false,
 				constraints: crate::syn::MatchConstraints::default(),
 				source: LogicalTraverseSource::Expression(source),
@@ -3026,6 +3187,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the traverse step result.
 	fn traverse_step(
 		&self,
 		expression: &Expr,
@@ -3121,6 +3283,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the traverse repeat result.
 	fn traverse_repeat(
 		&self,
 		repeat: ParsedRepeat,
@@ -3176,6 +3339,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the traverse algorithm result.
 	fn traverse_algorithm(
 		&self,
 		arguments: &[Expr],
@@ -3266,6 +3430,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Validates traverse step effect.
 	fn validate_traverse_step_effect(
 		&self,
 		kind: TraverseStepKind,
@@ -3296,6 +3461,7 @@ impl<'a> Analyzer<'a> {
 
 	/// Analyzes a complete MATCH statement.
 	fn match_statement(&self, statement: &MatchStatement) -> FerrosGrynnResult<LogicalMatch> {
+		let layout_start = self.layout_shell_bytes.get();
 		let timeout = statement
 			.timeout
 			.as_ref()
@@ -3358,7 +3524,11 @@ impl<'a> Analyzer<'a> {
 		let return_graph = statement
 			.return_graph
 			.as_ref()
-			.map(|graph| self.return_graph(graph, Some(&bindings), graph.span))
+			.map(|graph| -> FerrosGrynnResult<_> {
+				let graph = self.return_graph(graph, Some(&bindings), graph.span)?;
+				self.admit_layout_shell(std::mem::size_of::<LogicalReturnGraph>(), 0)?;
+				Ok(Box::new(graph))
+			})
 			.transpose()?;
 		let mut projection = Vec::with_capacity(statement.projection.len());
 		let mut columns = Vec::with_capacity(statement.projection.len().max(1));
@@ -3423,11 +3593,14 @@ impl<'a> Analyzer<'a> {
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		self.admit_layout_shell(std::mem::size_of::<usize>(), 0)?;
+		let boxed_layout_bytes = self.layout_shell_delta(layout_start)?;
 		Ok(LogicalMatch {
+			boxed_layout_bytes,
 			graph,
 			timeout,
 			optional: statement.optional,
-			binding_distinct: statement.binding_distinct,
+			distinctness: statement.distinctness,
 			mode: statement.mode,
 			atom: statement.atom,
 			meta_scope: statement.meta_scope,
@@ -3436,7 +3609,6 @@ impl<'a> Analyzer<'a> {
 			filter,
 			projection,
 			return_graph,
-			projection_distinct: statement.projection_distinct,
 			order,
 			max_depth,
 			max_depth_binding,
@@ -3444,6 +3616,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Matches graph reference.
 	fn match_graph_reference(&self, expression: &Expr) -> FerrosGrynnResult<LogicalGraphReference> {
 		let graph = match &expression.kind {
 			ExprKind::Name(name) => {
@@ -3464,6 +3637,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Matches max depth.
 	fn match_max_depth(
 		&self,
 		expression: Option<&Expr>,
@@ -3529,8 +3703,10 @@ impl<'a> Analyzer<'a> {
 				&step.edge.selector,
 				step.edge.alias.as_ref(),
 				step.edge.label.as_ref(),
-				step.edge.properties.as_ref(),
-				step.edge.predicate.as_ref(),
+				MatchInlineFilters {
+					properties: step.edge.properties.as_ref(),
+					predicate: step.edge.predicate.as_ref(),
+				},
 				match_meta_required(meta_scope, EndpointDomain::Edge),
 				EndpointDomain::Edge,
 				aliases,
@@ -3785,10 +3961,11 @@ impl<'a> Analyzer<'a> {
 			bindings,
 		)?;
 		let owner = self.match_endpoint(&pattern.owner, true, true, aliases, bindings)?;
+		self.admit_layout_shell(std::mem::size_of::<MatchBinding>(), 0)?;
 		Ok(LogicalMatchPattern {
 			kind: LogicalMatchPatternKind::Within(LogicalWithinPattern {
 				child,
-				owner,
+				owner: Box::new(owner),
 				min: pattern.depth.min,
 				max,
 			}),
@@ -3816,8 +3993,10 @@ impl<'a> Analyzer<'a> {
 			&endpoint.selector,
 			endpoint.alias.as_ref(),
 			endpoint.label.as_ref(),
-			endpoint.properties.as_ref(),
-			endpoint.predicate.as_ref(),
+			MatchInlineFilters {
+				properties: endpoint.properties.as_ref(),
+				predicate: endpoint.predicate.as_ref(),
+			},
 			endpoint.meta || force_meta,
 			domain,
 			aliases,
@@ -3831,13 +4010,17 @@ impl<'a> Analyzer<'a> {
 		selector: &MatchSelector,
 		alias: Option<&crate::syn::Identifier>,
 		label: Option<&crate::syn::Identifier>,
-		properties: Option<&Expr>,
-		predicate: Option<&Expr>,
+		filters: MatchInlineFilters<'_>,
 		meta: bool,
 		domain: EndpointDomain,
 		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
 		bindings: &mut Schema,
 	) -> FerrosGrynnResult<MatchBinding> {
+		let MatchInlineFilters {
+			properties,
+			predicate,
+		} = filters;
+
 		let column = alias
 			.map(|alias| {
 				let ty = Type::AtomOccurrence(match domain {
@@ -3962,6 +4145,7 @@ impl<'a> Analyzer<'a> {
 		Ok(column)
 	}
 
+	/// Returns the select result.
 	fn select(
 		&self,
 		statement: &crate::syn::SelectStatement,
@@ -3970,6 +4154,7 @@ impl<'a> Analyzer<'a> {
 		self.select_with_outer(statement, span, None)
 	}
 
+	/// Returns the select with outer result.
 	fn select_with_outer(
 		&self,
 		statement: &crate::syn::SelectStatement,
@@ -4307,26 +4492,24 @@ impl<'a> Analyzer<'a> {
 						ty: result.columns[index].ty.clone(),
 						span: order.expression.span,
 					}
-				} else {
-					if statement.fetch_bridges.is_some() {
-						let mut schema = input_schema.clone();
-						for column in &mut schema.columns {
-							if result.index_of(&column.name).is_some() {
-								column.name = "".into();
-							}
+				} else if statement.fetch_bridges.is_some() {
+					let mut schema = input_schema.clone();
+					for column in &mut schema.columns {
+						if result.index_of(&column.name).is_some() {
+							column.name = "".into();
 						}
-						let offset = schema.columns.len();
-						schema.columns.extend(result.columns.iter().cloned());
-						schema.origins.extend(
-							result
-								.origins
-								.iter()
-								.map(|(index, origin)| (offset + *index, origin.clone())),
-						);
-						self.select_expr(&order.expression, Some(&schema), true, 0)?
-					} else {
-						self.select_expr(&order.expression, Some(&input_schema), true, 0)?
 					}
+					let offset = schema.columns.len();
+					schema.columns.extend(result.columns.iter().cloned());
+					schema.origins.extend(
+						result
+							.origins
+							.iter()
+							.map(|(index, origin)| (offset + *index, origin.clone())),
+					);
+					self.select_expr(&order.expression, Some(&schema), true, 0)?
+				} else {
+					self.select_expr(&order.expression, Some(&input_schema), true, 0)?
 				};
 				Ok(LogicalOrder {
 					expression,
@@ -4482,6 +4665,7 @@ impl<'a> Analyzer<'a> {
 		clippy::too_many_arguments,
 		reason = "search validation must see every SELECT expression context"
 	)]
+	/// Validates select search.
 	fn validate_select_search(
 		&self,
 		filter: Option<&TypedExpr>,
@@ -4585,13 +4769,11 @@ impl<'a> Analyzer<'a> {
 				TypedExprKind::Builtin {
 					function: Builtin::SearchScore(_) | Builtin::SearchHighlight(_),
 					..
-				} => {
-					return Err(self.semantic(
-						"search::score and search::highlight are valid only in SELECT projection \
-						 or ORDER BY.",
-						expression.span,
-					));
-				}
+				} => Err(self.semantic(
+					"search::score and search::highlight are valid only in SELECT projection or \
+					 ORDER BY.",
+					expression.span,
+				)),
 				_ => Ok(()),
 			})?;
 		}
@@ -4627,6 +4809,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Validates knn shape.
 	fn validate_knn_shape(
 		&self,
 		expression: &TypedExpr,
@@ -4670,6 +4853,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Returns the selected fulltext definition result.
 	fn selected_fulltext_definition<'definition>(
 		&self,
 		definitions: &'definition [LogicalFulltextDefinition],
@@ -4720,6 +4904,7 @@ impl<'a> Analyzer<'a> {
 		Ok(definition)
 	}
 
+	/// Validates vector definitions.
 	fn validate_vector_definitions(
 		&self,
 		origin: &ColumnOrigin,
@@ -4792,6 +4977,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Returns the reject search context result.
 	fn reject_search_context(
 		&self,
 		expression: &TypedExpr,
@@ -4815,6 +5001,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Validates search result expression.
 	fn validate_search_result_expression(
 		&self,
 		expression: &TypedExpr,
@@ -4858,6 +5045,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the select source result.
 	fn select_source(
 		&self,
 		source: &SelectSource,
@@ -5112,6 +5300,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the graph reference result.
 	fn graph_reference(
 		&self,
 		expression: &Expr,
@@ -5125,10 +5314,12 @@ impl<'a> Analyzer<'a> {
 		Ok(LogicalGraphReference::Expression(self.select_expr(expression, schema, false, 0)?))
 	}
 
+	/// Returns the expr result.
 	fn expr(&self, expr: &Expr, schema: Option<&Schema>) -> FerrosGrynnResult<TypedExpr> {
 		self.expr_context(expr, schema, false, false, 0)
 	}
 
+	/// Returns the expr with current result.
 	fn expr_with_current(
 		&self,
 		expr: &Expr,
@@ -5138,6 +5329,7 @@ impl<'a> Analyzer<'a> {
 		self.expr_context(expr, schema, allow_current_field, false, 0)
 	}
 
+	/// Returns the select expr result.
 	fn select_expr(
 		&self,
 		expr: &Expr,
@@ -5148,6 +5340,7 @@ impl<'a> Analyzer<'a> {
 		self.expr_context(expr, schema, false, allow_aggregates, aggregate_depth)
 	}
 
+	/// Returns the expr context result.
 	fn expr_context(
 		&self,
 		expr: &Expr,
@@ -6164,6 +6357,7 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Returns the fulltext definitions result.
 	fn fulltext_definitions(
 		&self,
 		origin: &ColumnOrigin,
@@ -6253,6 +6447,7 @@ impl<'a> Analyzer<'a> {
 		clippy::too_many_arguments,
 		reason = "KNN distance analysis shares the surrounding expression context"
 	)]
+	/// Returns the knn distance result.
 	fn knn_distance(
 		&self,
 		search: Option<&KnnSearchArgument>,
@@ -6347,6 +6542,7 @@ impl<'a> Analyzer<'a> {
 		Ok((distance, None))
 	}
 
+	/// Returns the knn named distance result.
 	fn knn_named_distance(
 		&self,
 		name: &str,
@@ -6401,6 +6597,7 @@ impl<'a> Analyzer<'a> {
 		Ok(LogicalKnnDistance::Named(key))
 	}
 
+	/// Returns the vector definitions result.
 	fn vector_definitions(
 		&self,
 		origin: &ColumnOrigin,
@@ -6449,6 +6646,7 @@ impl<'a> Analyzer<'a> {
 			.collect()
 	}
 
+	/// Returns the closure result.
 	fn closure(
 		&self,
 		closure: &crate::syn::ClosureExpr,
@@ -6462,6 +6660,7 @@ impl<'a> Analyzer<'a> {
 			slot.mutable = false;
 		}
 		let mut analyzer = Self {
+			layout_shell_bytes: Cell::new(0),
 			source: self.source,
 			catalog: self.catalog,
 			slots,
@@ -6498,7 +6697,7 @@ impl<'a> Analyzer<'a> {
 				(LogicalClosureBody::Expression(Box::new(expression)), inferred, effect)
 			}
 			crate::syn::ClosureBody::Block(block) => {
-				let block = analyzer.block(block, 0, None)?.0;
+				let mut block = analyzer.block(block, 0, None)?.0;
 				if let [
 					LogicalBlockStatement {
 						statement: LogicalStatement::Return {
@@ -6506,13 +6705,20 @@ impl<'a> Analyzer<'a> {
 						},
 						timeout: None,
 					},
-				] = block.statements.as_slice()
+				] = block.statements.as_mut_slice()
 				{
-					(
-						LogicalClosureBody::Expression(Box::new(value.clone())),
-						value.ty.clone(),
-						typed_expression_effect(value),
-					)
+					// The surrounding block is discarded, so retain its owned
+					// value without another deep clone of
+					// already admitted layout shells.
+					let span = value.span;
+					let value = std::mem::replace(value, TypedExpr {
+						kind: TypedExprKind::Constant(Value::None),
+						ty: Type::Any,
+						span,
+					});
+					let inferred = value.ty.clone();
+					let effect = typed_expression_effect(&value);
+					(LogicalClosureBody::Expression(Box::new(value)), inferred, effect)
 				} else {
 					let inferred = logical_block_result_type(&block);
 					let effect = logical_block_effect(&block);
@@ -6530,16 +6736,22 @@ impl<'a> Analyzer<'a> {
 			return Err(self
 				.semantic(&format!("Closure body has type {inferred}, expected {result}."), span));
 		}
+		let body_layout_bytes = analyzer.layout_shell_bytes.get();
+		let boxed_layout_bytes =
+			self.admit_layout_shell(std::mem::size_of::<usize>(), body_layout_bytes)?;
 		Ok(LogicalClosure {
+			boxed_layout_bytes,
 			parameters,
 			captures,
 			result,
 			body,
 			effect,
 			slot_count: analyzer.next_slot as usize,
-			retained_plan_bytes: std::mem::size_of::<LogicalClosure>().saturating_add(
-				(span.len as usize).saturating_mul(std::mem::size_of::<TypedExpr>()),
-			),
+			retained_plan_bytes: std::mem::size_of::<LogicalClosure>()
+				.saturating_add(
+					(span.len as usize).saturating_mul(std::mem::size_of::<TypedExpr>()),
+				)
+				.saturating_add(body_layout_bytes),
 			named_function: None,
 		})
 	}
@@ -6578,6 +6790,7 @@ impl<'a> Analyzer<'a> {
 		Ok(candidates)
 	}
 
+	/// Returns the named function result.
 	fn named_function(
 		&self,
 		name: &str,
@@ -6667,7 +6880,9 @@ impl<'a> Analyzer<'a> {
 				FunctionEffect::Stable => ClosureEffect::StableRead,
 				FunctionEffect::Impure => ClosureEffect::DataMutation,
 			};
+			let boxed_layout_bytes = self.admit_layout_shell(std::mem::size_of::<usize>(), 0)?;
 			let placeholder = LogicalClosure {
+				boxed_layout_bytes,
 				parameters: function
 					.parameters()
 					.enumerate()
@@ -6772,6 +6987,7 @@ impl<'a> Analyzer<'a> {
 		))
 	}
 
+	/// Returns the builtin result.
 	fn builtin(
 		&self,
 		callee: &Expr,
@@ -6950,6 +7166,7 @@ impl<'a> Analyzer<'a> {
 		Ok((function, result))
 	}
 
+	/// Validates builtin arguments.
 	fn validate_builtin_arguments(
 		&self,
 		key: &str,
@@ -7024,6 +7241,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Returns the binary type result.
 	fn binary_type(
 		&self,
 		op: BinaryOperator,
@@ -7114,6 +7332,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the literal result.
 	fn literal(&self, literal: &Literal, span: TextSpan) -> FerrosGrynnResult<Value> {
 		match literal {
 			Literal::None => Ok(Value::None),
@@ -7146,6 +7365,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Scans target.
 	fn scan_target(&self, target: &SelectTarget) -> FerrosGrynnResult<ScanTarget> {
 		match target {
 			SelectTarget::Class(class) => Ok(ScanTarget::Class(class.value.clone())),
@@ -7198,10 +7418,12 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the type name result.
 	fn type_name(&self, name: &TypeName) -> FerrosGrynnResult<Type> {
 		self.type_name_value(name.value.as_ref(), name.span)
 	}
 
+	/// Returns the type name value result.
 	fn type_name_value(&self, value: &str, span: TextSpan) -> FerrosGrynnResult<Type> {
 		let lower = value.to_ascii_lowercase();
 		let ty = match lower.as_str() {
@@ -7260,10 +7482,12 @@ impl<'a> Analyzer<'a> {
 		Ok(ty)
 	}
 
+	/// Returns the declare result.
 	fn declare(&mut self, name: &crate::syn::Identifier, ty: Type) -> FerrosGrynnResult<u32> {
 		self.declare_with_mutability(name, ty, false)
 	}
 
+	/// Returns the declare mutable result.
 	fn declare_mutable(
 		&mut self,
 		name: &crate::syn::Identifier,
@@ -7272,6 +7496,7 @@ impl<'a> Analyzer<'a> {
 		self.declare_with_mutability(name, ty, true)
 	}
 
+	/// Returns the declare with mutability result.
 	fn declare_with_mutability(
 		&mut self,
 		name: &crate::syn::Identifier,
@@ -7309,6 +7534,7 @@ impl<'a> Analyzer<'a> {
 		Ok(id)
 	}
 
+	/// Pops scope.
 	fn pop_scope(&mut self) {
 		let Some(scope) = self.scopes.pop() else {
 			return;
@@ -7322,6 +7548,7 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Returns the semantic result.
 	fn semantic(&self, message: &str, span: TextSpan) -> FerrosGrynnError {
 		self.locate(
 			FerrosGrynnError::invalid_argument(message)
@@ -7330,6 +7557,7 @@ impl<'a> Analyzer<'a> {
 		)
 	}
 
+	/// Validates recursive cycle.
 	fn validate_recursive_cycle(
 		catalog: &dyn QueryCatalog,
 		stack: &[FunctionId],
@@ -7364,6 +7592,7 @@ impl<'a> Analyzer<'a> {
 		Ok(())
 	}
 
+	/// Returns the unsupported result.
 	fn unsupported(&self, feature: &str, span: TextSpan) -> FerrosGrynnError {
 		self.locate(
 			FerrosGrynnError::query_feature_not_supported(feature)
@@ -7372,12 +7601,14 @@ impl<'a> Analyzer<'a> {
 		)
 	}
 
+	/// Returns the locate result.
 	fn locate(&self, error: FerrosGrynnError, span: TextSpan) -> FerrosGrynnError {
 		Location::from_source(None, self.source, span)
 			.map_or(error.clone(), |location| error.with_location(location))
 	}
 }
 
+/// Returns the logical block result type result.
 fn logical_block_result_type(block: &LogicalBlock) -> Type {
 	block
 		.statements
@@ -7385,6 +7616,7 @@ fn logical_block_result_type(block: &LogicalBlock) -> Type {
 		.map_or(Type::None, |statement| logical_statement_result_type(&statement.statement))
 }
 
+/// Returns the logical statement result type result.
 fn logical_statement_result_type(statement: &LogicalStatement) -> Type {
 	match statement {
 		LogicalStatement::Return {
@@ -7413,6 +7645,7 @@ fn logical_statement_result_type(statement: &LogicalStatement) -> Type {
 	}
 }
 
+/// Returns the logical block effect result.
 fn logical_block_effect(block: &LogicalBlock) -> ClosureEffect {
 	block.statements.iter().fold(ClosureEffect::Pure, |effect, statement| {
 		let timeout_effect = match &statement.timeout {
@@ -7423,6 +7656,7 @@ fn logical_block_effect(block: &LogicalBlock) -> ClosureEffect {
 	})
 }
 
+/// Returns the logical statement effect result.
 pub(in crate::gql) fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
 	match statement {
 		LogicalStatement::Explain(explain) => {
@@ -7569,6 +7803,7 @@ pub(in crate::gql) fn logical_statement_effect(statement: &LogicalStatement) -> 
 	}
 }
 
+/// Returns the typed expression effect result.
 fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 	match &expression.kind {
 		TypedExprKind::Traversal(traverse) => {
@@ -7763,6 +7998,7 @@ fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 	}
 }
 
+/// Returns the search slot argument result.
 fn search_slot_argument(
 	argument: Option<&TypedExpr>,
 	span: TextSpan,
@@ -7775,8 +8011,8 @@ fn search_slot_argument(
 	else {
 		return Err(error("Search match slot must be a constant integer.", span));
 	};
-	let slot = u16::try_from(number.clone())
-		.map_err(|_| error("Search match slot must be in 1..=65535.", span))?;
+	let slot = u16::try_from(*number)
+		.map_err(|_conversion_error| error("Search match slot must be in 1..=65535.", span))?;
 	if slot == 0 {
 		return Err(error("Search match slot must be in 1..=65535.", span));
 	}
@@ -7784,24 +8020,40 @@ fn search_slot_argument(
 }
 
 #[derive(Clone, Copy)]
+/// Builtin argument alternatives.
 enum BuiltinArgument {
+	/// Any case of builtin argument.
 	Any,
+	/// Geometry case of builtin argument.
 	Geometry,
+	/// Number case of builtin argument.
 	Number,
+	/// Integer case of builtin argument.
 	Integer,
+	/// String case of builtin argument.
 	String,
+	/// Regex or string case of builtin argument.
 	RegexOrString,
+	/// Matcher case of builtin argument.
 	Matcher,
+	/// Date time case of builtin argument.
 	DateTime,
+	/// Duration case of builtin argument.
 	Duration,
+	/// Array case of builtin argument.
 	Array,
+	/// Set case of builtin argument.
 	Set,
+	/// Path case of builtin argument.
 	Path,
+	/// Record or atom case of builtin argument.
 	RecordOrAtom,
+	/// Atom occurrence case of builtin argument.
 	AtomOccurrence,
 }
 
 impl BuiltinArgument {
+	/// Returns whether the accepts condition holds.
 	fn accepts(self, ty: &Type) -> bool {
 		matches!(ty, Type::Any)
 			|| match self {
@@ -7827,6 +8079,7 @@ impl BuiltinArgument {
 			}
 	}
 
+	/// Returns the name result.
 	const fn name(self) -> &'static str {
 		match self {
 			Self::Any => "any",
@@ -7847,6 +8100,7 @@ impl BuiltinArgument {
 	}
 }
 
+/// Returns the keep levelpath enabled result.
 fn keep_levelpath_enabled(
 	clause: Option<&crate::syn::KeepLevelPathClause>,
 	allowed_alias: Option<&crate::syn::Identifier>,
@@ -7866,6 +8120,7 @@ fn keep_levelpath_enabled(
 	Ok(true)
 }
 
+/// Validates reserved levelpath data.
 fn validate_reserved_levelpath_data(
 	data: Option<&DmlData>,
 	error: impl Fn(&str, TextSpan) -> FerrosGrynnError,
@@ -7886,6 +8141,7 @@ fn validate_reserved_levelpath_data(
 	Ok(())
 }
 
+/// Collects expr names.
 fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 	match &expr.kind {
 		ExprKind::Name(name) => {
@@ -8043,6 +8299,7 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 	}
 }
 
+/// Returns the builtin name result.
 fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
 	if let ExprKind::Name(name) = &callee.kind {
 		return Some(("", name.value.as_ref()));
@@ -8061,6 +8318,7 @@ fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
 	Some((namespace.value.as_ref(), field.value.as_ref()))
 }
 
+/// Compiles named function.
 pub(in crate::gql) fn compile_named_function(
 	catalog: &dyn QueryCatalog,
 	function: &crate::datastore::SchemaFunction,
@@ -8213,6 +8471,7 @@ fn function_type_source_bytes(mut value: &Type) -> usize {
 	bytes
 }
 
+/// Returns the function source type result.
 fn function_source_type(value: &Type) -> FerrosGrynnResult<String> {
 	let name = match value {
 		Type::Any => "any".to_owned(),
@@ -8254,6 +8513,7 @@ fn function_source_type(value: &Type) -> FerrosGrynnResult<String> {
 	Ok(name)
 }
 
+/// Returns the function argument rank result.
 fn function_argument_rank(expected: &Type, actual: &Type) -> Option<u8> {
 	if expected == actual {
 		return Some(0);
@@ -8272,6 +8532,7 @@ fn function_argument_rank(expected: &Type, actual: &Type) -> Option<u8> {
 	}
 }
 
+/// Returns the named argument order result.
 fn named_argument_order(
 	function: &SchemaFunction,
 	argument_names: &[Option<Identifier>],
@@ -8306,6 +8567,7 @@ fn named_argument_order(
 	order.iter().all(|index| *index != usize::MAX).then_some(order)
 }
 
+/// Returns the pipeline parts result.
 fn pipeline_parts<'expression>(
 	expression: &'expression Expr,
 	steps: &mut Vec<&'expression Expr>,
@@ -8323,17 +8585,25 @@ fn pipeline_parts<'expression>(
 	source
 }
 
+/// Parsed repeat state.
 struct ParsedRepeat {
+	/// Arguments associated with this parsed repeat.
 	arguments: Vec<Expr>,
+	/// Modifiers associated with this parsed repeat.
 	modifiers: Vec<ParsedRepeatModifier>,
 }
 
+/// Parsed repeat modifier state.
 struct ParsedRepeatModifier {
+	/// Name associated with this parsed repeat modifier.
 	name: Box<str>,
+	/// Arguments associated with this parsed repeat modifier.
 	arguments: Vec<Expr>,
+	/// Source byte range used to locate diagnostics.
 	span: TextSpan,
 }
 
+/// Parses repeat syntax.
 fn parse_repeat_syntax(expression: &Expr) -> Option<ParsedRepeat> {
 	let ExprKind::Call {
 		callee,
@@ -8374,6 +8644,7 @@ fn parse_repeat_syntax(expression: &Expr) -> Option<ParsedRepeat> {
 	Some(repeat)
 }
 
+/// Ensures traversal closure.
 fn ensure_traversal_closure(
 	analyzer: &Analyzer<'_>,
 	expression: &TypedExpr,
@@ -8406,6 +8677,7 @@ fn ensure_traversal_closure(
 	))
 }
 
+/// Pushes traverse result column.
 fn push_traverse_result_column(schema: &mut Schema, name: Box<str>, ty: Type) {
 	if let Some(column) = schema.columns.iter_mut().find(|column| column.name == name) {
 		column.ty = unify(column.ty.clone(), ty);
@@ -8418,6 +8690,7 @@ fn push_traverse_result_column(schema: &mut Schema, name: Box<str>, ty: Type) {
 	}
 }
 
+/// Returns the traverse source item type result.
 fn traverse_source_item_type(source: &LogicalTraverseSource) -> Type {
 	match source {
 		LogicalTraverseSource::Expression(expression) => collection_item_type(&expression.ty),
@@ -8434,6 +8707,7 @@ fn traverse_source_item_type(source: &LogicalTraverseSource) -> Type {
 	}
 }
 
+/// Returns the collection item type result.
 fn collection_item_type(ty: &Type) -> Type {
 	match ty {
 		Type::Array(item) | Type::Set(item) | Type::Range(item) => (**item).clone(),
@@ -8441,6 +8715,7 @@ fn collection_item_type(ty: &Type) -> Type {
 	}
 }
 
+/// Returns the traverse step output type result.
 fn traverse_step_output_type(step: &LogicalTraverseStep, current: Type) -> Type {
 	if step.kind.is_tensor_analytics() {
 		return Type::Object;
@@ -8495,6 +8770,7 @@ fn traverse_step_output_type(step: &LogicalTraverseStep, current: Type) -> Type 
 	}
 }
 
+/// Returns the traverse step kind result.
 fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 	Some(match name.to_ascii_lowercase().as_str() {
 		"v" => TraverseStepKind::Vertices,
@@ -8580,6 +8856,7 @@ fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 	})
 }
 
+/// Returns the traverse step arity result.
 const fn traverse_step_arity(kind: TraverseStepKind) -> std::ops::RangeInclusive<usize> {
 	match kind {
 		TraverseStepKind::AllShortestPaths | TraverseStepKind::AllWeightedShortestPaths => 1..=2,
@@ -8663,6 +8940,7 @@ const fn traverse_step_arity(kind: TraverseStepKind) -> std::ops::RangeInclusive
 	}
 }
 
+/// Returns the aggregate name result.
 fn aggregate_name(callee: &Expr) -> Option<Aggregate> {
 	if let ExprKind::Name(name) = &callee.kind {
 		return match name.value.to_ascii_lowercase().as_str() {
@@ -8685,6 +8963,7 @@ fn aggregate_name(callee: &Expr) -> Option<Aggregate> {
 	}
 }
 
+/// Returns the column origin result.
 fn column_origin<'a>(
 	schema: Option<&'a Schema>,
 	expression: &TypedExpr,
@@ -8695,6 +8974,7 @@ fn column_origin<'a>(
 	schema?.origins.get(&column)
 }
 
+/// Returns whether the index scope matches condition holds.
 fn index_scope_matches(index: IndexScope, source: Option<IndexScope>) -> bool {
 	match source {
 		Some(source) => index == source,
@@ -8702,6 +8982,7 @@ fn index_scope_matches(index: IndexScope, source: Option<IndexScope>) -> bool {
 	}
 }
 
+/// Visits typed expression.
 pub(super) fn visit_typed_expression<'expression, Error>(
 	expression: &'expression TypedExpr,
 	visit: &mut impl FnMut(&'expression TypedExpr) -> Result<(), Error>,
@@ -8855,6 +9136,7 @@ pub(super) fn visit_typed_expression<'expression, Error>(
 	Ok(())
 }
 
+/// Returns whether the typed expression contains knn condition holds.
 fn typed_expression_contains_knn(expression: &TypedExpr) -> bool {
 	let mut found = false;
 	let result = visit_typed_expression(expression, &mut |expression| {
@@ -8867,6 +9149,7 @@ fn typed_expression_contains_knn(expression: &TypedExpr) -> bool {
 	}
 }
 
+/// Returns whether the typed expression is statement fixed condition holds.
 fn typed_expression_is_statement_fixed(expression: &TypedExpr) -> bool {
 	let mut fixed = true;
 	let result = visit_typed_expression(expression, &mut |expression| {
@@ -8888,6 +9171,7 @@ fn typed_expression_is_statement_fixed(expression: &TypedExpr) -> bool {
 	}
 }
 
+/// Returns whether the typed expression is search related condition holds.
 fn typed_expression_is_search_related(expression: &TypedExpr) -> bool {
 	matches!(
 		expression.kind,
@@ -8900,6 +9184,7 @@ fn typed_expression_is_search_related(expression: &TypedExpr) -> bool {
 	)
 }
 
+/// Returns whether the vector distance matches condition holds.
 fn vector_distance_matches(options: ClassIndexOptions, distance: &LogicalKnnDistance) -> bool {
 	let expected = match distance {
 		LogicalKnnDistance::Builtin(distance) => Some(*distance),
@@ -8925,6 +9210,7 @@ fn vector_distance_matches(options: ClassIndexOptions, distance: &LogicalKnnDist
 	expected.is_some_and(|expected| expected == actual)
 }
 
+/// Returns the aggregate type result.
 fn aggregate_type(function: Aggregate, argument: Option<&TypedExpr>) -> Type {
 	match function {
 		Aggregate::Count => Type::Int,
@@ -8941,6 +9227,7 @@ fn aggregate_type(function: Aggregate, argument: Option<&TypedExpr>) -> Type {
 	}
 }
 
+/// Returns the graph source schema result.
 fn graph_source_schema() -> Schema {
 	Schema {
 		columns: [
@@ -8964,6 +9251,7 @@ fn graph_source_schema() -> Schema {
 	}
 }
 
+/// Returns the all columns wildcard result.
 fn all_columns_wildcard(schema: &Schema) -> Vec<LogicalWildcardField> {
 	schema
 		.columns
@@ -8976,6 +9264,7 @@ fn all_columns_wildcard(schema: &Schema) -> Vec<LogicalWildcardField> {
 		.collect()
 }
 
+/// Returns the atom wildcard result.
 fn atom_wildcard(schema: &Schema, mode: ClassSchemaMode) -> Vec<LogicalWildcardField> {
 	let mut fields = Vec::new();
 	if let Some(index) = schema.index_of("id") {
@@ -8986,13 +9275,22 @@ fn atom_wildcard(schema: &Schema, mode: ClassSchemaMode) -> Vec<LogicalWildcardF
 	}
 	match mode {
 		ClassSchemaMode::Schemafull => {
-			fields.extend(schema.columns.iter().enumerate().filter_map(|(index, column)| {
-				(!matches!(column.name.as_ref(), "id" | "class" | "kind" | "label" | "properties"))
-					.then(|| LogicalWildcardField::Column {
+			fields.extend(
+				schema
+					.columns
+					.iter()
+					.enumerate()
+					.filter(|(_, column)| {
+						!matches!(
+							column.name.as_ref(),
+							"id" | "class" | "kind" | "label" | "properties"
+						)
+					})
+					.map(|(index, column)| LogicalWildcardField::Column {
 						name: column.name.clone(),
 						index,
-					})
-			}));
+					}),
+			);
 		}
 		ClassSchemaMode::Schemaless => {
 			if let Some(index) = schema.index_of("properties") {
@@ -9005,6 +9303,7 @@ fn atom_wildcard(schema: &Schema, mode: ClassSchemaMode) -> Vec<LogicalWildcardF
 	fields
 }
 
+/// Returns the offset wildcard result.
 fn offset_wildcard(field: &LogicalWildcardField, offset: usize) -> LogicalWildcardField {
 	match field {
 		LogicalWildcardField::Column {
@@ -9062,6 +9361,7 @@ pub(super) fn validate_projection_paths(
 	Ok(())
 }
 
+/// Returns the select expression name result.
 fn select_expression_name(expression: &Expr) -> Option<Box<str>> {
 	match &expression.kind {
 		ExprKind::Name(name) => Some(name.value.clone()),
@@ -9073,6 +9373,7 @@ fn select_expression_name(expression: &Expr) -> Option<Box<str>> {
 	}
 }
 
+/// Returns whether the expr contains aggregate condition holds.
 fn expr_contains_aggregate(expression: &Expr) -> bool {
 	match &expression.kind {
 		ExprKind::Call {
@@ -9171,6 +9472,7 @@ fn expr_contains_aggregate(expression: &Expr) -> bool {
 	}
 }
 
+/// Returns whether the expr references row condition holds.
 fn expr_references_row(expression: &Expr) -> bool {
 	match &expression.kind {
 		ExprKind::Name(_) => true,
@@ -9264,6 +9566,7 @@ fn expr_references_row(expression: &Expr) -> bool {
 	}
 }
 
+/// Returns whether the typed expr contains aggregate condition holds.
 fn typed_expr_contains_aggregate(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Aggregate {
@@ -9381,6 +9684,7 @@ fn typed_expr_contains_aggregate(expression: &TypedExpr) -> bool {
 	}
 }
 
+/// Returns whether the group expr equivalent condition holds.
 pub(in crate::gql) fn group_expr_equivalent(left: &TypedExpr, right: &TypedExpr) -> bool {
 	match (&left.kind, &right.kind) {
 		(TypedExprKind::Constant(left), TypedExprKind::Constant(right)) => left == right,
@@ -9511,6 +9815,7 @@ pub(in crate::gql) fn group_expr_equivalent(left: &TypedExpr, right: &TypedExpr)
 	}
 }
 
+/// Returns whether the optional group expr equivalent condition holds.
 fn optional_group_expr_equivalent(left: Option<&TypedExpr>, right: Option<&TypedExpr>) -> bool {
 	match (left, right) {
 		(Some(left), Some(right)) => group_expr_equivalent(left, right),
@@ -9519,6 +9824,7 @@ fn optional_group_expr_equivalent(left: Option<&TypedExpr>, right: Option<&Typed
 	}
 }
 
+/// Returns the class kind result.
 const fn class_kind(kind: ClassKindName) -> AtomKind {
 	match kind {
 		ClassKindName::Node => AtomKind::Node,
@@ -9526,6 +9832,7 @@ const fn class_kind(kind: ClassKindName) -> AtomKind {
 	}
 }
 
+/// Returns the class schema mode result.
 const fn class_schema_mode(mode: ClassSchemaModeName) -> ClassSchemaMode {
 	match mode {
 		ClassSchemaModeName::Schemaless => ClassSchemaMode::Schemaless,
@@ -9533,6 +9840,7 @@ const fn class_schema_mode(mode: ClassSchemaModeName) -> ClassSchemaMode {
 	}
 }
 
+/// Returns the function effect result.
 const fn function_effect(effect: FunctionEffectName) -> FunctionEffect {
 	match effect {
 		FunctionEffectName::Pure => FunctionEffect::Pure,
@@ -9541,6 +9849,7 @@ const fn function_effect(effect: FunctionEffectName) -> FunctionEffect {
 	}
 }
 
+/// Returns the vector element result.
 const fn vector_element(element: VectorElementName) -> VectorKind {
 	match element {
 		VectorElementName::F64 => VectorKind::F64,
@@ -9554,6 +9863,7 @@ const fn vector_element(element: VectorElementName) -> VectorKind {
 	}
 }
 
+/// Returns the analyzer tokenizer result.
 const fn analyzer_tokenizer(tokenizer: AnalyzerTokenizerName) -> AnalyzerTokenizer {
 	match tokenizer {
 		AnalyzerTokenizerName::Blank => AnalyzerTokenizer::Blank,
@@ -9563,6 +9873,7 @@ const fn analyzer_tokenizer(tokenizer: AnalyzerTokenizerName) -> AnalyzerTokeniz
 	}
 }
 
+/// Returns the analyzer language result.
 fn analyzer_language(language: &Identifier) -> FerrosGrynnResult<AnalyzerLanguage> {
 	match language.value.to_ascii_lowercase().as_str() {
 		"arabic" => Ok(AnalyzerLanguage::Arabic),
@@ -9590,14 +9901,17 @@ fn analyzer_language(language: &Identifier) -> FerrosGrynnResult<AnalyzerLanguag
 	}
 }
 
+/// Returns whether this value is number.
 const fn is_number(ty: &Type) -> bool {
 	matches!(ty, Type::Any | Type::Number | Type::Int | Type::Float | Type::Decimal)
 }
 
+/// Returns whether this value is integer.
 const fn is_integer(ty: &Type) -> bool {
 	matches!(ty, Type::Any | Type::Number | Type::Int)
 }
 
+/// Returns whether the compatible condition holds.
 pub(super) fn compatible(expected: &Type, actual: &Type) -> bool {
 	expected == actual
 		|| matches!(expected, Type::Any)

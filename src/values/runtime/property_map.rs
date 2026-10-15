@@ -11,35 +11,45 @@ use thin_vec::ThinVec;
 
 use super::Value;
 
+/// Type used to represent entry.
 type Entry = (PropertyKeyId, Value);
 
+/// Interned property-name identifier used by compact property maps.
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[repr(transparent)]
-pub struct PropertyKeyId(u32);
+pub struct PropertyKeyId(
+	/// Numeric identifier assigned by the property dictionary.
+	u32,
+);
 
 impl PropertyKeyId {
+	/// Constructs `PropertyKeyId` from the supplied initial state.
 	pub const fn new(value: u32) -> Self {
 		Self(value)
 	}
 
+	/// Returns the numeric identifier represented by this PropertyKeyId.
 	pub const fn get(self) -> u32 {
 		self.0
 	}
 }
 
 impl fmt::Display for PropertyKeyId {
+	/// Formats `PropertyKeyId` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(&self.0, f)
 	}
 }
 
 impl From<u32> for PropertyKeyId {
+	/// Converts `u32` into `PropertyKeyId`.
 	fn from(value: u32) -> Self {
 		Self(value)
 	}
 }
 
 impl From<PropertyKeyId> for u32 {
+	/// Converts `PropertyKeyId` into `u32`.
 	fn from(value: PropertyKeyId) -> Self {
 		value.0
 	}
@@ -54,40 +64,49 @@ impl From<PropertyKeyId> for u32 {
 #[derive(Default, Clone)]
 #[repr(transparent)]
 pub struct PropertyMap {
+	/// Entries associated with this property map.
 	entries: ThinVec<Entry>,
 }
 
 impl PropertyMap {
+	/// Constructs `PropertyMap` from the supplied initial state.
 	pub fn new() -> Self {
 		Self::default()
 	}
 
+	/// Creates an empty collection with the requested initial capacity.
 	pub fn with_capacity(capacity: usize) -> Self {
 		Self {
 			entries: ThinVec::with_capacity(capacity),
 		}
 	}
 
+	/// Returns the logical element count of this `PropertyMap`.
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
+	/// Reports whether this `PropertyMap` contains no logical elements.
 	pub fn is_empty(&self) -> bool {
 		self.entries.is_empty()
 	}
 
+	/// Looks up the requested entry without modifying the collection.
 	pub fn get(&self, key: PropertyKeyId) -> Option<&Value> {
 		self.find(key).ok().map(|index| &self.entries[index].1)
 	}
 
+	/// Borrows the requested entry mutably when it exists.
 	pub fn get_mut(&mut self, key: PropertyKeyId) -> Option<&mut Value> {
 		self.find(key).ok().map(|index| &mut self.entries[index].1)
 	}
 
+	/// Tests membership of key for `PropertyMap`.
 	pub fn contains_key(&self, key: PropertyKeyId) -> bool {
 		self.find(key).is_ok()
 	}
 
+	/// Inserts a key and value using the collection's replacement rules.
 	pub fn insert<IntoValue: Into<Value>>(
 		&mut self,
 		key: PropertyKeyId,
@@ -103,24 +122,29 @@ impl PropertyMap {
 		}
 	}
 
+	/// Removes the requested entry and returns it when present.
 	pub fn remove(&mut self, key: PropertyKeyId) -> Option<Value> {
 		self.find(key).ok().map(|index| self.entries.remove(index).1)
 	}
 
+	/// Removes all logical elements from the collection.
 	pub fn clear(&mut self) {
 		self.entries.clear();
 	}
 
+	/// Returns reserve for `PropertyMap`.
 	pub fn reserve(&mut self, additional: usize) {
 		self.entries.reserve(additional);
 	}
 
+	/// Borrows the elements of this `PropertyMap` for iteration.
 	pub fn iter(&self) -> PropertyIter<'_> {
 		PropertyIter {
 			inner: self.entries.iter(),
 		}
 	}
 
+	/// Returns values for `PropertyMap`.
 	pub fn values(&self) -> impl DoubleEndedIterator<Item = &Value> + ExactSizeIterator {
 		self.entries.iter().map(|(_, value)| value)
 	}
@@ -135,22 +159,26 @@ impl PropertyMap {
 		)
 	}
 
+	/// Finds property map.
 	fn find(&self, key: PropertyKeyId) -> Result<usize, usize> {
 		self.entries.binary_search_by_key(&key, |(key, _)| *key)
 	}
 }
 
 impl Debug for PropertyMap {
+	/// Formats `PropertyMap` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		f.debug_map().entries(self.iter()).finish()
 	}
 }
 
+/// Returns the entry ref result.
 const fn entry_ref(entry: &Entry) -> (PropertyKeyId, &Value) {
 	(entry.0, &entry.1)
 }
 
 impl PartialEq for PropertyMap {
+	/// Compares this `PropertyMap` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.entries == other.entries
 	}
@@ -159,24 +187,29 @@ impl PartialEq for PropertyMap {
 impl Eq for PropertyMap {}
 
 impl PartialOrd for PropertyMap {
+	/// Compares this `PropertyMap` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for PropertyMap {
+	/// Compares this `PropertyMap` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.entries.cmp(&other.entries)
 	}
 }
 
 impl Hash for PropertyMap {
+	/// Feeds this `PropertyMap` into the supplied hasher.
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.entries.hash(state);
 	}
 }
 
 impl FromIterator<(PropertyKeyId, Value)> for PropertyMap {
+	/// Builds this `PropertyMap` from the supplied elements.
 	fn from_iter<I: IntoIterator<Item = (PropertyKeyId, Value)>>(iter: I) -> Self {
 		let iter = iter.into_iter();
 		let mut result = Self::with_capacity(iter.size_hint().0);
@@ -191,34 +224,42 @@ impl<'a> IntoIterator for &'a PropertyMap {
 	type IntoIter = PropertyIter<'a>;
 	type Item = (PropertyKeyId, &'a Value);
 
+	/// Iterates over borrowed elements without consuming the collection.
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter()
 	}
 }
 
+/// Iterator over interned property keys and their borrowed runtime values.
 pub struct PropertyIter<'a> {
+	/// Inner associated with this property iter.
 	inner: SliceIter<'a, Entry>,
 }
 
 impl<'a> Iterator for PropertyIter<'a> {
 	type Item = (PropertyKeyId, &'a Value);
 
+	/// Advances this `PropertyIter<'a>` and returns its next element, if any.
 	fn next(&mut self) -> Option<Self::Item> {
 		self.inner.next().map(entry_ref)
 	}
 
+	/// Returns lower and optional upper bounds on the remaining element count.
 	fn size_hint(&self) -> (usize, Option<usize>) {
 		self.inner.size_hint()
 	}
 }
 
 impl DoubleEndedIterator for PropertyIter<'_> {
+	/// Advances this `PropertyIter<'_>` from the back and returns its next
+	/// element, if any.
 	fn next_back(&mut self) -> Option<Self::Item> {
 		self.inner.next_back().map(entry_ref)
 	}
 }
 
 impl ExactSizeIterator for PropertyIter<'_> {
+	/// Returns the logical element count of this `PropertyIter<'_>`.
 	fn len(&self) -> usize {
 		self.inner.len()
 	}
@@ -227,6 +268,7 @@ impl ExactSizeIterator for PropertyIter<'_> {
 impl FusedIterator for PropertyIter<'_> {}
 
 #[cfg(test)]
+/// Regression tests for property map behavior.
 mod tests {
 	use std::{
 		collections::hash_map::DefaultHasher,
@@ -236,6 +278,7 @@ mod tests {
 
 	use super::{PropertyKeyId, PropertyMap};
 
+	/// Verifies keeps entries sorted and replaces existing values.
 	#[test]
 	fn keeps_entries_sorted_and_replaces_existing_values() {
 		let mut properties = PropertyMap::new();
@@ -254,6 +297,7 @@ mod tests {
 		);
 	}
 
+	/// Verifies empty map is pointer sized and does not reserve storage.
 	#[test]
 	fn empty_map_is_pointer_sized_and_does_not_reserve_storage() {
 		let properties = PropertyMap::new();
@@ -262,6 +306,7 @@ mod tests {
 		assert_send_sync::<PropertyMap>();
 	}
 
+	/// Verifies removal preserves order and clear preserves validity.
 	#[test]
 	fn removal_preserves_order_and_clear_preserves_validity() {
 		let mut properties = (0..16)
@@ -280,6 +325,7 @@ mod tests {
 		assert_eq!(properties.len(), 1);
 	}
 
+	/// Verifies equality order and hash ignore insertion order.
 	#[test]
 	fn equality_order_and_hash_ignore_insertion_order() {
 		let mut first = PropertyMap::new();
@@ -300,6 +346,7 @@ mod tests {
 		assert_eq!(first_hash.finish(), second_hash.finish());
 	}
 
+	/// Verifies clone is independent.
 	#[test]
 	fn clone_is_independent() {
 		let mut properties = (0..16)
@@ -312,6 +359,7 @@ mod tests {
 		assert!(clone.contains_key(PropertyKeyId::new(8)));
 	}
 
+	/// Verifies from iterator uses last duplicate value.
 	#[test]
 	fn from_iterator_uses_last_duplicate_value() {
 		let properties = [
@@ -329,5 +377,6 @@ mod tests {
 		);
 	}
 
+	/// Returns assert send sync for this module.
 	fn assert_send_sync<T: Send + Sync>() {}
 }

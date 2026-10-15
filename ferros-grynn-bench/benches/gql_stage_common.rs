@@ -8,14 +8,20 @@ use ferros_grynn::{
 	values::{Object, PropertyKeyId, PropertyMap, RecordId, Value},
 };
 
+/// Default record population shared by staged GQL benchmarks.
 const DEFAULT_ROWS: usize = 2_000;
 
+/// Seeded datastore, records and property key used by mutation benchmarks.
 struct MutationFixture {
+	/// Datastore retained by the fixture or operation.
 	store: Datastore,
+	/// Stable record identities seeded for the scenario.
 	records: Vec<RecordId>,
+	/// Interned property-name identifier used for value lookup.
 	key: PropertyKeyId,
 }
 
+/// Returns rows for this module.
 fn rows() -> usize {
 	std::env::var("FG_STAGE_GATE_ROWS")
 		.ok()
@@ -24,6 +30,7 @@ fn rows() -> usize {
 		.max(1)
 }
 
+/// Returns assert query for this module.
 fn assert_query(store: &Datastore, query: &str) {
 	let results = store.execute(query, &Object::new()).expect("gate query must execute");
 	if let Some(error) = results.iter().find_map(|result| result.result.as_ref().err()) {
@@ -32,6 +39,7 @@ fn assert_query(store: &Datastore, query: &str) {
 	black_box(results);
 }
 
+/// Builds the mutation fixture used by nearby scenarios.
 fn mutation_fixture(index: bool) -> MutationFixture {
 	let store = Datastore::in_memory();
 	assert_query(
@@ -66,6 +74,7 @@ fn mutation_fixture(index: bool) -> MutationFixture {
 	}
 }
 
+/// Returns mutate all for this module.
 fn mutate_all(fixture: &mut MutationFixture) {
 	let mut transaction = fixture.store.begin();
 	for (ordinal, record) in fixture.records.iter().enumerate() {
@@ -76,6 +85,7 @@ fn mutate_all(fixture: &mut MutationFixture) {
 	black_box(transaction.commit().expect("mutation batch must commit"));
 }
 
+/// Measures common with the benchmark harness.
 fn benchmark_common(criterion: &mut Criterion) {
 	let return_store = Datastore::in_memory();
 	let mut query = criterion.benchmark_group("gql_stage_common/query");
@@ -91,6 +101,8 @@ fn benchmark_common(criterion: &mut Criterion) {
 	mutation.warm_up_time(Duration::from_secs(1));
 	mutation.measurement_time(Duration::from_secs(4));
 	mutation.sample_size(10);
+	// Rebuild each fixture outside timing so every mutation sample starts from
+	// the same data.
 	mutation.bench_function("no_index", |bench| {
 		bench.iter_batched_ref(|| mutation_fixture(false), mutate_all, BatchSize::LargeInput);
 	});

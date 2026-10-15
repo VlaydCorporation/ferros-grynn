@@ -48,10 +48,12 @@ fn keys() -> FerrosGrynnResult<Vec<ConflictKey>> {
 
 /// Interleaved revisions match an independent single-map oracle exactly.
 #[test]
-fn versions_match_all_conflict_namespaces_and_preserve_snapshots() -> FerrosGrynnResult<()> {
+fn versions_match_all_conflict_namespaces_and_preserve_snapshots() {
+	use crate::test_assertions::AssertResult as _;
+
 	let mut versions = Arc::new(VersionStore::default());
 	let mut oracle = BTreeMap::new();
-	let keys = keys()?;
+	let keys = keys().assert_ok();
 	for revision in 1..=3 {
 		let previous = Arc::clone(&versions);
 		let previous_oracle = oracle.clone();
@@ -74,14 +76,15 @@ fn versions_match_all_conflict_namespaces_and_preserve_snapshots() -> FerrosGryn
 		assert_eq!(versions.controls.events.len(), 2);
 		assert_eq!(versions.primary.len(), keys.len() - 5);
 	}
-	Ok(())
 }
 
 /// Independent controls and primary writes copy only their own domain.
 #[test]
-fn versions_copy_only_the_mutated_domain() -> FerrosGrynnResult<()> {
+fn versions_copy_only_the_mutated_domain() {
+	use crate::test_assertions::AssertResult as _;
+
 	let mut original = VersionStore::default();
-	for key in keys()? {
+	for key in keys().assert_ok() {
 		original.insert(key, 7);
 	}
 	let mut control = original.clone();
@@ -102,20 +105,21 @@ fn versions_copy_only_the_mutated_domain() -> FerrosGrynnResult<()> {
 	assert!(!Arc::ptr_eq(&event.controls.events, &original.controls.events));
 	assert!(!primary.same_primary(&original));
 	let mut independently_equal = VersionStore::default();
-	for key in keys()? {
+	for key in keys().assert_ok() {
 		independently_equal.insert(key, 7);
 	}
 	assert!(!Arc::ptr_eq(&independently_equal.primary, &original.primary));
 	assert!(independently_equal.same_primary(&original));
 	assert!(independently_equal.same_controls(&original));
-	Ok(())
 }
 
 /// Rebase preserves committed controls even at the provisional data stamp.
 #[test]
-fn versions_rebase_restamps_only_private_data_and_admits_both_trees() -> FerrosGrynnResult<()> {
+fn versions_rebase_restamps_only_private_data_and_admits_both_trees() {
+	use crate::test_assertions::AssertResult as _;
+
 	let mut original = VersionStore::default();
-	for key in keys()? {
+	for key in keys().assert_ok() {
 		original.insert(key, 7);
 	}
 	let mut current = original.clone();
@@ -133,44 +137,58 @@ fn versions_rebase_restamps_only_private_data_and_admits_both_trees() -> FerrosG
 	let mut control_only = original.clone();
 	control_only.rebase(&current, 10, 11, false);
 	assert!(Arc::ptr_eq(&control_only.primary, &original.primary));
-	assert!(control_only.rebase_allocation_bytes(false)? < original.rebase_allocation_bytes(true)?);
+	assert!(
+		control_only.rebase_allocation_bytes(false).assert_ok()
+			< original.rebase_allocation_bytes(true).assert_ok()
+	);
 	let width = std::mem::size_of::<(ConflictKey, u64)>();
 	assert_eq!(
-		original.allocation_bytes()?,
-		crate::values::storage::tree_allocation_bytes(original.primary.len(), width)?
-			+ crate::values::storage::tree_allocation_bytes(original.controls.live.len(), width)?
-			+ crate::values::storage::tree_allocation_bytes(original.controls.events.len(), width)?
+		original.allocation_bytes().assert_ok(),
+		crate::values::storage::tree_allocation_bytes(original.primary.len(), width).assert_ok()
+			+ crate::values::storage::tree_allocation_bytes(original.controls.live.len(), width)
+				.assert_ok()
+			+ crate::values::storage::tree_allocation_bytes(original.controls.events.len(), width)
+				.assert_ok()
 	);
-	Ok(())
 }
 
+/// Verifies versions retire only unreachable event keys and keep old snapshots.
 #[test]
-fn versions_retire_only_unreachable_event_keys_and_keep_old_snapshots() -> FerrosGrynnResult<()> {
-	use crate::datastore::{
-		EventAsyncOptions,
-		EventCause,
-		EventDefinition,
-		EventExecution,
-		EventInvocation,
-		EventOutbox,
-		EventTarget,
+fn versions_retire_only_unreachable_event_keys_and_keep_old_snapshots() {
+	use crate::{
+		datastore::{
+			EventAsyncOptions,
+			EventCause,
+			EventDefinition,
+			EventExecution,
+			EventInvocation,
+			EventOutbox,
+			EventTarget,
+		},
+		test_assertions::AssertResult as _,
 	};
-	let mut definition =
-		EventDefinition::new("a", EventTarget::Class(ClassId::from_storage(1)?), "true", "1")?
-			.with_execution(EventExecution::Async(EventAsyncOptions::default()));
-	definition.id = Some(EventId::from_storage(2)?);
+	let mut definition = EventDefinition::new(
+		"a",
+		EventTarget::Class(ClassId::from_storage(1).assert_ok()),
+		"true",
+		"1",
+	)
+	.assert_ok()
+	.with_execution(EventExecution::Async(EventAsyncOptions::default()));
+	definition.id = Some(EventId::from_storage(2).assert_ok());
 	let mut invocation = EventInvocation::queued(
 		&definition,
-		EventCause::next(None, definition.execution())?,
+		EventCause::next(None, definition.execution()).assert_ok(),
 		Arc::from([1_u8]),
 		5,
-	)?;
+	)
+	.assert_ok();
 	let kept = JobId::from_uuid(uuid::Uuid::from_u128(1).into());
 	invocation.id = kept;
 	let mut outbox = EventOutbox::default();
-	outbox.enqueue(Arc::new(invocation), 7)?;
+	outbox.enqueue(Arc::new(invocation), 7).assert_ok();
 	let mut original = VersionStore::default();
-	for key in keys()? {
+	for key in keys().assert_ok() {
 		original.insert(key, 7);
 	}
 	for index in 2..=20_000_u128 {
@@ -186,6 +204,5 @@ fn versions_retire_only_unreachable_event_keys_and_keep_old_snapshots() -> Ferro
 	assert!(Arc::ptr_eq(&current.primary, &original.primary));
 	assert!(Arc::ptr_eq(&current.controls.live, &original.controls.live));
 	assert_eq!(current.get(&ConflictKey::EventInvocation(kept)), Some(&7));
-	assert!(current.event_copy_bytes(1)? < original.event_copy_bytes(1)?);
-	Ok(())
+	assert!(current.event_copy_bytes(1).assert_ok() < original.event_copy_bytes(1).assert_ok());
 }

@@ -21,11 +21,20 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOwner {
 	/// User-visible CLASS/GRAPH source history.
-	Changefeed(ChangefeedId),
+	Changefeed(
+		/// User-visible CLASS/GRAPH source history.
+		ChangefeedId,
+	),
 	/// Private already-computed subscription history.
-	Live(LiveId),
+	Live(
+		/// Private already-computed subscription history.
+		LiveId,
+	),
 	/// Transactional invocation journal owned by the durable database UUID.
-	EventOutbox(uuid::Uuid),
+	EventOutbox(
+		/// Transactional invocation journal owned by the durable database UUID.
+		uuid::Uuid,
+	),
 }
 
 impl HistoryOwner {
@@ -445,6 +454,7 @@ fn u32_at(bytes: &[u8; PAGE_SIZE], offset: usize) -> u32 {
 }
 
 #[cfg(test)]
+/// Regression tests for pages behavior.
 mod tests {
 	use super::{
 		BODY,
@@ -459,20 +469,22 @@ mod tests {
 	};
 	use crate::{
 		changefeed::ChangefeedId,
-		gql_status::FerrosGrynnResult,
 		storage::{
 			history_codec::{CodecBudget, invalid},
 			page::{AlignedPage, PAGE_SIZE},
 		},
 	};
 
+	/// Verifies changefeed segment header golden and reserved bytes.
 	#[test]
-	fn changefeed_segment_header_golden_and_reserved_bytes() -> FerrosGrynnResult<()> {
+	fn changefeed_segment_header_golden_and_reserved_bytes() {
+		use crate::test_assertions::AssertResult as _;
+
 		let header = SegmentHeader {
 			database: uuid::Uuid::from_u128(1),
-			owner: HistoryOwner::Changefeed(ChangefeedId::from_uuid(
-				uuid::Uuid::from_u128(2).into(),
-			)?),
+			owner: HistoryOwner::Changefeed(
+				ChangefeedId::from_uuid(uuid::Uuid::from_u128(2).into()).assert_ok(),
+			),
 			segment: uuid::Uuid::from_u128(3),
 			pages: 3,
 			commits: 1,
@@ -482,8 +494,8 @@ mod tests {
 			last_time: 10,
 		};
 		let mut page = AlignedPage::zeroed();
-		encode_header(header, &mut page)?;
-		assert_eq!(decode_header(&page)?, header);
+		encode_header(header, &mut page).assert_ok();
+		assert_eq!(decode_header(&page).assert_ok(), header);
 		assert_eq!(&page.as_bytes()[BODY..BODY + 8], &[b'F', b'C', b'F', b'S', 1, 0, 0, 0]);
 		assert_eq!(&page.as_bytes()[BODY + 56..BODY + 88], &[
 			3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0,
@@ -502,9 +514,9 @@ mod tests {
 		golden[104] = 10;
 		assert_eq!(&page.as_bytes()[BODY..BODY + 120], golden);
 		for offset in [BODY + 7, BODY + 120, PAGE_SIZE - 1] {
-			encode_header(header, &mut page)?;
+			encode_header(header, &mut page).assert_ok();
 			page.as_bytes_mut()[offset] = 1;
-			page.seal()?;
+			page.seal().assert_ok();
 			assert!(decode_header(&page).is_err());
 		}
 		for bad in [
@@ -527,16 +539,17 @@ mod tests {
 		] {
 			assert!(encode_header(bad, &mut page).is_err());
 		}
-		Ok(())
 	}
 
 	/// The same UUID in distinct namespaces remains a different owner. Unknown
 	/// tags, nil owners and reserved bytes never become trusted descriptors.
 	#[test]
-	fn history_segment_owner_namespaces_are_checked() -> FerrosGrynnResult<()> {
+	fn history_segment_owner_namespaces_are_checked() {
+		use crate::test_assertions::AssertResult as _;
+
 		let identity = uuid::Uuid::from_u128(2);
-		let source = HistoryOwner::Changefeed(ChangefeedId::from_uuid(identity.into())?);
-		let live = HistoryOwner::Live(crate::live::LiveId::from_uuid(identity.into())?);
+		let source = HistoryOwner::Changefeed(ChangefeedId::from_uuid(identity.into()).assert_ok());
+		let live = HistoryOwner::Live(crate::live::LiveId::from_uuid(identity.into()).assert_ok());
 		let events = HistoryOwner::EventOutbox(identity);
 		assert_ne!(source, live);
 		assert_ne!(source, events);
@@ -553,42 +566,46 @@ mod tests {
 			last_time: 10,
 		};
 		let mut page = AlignedPage::zeroed();
-		encode_header(header, &mut page)?;
+		encode_header(header, &mut page).assert_ok();
 		assert_eq!(page.as_bytes()[BODY + 6], 1);
 		assert_eq!(page.as_bytes()[BODY + 7], 0);
-		assert_eq!(decode_header(&page)?, header);
+		assert_eq!(decode_header(&page).assert_ok(), header);
 		encode_header(
 			SegmentHeader {
 				owner: events,
 				..header
 			},
 			&mut page,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(page.as_bytes()[BODY + 6], 2);
-		assert_eq!(decode_header(&page)?.owner, events);
+		assert_eq!(decode_header(&page).assert_ok().owner, events);
 		for tag in [3, u8::MAX] {
-			encode_header(header, &mut page)?;
+			encode_header(header, &mut page).assert_ok();
 			page.as_bytes_mut()[BODY + 6] = tag;
-			page.seal()?;
+			page.seal().assert_ok();
 			assert!(decode_header(&page).is_err());
 		}
-		encode_header(header, &mut page)?;
+		encode_header(header, &mut page).assert_ok();
 		page.as_bytes_mut()[BODY + 24..BODY + 40].fill(0);
-		page.seal()?;
+		page.seal().assert_ok();
 		assert!(decode_header(&page).is_err());
-		Ok(())
 	}
 
+	/// Verifies changefeed continuations roundtrip large payload and validate
+	/// ordinals.
 	#[test]
-	fn changefeed_continuations_roundtrip_large_payload_and_validate_ordinals()
-	-> FerrosGrynnResult<()> {
+	fn changefeed_continuations_roundtrip_large_payload_and_validate_ordinals() {
+		use crate::test_assertions::AssertResult as _;
+
 		let payload = vec![0x5a; CHUNK_BYTES * 2 + 9];
 		let (locator, mut pages) = encode_pages(
 			&payload,
 			1_u64 << 54,
 			7,
-			&mut CodecBudget::new(16 * PAGE_SIZE, payload.len())?,
-		)?;
+			&mut CodecBudget::new(16 * PAGE_SIZE, payload.len()).assert_ok(),
+		)
+		.assert_ok();
 		let mut read = |number: crate::storage::page::PageNo, output: &mut AlignedPage| {
 			let page = pages
 				.get((number.get() - 7) as usize)
@@ -597,12 +614,19 @@ mod tests {
 			Ok(())
 		};
 		assert_eq!(
-			decode_pages(locator, 10, &mut read, &mut CodecBudget::new(16 * PAGE_SIZE, 0)?)?,
+			decode_pages(
+				locator,
+				10,
+				&mut read,
+				&mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok()
+			)
+			.assert_ok(),
 			payload
 		);
-		let middle = pages.get_mut(1).ok_or_else(|| invalid("fixture middle page is absent"))?;
+		let middle =
+			pages.get_mut(1).ok_or_else(|| invalid("fixture middle page is absent")).assert_ok();
 		middle.as_bytes_mut()[BODY + 24..BODY + 28].copy_from_slice(&0_u32.to_le_bytes());
-		middle.seal()?;
+		middle.seal().assert_ok();
 		let mut read = |number: crate::storage::page::PageNo, output: &mut AlignedPage| {
 			let page = pages
 				.get((number.get() - 7) as usize)
@@ -611,15 +635,22 @@ mod tests {
 			Ok(())
 		};
 		assert!(
-			decode_pages(locator, 10, &mut read, &mut CodecBudget::new(16 * PAGE_SIZE, 0)?)
-				.is_err()
+			decode_pages(
+				locator,
+				10,
+				&mut read,
+				&mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok()
+			)
+			.is_err()
 		);
-		Ok(())
 	}
 
+	/// Verifies changefeed continuations reject untrusted lengths and budgets
+	/// before read.
 	#[test]
-	fn changefeed_continuations_reject_untrusted_lengths_and_budgets_before_read()
-	-> FerrosGrynnResult<()> {
+	fn changefeed_continuations_reject_untrusted_lengths_and_budgets_before_read() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut reads = 0;
 		let mut read = |_number, _page: &mut AlignedPage| {
 			reads += 1;
@@ -650,22 +681,35 @@ mod tests {
 			},
 		] {
 			assert!(
-				decode_pages(bad, 2, &mut read, &mut CodecBudget::new(4 * PAGE_SIZE, 0)?).is_err()
+				decode_pages(
+					bad,
+					2,
+					&mut read,
+					&mut CodecBudget::new(4 * PAGE_SIZE, 0).assert_ok()
+				)
+				.is_err()
 			);
 		}
-		assert!(decode_pages(locator, 2, &mut read, &mut CodecBudget::new(1, 0)?).is_err());
+		assert!(
+			decode_pages(locator, 2, &mut read, &mut CodecBudget::new(1, 0).assert_ok()).is_err()
+		);
 		assert_eq!(reads, 0);
-		assert!(encode_pages(&[1], 1, 1, &mut CodecBudget::new(PAGE_SIZE - 1, 0)?).is_err());
-		Ok(())
+		assert!(
+			encode_pages(&[1], 1, 1, &mut CodecBudget::new(PAGE_SIZE - 1, 0).assert_ok()).is_err()
+		);
 	}
 
+	/// Verifies changefeed continuation golden boundaries and resealed
+	/// corruption.
 	#[test]
-	fn changefeed_continuation_golden_boundaries_and_resealed_corruption() -> FerrosGrynnResult<()>
-	{
+	fn changefeed_continuation_golden_boundaries_and_resealed_corruption() {
+		use crate::test_assertions::AssertResult as _;
+
 		for length in [1, CHUNK_BYTES, CHUNK_BYTES + 1] {
 			let payload = vec![0xa5; length];
 			let (locator, mut pages) =
-				encode_pages(&payload, 9, 1, &mut CodecBudget::new(16 * PAGE_SIZE, 0)?)?;
+				encode_pages(&payload, 9, 1, &mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok())
+					.assert_ok();
 			let mut golden = [0_u8; 48];
 			golden[..8].copy_from_slice(b"FCFE\x01\0\0\0");
 			golden[8] = 9;
@@ -685,8 +729,9 @@ mod tests {
 					locator,
 					1 + u64::from(locator.pages),
 					&mut read,
-					&mut CodecBudget::new(16 * PAGE_SIZE, 0)?
-				)?,
+					&mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok()
+				)
+				.assert_ok(),
 				payload
 			);
 			assert!(
@@ -694,7 +739,7 @@ mod tests {
 					locator,
 					u64::from(locator.pages),
 					&mut read,
-					&mut CodecBudget::new(16 * PAGE_SIZE, 0)?
+					&mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok()
 				)
 				.is_err()
 			);
@@ -703,7 +748,7 @@ mod tests {
 			{
 				let original = pages[0].as_bytes()[offset];
 				pages[0].as_bytes_mut()[offset] ^= 1;
-				pages[0].seal()?;
+				pages[0].seal().assert_ok();
 				let mut read = |number: crate::storage::page::PageNo, output: &mut AlignedPage| {
 					output
 						.as_bytes_mut()
@@ -715,18 +760,20 @@ mod tests {
 						locator,
 						1 + u64::from(locator.pages),
 						&mut read,
-						&mut CodecBudget::new(16 * PAGE_SIZE, 0)?
+						&mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok()
 					)
 					.is_err()
 				);
 				pages[0].as_bytes_mut()[offset] = original;
-				pages[0].seal()?;
+				pages[0].seal().assert_ok();
 			}
 			if length % CHUNK_BYTES != 0 {
-				let last =
-					pages.last_mut().ok_or_else(|| invalid("fixture continuation is absent"))?;
+				let last = pages
+					.last_mut()
+					.ok_or_else(|| invalid("fixture continuation is absent"))
+					.assert_ok();
 				last.as_bytes_mut()[PAGE_SIZE - 1] = 1;
-				last.seal()?;
+				last.seal().assert_ok();
 				let mut read = |number: crate::storage::page::PageNo, output: &mut AlignedPage| {
 					output
 						.as_bytes_mut()
@@ -738,13 +785,12 @@ mod tests {
 						locator,
 						1 + u64::from(locator.pages),
 						&mut read,
-						&mut CodecBudget::new(16 * PAGE_SIZE, 0)?
+						&mut CodecBudget::new(16 * PAGE_SIZE, 0).assert_ok()
 					)
 					.is_err()
 				);
 			}
 		}
-		assert!(encode_pages(&[], 1, 1, &mut CodecBudget::new(PAGE_SIZE, 0)?).is_err());
-		Ok(())
+		assert!(encode_pages(&[], 1, 1, &mut CodecBudget::new(PAGE_SIZE, 0).assert_ok()).is_err());
 	}
 }

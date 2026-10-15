@@ -28,9 +28,12 @@ use crate::{
 };
 
 /// Concrete evaluator reused while one immutable root is encoded.
-pub(crate) struct PureFunctionEvaluator<'a> {
+pub struct PureFunctionEvaluator<'a> {
+	/// Catalog associated with this pure function evaluator.
 	catalog: RootCatalog<'a>,
+	/// Cache associated with this pure function evaluator.
 	cache: Arc<LanguageClosureState>,
+	/// Control associated with this pure function evaluator.
 	control: ExecutionControl,
 }
 
@@ -286,6 +289,7 @@ impl<'a> PureFunctionEvaluator<'a> {
 			&& matches!(function.result(), Type::Int | Type::Float | Type::Decimal | Type::Number)
 	}
 
+	/// Returns the invoke result.
 	fn invoke(
 		&self,
 		id: FunctionId,
@@ -352,37 +356,42 @@ impl<'a> PureFunctionEvaluator<'a> {
 }
 
 #[cfg(test)]
+/// Regression tests for pure function behavior.
 mod tests {
 	use std::cell::Cell;
 
 	use super::*;
 	use crate::{
 		datastore::SchemaFunctionParameter,
+		test_assertions::AssertOption as _,
 		values::{Text, Type},
 	};
 
+	/// Verifies pure block function runs without query read.
 	#[test]
-	fn pure_block_function_runs_without_query_read() -> FerrosGrynnResult<()> {
+	fn pure_block_function_runs_without_query_read() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut root = DatabaseRoot::default();
-		let id = FunctionId::new(1).expect("non-zero function id");
+		let id = FunctionId::new(1).assert_some_with("non-zero function id");
 		let mut function = SchemaFunction::new(
 			Text::from("fn"),
 			Text::from("double"),
-			vec![SchemaFunctionParameter::new(Text::from("value"), Type::Int)?],
+			vec![SchemaFunctionParameter::new(Text::from("value"), Type::Int).assert_ok()],
 			Type::Int,
 			FunctionEffect::Pure,
 			false,
 			None,
 			Text::from("{ LET $next = $value * 2; RETURN $next; }"),
-		)?;
+		)
+		.assert_ok();
 		function.id = Some(id);
 		Arc::make_mut(&mut root.schema).functions.insert(id, Arc::new(function));
 		let evaluator = PureFunctionEvaluator::new(&root);
 		assert_eq!(
-			evaluator.invoke(id, SchemaVersion::INITIAL, &[Value::from(21_i64)])?,
+			evaluator.invoke(id, SchemaVersion::INITIAL, &[Value::from(21_i64)]).assert_ok(),
 			Value::from(42_i64)
 		);
-		Ok(())
 	}
 
 	thread_local! {
@@ -403,44 +412,52 @@ mod tests {
 		})
 	}
 
+	/// Verifies pure builder admits compilers frames and cancels inside calls.
 	#[test]
-	fn pure_builder_admits_compilers_frames_and_cancels_inside_calls() -> FerrosGrynnResult<()> {
+	fn pure_builder_admits_compilers_frames_and_cancels_inside_calls() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut root = DatabaseRoot::default();
-		let id = FunctionId::new(1).ok_or_else(|| FerrosGrynnError::invalid_argument("test id"))?;
+		let id = FunctionId::new(1)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("test id"))
+			.assert_ok();
 		let mut function = SchemaFunction::new(
 			"fn",
 			"iterate",
-			vec![SchemaFunctionParameter::new("value", Type::Any)?],
+			vec![SchemaFunctionParameter::new("value", Type::Any).assert_ok()],
 			Type::Int,
 			FunctionEffect::Pure,
 			true,
 			None,
 			"{ FOR $i IN 0..1000000 { LET $copy = $i; }; RETURN 1; }",
-		)?;
+		)
+		.assert_ok();
 		function.id = Some(id);
 		Arc::make_mut(&mut root.schema).functions.insert(id, Arc::new(function));
 		let version = SchemaVersion::INITIAL;
-		let evaluator = PureFunctionEvaluator::for_builder(&root, 64, || Ok(()))?;
+		let evaluator = PureFunctionEvaluator::for_builder(&root, 64, || Ok(())).assert_ok();
 		assert!(evaluator.dependencies(id, version).is_err());
 		BUILDER_CHECKS.set(0);
-		let evaluator = PureFunctionEvaluator::for_builder(&root, 2 << 20, cancel_during_function)?;
+		let evaluator =
+			PureFunctionEvaluator::for_builder(&root, 2 << 20, cancel_during_function).assert_ok();
 		let error = evaluator
 			.invoke(id, version, &[Value::None])
 			.err()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("loop did not cancel"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("loop did not cancel"))
+			.assert_ok();
 		assert_eq!(error.status().code(), FerrosGrynnError::query_cancelled().status().code());
 		assert_eq!(BUILDER_CHECKS.get(), 129);
 		assert_eq!(evaluator.control.barrier_memory_available(), 1 << 20);
 		BUILDER_CHECKS.set(0);
-		evaluator.dependencies(id, version)?;
-		let evaluator = PureFunctionEvaluator::for_builder(&root, 2 << 20, || Ok(()))?;
+		evaluator.dependencies(id, version).assert_ok();
+		let evaluator = PureFunctionEvaluator::for_builder(&root, 2 << 20, || Ok(())).assert_ok();
 		let oversized = Value::from("x".repeat(2 << 20));
 		let error = evaluator
 			.invoke(id, version, &[oversized])
 			.err()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("frame was not rejected"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("frame was not rejected"))
+			.assert_ok();
 		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
 		assert_eq!(evaluator.control.barrier_memory_available(), 1 << 20);
-		Ok(())
 	}
 }

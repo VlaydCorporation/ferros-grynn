@@ -98,6 +98,7 @@ pub(super) fn reverse_key(global: GlobalAtomId, graph: GraphId) -> Vec<u8> {
 	key
 }
 
+/// Returns the disk ref result.
 fn disk_ref(id: crate::graph::AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	let kind = id
 		.kind()
@@ -111,17 +112,24 @@ fn disk_ref(id: crate::graph::AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 }
 
 #[cfg(test)]
+/// Regression tests for membership index behavior.
 mod tests {
 	use super::*;
 	use crate::graph::{AtomId, AtomKind};
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 
+	/// Verifies reverse key groups graphs under full generation aware global
+	/// id.
 	#[test]
-	fn reverse_key_groups_graphs_under_full_generation_aware_global_id() -> FerrosGrynnResult<()> {
-		let global = GlobalAtomId::from_raw(AtomId::from_parts(AtomKind::Node, 8, 3)?.raw());
-		let first = reverse_key(global, GraphId::new(2).unwrap());
-		let second = reverse_key(global, GraphId::new(9).unwrap());
+	fn reverse_key_groups_graphs_under_full_generation_aware_global_id() {
+		use crate::test_assertions::AssertResult as _;
+
+		let global =
+			GlobalAtomId::from_raw(AtomId::from_parts(AtomKind::Node, 8, 3).assert_ok().raw());
+		let first = reverse_key(global, GraphId::new(2).assert_some());
+		let second = reverse_key(global, GraphId::new(9).assert_some());
 		assert_eq!(&first[..8], &global.raw().to_be_bytes());
 		assert!(first < second);
-		Ok(())
 	}
 }

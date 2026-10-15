@@ -1,13 +1,19 @@
+#![cfg(test)]
 #![allow(
 	clippy::expect_used,
 	clippy::unwrap_used,
 	reason = "integration tests fail immediately when public datastore operations return an error"
 )]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 #[cfg(all(test, windows))]
+/// Assertions shared by integration-test targets regression tests.
 mod common;
 
 #[cfg(all(test, windows))]
+/// Regression tests for local datastore behavior.
 mod tests {
 	use std::{
 		fs::OpenOptions,
@@ -49,9 +55,13 @@ mod tests {
 		create_uncommitted_graph,
 		exercise_normalized_atom_model,
 	};
+	use crate::test_assertions::AssertOption as _;
 
 	/// Unique database directory removed after a local integration test.
-	struct LocalTestDirectory(PathBuf);
+	struct LocalTestDirectory(
+		/// Unique database directory removed after a local integration test.
+		PathBuf,
+	);
 
 	impl LocalTestDirectory {
 		/// Reserves a unique path without creating it before `create_local`.
@@ -69,6 +79,8 @@ mod tests {
 	}
 
 	impl Drop for LocalTestDirectory {
+		/// Runs cleanup for this `LocalTestDirectory` before its fields are
+		/// released.
 		fn drop(&mut self) {
 			drop(std::fs::remove_dir_all(&self.0));
 		}
@@ -81,6 +93,7 @@ mod tests {
 		options
 	}
 
+	/// Verifies commit survives close and reopen.
 	#[test]
 	fn commit_survives_close_and_reopen() {
 		let directory = LocalTestDirectory::new();
@@ -95,6 +108,7 @@ mod tests {
 		assert_people_graph(&reopened, &reference, &alice, name);
 	}
 
+	/// Verifies dropped transaction is not recovered.
 	#[test]
 	fn dropped_transaction_is_not_recovered() {
 		let directory = LocalTestDirectory::new();
@@ -108,6 +122,7 @@ mod tests {
 		assert!(GraphRef::read(&reference, &reopened.begin()).is_err());
 	}
 
+	/// Verifies normalized atom model survives restart checkpoint and reopen.
 	#[test]
 	fn normalized_atom_model_survives_restart_checkpoint_and_reopen() {
 		let directory = LocalTestDirectory::new();
@@ -121,6 +136,7 @@ mod tests {
 		assert_people_graph_atom(&reopened, &remaining_graph, &alice, name);
 	}
 
+	/// Verifies standard and nested match survive reopen.
 	#[test]
 	fn standard_and_nested_match_survive_reopen() {
 		let directory = LocalTestDirectory::new();
@@ -207,6 +223,7 @@ mod tests {
 		assert_eq!(observe(&reopened, levelpath), expected_levelpath);
 	}
 
+	/// Verifies atomic import generation survives reopen without checkpoint.
 	#[test]
 	fn atomic_import_generation_survives_reopen_without_checkpoint() {
 		let directory = LocalTestDirectory::new();
@@ -238,6 +255,7 @@ mod tests {
 		assert!(read.membership(graph.id(), &bob).unwrap().is_some());
 	}
 
+	/// Verifies gql transaction and control state survive reopen.
 	#[test]
 	fn gql_transaction_and_control_state_survive_reopen() {
 		let directory = LocalTestDirectory::new();
@@ -271,9 +289,11 @@ mod tests {
 		let reopened = Datastore::open_local(directory.path(), options).unwrap();
 		let rows =
 			reopened.execute("SELECT VALUE version FROM person:alice;", &Object::new()).unwrap();
-		let Value::Array(values) = rows[0].result.as_ref().unwrap().value() else {
-			panic!("SELECT VALUE must return an array");
-		};
+		let values = match rows[0].result.as_ref().unwrap().value() {
+			Value::Array(values) => Some(values),
+			_ => None,
+		}
+		.assert_some_with("SELECT VALUE must return an array");
 		assert_eq!(values.as_slice(), &[Value::from(1_i64)]);
 		assert_eq!(
 			reopened.execute("FOR $x IN 1..=3 { $x * 2; };", &Object::new()).unwrap()[0]
@@ -285,8 +305,10 @@ mod tests {
 		);
 	}
 
+	/// Verifies optimizer plan and deterministic result survive reopen.
 	#[test]
 	fn optimizer_plan_and_deterministic_result_survive_reopen() {
+		/// Returns observe for this module.
 		fn observe(store: &Datastore) -> (Value, Value) {
 			let mut session = store.session();
 			session
@@ -318,9 +340,11 @@ mod tests {
 				.unwrap()
 				.into_parts()
 				.0;
-			let Value::Object(explain) = explain else {
-				panic!("EXPLAIN JSON must return an object");
-			};
+			let explain = match explain {
+				Value::Object(explain) => Some(explain),
+				_ => None,
+			}
+			.assert_some_with("EXPLAIN JSON must return an object");
 			let hash = explain.get("plan_hash").cloned().unwrap();
 			session.execute("CANCEL;", &Object::new()).unwrap();
 			(result, hash)
@@ -345,6 +369,7 @@ mod tests {
 		assert_eq!(observe(&reopened), before);
 	}
 
+	/// Verifies atomic import streams every index family and reopens.
 	#[test]
 	fn atomic_import_streams_every_index_family_and_reopens() {
 		let directory = LocalTestDirectory::new();
@@ -426,9 +451,11 @@ mod tests {
 				&Object::new(),
 			)
 			.unwrap();
-		let Value::Object(report) = results[0].result.as_ref().unwrap().value() else {
-			panic!("import must return a structured report");
-		};
+		let report = match results[0].result.as_ref().unwrap().value() {
+			Value::Object(report) => Some(report),
+			_ => None,
+		}
+		.assert_some_with("import must return a structured report");
 		let timings = report
 			.get("index_timings_ns")
 			.and_then(Value::as_object)
@@ -525,6 +552,7 @@ mod tests {
 		);
 	}
 
+	/// Verifies atomic import all dml matches ram before and after reopen.
 	#[test]
 	fn atomic_import_all_dml_matches_ram_before_and_after_reopen() {
 		let memory = Datastore::in_memory();
@@ -544,6 +572,7 @@ mod tests {
 		assert_eq!(observe_all_dml_import(&reopened, local_graph.id()), expected);
 	}
 
+	/// Verifies import segments do not stream items into the wal.
 	#[test]
 	fn import_segments_do_not_stream_items_into_the_wal() {
 		let run = |items: u64| {
@@ -584,6 +613,7 @@ mod tests {
 		assert_eq!(many_wal, single_wal);
 	}
 
+	/// Verifies statistics auxiliary files are not read during open.
 	#[test]
 	fn statistics_auxiliary_files_are_not_read_during_open() {
 		let directory = LocalTestDirectory::new();
@@ -612,6 +642,7 @@ mod tests {
 		assert!(reopened.begin().atom(&carol).unwrap().is_none());
 	}
 
+	/// Verifies startup removes stale import sort sessions.
 	#[test]
 	fn startup_removes_stale_import_sort_sessions() {
 		let directory = LocalTestDirectory::new();
@@ -627,6 +658,7 @@ mod tests {
 		drop(reopened);
 	}
 
+	/// Verifies corrupted import primary is rejected on reopen.
 	#[test]
 	fn corrupted_import_primary_is_rejected_on_reopen() {
 		let directory = LocalTestDirectory::new();
@@ -650,6 +682,7 @@ mod tests {
 		assert!(Datastore::open_local(directory.path(), options).is_err());
 	}
 
+	/// Verifies named build graph survives reopen.
 	#[test]
 	fn named_build_graph_survives_reopen() {
 		let directory = LocalTestDirectory::new();
@@ -700,6 +733,8 @@ mod tests {
 		));
 	}
 
+	/// Verifies named build shared child reopens and is replaced and removed
+	/// atomically.
 	#[test]
 	fn named_build_shared_child_reopens_and_is_replaced_and_removed_atomically() {
 		let directory = LocalTestDirectory::new();
@@ -783,6 +818,7 @@ mod tests {
 		assert!(replacement_child.read(&verify).is_err());
 	}
 
+	/// Verifies native async normalized model survives reopen.
 	#[cfg(feature = "native-async-io")]
 	#[test]
 	fn native_async_normalized_model_survives_reopen() {
@@ -797,6 +833,7 @@ mod tests {
 		assert_people_graph_atom(&reopened, &remaining_graph, &alice, name);
 	}
 
+	/// Returns assert people graph atom for this module.
 	fn assert_people_graph_atom(
 		store: &Datastore,
 		graph: &GraphRef,
@@ -811,6 +848,7 @@ mod tests {
 		);
 	}
 
+	/// Prepares all dml import for this module.
 	fn prepare_all_dml_import(store: &Datastore) -> GraphRef {
 		let mut schema = store.begin();
 		schema.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
@@ -820,6 +858,7 @@ mod tests {
 		graph
 	}
 
+	/// Returns run all dml import for this module.
 	fn run_all_dml_import(store: &Datastore) {
 		let results = store
 			.execute(
@@ -835,6 +874,7 @@ mod tests {
 		assert!(results[0].result.is_ok());
 	}
 
+	/// Returns observe all dml import for this module.
 	fn observe_all_dml_import(
 		store: &Datastore,
 		graph: ferros_grynn::graph::GraphId,
@@ -851,10 +891,12 @@ mod tests {
 			.collect()
 	}
 
+	/// Finds file for this module.
 	fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 		find_files(root, name).into_iter().next()
 	}
 
+	/// Returns corrupt byte for this module.
 	fn corrupt_byte(path: &Path, offset: u64) {
 		let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
 		let mut byte = [0_u8; 1];
@@ -866,14 +908,17 @@ mod tests {
 		file.sync_all().unwrap();
 	}
 
+	/// Finds files for this module.
 	fn find_files(root: &Path, name: &str) -> Vec<PathBuf> {
 		find_matching_files(root, |candidate| candidate == name)
 	}
 
+	/// Finds files starting with for this module.
 	fn find_files_starting_with(root: &Path, prefix: &str) -> Vec<PathBuf> {
 		find_matching_files(root, |candidate| candidate.starts_with(prefix))
 	}
 
+	/// Finds matching files for this module.
 	fn find_matching_files(root: &Path, mut matches: impl FnMut(&str) -> bool) -> Vec<PathBuf> {
 		let mut directories = vec![root.to_path_buf()];
 		let mut matches_paths = Vec::new();
@@ -897,6 +942,7 @@ mod tests {
 		matches_paths
 	}
 
+	/// Returns directory bytes for this module.
 	fn directory_bytes(root: &Path) -> u64 {
 		let mut total = 0_u64;
 		let mut directories = vec![root.to_path_buf()];

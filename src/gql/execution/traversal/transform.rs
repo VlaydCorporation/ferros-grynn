@@ -5,6 +5,7 @@ use std::num::NonZeroU64;
 use super::*;
 
 impl<Read: QueryRead> TraversalMachine<'_, Read> {
+	/// Applies stream for `TraversalMachine<'_, Read>`.
 	pub(super) fn apply_stream(
 		&mut self,
 		stage: usize,
@@ -260,6 +261,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		}
 	}
 
+	/// Matches child for `TraversalMachine<'_, Read>`.
 	fn match_child(
 		&self,
 		step: &PreparedStep,
@@ -305,6 +307,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(output)
 	}
 
+	/// Returns invoke argument for `TraversalMachine<'_, Read>`.
 	pub(super) fn invoke_argument(
 		&mut self,
 		step: &PreparedStep,
@@ -315,6 +318,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		self.invoke(closure_argument(step, position)?, arguments, allow_mutation)
 	}
 
+	/// Returns invoke for `TraversalMachine<'_, Read>`.
 	fn invoke(
 		&mut self,
 		closure: &Closure,
@@ -343,6 +347,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(value)
 	}
 
+	/// Returns limit for `TraversalMachine<'_, Read>`.
 	fn limit(
 		&mut self,
 		stage: usize,
@@ -362,6 +367,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(vec![traverser])
 	}
 
+	/// Returns skip for `TraversalMachine<'_, Read>`.
 	fn skip(
 		&mut self,
 		stage: usize,
@@ -379,6 +385,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(vec![traverser])
 	}
 
+	/// Returns repeat for `TraversalMachine<'_, Read>`.
 	fn repeat(
 		&mut self,
 		step: &PreparedStep,
@@ -453,6 +460,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(emitted)
 	}
 
+	/// Returns branch for `TraversalMachine<'_, Read>`.
 	fn branch(
 		&mut self,
 		step: &PreparedStep,
@@ -474,6 +482,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(output)
 	}
 
+	/// Returns choose for `TraversalMachine<'_, Read>`.
 	fn choose(
 		&mut self,
 		step: &PreparedStep,
@@ -506,6 +515,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(output)
 	}
 
+	/// Returns coalesce for `TraversalMachine<'_, Read>`.
 	fn coalesce(
 		&mut self,
 		step: &PreparedStep,
@@ -538,6 +548,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	}
 }
 
+/// Reserves traverser for this module.
 fn reserve_traverser(
 	account: &mut BarrierAccount,
 	traverser: &Traverser,
@@ -554,6 +565,7 @@ fn reserve_traverser(
 	}
 }
 
+/// Returns string argument for this module.
 fn string_argument(step: &PreparedStep, position: usize) -> FerrosGrynnResult<&str> {
 	step.arguments.get(position).and_then(Value::as_str).ok_or_else(|| {
 		FerrosGrynnError::traversal_source_type_mismatch(
@@ -565,6 +577,7 @@ fn string_argument(step: &PreparedStep, position: usize) -> FerrosGrynnResult<&s
 	})
 }
 
+/// Returns closure argument for this module.
 fn closure_argument(step: &PreparedStep, position: usize) -> FerrosGrynnResult<&Closure> {
 	step.arguments.get(position).map_or_else(
 		|| {
@@ -577,6 +590,7 @@ fn closure_argument(step: &PreparedStep, position: usize) -> FerrosGrynnResult<&
 	)
 }
 
+/// Returns value closure for this module.
 fn value_closure(value: &Value) -> FerrosGrynnResult<&Closure> {
 	let Value::Closure(closure) = value else {
 		return Err(FerrosGrynnError::traversal_source_type_mismatch(
@@ -587,6 +601,7 @@ fn value_closure(value: &Value) -> FerrosGrynnResult<&Closure> {
 	Ok(closure)
 }
 
+/// Returns expand algorithm value for this module.
 fn expand_algorithm_value(value: Value) -> FerrosGrynnResult<Vec<Value>> {
 	match value {
 		Value::Array(values) => Ok(values.into_iter().collect()),
@@ -597,6 +612,7 @@ fn expand_algorithm_value(value: Value) -> FerrosGrynnResult<Vec<Value>> {
 	}
 }
 
+/// Returns collection or one for this module.
 fn collection_or_one(value: Value) -> FerrosGrynnResult<Vec<Value>> {
 	match value {
 		Value::Array(values) => Ok(values.into_iter().collect()),

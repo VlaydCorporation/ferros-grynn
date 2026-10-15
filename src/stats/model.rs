@@ -9,6 +9,7 @@ use crate::{
 
 /// Base atoms or the effective view of one graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum StatisticsScope {
 	/// Database-global base values.
 	Base,
@@ -21,6 +22,7 @@ pub enum StatisticsScope {
 
 /// Runtime key for one graph-local label statistic.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub struct LabelStatisticKey {
 	/// Node or edge label namespace.
 	pub kind: AtomKind,
@@ -30,6 +32,7 @@ pub struct LabelStatisticKey {
 
 /// Exact cardinality and effective-property total of one graph label.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LabelStatistic {
 	/// Exact number of labeled occurrences.
 	pub atom_count: u64,
@@ -40,6 +43,7 @@ pub struct LabelStatistic {
 /// Direction represented by one degree histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum DegreeDirection {
 	/// Outgoing directed incidence.
 	Out = 0,
@@ -63,6 +67,7 @@ impl DegreeDirection {
 
 /// Global or per-node-label degree distribution identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub struct DegreeHistogramKey {
 	/// `None` addresses the whole graph.
 	pub label: Option<LabelStatisticKey>,
@@ -72,6 +77,7 @@ pub struct DegreeHistogramKey {
 
 /// One exact range in an equi-depth degree histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DegreeBucket {
 	/// Inclusive lower degree.
 	pub minimum: u32,
@@ -83,6 +89,7 @@ pub struct DegreeBucket {
 
 /// Bounded equi-depth degree distribution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DegreeHistogram {
 	/// Ordered non-empty buckets.
 	pub buckets: Vec<DegreeBucket>,
@@ -90,6 +97,7 @@ pub struct DegreeHistogram {
 
 /// Stable identity of one property distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub struct PropertyHistogramKey {
 	/// Owning class.
 	pub class_id: ClassId,
@@ -101,6 +109,7 @@ pub struct PropertyHistogramKey {
 
 /// One exact range over canonical order-preserving value bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PropertyBucket {
 	/// Inclusive lower value.
 	pub lower: Vec<u8>,
@@ -115,6 +124,7 @@ pub struct PropertyBucket {
 /// Algorithm used to build one property histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum HistogramMethod {
 	/// Full exact scan.
 	Exact = 0,
@@ -135,6 +145,7 @@ impl HistogramMethod {
 
 /// Property distribution for one class field and scope.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PropertyHistogram {
 	/// Format-v1 storage type tag.
 	pub type_tag: u8,
@@ -155,6 +166,7 @@ pub struct PropertyHistogram {
 }
 
 /// Resolved schema field eligible for histogram collection.
+#[non_exhaustive]
 pub struct StatisticField<'field> {
 	/// Owning class.
 	pub class_id: ClassId,
@@ -168,6 +180,7 @@ pub struct StatisticField<'field> {
 
 /// Database-global exact counters and Base histograms.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct BaseStatistics {
 	/// Database revision represented by exact counters.
 	pub revision: u64,
@@ -183,6 +196,10 @@ pub struct BaseStatistics {
 
 impl BaseStatistics {
 	/// Marks bulk distributions stale after a committed base-row change.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn mark_dirty(&mut self, changed_rows: u64, revision: u64) -> FerrosGrynnResult<()> {
 		self.dirty_rows = checked_add(self.dirty_rows, changed_rows, "base dirty-row count")?;
 		self.revision = revision;
@@ -192,6 +209,7 @@ impl BaseStatistics {
 
 /// Exact counters and bulk distributions for one graph revision.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct GraphStatistics {
 	/// Graph revision represented by exact counters.
 	pub revision: u64,
@@ -235,6 +253,10 @@ impl GraphStatistics {
 	}
 
 	/// Marks bulk distributions stale after committed graph-local work.
+	///
+	/// # Errors
+	///
+	/// Propagates errors returned by the underlying operation.
 	pub fn mark_dirty(&mut self, changed_rows: u64, revision: u64) -> FerrosGrynnResult<()> {
 		self.dirty_rows = checked_add(self.dirty_rows, changed_rows, "graph dirty-row count")?;
 		self.revision = revision;
@@ -242,6 +264,7 @@ impl GraphStatistics {
 	}
 }
 
+/// Returns the average result.
 fn average(total: u64, count: u64) -> f64 {
 	if count == 0 {
 		0.0
@@ -250,6 +273,7 @@ fn average(total: u64, count: u64) -> f64 {
 	}
 }
 
+/// Returns the checked add result.
 fn checked_add(left: u64, right: u64, name: &str) -> FerrosGrynnResult<u64> {
 	left.checked_add(right).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file(format!("statistics {name} overflows u64"))

@@ -13,7 +13,7 @@ use super::{
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 /// Validates every orthogonal topology constraint against one immutable graph.
-pub(crate) fn validate_topology_constraints<Reader: GraphRead>(
+pub fn validate_topology_constraints<Reader: GraphRead>(
 	graph: &Reader,
 	constraints: GraphTopologyConstraints,
 ) -> FerrosGrynnResult<()> {
@@ -68,6 +68,7 @@ pub(crate) fn validate_topology_constraints<Reader: GraphRead>(
 	Ok(())
 }
 
+/// Validates bipartite.
 fn validate_bipartite(adjacency: &BTreeMap<AtomId, Vec<AtomId>>) -> FerrosGrynnResult<()> {
 	let mut colors = BTreeMap::<AtomId, bool>::new();
 	for start in adjacency.keys().copied() {
@@ -95,6 +96,7 @@ fn validate_bipartite(adjacency: &BTreeMap<AtomId, Vec<AtomId>>) -> FerrosGrynnR
 	Ok(())
 }
 
+/// Returns the ordered pair result.
 fn ordered_pair(left: AtomId, right: AtomId) -> (AtomId, AtomId) {
 	if left <= right {
 		(left, right)
@@ -103,27 +105,32 @@ fn ordered_pair(left: AtomId, right: AtomId) -> (AtomId, AtomId) {
 	}
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::graph_constraint_violation("graph topology", reason.into())
 }
 
 #[cfg(test)]
+/// Regression tests for validate behavior.
 mod tests {
 	use super::validate_topology_constraints;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::{
 		graph::{EdgeTopology, Graph, GraphTopologyConstraint, GraphTopologyConstraints, Mutable},
 		values::PropertyMap,
 	};
 
+	/// Verifies rejects an odd cycle for bipartite contract.
 	#[test]
 	fn rejects_an_odd_cycle_for_bipartite_contract() {
 		let mut graph = Graph::<Mutable>::new();
-		let a = graph.add_node(None, PropertyMap::new()).unwrap();
-		let b = graph.add_node(None, PropertyMap::new()).unwrap();
-		let c = graph.add_node(None, PropertyMap::new()).unwrap();
-		graph.add_edge(EdgeTopology::undirected([a, b]), None, PropertyMap::new()).unwrap();
-		graph.add_edge(EdgeTopology::undirected([b, c]), None, PropertyMap::new()).unwrap();
-		graph.add_edge(EdgeTopology::undirected([c, a]), None, PropertyMap::new()).unwrap();
+		let a = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let b = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let c = graph.add_node(None, PropertyMap::new()).assert_ok();
+		graph.add_edge(EdgeTopology::undirected([a, b]), None, PropertyMap::new()).assert_ok();
+		graph.add_edge(EdgeTopology::undirected([b, c]), None, PropertyMap::new()).assert_ok();
+		graph.add_edge(EdgeTopology::undirected([c, a]), None, PropertyMap::new()).assert_ok();
 		let mut constraints = GraphTopologyConstraints::empty();
 		constraints.insert(GraphTopologyConstraint::Bipartite);
 		assert!(validate_topology_constraints(&graph, constraints).is_err());

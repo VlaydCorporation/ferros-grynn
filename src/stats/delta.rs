@@ -2,18 +2,20 @@
 
 use super::{LabelStatisticKey, StatisticsStore};
 use crate::{
-	datastore::{BaseAtom, ClassId, GraphOccurrence, OccurrenceState},
+	datastore::{BaseAtom, ClassId, GraphOccurrence, OccurrenceStateRef},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomKind, EdgeTopology, GraphId},
 	values::{PropertyKeyId, PropertyMap},
 };
 
 impl StatisticsStore {
+	/// Inserts base.
 	pub(crate) fn insert_base(&mut self, class: ClassId) -> FerrosGrynnResult<()> {
 		increment(self.base_mut().classes.entry(class).or_default(), 1, "base class count")?;
 		self.mark_base_dirty(1)
 	}
 
+	/// Removes base.
 	pub(crate) fn remove_base(&mut self, class: ClassId) -> FerrosGrynnResult<()> {
 		decrement(
 			self.base_mut()
@@ -26,6 +28,7 @@ impl StatisticsStore {
 		self.mark_base_dirty(1)
 	}
 
+	/// Replaces base property.
 	pub(crate) fn replace_base_property(
 		&mut self,
 		before: &BaseAtom,
@@ -56,34 +59,7 @@ impl StatisticsStore {
 		Ok(())
 	}
 
-	pub(crate) fn insert_occurrence(
-		&mut self,
-		graph: GraphId,
-		atom: &BaseAtom,
-		occurrence: &GraphOccurrence,
-	) -> FerrosGrynnResult<()> {
-		let property_count =
-			u64::try_from(effective_property_count(atom.properties(), occurrence)?)
-				.map_err(|_error| invalid("effective property count exceeds u64"))?;
-		let topology = match occurrence.state() {
-			OccurrenceState::Node {
-				..
-			} => None,
-			OccurrenceState::Edge {
-				topology,
-				..
-			} => Some(topology),
-		};
-		self.insert_occurrence_parts(
-			graph,
-			atom.class_id(),
-			atom.kind(),
-			occurrence.label(),
-			topology,
-			property_count,
-		)
-	}
-
+	/// Inserts fresh occurrence.
 	pub(crate) fn insert_fresh_occurrence(
 		&mut self,
 		graph: GraphId,
@@ -103,6 +79,7 @@ impl StatisticsStore {
 		)
 	}
 
+	/// Inserts occurrence parts.
 	fn insert_occurrence_parts(
 		&mut self,
 		graph: GraphId,
@@ -127,6 +104,8 @@ impl StatisticsStore {
 					undirected,
 					"total undirected degree",
 				)?;
+				// Point deltas keep a conservative upper bound; ANALYZE
+				// rebuilds the exact maximum.
 				statistics.maximum_out_degree =
 					statistics.maximum_out_degree.max(statistics.total_out_degree);
 				statistics.maximum_in_degree =
@@ -148,6 +127,7 @@ impl StatisticsStore {
 		self.mark_graph_dirty(graph, 1)
 	}
 
+	/// Removes occurrence.
 	pub(crate) fn remove_occurrence(
 		&mut self,
 		graph: GraphId,
@@ -165,11 +145,11 @@ impl StatisticsStore {
 			1,
 			"graph class count",
 		)?;
-		match occurrence.state() {
-			OccurrenceState::Node {
+		match occurrence.state().view() {
+			OccurrenceStateRef::Node {
 				..
 			} => decrement(&mut statistics.node_count, 1, "graph node count")?,
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology,
 				..
 			} => {
@@ -192,6 +172,7 @@ impl StatisticsStore {
 		self.mark_graph_dirty(graph, 1)
 	}
 
+	/// Replaces occurrence.
 	pub(crate) fn replace_occurrence(
 		&mut self,
 		graph: GraphId,
@@ -202,15 +183,15 @@ impl StatisticsStore {
 		let before_count = effective_property_count(atom.properties(), before)?;
 		let after_count = effective_property_count(atom.properties(), after)?;
 		if let (
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology: before,
 				..
 			},
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology: after,
 				..
 			},
-		) = (before.state(), after.state())
+		) = (before.state().view(), after.state().view())
 			&& before != after
 		{
 			let before = topology_counts(before)?;
@@ -243,6 +224,7 @@ impl StatisticsStore {
 		self.mark_graph_dirty(graph, 1)
 	}
 
+	/// Returns the add label result.
 	fn add_label(
 		&mut self,
 		graph: GraphId,
@@ -271,6 +253,7 @@ impl StatisticsStore {
 		)
 	}
 
+	/// Removes label.
 	fn remove_label(
 		&mut self,
 		graph: GraphId,
@@ -305,6 +288,7 @@ impl StatisticsStore {
 		Ok(())
 	}
 
+	/// Returns the adjust label property count result.
 	fn adjust_label_property_count(
 		&mut self,
 		graph: GraphId,
@@ -333,12 +317,14 @@ impl StatisticsStore {
 		}
 	}
 
+	/// Marks base dirty.
 	fn mark_base_dirty(&mut self, rows: u64) -> FerrosGrynnResult<()> {
 		increment(&mut self.base_mut().dirty_rows, rows, "base dirty rows")?;
 		self.base_touched = true;
 		Ok(())
 	}
 
+	/// Marks graph dirty.
 	fn mark_graph_dirty(&mut self, graph: GraphId, rows: u64) -> FerrosGrynnResult<()> {
 		let statistics =
 			self.graph_mut(graph).ok_or_else(|| invalid("statistics graph is absent"))?;
@@ -348,6 +334,7 @@ impl StatisticsStore {
 	}
 }
 
+/// Returns the effective property count result.
 fn effective_property_count(
 	base: &PropertyMap,
 	occurrence: &GraphOccurrence,
@@ -369,6 +356,7 @@ fn effective_property_count(
 		.ok_or_else(|| invalid("effective property count overflows usize"))
 }
 
+/// Returns the topology counts result.
 fn topology_counts(topology: &EdgeTopology) -> FerrosGrynnResult<[u64; 3]> {
 	let local_nodes = |endpoints: &[crate::graph::EdgeEndpoint]| {
 		endpoints
@@ -403,6 +391,7 @@ fn topology_counts(topology: &EdgeTopology) -> FerrosGrynnResult<[u64; 3]> {
 	])
 }
 
+/// Returns the increment result.
 fn increment(target: &mut u64, amount: u64, name: &str) -> FerrosGrynnResult<()> {
 	*target = target
 		.checked_add(amount)
@@ -410,6 +399,7 @@ fn increment(target: &mut u64, amount: u64, name: &str) -> FerrosGrynnResult<()>
 	Ok(())
 }
 
+/// Returns the decrement result.
 fn decrement(target: &mut u64, amount: u64, name: &str) -> FerrosGrynnResult<()> {
 	*target = target
 		.checked_sub(amount)
@@ -417,6 +407,7 @@ fn decrement(target: &mut u64, amount: u64, name: &str) -> FerrosGrynnResult<()>
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

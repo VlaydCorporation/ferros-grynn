@@ -31,94 +31,142 @@ use crate::{
 	values::{PropertyKeyId, storage::DiskAtomRef},
 };
 
+/// Format version for side format.
 const SIDE_FORMAT_VERSION: u16 = 1;
+/// Configured null page value.
 const NULL_PAGE: u64 = u64::MAX;
+/// Configured stream header bytes value.
 const STREAM_HEADER_BYTES: usize = 48;
+/// Configured stream payload bytes value.
 const STREAM_PAYLOAD_BYTES: usize = PAGE_SIZE - STREAM_HEADER_BYTES;
+/// Configured header fixed end value.
 const HEADER_FIXED_END: usize = 192;
+/// Configured flag highlights value.
 const FLAG_HIGHLIGHTS: u16 = 1;
+/// Configured implementation fingerprint value.
 const IMPLEMENTATION_FINGERPRINT: u64 = 0x9c7b_6dd1_a4a8_12ef;
 
 /// One source document after execution of its exact analyzer version.
 pub(in crate::storage) struct FulltextDocument {
+	/// Atom associated with this fulltext document.
 	pub(in crate::storage) atom: DiskAtomRef,
+	/// Tokens associated with this fulltext document.
 	pub(in crate::storage) tokens: Vec<AnalyzedToken>,
 }
 
 /// Logical metadata encoded into page zero of one immutable FGFT side-file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FulltextBuildSpec {
+pub struct FulltextBuildSpec {
+	/// Index associated with this fulltext build spec.
 	pub(crate) index: IndexId,
+	/// Schema version of the index definition.
 	pub(crate) index_version: SchemaVersion,
+	/// Analyzer associated with this fulltext build spec.
 	pub(crate) analyzer: AnalyzerId,
+	/// Analyzer version associated with this fulltext build spec.
 	pub(crate) analyzer_version: SchemaVersion,
+	/// Scope associated with this fulltext build spec.
 	pub(crate) scope: IndexScope,
+	/// Class associated with this fulltext build spec.
 	pub(crate) class: ClassId,
+	/// Field associated with this fulltext build spec.
 	pub(crate) field: PropertyKeyId,
+	/// Options associated with this fulltext build spec.
 	pub(crate) options: FulltextIndexOptions,
+	/// Build revision associated with this fulltext build spec.
 	pub(crate) build_revision: u64,
 }
 
 /// One complete immutable Fulltext file before catalog publication.
 pub(in crate::storage) struct BuiltFulltextIndex {
+	/// Root associated with this built fulltext index.
 	pub(in crate::storage) root: PageNo,
+	/// Pages associated with this built fulltext index.
 	pub(in crate::storage) pages: Vec<AlignedPage>,
 }
 
 /// One posting reconstructed from the exact immutable side-file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FulltextPosting {
+pub struct FulltextPosting {
+	/// Atom associated with this fulltext posting.
 	pub(crate) atom: DiskAtomRef,
+	/// Term frequency associated with this fulltext posting.
 	pub(crate) term_frequency: u32,
+	/// Document length associated with this fulltext posting.
 	pub(crate) document_length: u32,
+	/// Spans associated with this fulltext posting.
 	pub(crate) spans: Vec<(u32, u32)>,
 }
 
 /// One dictionary entry and its sorted postings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FulltextTerm {
+pub struct FulltextTerm {
+	/// Term associated with this fulltext term.
 	pub(crate) term: Vec<u8>,
+	/// Total term frequency associated with this fulltext term.
 	pub(crate) total_term_frequency: u64,
+	/// Postings associated with this fulltext term.
 	pub(crate) postings: Vec<FulltextPosting>,
 }
 
 /// One indexed document, including documents whose analyzer produced no terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FulltextDocumentState {
+pub struct FulltextDocumentState {
+	/// Atom associated with this fulltext document state.
 	pub(crate) atom: DiskAtomRef,
+	/// Document length associated with this fulltext document state.
 	pub(crate) document_length: u32,
 }
 
 /// Fully validated logical projection of an immutable FGFT side-file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodedFulltextIndex {
+pub struct DecodedFulltextIndex {
+	/// Spec associated with this decoded fulltext index.
 	pub(crate) spec: FulltextBuildSpec,
+	/// Document count associated with this decoded fulltext index.
 	pub(crate) document_count: u64,
+	/// Total document length associated with this decoded fulltext index.
 	pub(crate) total_document_length: u64,
+	/// Documents associated with this decoded fulltext index.
 	pub(crate) documents: Vec<FulltextDocumentState>,
+	/// Terms associated with this decoded fulltext index.
 	pub(crate) terms: Vec<FulltextTerm>,
 }
 
 #[derive(Default)]
+/// Posting accumulator state.
 struct PostingAccumulator {
+	/// Term frequency associated with this posting accumulator.
 	term_frequency: u32,
+	/// Document length associated with this posting accumulator.
 	document_length: u32,
+	/// Spans associated with this posting accumulator.
 	spans: Vec<(u32, u32)>,
 }
 
 #[derive(Debug)]
+/// Encoded term state.
 struct EncodedTerm {
+	/// Term associated with this encoded term.
 	term: Vec<u8>,
+	/// Hash associated with this encoded term.
 	hash: u64,
+	/// Posting offset associated with this encoded term.
 	posting_offset: u64,
+	/// Posting length associated with this encoded term.
 	posting_length: u64,
+	/// Document frequency associated with this encoded term.
 	document_frequency: u32,
+	/// Total term frequency associated with this encoded term.
 	total_term_frequency: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Stream location state.
 struct StreamLocation {
+	/// First associated with this stream location.
 	first: u64,
+	/// Pages associated with this stream location.
 	pages: u64,
 }
 
@@ -370,18 +418,29 @@ pub(in crate::storage) fn decode_fulltext_index(
 	})
 }
 
+/// Header state.
 struct Header {
+	/// Spec associated with this header.
 	spec: FulltextBuildSpec,
+	/// Document count associated with this header.
 	document_count: u64,
+	/// Total document length associated with this header.
 	total_document_length: u64,
+	/// Term count associated with this header.
 	term_count: u64,
+	/// Dictionary associated with this header.
 	dictionary: StreamLocation,
+	/// Hash associated with this header.
 	hash: StreamLocation,
+	/// Postings associated with this header.
 	postings: StreamLocation,
+	/// Documents associated with this header.
 	documents: StreamLocation,
+	/// Highlights associated with this header.
 	highlights: bool,
 }
 
+/// Encodes header.
 fn encode_header(
 	page: &mut AlignedPage,
 	spec: FulltextBuildSpec,
@@ -433,6 +492,7 @@ fn encode_header(
 	page.seal()
 }
 
+/// Decodes header.
 fn decode_header(page: &AlignedPage) -> FerrosGrynnResult<Header> {
 	let header = page.validate(PageNo::new(0))?;
 	if header.page_type() != PageType::IndexFulltextHeader || !header.flags().is_empty() {
@@ -510,12 +570,13 @@ fn decode_header(page: &AlignedPage) -> FerrosGrynnResult<Header> {
 	})
 }
 
+/// Decodes documents.
 fn decode_documents(bytes: &[u8]) -> FerrosGrynnResult<Vec<FulltextDocumentState>> {
 	if !bytes.len().is_multiple_of(16) {
 		return Err(invalid("Fulltext document stream has a partial record"));
 	}
 	let mut documents = Vec::with_capacity(bytes.len() / 16);
-	for record in bytes.chunks_exact(16) {
+	for record in bytes.as_chunks::<16>().0 {
 		let atom = DiskAtomRef::from_raw(read_u64(record, 0)?)?;
 		if read_u32(record, 12)? != 0
 			|| documents
@@ -532,6 +593,7 @@ fn decode_documents(bytes: &[u8]) -> FerrosGrynnResult<Vec<FulltextDocumentState
 	Ok(documents)
 }
 
+/// Returns the page count for stream result.
 fn page_count_for_stream(bytes: usize) -> FerrosGrynnResult<u64> {
 	if bytes == 0 {
 		return Ok(0);
@@ -540,6 +602,7 @@ fn page_count_for_stream(bytes: usize) -> FerrosGrynnResult<u64> {
 	u64::try_from(pages).map_err(|_error| invalid("Fulltext stream page count exceeds u64"))
 }
 
+/// Encodes stream.
 fn encode_stream(
 	pages: &mut [AlignedPage],
 	first: u64,
@@ -591,6 +654,7 @@ fn encode_stream(
 	})
 }
 
+/// Decodes stream.
 fn decode_stream(
 	pages: &[AlignedPage],
 	location: StreamLocation,
@@ -645,12 +709,17 @@ fn decode_stream(
 	Ok(output)
 }
 
+/// Decoded dictionary entry state.
 struct DecodedDictionaryEntry {
+	/// Position relative to the beginning of the associated buffer.
 	offset: u64,
+	/// Hash associated with this decoded dictionary entry.
 	hash: u64,
+	/// Term associated with this decoded dictionary entry.
 	term: FulltextTerm,
 }
 
+/// Decodes dictionary.
 fn decode_dictionary(
 	dictionary: &[u8],
 	postings: &[u8],
@@ -725,6 +794,7 @@ fn decode_dictionary(
 	Ok(output)
 }
 
+/// Decodes postings.
 fn decode_postings(bytes: &[u8], highlights: bool) -> FerrosGrynnResult<Vec<FulltextPosting>> {
 	if bytes.len() < 16 || usize::try_from(read_u64(bytes, 0)?).ok() != Some(bytes.len()) {
 		return Err(invalid("Fulltext posting segment length is malformed"));
@@ -785,6 +855,7 @@ fn decode_postings(bytes: &[u8], highlights: bool) -> FerrosGrynnResult<Vec<Full
 	Ok(output)
 }
 
+/// Validates hash stream.
 fn validate_hash_stream(
 	bytes: &[u8],
 	dictionary: &[DecodedDictionaryEntry],
@@ -795,7 +866,7 @@ fn validate_hash_stream(
 	let by_offset =
 		dictionary.iter().map(|entry| (entry.offset, entry)).collect::<BTreeMap<_, _>>();
 	let mut previous = None::<(u64, u64)>;
-	for chunk in bytes.chunks_exact(24) {
+	for chunk in bytes.as_chunks::<24>().0 {
 		let hash = read_u64(chunk, 0)?;
 		let offset = read_u64(chunk, 8)?;
 		let term_length = usize::try_from(read_u32(chunk, 16)?)
@@ -820,26 +891,32 @@ fn validate_hash_stream(
 	Ok(())
 }
 
+/// Writes u16.
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 	bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32.
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64.
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 	bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32 vec.
 fn write_u32_vec(bytes: &mut Vec<u8>, value: u32) {
 	bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64 vec.
 fn write_u64_vec(bytes: &mut Vec<u8>, value: u64) {
 	bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Reads u16.
 fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 	let value = bytes
 		.get(offset..offset + 2)
@@ -847,6 +924,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 	Ok(u16::from_le_bytes(value.try_into().map_err(|_error| invalid("invalid u16"))?))
 }
 
+/// Reads u32.
 fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 	let value = bytes
 		.get(offset..offset + 4)
@@ -854,6 +932,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 	Ok(u32::from_le_bytes(value.try_into().map_err(|_error| invalid("invalid u32"))?))
 }
 
+/// Reads u64.
 fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 	let value = bytes
 		.get(offset..offset + 8)
@@ -861,11 +940,13 @@ fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 	Ok(u64::from_le_bytes(value.try_into().map_err(|_error| invalid("invalid u64"))?))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for fulltext index behavior.
 mod tests {
 	use std::{
 		collections::BTreeMap,
@@ -875,6 +956,8 @@ mod tests {
 	};
 
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{AnalyzerFilter, AnalyzerTokenizer, SchemaAnalyzer, analyze_builtin},
 		graph::{AtomKind, GraphId},
@@ -882,67 +965,80 @@ mod tests {
 		values::Text,
 	};
 
+	/// Process-local suffix counter that separates temporary full-text-index
+	/// test directories.
 	static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-	struct TestDirectory(std::path::PathBuf);
+	/// Temporary directory owner used to keep test files alive for their
+	/// scenario.
+	struct TestDirectory(
+		/// Path retained for the lifetime of the temporary directory owner.
+		std::path::PathBuf,
+	);
 
 	impl TestDirectory {
+		/// Constructs `TestDirectory` from the supplied initial state.
 		fn new() -> Self {
 			let path = std::env::temp_dir().join(format!(
 				"fgft-stream-{:016x}",
 				NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
 			));
-			fs::create_dir_all(&path).unwrap();
+			fs::create_dir_all(&path).assert_ok();
 			Self(path)
 		}
 	}
 
 	impl Drop for TestDirectory {
+		/// Runs cleanup for this `TestDirectory` before its fields are
+		/// released.
 		fn drop(&mut self) {
 			drop(fs::remove_dir_all(&self.0));
 		}
 	}
 
+	/// Returns spec for this module.
 	fn spec(scope: IndexScope, highlights: bool) -> FulltextBuildSpec {
-		let analyzer = AnalyzerId::new(5).unwrap();
+		let analyzer = AnalyzerId::new(5).assert_some();
 		FulltextBuildSpec {
-			index: IndexId::new(7).unwrap(),
+			index: IndexId::new(7).assert_some(),
 			index_version: SchemaVersion::INITIAL,
 			analyzer,
 			analyzer_version: SchemaVersion::INITIAL,
 			scope,
-			class: ClassId::new(11).unwrap(),
+			class: ClassId::new(11).assert_some(),
 			field: PropertyKeyId::new(13),
 			options: FulltextIndexOptions::defaults(analyzer, SchemaVersion::INITIAL, highlights),
 			build_revision: 23,
 		}
 	}
 
+	/// Returns analyzer for this module.
 	fn analyzer() -> SchemaAnalyzer {
 		SchemaAnalyzer::new("english", [AnalyzerTokenizer::Blank], [AnalyzerFilter::Lowercase])
-			.unwrap()
+			.assert_ok()
 	}
 
+	/// Verifies round trips terms postings statistics and spans.
 	#[test]
 	fn round_trips_terms_postings_statistics_and_spans() {
 		let analyzer = analyzer();
 		let documents = vec![
 			FulltextDocument {
-				atom: DiskAtomRef::from_parts(AtomKind::Node, 1).unwrap(),
-				tokens: analyze_builtin(&analyzer, "Rust rust").unwrap(),
+				atom: DiskAtomRef::from_parts(AtomKind::Node, 1).assert_ok(),
+				tokens: analyze_builtin(&analyzer, "Rust rust").assert_ok(),
 			},
 			FulltextDocument {
-				atom: DiskAtomRef::from_parts(AtomKind::Node, 2).unwrap(),
-				tokens: analyze_builtin(&analyzer, "Graph").unwrap(),
+				atom: DiskAtomRef::from_parts(AtomKind::Node, 2).assert_ok(),
+				tokens: analyze_builtin(&analyzer, "Graph").assert_ok(),
 			},
 			FulltextDocument {
-				atom: DiskAtomRef::from_parts(AtomKind::Node, 3).unwrap(),
+				atom: DiskAtomRef::from_parts(AtomKind::Node, 3).assert_ok(),
 				tokens: Vec::new(),
 			},
 		];
 		let expected = spec(IndexScope::Base, true);
-		let built = build_fulltext_index(expected, documents).unwrap();
-		let decoded = decode_fulltext_index(&built.pages).unwrap();
+		let built = build_fulltext_index(expected, documents).assert_ok();
+		let decoded = decode_fulltext_index(&built.pages).assert_ok();
 		assert_eq!(decoded.spec, expected);
 		assert_eq!(decoded.document_count, 3);
 		assert_eq!(decoded.total_document_length, 3);
@@ -954,31 +1050,32 @@ mod tests {
 		assert_eq!(decoded.terms[1].postings[0].spans, vec![(0, 4), (5, 9)]);
 	}
 
+	/// Verifies streaming builder matches buffered builder across spilled runs.
 	#[test]
 	fn streaming_builder_matches_buffered_builder_across_spilled_runs() {
 		let directory = TestDirectory::new();
 		let path = directory.0.join("fulltext.fgidx");
-		let file = DirectFile::create_new(&path).unwrap();
+		let file = DirectFile::create_new(&path).assert_ok();
 		let analyzer = analyzer();
 		let make_documents = || {
 			(1..=96_u64)
 				.map(|slot| FulltextDocument {
-					atom: DiskAtomRef::from_parts(AtomKind::Node, slot).unwrap(),
+					atom: DiskAtomRef::from_parts(AtomKind::Node, slot).assert_ok(),
 					tokens: analyze_builtin(
 						&analyzer,
 						format!("shared term{slot} shared").as_str(),
 					)
-					.unwrap(),
+					.assert_ok(),
 				})
 				.collect::<Vec<_>>()
 		};
 		let expected = decode_fulltext_index(
-			&build_fulltext_index(spec(IndexScope::Base, true), make_documents()).unwrap().pages,
+			&build_fulltext_index(spec(IndexScope::Base, true), make_documents()).assert_ok().pages,
 		)
-		.unwrap();
+		.assert_ok();
 		with_external_sort_options(
-			NonZeroUsize::new(1024).unwrap(),
-			NonZeroUsize::new(1).unwrap(),
+			NonZeroUsize::new(1024).assert_some(),
+			NonZeroUsize::new(1).assert_some(),
 			|| {
 				write_fulltext_index_stream(
 					spec(IndexScope::Base, true),
@@ -989,40 +1086,43 @@ mod tests {
 				.map(|_built| ())
 			},
 		)
-		.unwrap();
+		.assert_ok();
 
-		let mut pages = Vec::with_capacity(usize::try_from(file.page_count()).unwrap());
+		let mut pages = Vec::with_capacity(usize::try_from(file.page_count()).assert_ok());
 		for page in 0..file.page_count() {
 			pages.push(AlignedPage::zeroed());
-			file.read_page(PageNo::new(page), pages.last_mut().unwrap()).unwrap();
+			file.read_page(PageNo::new(page), pages.last_mut().assert_some()).assert_ok();
 		}
-		let actual = decode_fulltext_index(&pages).unwrap();
+		let actual = decode_fulltext_index(&pages).assert_ok();
 		assert_eq!(actual, expected);
 	}
 
+	/// Verifies rejects corrupt term hash after page checksum is resealed.
 	#[test]
 	fn rejects_corrupt_term_hash_after_page_checksum_is_resealed() {
 		let analyzer = analyzer();
 		let built = build_fulltext_index(
 			spec(
 				IndexScope::Effective {
-					graph: GraphId::new(2).unwrap(),
+					graph: GraphId::new(2).assert_some(),
 				},
 				false,
 			),
 			vec![FulltextDocument {
-				atom: DiskAtomRef::from_parts(AtomKind::Edge, 4).unwrap(),
-				tokens: analyze_builtin(&analyzer, "term").unwrap(),
+				atom: DiskAtomRef::from_parts(AtomKind::Edge, 4).assert_ok(),
+				tokens: analyze_builtin(&analyzer, "term").assert_ok(),
 			}],
 		)
-		.unwrap();
+		.assert_ok();
 		let mut pages = built.pages;
 		let dictionary = &mut pages[1];
 		dictionary.as_bytes_mut()[STREAM_HEADER_BYTES + 8] ^= 1;
-		dictionary.seal().unwrap();
+		dictionary.seal().assert_ok();
 		assert!(decode_fulltext_index(&pages).is_err());
 	}
 
+	/// Verifies hash stream accepts distinct full terms with equal hash
+	/// metadata only after bytes check.
 	#[test]
 	fn hash_stream_accepts_distinct_full_terms_with_equal_hash_metadata_only_after_bytes_check() {
 		let mut by_hash = BTreeMap::<u64, Vec<Text>>::new();

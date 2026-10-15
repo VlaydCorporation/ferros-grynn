@@ -121,6 +121,8 @@ where
 	/// Implements the cancellation order required by native I/O lifetimes.
 	fn shutdown(&mut self) -> FerrosGrynnResult<()> {
 		self.cancelled.store(true, Ordering::Release);
+		// Disconnect before joining so a worker blocked on the bounded send can
+		// exit.
 		drop(self.receiver.take());
 		if let Some(worker) = self.worker.take() {
 			worker.join().map_err(|payload| {
@@ -148,6 +150,7 @@ impl<Extent> Drop for PrototypePrefetchCursor<Extent> {
 	clippy::panic_in_result_fn,
 	reason = "fallible test setup returns Result while assertions report contract failures"
 )]
+/// Regression tests for prefetch behavior.
 mod tests {
 	use std::{
 		error::Error,
@@ -174,11 +177,14 @@ mod tests {
 	}
 
 	impl Drop for ReservationToken {
+		/// Runs cleanup for this `ReservationToken` before its fields are
+		/// released.
 		fn drop(&mut self) {
 			self.dropped.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
+	/// Verifies pipeline preserves input order.
 	#[test]
 	fn pipeline_preserves_input_order() -> Result<(), Box<dyn Error>> {
 		let depth = NonZeroUsize::new(4).ok_or("zero depth")?;
@@ -192,6 +198,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies first error is terminal and ordered.
 	#[test]
 	fn first_error_is_terminal_and_ordered() -> Result<(), Box<dyn Error>> {
 		let depth = NonZeroUsize::new(2).ok_or("zero depth")?;
@@ -214,6 +221,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies worker panic is reported as one terminal error.
 	#[test]
 	fn worker_panic_is_reported_as_one_terminal_error() -> Result<(), Box<dyn Error>> {
 		let depth = NonZeroUsize::new(2).ok_or("zero depth")?;
@@ -230,6 +238,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies early drop cancels queued work and joins.
 	#[test]
 	fn early_drop_cancels_queued_work_and_joins() -> Result<(), Box<dyn Error>> {
 		let depth = NonZeroUsize::new(2).ok_or("zero depth")?;
@@ -260,6 +269,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies channel depth bounds completed extents.
 	#[test]
 	fn channel_depth_bounds_completed_extents() -> Result<(), Box<dyn Error>> {
 		let depth = NonZeroUsize::new(4).ok_or("zero depth")?;
@@ -285,6 +295,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies reservation token exposes ordinal.
 	#[test]
 	fn reservation_token_exposes_ordinal() -> Result<(), Box<dyn Error>> {
 		let dropped = Arc::new(AtomicUsize::new(0));

@@ -7,46 +7,81 @@ use crate::{
 	values::{Type, VectorKind},
 };
 
+/// Configured max depth value.
 const MAX_DEPTH: usize = 64;
+/// Configured max members value.
 const MAX_MEMBERS: usize = 4096;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
+/// Tag alternatives.
 enum Tag {
+	/// Type constraint accepting an unconstrained value.
 	Any = 0x00,
+	/// Type constraint accepting an absent value.
 	None = 0x01,
+	/// Type constraint accepting an explicit null value.
 	Null = 0x02,
+	/// Type constraint accepting a Boolean value.
 	Bool = 0x03,
+	/// Type constraint accepting a numeric value.
 	Number = 0x04,
+	/// Type constraint accepting a signed integer.
 	Int = 0x05,
+	/// Type constraint accepting a floating-point number.
 	Float = 0x06,
+	/// Type constraint accepting a decimal number.
 	Decimal = 0x07,
+	/// Type constraint accepting text.
 	String = 0x08,
+	/// Type constraint accepting a duration.
 	Duration = 0x09,
+	/// Type constraint accepting a time-zone-aware timestamp.
 	DateTime = 0x0a,
+	/// Type constraint accepting a ULID.
 	Ulid = 0x0b,
+	/// Type constraint accepting a UUID.
 	Uuid = 0x0c,
+	/// Type constraint accepting an ordered sequence of values.
 	Array = 0x0d,
+	/// Type constraint accepting an ordered set of distinct values.
 	Set = 0x0e,
+	/// Type constraint accepting a text-keyed value map.
 	Object = 0x0f,
+	/// Type constraint accepting a geometry value.
 	Geometry = 0x10,
+	/// Type constraint accepting a numeric vector.
 	Vector = 0x11,
+	/// Type constraint accepting binary bytes.
 	Bytes = 0x12,
+	/// Type constraint accepting a class-qualified record identity.
 	Record = 0x13,
+	/// Type constraint accepting a compiled regular expression.
 	Regex = 0x14,
+	/// Type constraint accepting a bounded or unbounded value interval.
 	Range = 0x15,
+	/// Type constraint accepting a stable atom reference.
 	Atom = 0x16,
+	/// Type constraint accepting a snapshot-qualified path.
 	Path = 0x17,
+	/// Type constraint accepting a materialized graph family.
 	Graph = 0x18,
+	/// Type constraint accepting an optional value.
 	Option = 0x19,
+	/// Type constraint accepting a union of accepted value types.
 	Union = 0x1a,
+	/// Type constraint accepting a structured record constraint.
 	RecordShape = 0x1b,
+	/// Type constraint accepting a runtime callable.
 	Closure = 0x1c,
+	/// Type constraint accepting a stable graph reference.
 	GraphRef = 0x1d,
+	/// Type constraint accepting a runtime matcher.
 	Matcher = 0x1e,
 }
 
 impl Tag {
+	/// Decodes tag.
 	fn decode(value: u8) -> FerrosGrynnResult<Self> {
 		Ok(match value {
 			0x00 => Self::Any,
@@ -85,6 +120,7 @@ impl Tag {
 	}
 }
 
+/// Encodes the current state.
 pub(super) fn encode(output: &mut Vec<u8>, value: &Type, depth: usize) -> FerrosGrynnResult<()> {
 	if depth > MAX_DEPTH {
 		return Err(invalid("schema type nesting exceeds 64 levels"));
@@ -166,6 +202,7 @@ pub(super) fn encode(output: &mut Vec<u8>, value: &Type, depth: usize) -> Ferros
 	Ok(())
 }
 
+/// Decodes the current state.
 pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResult<Type> {
 	if depth > MAX_DEPTH {
 		return Err(invalid("schema type nesting exceeds 64 levels"));
@@ -254,6 +291,7 @@ pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResu
 	})
 }
 
+/// Writes count.
 fn write_count(output: &mut Vec<u8>, count: usize) -> FerrosGrynnResult<()> {
 	if count > MAX_MEMBERS {
 		return Err(invalid("schema type member count exceeds 4096"));
@@ -266,6 +304,7 @@ fn write_count(output: &mut Vec<u8>, count: usize) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Reads count.
 fn read_count(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<usize> {
 	let count = usize::from(decoder.read_u16()?);
 	if count > MAX_MEMBERS {
@@ -286,6 +325,7 @@ fn check_member_bytes(
 	Ok(())
 }
 
+/// Returns the atom kind result.
 const fn atom_kind(kind: AtomKind) -> u8 {
 	match kind {
 		AtomKind::Node => 0,
@@ -293,6 +333,7 @@ const fn atom_kind(kind: AtomKind) -> u8 {
 	}
 }
 
+/// Decodes atom kind.
 fn decode_atom_kind(value: u8) -> FerrosGrynnResult<AtomKind> {
 	match value {
 		0 => Ok(AtomKind::Node),
@@ -301,6 +342,7 @@ fn decode_atom_kind(value: u8) -> FerrosGrynnResult<AtomKind> {
 	}
 }
 
+/// Returns the graph kind result.
 pub(super) const fn graph_kind(kind: GraphKind) -> u8 {
 	match kind {
 		GraphKind::Graph => 0,
@@ -314,6 +356,7 @@ pub(super) const fn graph_kind(kind: GraphKind) -> u8 {
 	}
 }
 
+/// Decodes graph kind.
 pub(super) fn decode_graph_kind(value: u8) -> FerrosGrynnResult<GraphKind> {
 	match value {
 		0 => Ok(GraphKind::Graph),
@@ -328,6 +371,7 @@ pub(super) fn decode_graph_kind(value: u8) -> FerrosGrynnResult<GraphKind> {
 	}
 }
 
+/// Returns the vector kind result.
 const fn vector_kind(kind: VectorKind) -> u8 {
 	match kind {
 		VectorKind::F64 => 0,
@@ -341,6 +385,7 @@ const fn vector_kind(kind: VectorKind) -> u8 {
 	}
 }
 
+/// Decodes vector kind.
 fn decode_vector_kind(value: u8) -> FerrosGrynnResult<VectorKind> {
 	match value {
 		0 => Ok(VectorKind::F64),

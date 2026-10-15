@@ -86,10 +86,10 @@ fn fixture(count: usize) -> FerrosGrynnResult<Fixture> {
 		for ordinal in start..count.min(start + 128) {
 			let subject =
 				BridgeMappingSubject::Atom(RecordId::from_value("person", Value::from(ordinal))?);
-			let external = BridgeEntityRef {
+			let external = BridgeEntityRef::new(
 				database,
-				record: RecordId::from_value("profile", Value::from(ordinal))?,
-			};
+				RecordId::from_value("profile", Value::from(ordinal))?,
+			);
 			let reference = tx.register_bridge_mapping(subject.clone(), external.clone())?;
 			if indices.contains(&ordinal) {
 				hits.push((subject, external, reference));
@@ -182,10 +182,7 @@ fn probe(count: usize) -> FerrosGrynnResult<()> {
 	measure(count, "reverse_miss", |_| {
 		assert!(
 			black_box(fixture.store.begin().bridge_mapping_external(
-				&BridgeEntityRef {
-					database: fixture.database,
-					record: missing.clone()
-				},
+				&BridgeEntityRef::new(fixture.database, missing.clone()),
 				BridgeMappingRole::Atom
 			)?)
 			.is_none()
@@ -199,17 +196,20 @@ fn probe(count: usize) -> FerrosGrynnResult<()> {
 			graph: fixture.graph,
 			edge: fixture.spares[i].clone(),
 		};
-		let entity = BridgeEntityRef {
-			database: fixture.database,
-			record: RecordId::from_value("relation", Value::from(i))?,
-		};
-		let reference =
-			tx.reserve_bridge_mapping(subject, entity.clone(), BridgeMirrorRequest {
-				relation: entity.record,
-				source: "profile:0".parse()?,
-				target: "profile:1".parse()?,
-				properties: Object::new(),
-			})?;
+		let entity = BridgeEntityRef::new(
+			fixture.database,
+			RecordId::from_value("relation", Value::from(i))?,
+		);
+		let reference = tx.reserve_bridge_mapping(
+			subject,
+			entity.clone(),
+			BridgeMirrorRequest::new(
+				entity.record,
+				"profile:0".parse()?,
+				"profile:1".parse()?,
+				Object::new(),
+			),
+		)?;
 		assert_eq!(
 			tx.bridge_mapping(reference)?.map(|row| row.state()),
 			Some(BridgeMappingState::Pending)

@@ -12,27 +12,38 @@ use crate::{
 	graph::{AtomId, GraphRead},
 };
 
+/// Articulation points and bridge edges found by a graph cut analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CutSet {
+	/// Articulation points associated with this cut set.
 	articulation_points: Box<[AtomId]>,
+	/// Bridges associated with this cut set.
 	bridges: Box<[AtomId]>,
 }
 
 impl CutSet {
+	/// Borrows the stored articulation points of this `CutSet`.
 	pub fn articulation_points(&self) -> &[AtomId] {
 		&self.articulation_points
 	}
 
+	/// Borrows the stored bridges of this `CutSet`.
 	pub fn bridges(&self) -> &[AtomId] {
 		&self.bridges
 	}
 }
 
+/// Finds cuts for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
 	find_cuts_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn find_cuts_with_check<R: GraphRead, Check>(
+/// Finds cuts with check.
+pub fn find_cuts_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<CutSet>
@@ -146,6 +157,7 @@ where
 	})
 }
 
+/// Checks candidate.
 fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
 where
 	Check: FnMut() -> FerrosGrynnResult<()>,
@@ -157,7 +169,10 @@ where
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Cut frame state.
 struct CutFrame {
+	/// Node associated with this cut frame.
 	node: AtomId,
+	/// Next associated with this cut frame.
 	next: usize,
 }

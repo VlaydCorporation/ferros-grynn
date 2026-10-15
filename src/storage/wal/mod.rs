@@ -59,7 +59,7 @@ pub(in crate::storage) use state::{
 	WalClocks,
 };
 #[cfg(test)]
-pub(crate) use writer::{CommitFailureGuard, CommitFailurePoint};
+pub use writer::{CommitFailureGuard, CommitFailurePoint};
 #[allow(
 	clippy::wildcard_imports,
 	reason = "move-only WAL split keeps the existing codec and recovery helpers during stage 1"
@@ -69,16 +69,7 @@ use {codec::*, recovery::*};
 use super::{
 	graph_index::stamp_count_index_lsn,
 	page::{AlignedPage, PAGE_SIZE, PageHeader, PageLsn, PageNo, PageType, validate_page_bytes},
-	types::{
-		CheckpointGeneration,
-		CommitTs,
-		DataFileId,
-		DataFileKind,
-		Lsn,
-		PageKey,
-		StorageSnapshot,
-		TxId,
-	},
+	types::{CheckpointGeneration, CommitTs, DataFileId, Lsn, PageKey, StorageSnapshot, TxId},
 };
 use crate::{
 	datastore::DataSpaceId,
@@ -90,6 +81,7 @@ use crate::{
 	clippy::panic_in_result_fn,
 	reason = "fallible WAL fixtures return Result while assertions report contract failures"
 )]
+/// Regression tests for wal behavior.
 mod tests {
 	use std::{
 		error::Error,
@@ -109,7 +101,10 @@ mod tests {
 	use super::*;
 	use crate::{
 		graph::GraphId,
-		storage::page::{PAGE_HEADER_SIZE, PageFlags, PageType},
+		storage::{
+			page::{PAGE_HEADER_SIZE, PageFlags, PageType},
+			types::DataFileKind,
+		},
 	};
 
 	/// Stable singleton system file used by WAL fixtures.
@@ -124,7 +119,10 @@ mod tests {
 	static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 	/// Temporary directory removed on success and unwind.
-	struct TestDirectory(PathBuf);
+	struct TestDirectory(
+		/// Path retained for the lifetime of the temporary directory owner.
+		PathBuf,
+	);
 
 	impl TestDirectory {
 		/// Allocates one absent path in the current workspace.
@@ -518,6 +516,8 @@ mod tests {
 	/// Concurrent disjoint writers serialize through one global commit lock.
 	#[test]
 	fn concurrent_commits_publish_monotonic_clocks() -> Result<(), Box<dyn Error>> {
+		/// Concurrent writers used to test serialized publication of monotonic
+		/// commit clocks.
 		const WRITER_COUNT: usize = 4;
 		let directory = TestDirectory::new()?;
 		let wal = Arc::new(FrameWal::create_new(directory.as_path())?);

@@ -265,6 +265,7 @@ fn event_definition_bytes(event: &EventDefinition) -> FerrosGrynnResult<usize> {
 }
 
 #[cfg(test)]
+/// Regression tests for event behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -283,36 +284,50 @@ mod tests {
 		Ok((store, EventTarget::Class(item), EventTarget::Class(audit)))
 	}
 
+	/// Verifies event registration compiles but does not execute handler.
 	#[test]
-	fn event_registration_compiles_but_does_not_execute_handler() -> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_registration_compiles_but_does_not_execute_handler() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut tx = store.begin();
-		let id = tx.define_event(EventDefinition::new(
-			"audit",
-			target,
-			"true",
-			"{ CREATE audit:unexpected; }",
-		)?)?;
-		assert!(tx.atom(&"audit:unexpected".parse()?)?.is_none());
-		assert_eq!(tx.event(id)?.map(|event| event.target()), Some(target));
-		tx.commit()?;
+		let id = tx
+			.define_event(
+				EventDefinition::new("audit", target, "true", "{ CREATE audit:unexpected; }")
+					.assert_ok(),
+			)
+			.assert_ok();
+		assert!(tx.atom(&"audit:unexpected".parse().assert_ok()).assert_ok().is_none());
+		assert_eq!(tx.event(id).assert_ok().map(|event| event.target()), Some(target));
+		tx.commit().assert_ok();
 		let mut read = store.begin();
-		assert!(read.atom(&"audit:unexpected".parse()?)?.is_none());
-		assert_eq!(read.named_event(target, "audit")?.and_then(|event| event.id()), Some(id));
-		Ok(())
+		assert!(read.atom(&"audit:unexpected".parse().assert_ok()).assert_ok().is_none());
+		assert_eq!(
+			read.named_event(target, "audit").assert_ok().and_then(|event| event.id()),
+			Some(id)
+		);
 	}
 
+	/// Verifies event replacement is versioned and failed validation retains
+	/// definition.
 	#[test]
-	fn event_replacement_is_versioned_and_failed_validation_retains_definition()
-	-> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_replacement_is_versioned_and_failed_validation_retains_definition() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut tx = store.begin();
-		let id =
-			tx.define_event(EventDefinition::new("audit", target, "$event = 'CREATE'", "1")?)?;
-		tx.commit()?;
+		let id = tx
+			.define_event(
+				EventDefinition::new("audit", target, "$event = 'CREATE'", "1").assert_ok(),
+			)
+			.assert_ok();
+		tx.commit().assert_ok();
 		let mut write = store.begin();
-		let before =
-			write.event(id)?.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture event"))?;
+		let before = write
+			.event(id)
+			.assert_ok()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture event"))
+			.assert_ok();
 		assert!(
 			write
 				.replace_event(
@@ -322,177 +337,209 @@ mod tests {
 						target,
 						"true",
 						"{ DEFINE CLASS forbidden TYPE NODE; }"
-					)?
+					)
+					.assert_ok()
 				)
 				.is_err()
 		);
-		assert_eq!(write.event(id)?.as_deref(), Some(before.as_ref()));
-		write.replace_event(id, EventDefinition::new("audit", target, "true", "2")?)?;
-		assert_eq!(write.event(id)?.map(|event| event.version().get()), Some(2));
+		assert_eq!(write.event(id).assert_ok().as_deref(), Some(before.as_ref()));
+		write
+			.replace_event(id, EventDefinition::new("audit", target, "true", "2").assert_ok())
+			.assert_ok();
+		assert_eq!(write.event(id).assert_ok().map(|event| event.version().get()), Some(2));
 		assert_eq!(before.version().get(), 1);
-		write.commit()?;
+		write.commit().assert_ok();
 		let mut remove = store.begin();
-		remove.remove_event(id)?;
-		remove.commit()?;
-		assert!(store.begin().event(id)?.is_none());
-		Ok(())
+		remove.remove_event(id).assert_ok();
+		remove.commit().assert_ok();
+		assert!(store.begin().event(id).assert_ok().is_none());
 	}
 
+	/// Verifies event predicate rejects mutation and source escape without
+	/// installation.
 	#[test]
-	fn event_predicate_rejects_mutation_and_source_escape_without_installation()
-	-> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_predicate_rejects_mutation_and_source_escape_without_installation() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut tx = store.begin();
 		for (when, then) in [
 			("{ CREATE audit:forbidden; RETURN true; }", "1"),
 			("true", "1; CREATE audit:escaped;"),
 			("true", "{ COMMIT; }"),
 		] {
-			assert!(tx.define_event(EventDefinition::new("bad", target, when, then)?).is_err());
-			assert!(tx.named_event(target, "bad")?.is_none());
+			assert!(
+				tx.define_event(EventDefinition::new("bad", target, when, then).assert_ok())
+					.is_err()
+			);
+			assert!(tx.named_event(target, "bad").assert_ok().is_none());
 		}
-		assert!(tx.atom(&"audit:forbidden".parse()?)?.is_none());
-		assert!(tx.atom(&"audit:escaped".parse()?)?.is_none());
-		Ok(())
+		assert!(tx.atom(&"audit:forbidden".parse().assert_ok()).assert_ok().is_none());
+		assert!(tx.atom(&"audit:escaped".parse().assert_ok()).assert_ok().is_none());
 	}
 
+	/// Verifies event absent lookup and replacement use serializable conflicts.
 	#[test]
-	fn event_absent_lookup_and_replacement_use_serializable_conflicts() -> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_absent_lookup_and_replacement_use_serializable_conflicts() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut observer = store.begin();
-		assert!(observer.named_event(target, "new")?.is_none());
+		assert!(observer.named_event(target, "new").assert_ok().is_none());
 		let mut writer = store.begin();
-		writer.define_event(EventDefinition::new("new", target, "true", "1")?)?;
-		writer.commit()?;
-		observer.create_atom("item:observer".parse()?, PropertyMap::new())?;
+		writer
+			.define_event(EventDefinition::new("new", target, "true", "1").assert_ok())
+			.assert_ok();
+		writer.commit().assert_ok();
+		observer.create_atom("item:observer".parse().assert_ok(), PropertyMap::new()).assert_ok();
 		assert!(observer.commit().is_err());
 		let mut read = store.begin();
-		assert!(read.atom(&"item:observer".parse()?)?.is_none());
-		Ok(())
+		assert!(read.atom(&"item:observer".parse().assert_ok()).assert_ok().is_none());
 	}
 
+	/// Verifies event source removal retires definitions atomically.
 	#[test]
-	fn event_source_removal_retires_definitions_atomically() -> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_source_removal_retires_definitions_atomically() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut tx = store.begin();
-		let class_event =
-			tx.define_event(EventDefinition::new("class_event", target, "true", "1")?)?;
-		let graph = tx.define_graph("scope", crate::graph::GraphKind::Graph)?;
-		let graph_event = tx.define_event(EventDefinition::new(
-			"graph_event",
-			EventTarget::Graph(graph.id()),
-			"true",
-			"1",
-		)?)?;
-		tx.commit()?;
+		let class_event = tx
+			.define_event(EventDefinition::new("class_event", target, "true", "1").assert_ok())
+			.assert_ok();
+		let graph = tx.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
+		let graph_event = tx
+			.define_event(
+				EventDefinition::new("graph_event", EventTarget::Graph(graph.id()), "true", "1")
+					.assert_ok(),
+			)
+			.assert_ok();
+		tx.commit().assert_ok();
 		let mut remove = store.begin();
-		remove.remove_class("item")?;
-		remove.remove_graph("scope")?;
-		assert!(remove.event(class_event)?.is_none());
-		assert!(remove.event(graph_event)?.is_none());
-		remove.commit()?;
+		remove.remove_class("item").assert_ok();
+		remove.remove_graph("scope").assert_ok();
+		assert!(remove.event(class_event).assert_ok().is_none());
+		assert!(remove.event(graph_event).assert_ok().is_none());
+		remove.commit().assert_ok();
 		let mut read = store.begin();
-		assert!(read.event(class_event)?.is_none());
-		assert!(read.event(graph_event)?.is_none());
-		Ok(())
+		assert!(read.event(class_event).assert_ok().is_none());
+		assert!(read.event(graph_event).assert_ok().is_none());
 	}
 
+	/// Verifies event replacements pay for each retained payload.
 	#[test]
-	fn event_replacements_pay_for_each_retained_payload() -> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_replacements_pay_for_each_retained_payload() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut tx = store.begin();
-		let id = tx.define_event(EventDefinition::new("audit", target, "true", "1")?)?;
+		let id = tx
+			.define_event(EventDefinition::new("audit", target, "true", "1").assert_ok())
+			.assert_ok();
 		let first = tx.write_set_bytes();
-		let replacement =
-			EventDefinition::new("audit", target, "true", "2")?.with_comment("x".repeat(1024));
-		let bytes = event_definition_bytes(&replacement)?;
-		tx.replace_event(id, replacement.clone())?;
+		let replacement = EventDefinition::new("audit", target, "true", "2")
+			.assert_ok()
+			.with_comment("x".repeat(1024));
+		let bytes = event_definition_bytes(&replacement).assert_ok();
+		tx.replace_event(id, replacement.clone()).assert_ok();
 		assert_eq!(tx.write_set_bytes(), first + bytes);
-		tx.replace_event(id, replacement)?;
+		tx.replace_event(id, replacement).assert_ok();
 		assert_eq!(tx.write_set_bytes(), first + bytes * 2);
-		Ok(())
 	}
 
+	/// Verifies event transitive compilation respects remaining scratch.
 	#[test]
-	fn event_transitive_compilation_respects_remaining_scratch() -> FerrosGrynnResult<()> {
-		let (store, target, _audit) = setup()?;
+	fn event_transitive_compilation_respects_remaining_scratch() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, target, _audit) = setup().assert_ok();
 		let mut tx = store.begin();
 		let source = format!(
 			"DEFINE PURE FUNCTION fn::large() -> int {{ /* {} */ RETURN 1; }};",
 			"x".repeat(8192)
 		);
-		for result in tx.execute(&source, &crate::values::Object::new())? {
-			let _value = result.result?;
+		for result in tx.execute(&source, &crate::values::Object::new()).assert_ok() {
+			let _value = result.result.assert_ok();
 		}
-		let event = EventDefinition::new("audit", target, "true", "fn::large()")?;
+		let event = EventDefinition::new("audit", target, "true", "fn::large()").assert_ok();
 		assert!(crate::gql::validate_event_definition(&mut tx, &event, 256 * 1024, None).is_err());
-		assert!(tx.named_event(target, "audit")?.is_none());
-		Ok(())
+		assert!(tx.named_event(target, "audit").assert_ok().is_none());
 	}
 
+	/// Verifies event owned child overwrite conflicts with event metadata
+	/// reads.
 	#[test]
-	fn event_owned_child_overwrite_conflicts_with_event_metadata_reads() -> FerrosGrynnResult<()> {
+	fn event_owned_child_overwrite_conflicts_with_event_metadata_reads() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		setup.define_class(ClassSchema::new("module", AtomKind::Node, [])?)?;
-		setup.define_class(ClassSchema::new("document", AtomKind::Node, [])?)?;
-		let child = setup.define_graph("child", crate::graph::GraphKind::Graph)?;
-		let root = setup.define_graph("root", crate::graph::GraphKind::Metagraph)?;
-		let document = "document:spec".parse::<crate::values::RecordId>()?;
-		let module = "module:owner".parse::<crate::values::RecordId>()?;
-		setup.create_atom(document.clone(), PropertyMap::new())?;
-		setup.create_atom(module.clone(), PropertyMap::new())?;
-		setup.attach_node(child.id(), &document, None, None)?;
-		setup.attach_node(root.id(), &module, None, Some(child.id()))?;
-		setup.commit()?;
+		setup.define_class(ClassSchema::new("module", AtomKind::Node, []).assert_ok()).assert_ok();
+		setup
+			.define_class(ClassSchema::new("document", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let child = setup.define_graph("child", crate::graph::GraphKind::Graph).assert_ok();
+		let root = setup.define_graph("root", crate::graph::GraphKind::Metagraph).assert_ok();
+		let document = "document:spec".parse::<crate::values::RecordId>().assert_ok();
+		let module = "module:owner".parse::<crate::values::RecordId>().assert_ok();
+		setup.create_atom(document.clone(), PropertyMap::new()).assert_ok();
+		setup.create_atom(module.clone(), PropertyMap::new()).assert_ok();
+		setup.attach_node(child.id(), &document, None, None).assert_ok();
+		setup.attach_node(root.id(), &module, None, Some(child.id())).assert_ok();
+		setup.commit().assert_ok();
 		let mut build = store.begin();
-		for result in build.execute(
-			"BUILD GRAPH <META> copied FROM (MATCH (document AS d) WITHIN <(module AS owner)> IN \
-			 GRAPH root RETURN d, owner) NODES [d, owner]",
-			&crate::values::Object::new(),
-		)? {
-			let _value = result.result?;
+		for result in build
+			.execute(
+				"BUILD GRAPH <META> copied FROM (MATCH (document AS d) WITHIN <(module AS owner)> \
+				 IN GRAPH root RETURN d, owner) NODES [d, owner]",
+				&crate::values::Object::new(),
+			)
+			.assert_ok()
+		{
+			let _value = result.result.assert_ok();
 		}
 		let copied = build
-			.named_graph("copied")?
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture copied graph"))?;
+			.named_graph("copied")
+			.assert_ok()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture copied graph"))
+			.assert_ok();
 		let owned = build
 			.working
 			.schema
 			.all_graphs()
 			.find(|graph| graph.owner_root() == Some(copied.id()))
 			.map(|graph| graph.id())
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture owned graph"))?;
-		let child_event = build.define_event(EventDefinition::new(
-			"child",
-			EventTarget::Graph(owned),
-			"true",
-			"1",
-		)?)?;
-		let root_event = build.define_event(EventDefinition::new(
-			"root",
-			EventTarget::Graph(copied.id()),
-			"true",
-			"1",
-		)?)?;
-		build.commit()?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture owned graph"))
+			.assert_ok();
+		let child_event = build
+			.define_event(
+				EventDefinition::new("child", EventTarget::Graph(owned), "true", "1").assert_ok(),
+			)
+			.assert_ok();
+		let root_event = build
+			.define_event(
+				EventDefinition::new("root", EventTarget::Graph(copied.id()), "true", "1")
+					.assert_ok(),
+			)
+			.assert_ok();
+		build.commit().assert_ok();
 		let mut by_id = store.begin();
 		let mut by_name = store.begin();
-		assert!(by_id.event(child_event)?.is_some());
-		assert!(by_name.named_event(EventTarget::Graph(owned), "child")?.is_some());
+		assert!(by_id.event(child_event).assert_ok().is_some());
+		assert!(by_name.named_event(EventTarget::Graph(owned), "child").assert_ok().is_some());
 		let mut overwrite = store.begin();
 		for result in overwrite
-			.execute("BUILD GRAPH OVERWRITE <META> copied FROM []", &crate::values::Object::new())?
+			.execute("BUILD GRAPH OVERWRITE <META> copied FROM []", &crate::values::Object::new())
+			.assert_ok()
 		{
-			let _value = result.result?;
+			let _value = result.result.assert_ok();
 		}
-		overwrite.commit()?;
-		assert!(store.begin().event(child_event)?.is_none());
-		assert!(store.begin().event(root_event)?.is_some());
+		overwrite.commit().assert_ok();
+		assert!(store.begin().event(child_event).assert_ok().is_none());
+		assert!(store.begin().event(root_event).assert_ok().is_some());
 		for (mut observer, record) in [(by_id, "document:by_id"), (by_name, "document:by_name")] {
-			observer.create_atom(record.parse()?, PropertyMap::new())?;
+			observer.create_atom(record.parse().assert_ok(), PropertyMap::new()).assert_ok();
 			assert!(observer.commit().is_err());
 		}
-		Ok(())
 	}
 }

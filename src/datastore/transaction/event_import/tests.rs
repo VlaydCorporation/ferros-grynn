@@ -54,47 +54,51 @@ fn fixture(rejected_handler: bool) -> FerrosGrynnResult<(Datastore, crate::value
 	Ok((store, value))
 }
 
+/// Verifies event import off on are independent of changefeed and keep jobs
+/// private.
 #[test]
-fn event_import_off_on_are_independent_of_changefeed_and_keep_jobs_private() -> FerrosGrynnResult<()>
-{
+fn event_import_off_on_are_independent_of_changefeed_and_keep_jobs_private() {
+	use crate::test_assertions::AssertResult as _;
+
 	for events in [ImportEventsMode::Off, ImportEventsMode::On] {
 		for changefeed in [ImportChangefeedMode::Off, ImportChangefeedMode::On] {
-			let (store, value) = fixture(false)?;
-			store.import(
-				ImportOptions {
-					events,
-					changefeed,
-					segment_size: 1,
-					..ImportOptions::default()
-				},
-				|session| {
-					for (name, number) in [("a", 1), ("b", 3)] {
-						session.apply_item(|tx| {
-							tx.create_atom(
-								format!("item:{name}").parse()?,
-								PropertyMap::from_iter([(value, Value::from(number))]),
-							)
-						})?;
-						assert!(store.begin().atom(&format!("item:{name}").parse()?)?.is_none());
-						assert!(store.jobs()?.is_empty());
-					}
-					Ok(())
-				},
-			)?;
-			assert!(store.begin().atom(&"item:a".parse()?)?.is_some());
+			let (store, value) = fixture(false).assert_ok();
+			store
+				.import(
+					ImportOptions {
+						events,
+						changefeed,
+						segment_size: 1,
+						..ImportOptions::default()
+					},
+					|session| {
+						for (name, number) in [("a", 1), ("b", 3)] {
+							session.apply_item(|tx| {
+								tx.create_atom(
+									format!("item:{name}").parse()?,
+									PropertyMap::from_iter([(value, Value::from(number))]),
+								)
+							})?;
+							assert!(
+								store.begin().atom(&format!("item:{name}").parse()?)?.is_none()
+							);
+							assert!(store.jobs()?.is_empty());
+						}
+						Ok(())
+					},
+				)
+				.assert_ok();
+			assert!(store.begin().atom(&"item:a".parse().assert_ok()).assert_ok().is_some());
 			assert_eq!(
 				store
 					.begin()
-					.atom(&"audit:sync".parse()?)?
+					.atom(&"audit:sync".parse().assert_ok())
+					.assert_ok()
 					.and_then(|atom| atom.properties().get(value).cloned()),
-				if events == ImportEventsMode::On {
-					Some(Value::from(3))
-				} else {
-					None
-				}
+				(events == ImportEventsMode::On).then(|| Value::from(3))
 			);
 			assert_eq!(
-				store.jobs()?.len(),
+				store.jobs().assert_ok().len(),
 				if events == ImportEventsMode::On {
 					2
 				} else {
@@ -123,61 +127,67 @@ fn event_import_off_on_are_independent_of_changefeed_and_keep_jobs_private() -> 
 			);
 		}
 	}
-	Ok(())
 }
 
+/// Verifies event import skip and quarantine restore handler effects and spool.
 #[test]
-fn event_import_skip_and_quarantine_restore_handler_effects_and_spool() -> FerrosGrynnResult<()> {
+fn event_import_skip_and_quarantine_restore_handler_effects_and_spool() {
+	use crate::test_assertions::AssertResult as _;
+
 	for policy in [ImportViolationPolicy::Skip, ImportViolationPolicy::Quarantine] {
-		let (store, value) = fixture(true)?;
-		let report = store.import(
-			ImportOptions {
-				events: ImportEventsMode::On,
-				segment_size: 1,
-				on_violation: policy,
-				reject_limit: Some(1),
-				..ImportOptions::default()
-			},
-			|session| {
-				let rejected = session.apply_item_with_payload(Value::from("bad"), |tx| {
-					tx.create_atom(
-						"item:bad".parse()?,
-						PropertyMap::from_iter([(value, Value::from(1))]),
-					)?;
-					tx.set_base_property(&"item:bad".parse()?, value, Value::from(2))
-				})?;
-				assert!(matches!(rejected, ImportItemOutcome::Skipped(_)));
-				session.apply_item_with_payload(Value::from("good"), |tx| {
-					tx.create_atom(
-						"item:good".parse()?,
-						PropertyMap::from_iter([(value, Value::from(3))]),
-					)
-				})?;
-				assert!(store.jobs()?.is_empty());
-				Ok(())
-			},
-		)?;
+		let (store, value) = fixture(true).assert_ok();
+		let report = store
+			.import(
+				ImportOptions {
+					events: ImportEventsMode::On,
+					segment_size: 1,
+					on_violation: policy,
+					reject_limit: Some(1),
+					..ImportOptions::default()
+				},
+				|session| {
+					let rejected = session.apply_item_with_payload(Value::from("bad"), |tx| {
+						tx.create_atom(
+							"item:bad".parse()?,
+							PropertyMap::from_iter([(value, Value::from(1))]),
+						)?;
+						tx.set_base_property(&"item:bad".parse()?, value, Value::from(2))
+					})?;
+					assert!(matches!(rejected, ImportItemOutcome::Skipped(_)));
+					session.apply_item_with_payload(Value::from("good"), |tx| {
+						tx.create_atom(
+							"item:good".parse()?,
+							PropertyMap::from_iter([(value, Value::from(3))]),
+						)
+					})?;
+					assert!(store.jobs()?.is_empty());
+					Ok(())
+				},
+			)
+			.assert_ok();
 		assert_eq!(report.skipped_items(), 1);
-		assert!(store.begin().atom(&"item:bad".parse()?)?.is_none());
-		assert!(store.begin().atom(&"audit:partial".parse()?)?.is_none());
-		assert!(store.begin().atom(&"item:good".parse()?)?.is_some());
-		assert_eq!(store.jobs()?.len(), 1);
+		assert!(store.begin().atom(&"item:bad".parse().assert_ok()).assert_ok().is_none());
+		assert!(store.begin().atom(&"audit:partial".parse().assert_ok()).assert_ok().is_none());
+		assert!(store.begin().atom(&"item:good".parse().assert_ok()).assert_ok().is_some());
+		assert_eq!(store.jobs().assert_ok().len(), 1);
 		if let Some(id) = report.quarantine() {
-			let mut reader = store.open_quarantine(id)?;
+			let mut reader = store.open_quarantine(id).assert_ok();
 			assert_eq!(
-				reader.read_next()?.map(|item| item.payload().clone()),
+				reader.read_next().assert_ok().map(|item| item.payload().clone()),
 				Some(Value::from("bad"))
 			);
-			assert!(reader.read_next()?.is_none());
+			assert!(reader.read_next().assert_ok().is_none());
 		}
 	}
-	Ok(())
 }
 
+/// Verifies event import abort publishes no primary handler or invocation
+/// effects.
 #[test]
-fn event_import_abort_publishes_no_primary_handler_or_invocation_effects() -> FerrosGrynnResult<()>
-{
-	let (store, value) = fixture(false)?;
+fn event_import_abort_publishes_no_primary_handler_or_invocation_effects() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, value) = fixture(false).assert_ok();
 	let result = store.import(
 		ImportOptions {
 			events: ImportEventsMode::On,
@@ -192,138 +202,172 @@ fn event_import_abort_publishes_no_primary_handler_or_invocation_effects() -> Fe
 		},
 	);
 	assert!(result.is_err());
-	assert!(store.begin().atom(&"item:a".parse()?)?.is_none());
-	assert!(store.begin().atom(&"audit:sync".parse()?)?.is_none());
-	assert!(store.jobs()?.is_empty());
-	Ok(())
+	assert!(store.begin().atom(&"item:a".parse().assert_ok()).assert_ok().is_none());
+	assert!(store.begin().atom(&"audit:sync".parse().assert_ok()).assert_ok().is_none());
+	assert!(store.jobs().assert_ok().is_empty());
 }
 
+/// Verifies event import gql options share the sdk dispatch path.
 #[test]
-fn event_import_gql_options_share_the_sdk_dispatch_path() -> FerrosGrynnResult<()> {
-	let (store, _value) = fixture(false)?;
-	for result in store.execute(
-		"BEGIN IMPORT WITH (EVENTS = ON, CHANGEFEED = OFF, SEGMENT SIZE = 1); CREATE item:a \
-		 CONTENT { value: 4 }; END IMPORT;",
-		&Object::new(),
-	)? {
-		let _value = result.result?;
+fn event_import_gql_options_share_the_sdk_dispatch_path() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, _value) = fixture(false).assert_ok();
+	for result in store
+		.execute(
+			"BEGIN IMPORT WITH (EVENTS = ON, CHANGEFEED = OFF, SEGMENT SIZE = 1); CREATE item:a \
+			 CONTENT { value: 4 }; END IMPORT;",
+			&Object::new(),
+		)
+		.assert_ok()
+	{
+		let _value = result.result.assert_ok();
 	}
-	assert!(store.begin().atom(&"audit:sync".parse()?)?.is_some());
-	assert_eq!(store.jobs()?.len(), 1);
-	Ok(())
+	assert!(store.begin().atom(&"audit:sync".parse().assert_ok()).assert_ok().is_some());
+	assert_eq!(store.jobs().assert_ok().len(), 1);
 }
 
+/// Verifies event import preserves each sdk change before the next mutation.
 #[test]
-fn event_import_preserves_each_sdk_change_before_the_next_mutation() -> FerrosGrynnResult<()> {
-	let (store, value) = fixture(false)?;
-	store.import(
-		ImportOptions {
-			events: ImportEventsMode::On,
-			..ImportOptions::default()
-		},
-		|session| {
-			session.apply_item(|tx| {
-				let record: crate::values::RecordId = "item:a".parse()?;
-				tx.create_atom(record.clone(), PropertyMap::from_iter([(value, Value::from(1))]))?;
-				tx.set_base_property(&record, value, Value::from(2))?;
+fn event_import_preserves_each_sdk_change_before_the_next_mutation() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, value) = fixture(false).assert_ok();
+	store
+		.import(
+			ImportOptions {
+				events: ImportEventsMode::On,
+				..ImportOptions::default()
+			},
+			|session| {
+				session.apply_item(|tx| {
+					let record: crate::values::RecordId = "item:a".parse()?;
+					tx.create_atom(
+						record.clone(),
+						PropertyMap::from_iter([(value, Value::from(1))]),
+					)?;
+					tx.set_base_property(&record, value, Value::from(2))?;
+					Ok(())
+				})?;
+				session.apply_item(|tx| {
+					let record: crate::values::RecordId = "item:ephemeral".parse()?;
+					tx.create_atom(
+						record.clone(),
+						PropertyMap::from_iter([(value, Value::from(3))]),
+					)?;
+					tx.delete_atom(&record)
+				})?;
 				Ok(())
-			})?;
-			session.apply_item(|tx| {
-				let record: crate::values::RecordId = "item:ephemeral".parse()?;
-				tx.create_atom(record.clone(), PropertyMap::from_iter([(value, Value::from(3))]))?;
-				tx.delete_atom(&record)
-			})?;
-			Ok(())
-		},
-	)?;
+			},
+		)
+		.assert_ok();
 	assert_eq!(
 		store
 			.begin()
-			.atom(&"audit:sync".parse()?)?
+			.atom(&"audit:sync".parse().assert_ok())
+			.assert_ok()
 			.and_then(|atom| atom.properties().get(value).cloned()),
 		Some(Value::from(3))
 	);
-	assert!(store.begin().atom(&"item:ephemeral".parse()?)?.is_none());
-	assert_eq!(store.jobs()?.len(), 2);
-	Ok(())
+	assert!(store.begin().atom(&"item:ephemeral".parse().assert_ok()).assert_ok().is_none());
+	assert_eq!(store.jobs().assert_ok().len(), 2);
 }
 
+/// Verifies event import gql handlers keep the callers loop budget.
 #[test]
-fn event_import_gql_handlers_keep_the_callers_loop_budget() -> FerrosGrynnResult<()> {
-	let (store, _value) = fixture(false)?;
+fn event_import_gql_handlers_keep_the_callers_loop_budget() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, _value) = fixture(false).assert_ok();
 	let mut tx = store.begin();
 	let class = tx
-		.class("item")?
+		.class("item")
+		.assert_ok()
 		.and_then(|class| class.id())
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing item class"))?;
-	tx.define_event(EventDefinition::new(
-		"bounded",
-		EventTarget::Class(class),
-		"true",
-		"{ FOR $n IN 0..256 { 1; }; }",
-	)?)?;
-	tx.commit()?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing item class"))
+		.assert_ok();
+	tx.define_event(
+		EventDefinition::new(
+			"bounded",
+			EventTarget::Class(class),
+			"true",
+			"{ FOR $n IN 0..256 { 1; }; }",
+		)
+		.assert_ok(),
+	)
+	.assert_ok();
+	tx.commit().assert_ok();
 	let options = crate::gql::QueryExecutionOptions {
 		max_loop_iterations: 128,
 		..crate::gql::QueryExecutionOptions::default()
 	};
-	let result = store.session().execute_with_options(
-		"BEGIN IMPORT WITH (EVENTS = ON); CREATE item:a; END IMPORT;",
-		&Object::new(),
-		options,
-	)?;
+	let result = store
+		.session()
+		.execute_with_options(
+			"BEGIN IMPORT WITH (EVENTS = ON); CREATE item:a; END IMPORT;",
+			&Object::new(),
+			options,
+		)
+		.assert_ok();
 	assert!(result[0].result.is_err(), "{result:?}");
-	assert!(store.begin().atom(&"item:a".parse()?)?.is_none());
-	assert!(store.begin().atom(&"audit:sync".parse()?)?.is_none());
-	assert!(store.jobs()?.is_empty());
-	Ok(())
+	assert!(store.begin().atom(&"item:a".parse().assert_ok()).assert_ok().is_none());
+	assert!(store.begin().atom(&"audit:sync".parse().assert_ok()).assert_ok().is_none());
+	assert!(store.jobs().assert_ok().is_empty());
 }
 
+/// Verifies event import gql iteration dispatches each statement.
 #[test]
-fn event_import_gql_iteration_dispatches_each_statement() -> FerrosGrynnResult<()> {
-	let (store, value) = fixture(false)?;
-	for result in store.execute(
-		"BEGIN IMPORT WITH (EVENTS = ON, CHANGEFEED = ON); FOR $n IN [1] { CREATE item:a CONTENT \
-		 { value: 1 }; UPDATE item:a SET value = 2; CREATE item:b CONTENT { value: 3 }; DELETE \
-		 item:b; }; END IMPORT;",
-		&Object::new(),
-	)? {
-		result.result?;
+fn event_import_gql_iteration_dispatches_each_statement() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, value) = fixture(false).assert_ok();
+	for result in store
+		.execute(
+			"BEGIN IMPORT WITH (EVENTS = ON, CHANGEFEED = ON); FOR $n IN [1] { CREATE item:a \
+			 CONTENT { value: 1 }; UPDATE item:a SET value = 2; CREATE item:b CONTENT { value: 3 \
+			 }; DELETE item:b; }; END IMPORT;",
+			&Object::new(),
+		)
+		.assert_ok()
+	{
+		result.result.assert_ok();
 	}
 	assert_eq!(
 		store
 			.begin()
-			.atom(&"audit:sync".parse()?)?
+			.atom(&"audit:sync".parse().assert_ok())
+			.assert_ok()
 			.and_then(|atom| atom.properties().get(value).cloned()),
 		Some(Value::from(3))
 	);
-	assert_eq!(store.jobs()?.len(), 2);
+	assert_eq!(store.jobs().assert_ok().len(), 2);
 	let root = store.inner.current_root();
 	for ((_feed, stamp), group) in root.change_history().iter() {
 		if *stamp == root.commit_ts {
 			let batch = group
 				.full
 				.as_ref()
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("missing FULL batch"))?;
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("missing FULL batch"))
+				.assert_ok();
 			assert!(
 				batch.entries().iter().all(|entry| entry.operation() == 0),
 				"one Changefeed ordinal per import iteration"
 			);
 		}
 	}
-	Ok(())
 }
 
+/// Verifies event import failed end publishes no accepted handler or job.
 #[test]
-fn event_import_failed_end_publishes_no_accepted_handler_or_job() -> FerrosGrynnResult<()> {
-	let (store, value) = fixture(false)?;
+fn event_import_failed_end_publishes_no_accepted_handler_or_job() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, value) = fixture(false).assert_ok();
 	let mut seed = store.begin();
-	seed.define_field(
-		"item",
-		crate::datastore::ClassField::new("value", crate::values::Type::Int),
-	)?;
-	seed.set_class_schema_mode("item", crate::datastore::ClassSchemaMode::Schemafull)?;
-	seed.commit()?;
+	seed.define_field("item", crate::datastore::ClassField::new("value", crate::values::Type::Int))
+		.assert_ok();
+	seed.set_class_schema_mode("item", crate::datastore::ClassSchemaMode::Schemafull).assert_ok();
+	seed.commit().assert_ok();
 	let before = store.inner.current_root().commit_ts;
 	let mut accepted = false;
 	let result = store.import(
@@ -347,55 +391,65 @@ fn event_import_failed_end_publishes_no_accepted_handler_or_job() -> FerrosGrynn
 	assert!(accepted, "the accepted item must reach END validation");
 	assert!(result.is_err());
 	assert_eq!(store.inner.current_root().commit_ts, before);
-	assert!(store.begin().atom(&"item:bad".parse()?)?.is_none());
-	assert!(store.begin().atom(&"audit:sync".parse()?)?.is_none());
-	assert!(store.jobs()?.is_empty());
-	Ok(())
+	assert!(store.begin().atom(&"item:bad".parse().assert_ok()).assert_ok().is_none());
+	assert!(store.begin().atom(&"audit:sync".parse().assert_ok()).assert_ok().is_none());
+	assert!(store.jobs().assert_ok().is_empty());
 }
 
+/// Verifies event import end preserves independent job cancellation.
 #[test]
-fn event_import_end_preserves_independent_job_cancellation() -> FerrosGrynnResult<()> {
-	let (store, value) = fixture(false)?;
+fn event_import_end_preserves_independent_job_cancellation() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, value) = fixture(false).assert_ok();
 	let mut source = store.begin();
-	source.create_atom("item:old".parse()?, PropertyMap::from_iter([(value, 1.into())]))?;
-	source.commit()?;
+	source
+		.create_atom("item:old".parse().assert_ok(), PropertyMap::from_iter([(value, 1.into())]))
+		.assert_ok();
+	source.commit().assert_ok();
 	let old = store
-		.jobs()?
+		.jobs()
+		.assert_ok()
 		.first()
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing job"))?
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing job"))
+		.assert_ok()
 		.id();
-	store.import(
-		ImportOptions {
-			events: ImportEventsMode::On,
-			segment_size: 1,
-			..ImportOptions::default()
-		},
-		|session| {
-			session.apply_item(|tx| {
-				tx.create_atom("item:new".parse()?, PropertyMap::from_iter([(value, 2.into())]))
-			})?;
-			assert_eq!(store.jobs()?.len(), 1);
-			assert_eq!(
-				store.kill_job(old)?.state(),
-				crate::datastore::MaintenanceJobState::Cancelled
-			);
-			Ok(())
-		},
-	)?;
-	let jobs = store.jobs()?;
+	store
+		.import(
+			ImportOptions {
+				events: ImportEventsMode::On,
+				segment_size: 1,
+				..ImportOptions::default()
+			},
+			|session| {
+				session.apply_item(|tx| {
+					tx.create_atom("item:new".parse()?, PropertyMap::from_iter([(value, 2.into())]))
+				})?;
+				assert_eq!(store.jobs()?.len(), 1);
+				assert_eq!(
+					store.kill_job(old)?.state(),
+					crate::datastore::MaintenanceJobState::Cancelled
+				);
+				Ok(())
+			},
+		)
+		.assert_ok();
+	let jobs = store.jobs().assert_ok();
 	assert_eq!(jobs.len(), 2);
 	assert_eq!(
-		store.job(old)?.map(|job| job.state()),
+		store.job(old).assert_ok().map(|job| job.state()),
 		Some(crate::datastore::MaintenanceJobState::Cancelled)
 	);
 	assert_eq!(store.inner.current_root().event_outbox().pending_count, 1);
-	Ok(())
 }
 
+/// Verifies event import private spool counts capacity and rejects the next
+/// source.
 #[test]
-fn event_import_private_spool_counts_capacity_and_rejects_the_next_source() -> FerrosGrynnResult<()>
-{
-	let (store, _value) = fixture(false)?;
+fn event_import_private_spool_counts_capacity_and_rejects_the_next_source() {
+	use crate::test_assertions::AssertResult as _;
+
+	let (store, _value) = fixture(false).assert_ok();
 	let result = store.import(
 		ImportOptions {
 			events: ImportEventsMode::On,
@@ -451,6 +505,5 @@ fn event_import_private_spool_counts_capacity_and_rejects_the_next_source() -> F
 		},
 	);
 	assert!(result.is_err());
-	assert!(store.jobs()?.is_empty());
-	Ok(())
+	assert!(store.jobs().assert_ok().is_empty());
 }

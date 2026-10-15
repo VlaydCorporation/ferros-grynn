@@ -107,6 +107,8 @@ impl ChangefeedCursor {
 			ChangefeedReadMode::Net => 0,
 			ChangefeedReadMode::Full => 1,
 		};
+		// Byte 7 stays zero as a reserved format byte; decoding rejects nonzero
+		// values.
 		output[8..24].copy_from_slice(self.database.as_inner().as_bytes());
 		output[24..40].copy_from_slice(self.source.as_uuid().as_inner().as_bytes());
 		output[40..48].copy_from_slice(&self.stamp.get().to_le_bytes());
@@ -139,12 +141,16 @@ impl ChangefeedCursor {
 }
 
 #[cfg(test)]
+/// Regression tests for cursor behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies cursor preserves exact positions and rejects malformed frames.
 	#[test]
-	fn cursor_preserves_exact_positions_and_rejects_malformed_frames() -> FerrosGrynnResult<()> {
-		let source = ChangefeedId::from_uuid(uuid::Uuid::from_bytes([2; 16]).into())?;
+	fn cursor_preserves_exact_positions_and_rejects_malformed_frames() {
+		use crate::test_assertions::AssertResult as _;
+
+		let source = ChangefeedId::from_uuid(uuid::Uuid::from_bytes([2; 16]).into()).assert_ok();
 		for stamp in [0, 1_u64 << 53, u64::MAX] {
 			for mode in [ChangefeedReadMode::Net, ChangefeedReadMode::Full] {
 				let cursor = ChangefeedCursor::new(
@@ -152,9 +158,10 @@ mod tests {
 					source,
 					mode,
 					Versionstamp::new(stamp),
-				)?;
+				)
+				.assert_ok();
 				let encoded = cursor.encode();
-				assert_eq!(ChangefeedCursor::decode(encoded.as_slice())?, cursor);
+				assert_eq!(ChangefeedCursor::decode(encoded.as_slice()).assert_ok(), cursor);
 				for length in 0..48 {
 					assert!(ChangefeedCursor::decode(&encoded.as_slice()[..length]).is_err());
 				}
@@ -169,6 +176,5 @@ mod tests {
 			}
 		}
 		assert!(ChangefeedId::from_uuid(Uuid::default()).is_err());
-		Ok(())
 	}
 }

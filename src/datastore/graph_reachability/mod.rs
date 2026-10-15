@@ -16,6 +16,7 @@ const ARRAY_BYTES: u64 = PAGE_BYTES - 64;
 
 /// Only definitive labels may terminate an unbounded reachability query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(super) enum ReachabilityDecision {
 	/// An exact label proves reachability.
 	Yes,
@@ -100,6 +101,7 @@ pub enum ReachabilityLabels {
 
 /// Exact answer and work counters for one label lookup plus refinement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(super) struct ReachabilityAnswer {
 	/// Whether the target is reachable, including the seed itself.
 	pub(super) reachable: bool,
@@ -147,31 +149,7 @@ pub(super) fn build_reachability_labels(
 	check_scratch(limits, 0)?;
 	let mut chain_coordinates = None;
 	let algorithm = if requested == ReachabilityAlgorithm::Auto {
-		if tree {
-			if projected_bytes(limits, &[(count, 16)])? <= limits.max_bytes {
-				ReachabilityAlgorithm::TreeCover
-			} else {
-				ReachabilityAlgorithm::OnDemand
-			}
-		} else {
-			let (coordinates, chains) = chain_cover(dag, limits, check)?;
-			let cells =
-				count.checked_mul(chains).ok_or_else(|| artifact_error(limits.max_bytes))?;
-			chain_coordinates = Some((coordinates, chains));
-			if projected_bytes(limits, &[(count, 16), (cells, 8)])? <= limits.max_bytes {
-				ReachabilityAlgorithm::ChainCover
-			} else if projected_bytes(limits, &[
-				(count.checked_mul(4).ok_or_else(|| artifact_error(limits.max_bytes))?, 24),
-				(count, 8),
-			])? <= limits.max_bytes
-			{
-				ReachabilityAlgorithm::Ferrari(4)
-			} else if projected_bytes(limits, &[(count, 40)])? <= limits.max_bytes {
-				ReachabilityAlgorithm::Bfl(160)
-			} else {
-				ReachabilityAlgorithm::OnDemand
-			}
-		}
+		automatic_algorithm(dag, tree, limits, check, &mut chain_coordinates)?
 	} else {
 		requested
 	};
@@ -375,8 +353,51 @@ pub(super) fn build_reachability_labels(
 	}
 }
 
+/// Chooses AUTO's algorithm while retaining the admitted chain-cover workspace.
+///
+/// # Errors
+/// Returns the existing chain-cover, cancellation or projected-byte overflow
+/// error.
+fn automatic_algorithm(
+	dag: &ProjectedCondensation,
+	tree: bool,
+	limits: ReachabilityBuildLimits,
+	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	chain_coordinates: &mut Option<(Vec<(u64, u64)>, usize)>,
+) -> FerrosGrynnResult<ReachabilityAlgorithm> {
+	let count = dag.representatives.len();
+	Ok({
+		if tree {
+			if projected_bytes(limits, &[(count, 16)])? <= limits.max_bytes {
+				ReachabilityAlgorithm::TreeCover
+			} else {
+				ReachabilityAlgorithm::OnDemand
+			}
+		} else {
+			let (coordinates, chains) = chain_cover(dag, limits, check)?;
+			let cells =
+				count.checked_mul(chains).ok_or_else(|| artifact_error(limits.max_bytes))?;
+			*chain_coordinates = Some((coordinates, chains));
+			if projected_bytes(limits, &[(count, 16), (cells, 8)])? <= limits.max_bytes {
+				ReachabilityAlgorithm::ChainCover
+			} else if projected_bytes(limits, &[
+				(count.checked_mul(4).ok_or_else(|| artifact_error(limits.max_bytes))?, 24),
+				(count, 8),
+			])? <= limits.max_bytes
+			{
+				ReachabilityAlgorithm::Ferrari(4)
+			} else if projected_bytes(limits, &[(count, 40)])? <= limits.max_bytes {
+				ReachabilityAlgorithm::Bfl(160)
+			} else {
+				ReachabilityAlgorithm::OnDemand
+			}
+		}
+	})
+}
+
 impl ReachabilityLabels {
 	/// Returns the component extent represented by these labels.
+	#[cfg(test)]
 	pub(super) fn component_count(&self) -> usize {
 		match self {
 			Self::TreeCover {
@@ -409,6 +430,7 @@ impl ReachabilityLabels {
 	///
 	/// # Errors
 	/// Rejects source or target references outside the component extent.
+	#[cfg(test)]
 	pub(super) fn decision(
 		&self,
 		source: usize,
@@ -511,6 +533,7 @@ impl ReachabilityLabels {
 	///
 	/// # Errors
 	/// Returns a resource/cancellation error instead of a partial answer.
+	#[cfg(test)]
 	pub(super) fn reachable(
 		&self,
 		dag: &ProjectedCondensation,
@@ -594,6 +617,7 @@ impl ReachabilityLabels {
 }
 
 /// Inclusive interval containment, shared by exact and negative labels.
+#[cfg(test)]
 fn contains(source: (u64, u64), target: (u64, u64)) -> bool {
 	source.0 <= target.0 && target.1 <= source.1
 }
@@ -704,7 +728,7 @@ fn compress_ranges(row: &mut Vec<ReachabilityInterval>, limit: usize) {
 		}
 	}
 	row.truncate(write);
-	// ponytail: greedy gap compression preserves correctness; use optimal
+	// shortcut: greedy gap compression preserves correctness; use optimal
 	// covers when refinement counts justify their additional build cost.
 	while row.len() > limit {
 		let Some((index, _)) = row

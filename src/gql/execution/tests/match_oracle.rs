@@ -1,20 +1,28 @@
 use std::collections::VecDeque;
 
+#[cfg(test)]
+use crate::test_assertions::{AssertOption as _, AssertResult as _};
 use crate::{
 	datastore::{ClassSchema, Datastore, Transaction},
 	graph::{AtomKind, EdgeTopology, GraphKind},
 	values::{Number, Object, PropertyMap, RecordId, Value},
 };
 
+/// Path-repetition policy used by the independent MATCH test oracle.
 #[derive(Clone, Copy)]
 enum OracleMode {
+	/// Permit repeated nodes and edges.
 	Walk,
+	/// Reject repeated edges within a path.
 	Trail,
+	/// Reject repeated nodes within a path.
 	Acyclic,
+	/// Reject repeated nodes while permitting the final step to close a cycle.
 	Simple,
 }
 
 impl OracleMode {
+	/// Returns source for `OracleMode`.
 	fn source(self) -> &'static str {
 		match self {
 			Self::Walk => "WALK",
@@ -25,28 +33,35 @@ impl OracleMode {
 	}
 }
 
+/// Returns query lengths for this module.
 fn query_lengths(transaction: &mut Transaction, source: &str) -> Vec<usize> {
-	transaction.execute(source, &Object::new()).unwrap()[0]
+	transaction.execute(source, &Object::new()).assert_ok()[0]
 		.result
 		.as_ref()
-		.unwrap()
+		.assert_ok()
 		.value()
 		.as_array()
-		.unwrap()
+		.assert_some()
 		.iter()
-		.map(|row| match row.as_object().unwrap().get("length").unwrap() {
-			Value::Number(Number::Int(value)) => usize::try_from(*value).unwrap(),
-			value => panic!("path length must be an integer, got {value:?}"),
+		.map(|row| {
+			match row.as_object().assert_some().get("length").assert_some() {
+				Value::Number(Number::Int(value)) => Some(*value),
+				_ => None,
+			}
+			.assert_some_with("path length must be an integer")
 		})
+		.map(|value| usize::try_from(value).assert_ok())
 		.collect()
 }
 
+/// Returns oracle path count for this module.
 fn oracle_path_count(
 	edges: &[(usize, usize)],
 	source: usize,
 	target: usize,
 	mode: OracleMode,
 ) -> usize {
+	/// Returns visit for this module.
 	fn visit(
 		edges: &[(usize, usize)],
 		target: usize,
@@ -55,7 +70,7 @@ fn oracle_path_count(
 		used_edges: &mut Vec<usize>,
 		count: &mut usize,
 	) {
-		let current = *nodes.last().unwrap();
+		let current = *nodes.last().assert_some();
 		if current == target {
 			*count += 1;
 		}
@@ -95,6 +110,7 @@ fn oracle_path_count(
 	count
 }
 
+/// Returns oracle shortest for this module.
 fn oracle_shortest(edges: &[(usize, usize)], source: usize, target: usize) -> Option<usize> {
 	let mut distance = [usize::MAX; 3];
 	let mut queue = VecDeque::from([source]);
@@ -113,35 +129,39 @@ fn oracle_shortest(edges: &[(usize, usize)], source: usize, target: usize) -> Op
 	None
 }
 
+/// Verifies generated small graphs match the path mode and shortest oracle.
 #[test]
 fn generated_small_graphs_match_the_path_mode_and_shortest_oracle() {
+	/// Possible directed edges, including a self-loop, in the generated
+	/// path-oracle graphs.
 	const CANDIDATE_EDGES: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 2)];
+	/// Edge-subset masks covering empty, cyclic and branching oracle fixtures.
 	const MASKS: [u8; 8] = [0, 1, 3, 5, 7, 9, 13, 15];
 
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("oracle_node", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("oracle_edge", AtomKind::Edge, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("oracle_node", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("oracle_edge", AtomKind::Edge, []).assert_ok()).assert_ok();
 	let nodes = ["oracle_node:n0", "oracle_node:n1", "oracle_node:n2"]
-		.map(|value| value.parse::<RecordId>().unwrap());
+		.map(|value| value.parse::<RecordId>().assert_ok());
 	for node in &nodes {
-		seed.create_atom(node.clone(), PropertyMap::new()).unwrap();
+		seed.create_atom(node.clone(), PropertyMap::new()).assert_ok();
 	}
 	let edge_ids = MASKS.map(|mask| {
 		CANDIDATE_EDGES.map(|(from, to)| {
-			format!("oracle_edge:m{mask}_{from}_{to}").parse::<RecordId>().unwrap()
+			format!("oracle_edge:m{mask}_{from}_{to}").parse::<RecordId>().assert_ok()
 		})
 	});
 	for edges in &edge_ids {
 		for edge in edges {
-			seed.create_atom(edge.clone(), PropertyMap::new()).unwrap();
+			seed.create_atom(edge.clone(), PropertyMap::new()).assert_ok();
 		}
 	}
 	for (mask_index, mask) in MASKS.into_iter().enumerate() {
-		let graph = seed.define_graph(format!("oracle_{mask}"), GraphKind::Graph).unwrap();
+		let graph = seed.define_graph(format!("oracle_{mask}"), GraphKind::Graph).assert_ok();
 		let local = nodes
 			.iter()
-			.map(|node| seed.attach_node(graph.id(), node, None, None).unwrap())
+			.map(|node| seed.attach_node(graph.id(), node, None, None).assert_ok())
 			.collect::<Vec<_>>();
 		for (edge_index, &(from, to)) in CANDIDATE_EDGES.iter().enumerate() {
 			if mask & (1 << edge_index) != 0 {
@@ -153,11 +173,11 @@ fn generated_small_graphs_match_the_path_mode_and_shortest_oracle() {
 					None,
 					None,
 				)
-				.unwrap();
+				.assert_ok();
 			}
 		}
 	}
-	seed.commit().unwrap();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	for mask in MASKS {

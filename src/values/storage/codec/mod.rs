@@ -6,8 +6,11 @@
 
 //! Canonical format-version-1 codec and checked archive envelope.
 
+/// Bounded decoding of canonical storage values.
 mod decode;
+/// Canonical storage-value encoding and set normalization.
 mod encode;
+/// Versioned archive framing, length checks and checksum validation.
 mod envelope;
 
 pub(super) use encode::canonicalize_set;
@@ -22,29 +25,48 @@ use envelope::crc32;
 use super::{StorageValue, StorageValueRef};
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
+/// Range header bit indicating an inclusive lower endpoint.
 const RANGE_LOWER_INCLUSIVE: u8 = 1 << 0;
+/// Range header bit indicating an inclusive upper endpoint.
 const RANGE_UPPER_INCLUSIVE: u8 = 1 << 1;
+/// Range header bit indicating that no lower endpoint is stored.
 const RANGE_LOWER_UNBOUNDED: u8 = 1 << 2;
+/// Range header bit indicating that no upper endpoint is stored.
 const RANGE_UPPER_UNBOUNDED: u8 = 1 << 3;
+/// Mask of range-header bits accepted by the canonical decoder.
 const RANGE_ALLOWED_FLAGS: u8 = 0x0F;
+/// Duration header sign bit; a negative duration with no units is rejected.
 const DURATION_SIGN: u16 = 1 << 15;
+/// Duration header bits marking nonzero units, excluding the sign and reserved
+/// bits.
 const DURATION_UNIT_MASK: u16 = 0x7FE0;
+/// Magic bytes identifying the versioned value archive envelope.
 const ARCHIVE_MAGIC: [u8; 4] = *b"FGAR";
+/// Value archive envelope version accepted by the codec.
 const ARCHIVE_FORMAT_VERSION: u16 = 1;
+/// Fixed archive header size in bytes, including its reserved tail.
 const ARCHIVE_HEADER_LEN: usize = 32;
+/// Reserved archive-header bytes after magic, version, tag, length and
+/// checksum.
 const ARCHIVE_RESERVED_LEN: usize = ARCHIVE_HEADER_LEN - (4 + 2 + 4 + 8 + 4);
 
 /// Resource bounds applied before allocating from untrusted encoded lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
+	/// Maximum nested depth accepted by the operation or declaration.
 	pub max_depth: usize,
+	/// Maximum element count accepted for a decoded collection.
 	pub max_collection_len: usize,
+	/// Maximum byte length accepted for one decoded text value.
 	pub max_string_bytes: usize,
+	/// Maximum byte length accepted for one decoded binary value.
 	pub max_blob_bytes: usize,
+	/// Maximum combined allocation bytes admitted during decoding.
 	pub max_total_allocation: usize,
 }
 
 impl DecodeLimits {
+	/// Constructs `DecodeLimits` from the supplied initial state.
 	pub const fn new(
 		max_depth: usize,
 		max_collection_len: usize,
@@ -63,6 +85,7 @@ impl DecodeLimits {
 }
 
 impl Default for DecodeLimits {
+	/// Constructs the default initial state of `DecodeLimits`.
 	fn default() -> Self {
 		Self::new(64, 1_000_000, 16 * 1024 * 1024, 64 * 1024 * 1024, 128 * 1024 * 1024)
 	}
@@ -72,12 +95,14 @@ impl Default for DecodeLimits {
 pub struct CanonicalCodec;
 
 impl CanonicalCodec {
+	/// Returns encode for `CanonicalCodec`.
 	pub fn encode(value: StorageValueRef<'_>) -> FerrosGrynnResult<Vec<u8>> {
 		let mut output = Vec::new();
 		encode::encode_value(&mut output, &value)?;
 		Ok(output)
 	}
 
+	/// Returns decode for `CanonicalCodec`.
 	pub fn decode(bytes: &[u8], limits: DecodeLimits) -> FerrosGrynnResult<StorageValue> {
 		let (value, consumed) = Self::decode_prefix(bytes, limits)?;
 		if consumed != bytes.len() {
@@ -112,6 +137,7 @@ impl CanonicalCodec {
 	}
 }
 
+/// Returns canonical f32 for this module.
 fn canonical_f32(value: f32) -> u32 {
 	if value.is_nan() {
 		f32::NAN.to_bits()
@@ -122,31 +148,40 @@ fn canonical_f32(value: f32) -> u32 {
 	}
 }
 
+/// Returns truncated for this module.
 fn truncated(offset: usize) -> FerrosGrynnError {
 	invalid(offset, "encoded value is truncated")
 }
 
+/// Returns invalid for this module.
 fn invalid(offset: usize, reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_value_encoding(offset as u64, reason)
 }
 
+/// Returns limit error for this module.
 fn limit_error(name: &str, maximum: usize, actual: usize) -> FerrosGrynnError {
 	FerrosGrynnError::storage_decode_limit_exceeded(name, maximum as u64, actual as u64)
 }
 
 #[cfg(test)]
+/// Regression tests for codec behavior.
 mod tests {
 	use proptest::prelude::*;
 
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
+
+	/// Verifies geometry writer and default decoder agree at large point and
+	/// depth boundaries.
 	#[test]
 	fn geometry_writer_and_default_decoder_agree_at_large_point_and_depth_boundaries() {
-		let point = crate::values::Position::new([1.0, 2.0]).unwrap();
+		let point = crate::values::Position::new([1.0, 2.0]).assert_ok();
 		let large = crate::values::storage::StorageValue::Geometry(
 			crate::values::Geometry::MultiPoint(vec![point.clone(); 250_000]),
 		);
-		let bytes = super::CanonicalCodec::encode(large.as_ref()).unwrap();
+		let bytes = super::CanonicalCodec::encode(large.as_ref()).assert_ok();
 		assert_eq!(
-			super::CanonicalCodec::decode(&bytes, super::DecodeLimits::default()).unwrap(),
+			super::CanonicalCodec::decode(&bytes, super::DecodeLimits::default()).assert_ok(),
 			large
 		);
 		assert!(
@@ -161,9 +196,9 @@ mod tests {
 			geometry = crate::values::Geometry::Collection(vec![geometry]);
 		}
 		let value = crate::values::storage::StorageValue::Geometry(geometry);
-		let bytes = super::CanonicalCodec::encode(value.as_ref()).unwrap();
+		let bytes = super::CanonicalCodec::encode(value.as_ref()).assert_ok();
 		assert_eq!(
-			super::CanonicalCodec::decode(&bytes, super::DecodeLimits::default()).unwrap(),
+			super::CanonicalCodec::decode(&bytes, super::DecodeLimits::default()).assert_ok(),
 			value
 		);
 		let mut malformed = vec![0x23];
@@ -206,17 +241,18 @@ mod tests {
 		},
 	};
 
+	/// Verifies all format v1 tags round trip.
 	#[test]
 	fn all_format_v1_tags_round_trip() {
-		let point = Position::new([10.0, 20.0]).unwrap();
-		let second = Position::new([-10.0, -20.0]).unwrap();
+		let point = Position::new([10.0, 20.0]).assert_ok();
+		let second = Position::new([-10.0, -20.0]).assert_ok();
 		let ring = vec![
 			point.clone(),
 			second.clone(),
-			Position::new([10.0, -20.0]).unwrap(),
+			Position::new([10.0, -20.0]).assert_ok(),
 			point.clone(),
 		];
-		let local_atom = DiskAtomRef::from_parts(crate::values::AtomKind::Edge, 17).unwrap();
+		let local_atom = DiskAtomRef::from_parts(crate::values::AtomKind::Edge, 17).assert_ok();
 		let atom = StorageAtomRef {
 			kind: crate::values::AtomKind::Edge,
 			record_id: StorageRecordId {
@@ -272,10 +308,7 @@ mod tests {
 			StorageValue::Geometry(Geometry::LineString(vec![point.clone(), second.clone()])),
 			StorageValue::Geometry(Geometry::Polygon(vec![ring.clone()])),
 			StorageValue::Geometry(Geometry::MultiPoint(vec![point.clone(), second.clone()])),
-			StorageValue::Geometry(Geometry::MultiLineString(vec![vec![
-				point.clone(),
-				second.clone(),
-			]])),
+			StorageValue::Geometry(Geometry::MultiLineString(vec![vec![point.clone(), second]])),
 			StorageValue::Geometry(Geometry::MultiPolygon(vec![vec![ring]])),
 			StorageValue::Geometry(Geometry::Collection(vec![Geometry::Point(point)])),
 			StorageValue::Vector(Vector::F64(vec![1.0, 2.0])),
@@ -290,17 +323,18 @@ mod tests {
 			StorageValue::Vector(Vector::I8(vec![-1, 2])),
 			StorageValue::Vector(Vector::U8(vec![1, 255])),
 			StorageValue::AtomRef(atom),
-			StorageValue::GraphRef(DiskGraphRef::new(GraphId::new(7).unwrap())),
+			StorageValue::GraphRef(DiskGraphRef::new(GraphId::new(7).assert_some())),
 			StorageValue::QualifiedAtomRef(QualifiedAtomRef::new(9, local_atom)),
 		];
 
 		for value in values {
-			let encoded = CanonicalCodec::encode(value.as_ref()).unwrap();
-			let decoded = CanonicalCodec::decode(&encoded, DecodeLimits::default()).unwrap();
+			let encoded = CanonicalCodec::encode(value.as_ref()).assert_ok();
+			let decoded = CanonicalCodec::decode(&encoded, DecodeLimits::default()).assert_ok();
 			assert_eq!(decoded, value);
 		}
 	}
 
+	/// Verifies atom reference uses kind and canonical record id bytes.
 	#[test]
 	fn atom_reference_uses_kind_and_canonical_record_id_bytes() {
 		let value = StorageValue::AtomRef(StorageAtomRef {
@@ -310,7 +344,7 @@ mod tests {
 				part: StorageRecordIdPart::Int(4),
 			},
 		});
-		assert_eq!(CanonicalCodec::encode(value.as_ref()).unwrap(), [
+		assert_eq!(CanonicalCodec::encode(value.as_ref()).assert_ok(), [
 			TypeTag::AtomRef.byte(),
 			1,
 			TypeTag::RecordId.byte(),
@@ -323,34 +357,36 @@ mod tests {
 		]);
 	}
 
+	/// Verifies rejects unknown tags truncation noncanonical leb and utf8.
 	#[test]
 	fn rejects_unknown_tags_truncation_noncanonical_leb_and_utf8() {
 		assert_status(
-			CanonicalCodec::decode(&[0x14], DecodeLimits::default()).unwrap_err(),
+			CanonicalCodec::decode(&[0x14], DecodeLimits::default()).assert_err(),
 			"FG-22S01",
 		);
 		assert_status(
 			CanonicalCodec::decode(&[TypeTag::Float.byte(), 0], DecodeLimits::default())
-				.unwrap_err(),
+				.assert_err(),
 			"FG-22S02",
 		);
 		assert_status(
 			CanonicalCodec::decode(&[TypeTag::Int.byte(), 0x80, 0x00], DecodeLimits::default())
-				.unwrap_err(),
+				.assert_err(),
 			"FG-22S02",
 		);
 		assert_status(
 			CanonicalCodec::decode(&[TypeTag::String.byte(), 1, 0xFF], DecodeLimits::default())
-				.unwrap_err(),
+				.assert_err(),
 			"FG-22S02",
 		);
 	}
 
+	/// Verifies rejects duplicate or unsorted set object and record keys.
 	#[test]
 	fn rejects_duplicate_or_unsorted_set_object_and_record_keys() {
 		let duplicate_set = [TypeTag::Set.byte(), 2, TypeTag::Null.byte(), TypeTag::Null.byte()];
 		assert_status(
-			CanonicalCodec::decode(&duplicate_set, DecodeLimits::default()).unwrap_err(),
+			CanonicalCodec::decode(&duplicate_set, DecodeLimits::default()).assert_err(),
 			"FG-22S02",
 		);
 
@@ -369,7 +405,7 @@ mod tests {
 			TypeTag::Null.byte(),
 		];
 		assert_status(
-			CanonicalCodec::decode(&object, DecodeLimits::default()).unwrap_err(),
+			CanonicalCodec::decode(&object, DecodeLimits::default()).assert_err(),
 			"FG-22S02",
 		);
 
@@ -391,72 +427,79 @@ mod tests {
 			0,
 		];
 		assert_status(
-			CanonicalCodec::decode(&record, DecodeLimits::default()).unwrap_err(),
+			CanonicalCodec::decode(&record, DecodeLimits::default()).assert_err(),
 			"FG-22S02",
 		);
 	}
 
+	/// Verifies enforces depth length and allocation limits before reserve.
 	#[test]
 	fn enforces_depth_length_and_allocation_limits_before_reserve() {
 		let nested = [TypeTag::Array.byte(), 1, TypeTag::Array.byte(), 1, TypeTag::Null.byte()];
 		let limits = DecodeLimits::new(1, 10, 10, 10, 1024);
-		assert_status(CanonicalCodec::decode(&nested, limits).unwrap_err(), "FG-54S01");
+		assert_status(CanonicalCodec::decode(&nested, limits).assert_err(), "FG-54S01");
 
 		let long = [TypeTag::String.byte(), 4, b't', b'e', b's', b't'];
 		let limits = DecodeLimits::new(10, 10, 3, 10, 1024);
-		assert_status(CanonicalCodec::decode(&long, limits).unwrap_err(), "FG-54S01");
+		assert_status(CanonicalCodec::decode(&long, limits).assert_err(), "FG-54S01");
 
 		let array = [TypeTag::Array.byte(), 2, TypeTag::Null.byte(), TypeTag::Null.byte()];
 		let limits = DecodeLimits::new(10, 10, 10, 10, 1);
-		assert_status(CanonicalCodec::decode(&array, limits).unwrap_err(), "FG-54S01");
+		assert_status(CanonicalCodec::decode(&array, limits).assert_err(), "FG-54S01");
 	}
 
+	/// Verifies archive envelope checks magic version schema length and
+	/// checksum.
 	#[test]
 	fn archive_envelope_checks_magic_version_schema_length_and_checksum() {
 		let payload = b"checked rkyv payload";
-		let archive = ArchiveEnvelope::wrap(42, payload).unwrap();
-		let opened = ArchiveEnvelope::open(&archive, 42).unwrap();
+		let archive = ArchiveEnvelope::wrap(42, payload).assert_ok();
+		let opened = ArchiveEnvelope::open(&archive, 42).assert_ok();
 		assert_eq!(opened, payload);
 		assert_eq!(opened.as_ptr() as usize % rkyv::util::AlignedVec::<16>::ALIGNMENT, 0);
 
 		let mut corrupted = archive.clone();
 		let last = corrupted.len() - 1;
 		corrupted[last] ^= 1;
-		assert_status(ArchiveEnvelope::open(&corrupted, 42).unwrap_err(), "FG-22S06");
-		assert_status(ArchiveEnvelope::open(&archive, 7).unwrap_err(), "FG-22S06");
+		assert_status(ArchiveEnvelope::open(&corrupted, 42).assert_err(), "FG-22S06");
+		assert_status(ArchiveEnvelope::open(&archive, 7).assert_err(), "FG-22S06");
 		let mut reserved = archive.clone();
 		reserved[22] = 1;
-		assert_status(ArchiveEnvelope::open(&reserved, 42).unwrap_err(), "FG-22S06");
+		assert_status(ArchiveEnvelope::open(&reserved, 42).assert_err(), "FG-22S06");
 		let mut misaligned = rkyv::util::AlignedVec::<16>::new();
 		misaligned.push(0);
 		misaligned.extend_from_slice(&archive);
-		assert_status(ArchiveEnvelope::open(&misaligned[1..], 42).unwrap_err(), "FG-22S06");
+		assert_status(ArchiveEnvelope::open(&misaligned[1..], 42).assert_err(), "FG-22S06");
 		assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
 	}
 
+	/// Verifies range flag validation rejects reserved and inclusive unbounded
+	/// forms.
 	#[test]
 	fn range_flag_validation_rejects_reserved_and_inclusive_unbounded_forms() {
 		for flags in [0x10, 0x05] {
 			let bytes = [TypeTag::Range.byte(), flags];
 			assert_status(
-				CanonicalCodec::decode(&bytes, DecodeLimits::default()).unwrap_err(),
+				CanonicalCodec::decode(&bytes, DecodeLimits::default()).assert_err(),
 				"FG-22S02",
 			);
 		}
 	}
 
+	/// Verifies canonical float encoding rejects signed zero and nan payloads.
 	#[test]
 	fn canonical_float_encoding_rejects_signed_zero_and_nan_payloads() {
 		for bits in [(-0.0_f64).to_bits(), 0x7FF8_0000_0000_0001] {
 			let mut bytes = vec![TypeTag::Float.byte()];
 			bytes.extend_from_slice(&bits.to_le_bytes());
 			assert_status(
-				CanonicalCodec::decode(&bytes, DecodeLimits::default()).unwrap_err(),
+				CanonicalCodec::decode(&bytes, DecodeLimits::default()).assert_err(),
 				"FG-22S02",
 			);
 		}
 	}
 
+	/// Verifies duration rejects reserved bits zero units and negative zero.
 	#[test]
 	fn duration_rejects_reserved_bits_zero_units_and_negative_zero() {
 		for bytes in [
@@ -465,13 +508,14 @@ mod tests {
 			vec![TypeTag::Duration.byte(), 0, 0x80],
 		] {
 			assert_status(
-				CanonicalCodec::decode(&bytes, DecodeLimits::default()).unwrap_err(),
+				CanonicalCodec::decode(&bytes, DecodeLimits::default()).assert_err(),
 				"FG-22S02",
 			);
 		}
 	}
 
 	proptest! {
+		/// Verifies decoder never panics on arbitrary input.
 		#[test]
 		fn decoder_never_panics_on_arbitrary_input(
 			bytes in proptest::collection::vec(any::<u8>(), 0..512),
@@ -481,6 +525,7 @@ mod tests {
 		}
 	}
 
+	/// Returns assert status for this module.
 	fn assert_status(error: FerrosGrynnError, expected: &str) {
 		assert_eq!(error.status().code().to_string(), expected);
 	}

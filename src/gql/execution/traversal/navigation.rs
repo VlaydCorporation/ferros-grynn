@@ -2,8 +2,10 @@
 
 use super::*;
 
+/// Maximum atom IDs retained in one resumable traversal graph-scan page.
 const GRAPH_SCAN_WINDOW: usize = 256;
 
+/// Reports whether the value is navigation for this module.
 pub(super) const fn is_navigation(kind: TraverseStepKind) -> bool {
 	matches!(
 		kind,
@@ -23,6 +25,7 @@ pub(super) const fn is_navigation(kind: TraverseStepKind) -> bool {
 }
 
 impl<Read: QueryRead> TraversalMachine<'_, Read> {
+	/// Returns navigate for `TraversalMachine<'_, Read>`.
 	pub(super) fn navigate(
 		&mut self,
 		stage: usize,
@@ -49,6 +52,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		}
 	}
 
+	/// Returns start graph scan for `TraversalMachine<'_, Read>`.
 	fn start_graph_scan(
 		&mut self,
 		stage: usize,
@@ -77,6 +81,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		self.resume_graph_scan(stage)
 	}
 
+	/// Returns resume graph scan for `TraversalMachine<'_, Read>`.
 	pub(super) fn resume_graph_scan(&mut self, stage: usize) -> FerrosGrynnResult<Vec<Traverser>> {
 		let StageState::GraphScan(pending) = &mut self.states[stage] else {
 			return Err(FerrosGrynnError::invalid_argument(
@@ -126,6 +131,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(output)
 	}
 
+	/// Returns expand for `TraversalMachine<'_, Read>`.
 	fn expand(
 		&mut self,
 		step: &PreparedStep,
@@ -232,6 +238,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(output)
 	}
 
+	/// Returns local candidates for `TraversalMachine<'_, Read>`.
 	fn local_candidates(
 		&mut self,
 		source: BoundAtom,
@@ -306,6 +313,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(Some(candidates))
 	}
 
+	/// Returns edge endpoints for `TraversalMachine<'_, Read>`.
 	fn edge_endpoints(
 		&mut self,
 		kind: TraverseStepKind,
@@ -404,6 +412,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(output)
 	}
 
+	/// Returns meta inner for `TraversalMachine<'_, Read>`.
 	fn meta_inner(&self, mut traverser: Traverser) -> FerrosGrynnResult<Vec<Traverser>> {
 		let occurrence = occurrence(&traverser.current)?.clone();
 		let owner = self.bound_atom(&occurrence)?;
@@ -438,6 +447,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(vec![traverser])
 	}
 
+	/// Returns scoped index for `TraversalMachine<'_, Read>`.
 	fn scoped_index(&mut self, root: &GraphRef) -> FerrosGrynnResult<Rc<ScopedTraversalIndex>> {
 		if let Some(index) = self.scoped_indexes.get(&root.id()) {
 			return Ok(index.clone());
@@ -466,6 +476,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(index)
 	}
 
+	/// Returns bound atom for `TraversalMachine<'_, Read>`.
 	fn bound_atom(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<BoundAtom> {
 		let graph = self.read.graph(self.snapshot, occurrence.graph())?;
 		let atom = graph.atom_id(occurrence.atom())?.ok_or_else(|| {
@@ -477,6 +488,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(BoundAtom::new(occurrence.graph().id(), atom))
 	}
 
+	/// Returns bound occurrence for `TraversalMachine<'_, Read>`.
 	fn bound_occurrence(&mut self, atom: BoundAtom) -> FerrosGrynnResult<AtomOccurrenceRef> {
 		if let Some(occurrence) = self.occurrences.get(&atom) {
 			return Ok(occurrence.clone());
@@ -492,6 +504,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(occurrence)
 	}
 
+	/// Returns field value for `TraversalMachine<'_, Read>`.
 	pub(super) fn field_value(&self, value: &Value, field: &str) -> FerrosGrynnResult<Value> {
 		match value {
 			Value::Object(object) => Ok(object.get(field).cloned().unwrap_or(Value::None)),
@@ -532,6 +545,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		}
 	}
 
+	/// Returns edge is hyper for `TraversalMachine<'_, Read>`.
 	fn edge_is_hyper(&self, edge: BoundAtom) -> FerrosGrynnResult<bool> {
 		let reference = self.read.graph_reference(self.snapshot, edge.graph)?;
 		let graph = self.read.graph(self.snapshot, &reference)?;
@@ -541,6 +555,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(edge.topology()?.is_hyper())
 	}
 
+	/// Returns seed trace for `TraversalMachine<'_, Read>`.
 	fn seed_trace(
 		&mut self,
 		traverser: &mut Traverser,
@@ -561,6 +576,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(())
 	}
 
+	/// Appends trace for `TraversalMachine<'_, Read>`.
 	fn append_trace(
 		&mut self,
 		traverser: &mut Traverser,
@@ -631,6 +647,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(())
 	}
 
+	/// Returns edge weight for `TraversalMachine<'_, Read>`.
 	fn edge_weight(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Number> {
 		let graph = self.read.graph(self.snapshot, occurrence.graph())?;
 		let edge = graph.atom_id(occurrence.atom())?.ok_or_else(|| {
@@ -643,6 +660,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			.map_or(Ok(Number::Int(1)), Ok)
 	}
 
+	/// Materializes path for `TraversalMachine<'_, Read>`.
 	pub(super) fn materialize_path(&self, traverser: &Traverser) -> FerrosGrynnResult<Path> {
 		let trace = traverser.trace.ok_or_else(|| {
 			FerrosGrynnError::invalid_argument(
@@ -661,6 +679,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	}
 }
 
+/// Returns graph scan page for this module.
 fn graph_scan_page(
 	ids: impl Iterator<Item = FerrosGrynnResult<AtomId>>,
 	offset: usize,
@@ -674,27 +693,7 @@ fn graph_scan_page(
 	Ok((page, has_more))
 }
 
-#[cfg(test)]
-mod tests {
-	use super::{GRAPH_SCAN_WINDOW, graph_scan_page};
-	use crate::graph::{AtomId, AtomKind};
-
-	#[test]
-	fn graph_scan_pages_are_bounded_and_resumable() {
-		let ids = || (0..600).map(|slot| AtomId::from_parts(AtomKind::Node, slot, 0));
-		let (first, first_more) = graph_scan_page(ids(), 0).unwrap();
-		let (second, second_more) = graph_scan_page(ids(), GRAPH_SCAN_WINDOW).unwrap();
-		let (third, third_more) = graph_scan_page(ids(), GRAPH_SCAN_WINDOW * 2).unwrap();
-		assert_eq!(first.len(), GRAPH_SCAN_WINDOW);
-		assert_eq!(second.len(), GRAPH_SCAN_WINDOW);
-		assert_eq!(third.len(), 600 - GRAPH_SCAN_WINDOW * 2);
-		assert!(first_more && second_more && !third_more);
-		assert_eq!(first[0].slot(), 0);
-		assert_eq!(second[0].slot(), GRAPH_SCAN_WINDOW as u64);
-		assert_eq!(third[0].slot(), (GRAPH_SCAN_WINDOW * 2) as u64);
-	}
-}
-
+/// Returns occurrence for this module.
 fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
 	let Value::AtomOccurrence(occurrence) = value else {
 		return Err(FerrosGrynnError::traversal_source_type_mismatch(
@@ -703,4 +702,29 @@ fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
 		));
 	};
 	Ok(occurrence)
+}
+
+#[cfg(test)]
+/// Regression tests for navigation behavior.
+mod tests {
+	use super::{GRAPH_SCAN_WINDOW, graph_scan_page};
+	use crate::graph::{AtomId, AtomKind};
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
+
+	/// Verifies graph scan pages are bounded and resumable.
+	#[test]
+	fn graph_scan_pages_are_bounded_and_resumable() {
+		let ids = || (0..600).map(|slot| AtomId::from_parts(AtomKind::Node, slot, 0));
+		let (first, first_more) = graph_scan_page(ids(), 0).assert_ok();
+		let (second, second_more) = graph_scan_page(ids(), GRAPH_SCAN_WINDOW).assert_ok();
+		let (third, third_more) = graph_scan_page(ids(), GRAPH_SCAN_WINDOW * 2).assert_ok();
+		assert_eq!(first.len(), GRAPH_SCAN_WINDOW);
+		assert_eq!(second.len(), GRAPH_SCAN_WINDOW);
+		assert_eq!(third.len(), 600 - GRAPH_SCAN_WINDOW * 2);
+		assert!(first_more && second_more && !third_more);
+		assert_eq!(first[0].slot(), 0);
+		assert_eq!(second[0].slot(), GRAPH_SCAN_WINDOW as u64);
+		assert_eq!(third[0].slot(), (GRAPH_SCAN_WINDOW * 2) as u64);
+	}
 }

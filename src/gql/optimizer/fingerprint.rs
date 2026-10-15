@@ -530,9 +530,10 @@ fn hash_expr_inner(expression: &TypedExpr, state: &mut impl Hasher, text: Option
 					.and_then(|end| text.get(expression.span.offset as usize..end as usize))
 			}) {
 				// Cursor closures retain their complete source, including block
-				// control flow. shortcut: equivalent
-				// reformatted closures require a new cursor; normalize lexical
-				// tokens when that use case is supported.
+				// control flow.
+				// shortcut: reformatted equivalent closures require a new
+				// cursor; normalize lexical tokens when that
+				// use case is supported.
 				body.hash(state);
 				closure.result.hash(state);
 				std::mem::discriminant(&closure.effect).hash(state);

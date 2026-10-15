@@ -1,8 +1,14 @@
+#![cfg(test)]
 #![allow(
 	clippy::expect_used,
 	clippy::unwrap_used,
 	reason = "the ignored profiling probe must stop on invalid setup or query results"
 )]
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::{
 	fs::{self, OpenOptions},
@@ -18,6 +24,7 @@ use ferros_grynn::{
 	values::{Object, PropertyMap, RecordId, Value},
 };
 
+/// Verifies gql match stage 15 16 probe.
 #[test]
 #[ignore = "stage-15/16 MATCH performance gate"]
 fn gql_match_stage_15_16_probe() {
@@ -76,6 +83,7 @@ fn gql_match_stage_15_16_probe() {
 	}
 }
 
+/// Verifies gql match stage 16 resource probe.
 #[test]
 #[ignore = "stage-16 graph-first resource matrix"]
 fn gql_match_stage_16_resource_probe() {
@@ -117,6 +125,7 @@ fn gql_match_stage_16_resource_probe() {
 	}
 }
 
+/// Matches store for this module.
 fn match_store(rows: usize, fanout: usize) -> Datastore {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
@@ -158,6 +167,7 @@ fn match_store(rows: usize, fanout: usize) -> Datastore {
 	store
 }
 
+/// Returns layered path store for this module.
 fn layered_path_store(branching: usize, depth: usize) -> Datastore {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
@@ -199,6 +209,7 @@ fn layered_path_store(branching: usize, depth: usize) -> Datastore {
 	store
 }
 
+/// Returns hyper store for this module.
 fn hyper_store(arity: usize) -> Datastore {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
@@ -227,6 +238,7 @@ fn hyper_store(arity: usize) -> Datastore {
 	store
 }
 
+/// Returns nesting store for this module.
 fn nesting_store(fanout: usize) -> Datastore {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
@@ -246,22 +258,35 @@ fn nesting_store(fanout: usize) -> Datastore {
 	store
 }
 
+/// Returns execute for this module.
 fn execute(transaction: &mut Transaction, query: &str) -> Value {
 	transaction.execute(query, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0
 }
 
+/// Returns analyze for this module.
 fn analyze(store: &Datastore, query: &str) -> Object {
-	let Value::Object(root) =
-		store.execute(query, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0
-	else {
-		panic!("EXPLAIN ANALYZE must return an object")
-	};
-	let Some(Value::Object(metrics)) = root.get("analyze") else {
-		panic!("EXPLAIN ANALYZE metrics are missing")
-	};
+	let root = match store
+		.execute(query, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0
+	{
+		Value::Object(root) => Some(root),
+		_ => None,
+	}
+	.assert_some_with("EXPLAIN ANALYZE must return an object");
+	let metrics = match root.get("analyze") {
+		Some(Value::Object(metrics)) => Some(metrics),
+		_ => None,
+	}
+	.assert_some_with("EXPLAIN ANALYZE metrics are missing");
 	metrics.clone()
 }
 
+/// Returns metric for this module.
 fn metric(metrics: &Object, name: &str) -> u64 {
 	metrics
 		.get(name)
@@ -270,27 +295,41 @@ fn metric(metrics: &Object, name: &str) -> u64 {
 		.unwrap()
 }
 
+/// Returns env usize for this module.
 fn env_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
+/// Returns percentile for this module.
 fn percentile(values: &[u128], percentile: usize) -> u128 {
 	let index = values.len().saturating_sub(1).saturating_mul(percentile).div_ceil(100);
 	values[index]
 }
 
+/// Workload parameters and latency statistics emitted by the MATCH performance
+/// probe.
 struct ProbeRow<'a> {
+	/// Implementation candidate named in the performance-probe output.
 	variant: &'a str,
+	/// Workload named in the performance-probe output.
 	workload: &'a str,
+	/// Configured row count of the fixture or measurement.
 	rows: usize,
+	/// Number of outgoing incidences seeded per fixture node.
 	fanout: usize,
+	/// Depth bound used by the containment pattern or graph fixture.
 	depth: usize,
+	/// Number of repeated observations included in the reported measurement.
 	samples: usize,
+	/// Number of rows produced by the measured query.
 	result_rows: usize,
+	/// Median observed execution duration, in nanoseconds.
 	median_ns: u128,
+	/// Ninety-fifth-percentile execution duration, in nanoseconds.
 	p95_ns: u128,
 }
 
+/// Returns emit for this module.
 fn emit(row: ProbeRow<'_>) {
 	let csv = format!(
 		"{},{},{},{},{},{},{},{},{}",
@@ -321,6 +360,7 @@ fn emit(row: ProbeRow<'_>) {
 	writeln!(file, "{csv}").unwrap();
 }
 
+/// Returns emit resource for this module.
 fn emit_resource(workload: &str, width: usize, depth: usize, metrics: &Object) {
 	let csv = format!(
 		"{workload},{width},{depth},{},{},{},{},{},{},{},{}",

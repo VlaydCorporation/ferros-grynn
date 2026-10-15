@@ -2,42 +2,77 @@ use std::fmt::{self, Display, Formatter};
 
 use super::VectorKind;
 
+/// Logical value kind used to classify runtime values consistently.
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub enum ValueKind {
+	/// Logical kind identifying an absent value.
 	None,
+	/// Logical kind identifying an explicit null value.
 	Null,
+	/// Logical kind identifying a Boolean value.
 	Bool,
+	/// Logical kind identifying a signed integer.
 	Int,
+	/// Logical kind identifying a floating-point number.
 	Float,
+	/// Logical kind identifying a decimal number.
 	Decimal,
+	/// Logical kind identifying text.
 	String,
+	/// Logical kind identifying a duration.
 	Duration,
+	/// Logical kind identifying a time-zone-aware timestamp.
 	DateTime,
+	/// Logical kind identifying a ULID.
 	Ulid,
+	/// Logical kind identifying a UUID.
 	Uuid,
+	/// Logical kind identifying an ordered sequence of values.
 	Array,
+	/// Logical kind identifying an ordered set of distinct values.
 	Set,
+	/// Logical kind identifying a text-keyed value map.
 	Object,
+	/// Logical kind identifying a geometry value.
 	Geometry,
-	Vector(VectorKind),
+	/// Logical kind identifying a numeric vector.
+	Vector(
+		/// Logical kind identifying a numeric vector.
+		VectorKind,
+	),
+	/// Logical kind identifying binary bytes.
 	Bytes,
+	/// Logical kind identifying a stable graph reference.
 	GraphRef,
+	/// Logical kind identifying a class-qualified record identity.
 	Record,
+	/// Logical kind identifying a compiled regular expression.
 	Regex,
+	/// Logical kind identifying a runtime matcher.
 	Matcher,
+	/// Logical kind identifying a bounded or unbounded value interval.
 	Range,
+	/// Logical kind identifying a stable atom reference.
 	Atom,
+	/// Logical kind identifying a stable graph-qualified atom occurrence.
 	AtomOccurrence,
+	/// Logical kind identifying a snapshot-qualified path.
 	Path,
+	/// Logical kind identifying a graph-family subgraph value.
 	Subgraph,
+	/// Logical kind identifying a materialized graph family.
 	Graph,
+	/// Logical kind identifying a runtime callable.
 	Closure,
+	/// Logical kind identifying a runtime error value.
 	Error,
+	/// Logical kind identifying a runtime query cursor.
 	Cursor,
 }
 
 impl ValueKind {
+	/// Returns stable rank for `ValueKind`.
 	pub const fn stable_rank(self) -> u8 {
 		match self {
 			Self::None => 0,
@@ -71,6 +106,7 @@ impl ValueKind {
 		}
 	}
 
+	/// Returns name for `ValueKind`.
 	pub const fn name(self) -> &'static str {
 		match self {
 			Self::None => "none",
@@ -106,16 +142,19 @@ impl ValueKind {
 		}
 	}
 
+	/// Reports whether the value is number for `ValueKind`.
 	pub const fn is_number(self) -> bool {
 		matches!(self, Self::Int | Self::Float | Self::Decimal)
 	}
 
+	/// Reports whether the value is compatible with for `ValueKind`.
 	pub fn is_compatible_with(self, other: Self) -> bool {
 		(self.is_number() && other.is_number()) || self == other
 	}
 }
 
 impl Display for ValueKind {
+	/// Formats `ValueKind` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		f.write_str(self.name())
 	}

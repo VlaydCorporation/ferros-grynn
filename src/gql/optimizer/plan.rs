@@ -7,24 +7,42 @@ use crate::{datastore::IndexId, gql::ir::TraverseStepKind, syn::SelectJoinKind, 
 
 /// One observable fallback or planning-risk reason.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum PlanWarning {
+pub enum PlanWarning {
 	/// No histogram exists for a demanded class/field/scope.
-	StatisticsMissing(Box<str>),
+	StatisticsMissing(
+		/// No histogram exists for a demanded class/field/scope.
+		Box<str>,
+	),
 	/// A histogram exceeded the accepted dirty-row threshold.
-	StatisticsStale(Box<str>),
+	StatisticsStale(
+		/// A histogram exceeded the accepted dirty-row threshold.
+		Box<str>,
+	),
 	/// An optional index could not be used and scan remained correct.
-	IndexUnavailable(Box<str>),
+	IndexUnavailable(
+		/// An optional index could not be used and scan remained correct.
+		Box<str>,
+	),
 	/// Expected memory exceeds the in-memory barrier budget.
-	ResourceRisk(Box<str>),
+	ResourceRisk(
+		/// Expected memory exceeds the in-memory barrier budget.
+		Box<str>,
+	),
 	/// The requested execution mode is intentionally serialized by effects.
-	ExecutionLimited(Box<str>),
+	ExecutionLimited(
+		/// The requested execution mode is intentionally serialized by effects.
+		Box<str>,
+	),
 }
 
 /// Physical source selected for one logical relation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum SourceOperator {
+pub enum SourceOperator {
 	/// Stable primary lookup for one public record identity.
-	PointGet(RecordId),
+	PointGet(
+		/// Stable primary lookup for one public record identity.
+		RecordId,
+	),
 	/// Database-global class posting scan.
 	ClassScan {
 		/// Class name captured by typed analysis.
@@ -50,24 +68,34 @@ pub(crate) enum SourceOperator {
 	},
 	/// BM25 posting access through one Ready Fulltext generation.
 	FulltextIndexScan {
+		/// Index associated with this source operator.
 		index: IndexId,
+		/// Name associated with this source operator.
 		name: Box<str>,
 	},
 	/// Approximate HNSW access followed by exact full-vector reranking.
 	HnswSearch {
+		/// Index associated with this source operator.
 		index: IndexId,
+		/// Name associated with this source operator.
 		name: Box<str>,
 	},
 	/// Page-backed DiskANN access followed by exact full-vector reranking.
 	DiskAnnSearch {
+		/// Index associated with this source operator.
 		index: IndexId,
+		/// Name associated with this source operator.
 		name: Box<str>,
 	},
 	/// Exact count index lookup.
 	GeometryIndexScan {
+		/// Index associated with this source operator.
 		index: IndexId,
+		/// Name associated with this source operator.
 		name: Box<str>,
+		/// Column associated with this source operator.
 		column: usize,
+		/// Forced associated with this source operator.
 		forced: bool,
 	},
 	/// Exact count index lookup.
@@ -92,7 +120,7 @@ pub(crate) enum SourceOperator {
 
 /// Shape of a scalar-index access selected before runtime values are encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum IndexAccessKind {
+pub enum IndexAccessKind {
 	/// One or more exact probes cover the complete composite key.
 	Exact,
 	/// Equality prefix and optional range constrain the ordered index.
@@ -102,27 +130,38 @@ pub(crate) enum IndexAccessKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum IndexDirection {
+/// Index direction alternatives.
+pub enum IndexDirection {
+	/// Forward case of index direction.
 	Forward,
+	/// Reverse case of index direction.
 	Reverse,
 }
 
 /// Canonical rule whose decision affects physical execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AppliedRule {
+pub enum AppliedRule {
+	/// Constant folding case of applied rule.
 	ConstantFolding,
+	/// Conjunction decomposition case of applied rule.
 	ConjunctionDecomposition,
+	/// Predicate pushdown case of applied rule.
 	PredicatePushdown,
+	/// Projection pruning case of applied rule.
 	ProjectionPruning,
+	/// Late materialization case of applied rule.
 	LateMaterialization,
+	/// Limit pushdown case of applied rule.
 	LimitPushdown,
+	/// Count rewrite case of applied rule.
 	CountRewrite,
+	/// Sort elimination case of applied rule.
 	SortElimination,
 }
 
 /// One source node in stable preorder.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalSource {
+pub struct PhysicalSource {
 	/// Stable preorder node identifier.
 	pub(crate) node_id: u32,
 	/// Source alias from typed analysis.
@@ -141,7 +180,7 @@ pub(crate) struct PhysicalSource {
 
 /// Concrete join algorithm selected before execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum JoinOperator {
+pub enum JoinOperator {
 	/// In-memory equality hash join.
 	Hash,
 	/// Partitioned equality hash join using query runs.
@@ -154,21 +193,25 @@ pub(crate) enum JoinOperator {
 
 /// Side materialized into the hash table for one equality join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum JoinBuildSide {
+pub enum JoinBuildSide {
+	/// Left case of join build side.
 	Left,
+	/// Right case of join build side.
 	Right,
 }
 
 /// Exact right-index probe driven by columns from the current left row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct IndexJoinProbe {
+pub struct IndexJoinProbe {
+	/// Index associated with this index join probe.
 	pub(crate) index: IndexId,
+	/// Left columns associated with this index join probe.
 	pub(crate) left_columns: Vec<usize>,
 }
 
 /// One join node in stable preorder.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalJoin {
+pub struct PhysicalJoin {
 	/// Stable preorder node identifier.
 	pub(crate) node_id: u32,
 	/// Source indexes already present on the left side.
@@ -195,7 +238,7 @@ pub(crate) struct PhysicalJoin {
 
 /// Physical SELECT plan consumed by the relational executor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalSelectPlan {
+pub struct PhysicalSelectPlan {
 	/// Physical source nodes in logical source-index order.
 	pub(crate) sources: Vec<PhysicalSource>,
 	/// Source indexes in physical left-deep execution order.
@@ -246,13 +289,14 @@ pub(crate) struct TensorProjectionPlan {
 
 /// Concrete operator selected for one MATCH plan node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum MatchOperator {
+pub enum MatchOperator {
 	/// Binds the first endpoint of one pattern.
 	MatchSeed,
 	/// Joins another required pattern with the current binding row.
 	MatchJoin,
 	/// Expands one StandardPath connector.
 	FixedExpand {
+		/// Direction associated with this match operator.
 		direction: crate::syn::MatchDirection,
 		/// Captured contribution identity included in the canonical
 		/// fingerprint.
@@ -260,6 +304,7 @@ pub(crate) enum MatchOperator {
 	},
 	/// Expands one AtomWalk connector.
 	AtomExpand {
+		/// Direction associated with this match operator.
 		direction: crate::syn::MatchDirection,
 		/// Captured contribution identity included in the canonical
 		/// fingerprint.
@@ -269,25 +314,37 @@ pub(crate) enum MatchOperator {
 	ResolveNestedEndpoint,
 	/// Enumerates bounded paths with the selected uniqueness mode.
 	PathEnumerate {
+		/// Direction associated with this match operator.
 		direction: crate::syn::MatchDirection,
+		/// Mode associated with this match operator.
 		mode: crate::syn::MatchPathMode,
+		/// Min associated with this match operator.
 		min: u32,
+		/// Max associated with this match operator.
 		max: u32,
 		/// Captured versioned cost included even when no artifact is selected.
 		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
 	},
 	/// Finds one canonical unweighted shortest path per target.
 	BreadthFirstShortest {
+		/// Direction associated with this match operator.
 		direction: crate::syn::MatchDirection,
+		/// Mode associated with this match operator.
 		mode: crate::syn::MatchPathMode,
+		/// Min associated with this match operator.
 		min: u32,
+		/// Max associated with this match operator.
 		max: u32,
 	},
 	/// Finds one canonical weighted shortest path per target.
 	DijkstraShortest {
+		/// Direction associated with this match operator.
 		direction: crate::syn::MatchDirection,
+		/// Mode associated with this match operator.
 		mode: crate::syn::MatchPathMode,
+		/// Min associated with this match operator.
 		min: u32,
+		/// Max associated with this match operator.
 		max: u32,
 		/// Additive or stateful PURE COST invocation contract.
 		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
@@ -326,6 +383,7 @@ pub(crate) enum MatchOperator {
 	HyperContains,
 	/// Expands a connector constrained to hyperedge topology.
 	HyperExpand {
+		/// Direction associated with this match operator.
 		direction: crate::syn::MatchDirection,
 		/// Captured contribution identity included in the canonical
 		/// fingerprint.
@@ -335,7 +393,9 @@ pub(crate) enum MatchOperator {
 	WithinJoin,
 	/// Walks a bounded containment chain.
 	TransitiveWithin {
+		/// Min associated with this match operator.
 		min: u32,
+		/// Max associated with this match operator.
 		max: u32,
 	},
 	/// Emits the unchanged input row when the whole optional clause is empty.
@@ -352,7 +412,7 @@ pub(crate) enum MatchOperator {
 
 /// One stable-preorder MATCH plan node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalMatchNode {
+pub struct PhysicalMatchNode {
 	/// Stable node identifier used by EXPLAIN.
 	pub(crate) node_id: u32,
 	/// Logical pattern index, absent for clause-wide barriers.
@@ -369,7 +429,7 @@ pub(crate) struct PhysicalMatchNode {
 
 /// Current MATCH operator sequence selected by the shared cost model.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalMatchPlan {
+pub struct PhysicalMatchPlan {
 	/// Resolved graph identity, absent only in deferred outer estimates.
 	pub(crate) graph: Option<crate::graph::GraphId>,
 	/// Pattern indexes in chosen execution order.
@@ -385,23 +445,40 @@ pub(crate) struct PhysicalMatchPlan {
 }
 
 /// Concrete input adapter selected for a traversal statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TraversalSourceOperator {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TraversalSourceOperator {
 	/// A scalar or collection expression evaluated once.
-	ValueSource,
+	Value,
 	/// Rows produced by the existing MATCH executor.
-	MatchSource,
+	Match,
 	/// Rows produced by the existing SELECT executor.
-	SelectSource,
+	Select,
+}
+
+impl std::fmt::Debug for TraversalSourceOperator {
+	/// Preserves the established physical-operator diagnostic names.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			Self::Value => "ValueSource",
+			Self::Match => "MatchSource",
+			Self::Select => "SelectSource",
+		})
+	}
 }
 
 /// Concrete traversal operator fixed before execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum TraversalOperator {
+pub enum TraversalOperator {
 	/// Initial source adapter.
-	Source(TraversalSourceOperator),
+	Source(
+		/// Initial source adapter.
+		TraversalSourceOperator,
+	),
 	/// One analyzed `tv::` step.
-	Step(TraverseStepKind),
+	Step(
+		/// One analyzed `tv::` step.
+		TraverseStepKind,
+	),
 	/// Induced analytics or complete seed-local all-shortest tensor operation.
 	Tensor {
 		/// Closed analyzed operation vocabulary.
@@ -413,9 +490,15 @@ pub(crate) enum TraversalOperator {
 	/// Final traversal RETURN projection.
 	Project,
 	/// Ready approximate neighbourhood binding fixed by physical planning.
-	NeighbourhoodSketch(crate::datastore::QueryNeighbourhoodSketch),
+	NeighbourhoodSketch(
+		/// Ready approximate neighbourhood binding fixed by physical planning.
+		crate::datastore::QueryNeighbourhoodSketch,
+	),
 	/// Directed HOP bound followed by exact canonical path reconstruction.
-	LandmarkShortest(crate::datastore::QueryLandmarkPath),
+	LandmarkShortest(
+		/// Directed HOP bound followed by exact canonical path reconstruction.
+		crate::datastore::QueryLandmarkPath,
+	),
 	/// Directed WEIGHT or additive COST bound followed by exact refinement.
 	LandmarkWeighted {
 		/// The analyzed path or distance operation.
@@ -427,7 +510,7 @@ pub(crate) enum TraversalOperator {
 
 /// One stable-preorder traversal plan node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalTraversalNode {
+pub struct PhysicalTraversalNode {
 	/// Stable node identifier used by EXPLAIN.
 	pub(crate) node_id: u32,
 	/// Source-order step index, absent for source and projection nodes.
@@ -446,7 +529,7 @@ pub(crate) struct PhysicalTraversalNode {
 
 /// Complete physical plan for the streaming traversal VM.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalTraversalPlan {
+pub struct PhysicalTraversalPlan {
 	/// Physical operators in stable execution order.
 	pub(crate) nodes: Vec<PhysicalTraversalNode>,
 	/// Estimated final traverser count.
@@ -492,7 +575,7 @@ impl PhysicalMatchPlan {
 
 /// Write-side phase shown by EXPLAIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum WriteOperator {
+pub enum WriteOperator {
 	/// Resolves statement targets against the private snapshot.
 	TargetSelection,
 	/// Applies one logical mutation.
@@ -509,7 +592,7 @@ pub(crate) enum WriteOperator {
 
 /// Physical phases of one DDL or DML statement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalWritePlan {
+pub struct PhysicalWritePlan {
 	/// Ordered physical phases.
 	pub(crate) operators: Vec<WriteOperator>,
 	/// Estimated target cardinality.
@@ -520,7 +603,7 @@ pub(crate) struct PhysicalWritePlan {
 
 /// Concrete graph-result operation projected by `EXPLAIN`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum GraphResultOperator {
+pub enum GraphResultOperator {
 	/// Produces one owned anonymous graph value.
 	GraphAssemble,
 	/// Installs one named graph tree through the transaction adapter.
@@ -529,31 +612,51 @@ pub(crate) enum GraphResultOperator {
 
 /// Publication behavior of one graph-result operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum GraphResultMode {
+pub enum GraphResultMode {
+	/// Anonymous case of graph result mode.
 	Anonymous,
+	/// Create case of graph result mode.
 	Create,
+	/// If not exists case of graph result mode.
 	IfNotExists,
+	/// Overwrite case of graph result mode.
 	Overwrite,
 }
 
 /// Fixed graph assembly plan; Stage 18 has no competing assembly algorithms.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PhysicalGraphResultPlan {
+pub struct PhysicalGraphResultPlan {
+	/// Operator associated with this physical graph result plan.
 	pub(crate) operator: GraphResultOperator,
+	/// Mode associated with this physical graph result plan.
 	pub(crate) mode: GraphResultMode,
+	/// Source associated with this physical graph result plan.
 	pub(crate) source: Option<Box<PhysicalPlan>>,
+	/// Name associated with this physical graph result plan.
 	pub(crate) name: Option<Box<str>>,
+	/// Family associated with this physical graph result plan.
 	pub(crate) family: Option<crate::graph::GraphKind>,
+	/// Validator bits associated with this physical graph result plan.
 	pub(crate) validator_bits: u16,
+	/// Has root associated with this physical graph result plan.
 	pub(crate) has_root: bool,
+	/// Has node selector associated with this physical graph result plan.
 	pub(crate) has_node_selector: bool,
+	/// Has edge selector associated with this physical graph result plan.
 	pub(crate) has_edge_selector: bool,
+	/// Node limit associated with this physical graph result plan.
 	pub(crate) node_limit: u64,
+	/// Edge limit associated with this physical graph result plan.
 	pub(crate) edge_limit: u64,
+	/// Expected nodes associated with this physical graph result plan.
 	pub(crate) expected_nodes: Cardinality,
+	/// Expected edges associated with this physical graph result plan.
 	pub(crate) expected_edges: Cardinality,
+	/// Expected scopes associated with this physical graph result plan.
 	pub(crate) expected_scopes: Cardinality,
+	/// Cost associated with this physical graph result plan.
 	pub(crate) cost: PlanCost,
+	/// Warnings associated with this physical graph result plan.
 	pub(crate) warnings: Vec<PlanWarning>,
 }
 
@@ -710,22 +813,45 @@ pub(crate) struct PhysicalLivePlan {
 
 /// Complete internal physical plan used by EXPLAIN and replay hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum PhysicalPlan {
+pub enum PhysicalPlan {
 	/// Relational SELECT.
-	Select(PhysicalSelectPlan),
+	Select(
+		/// Relational SELECT.
+		PhysicalSelectPlan,
+	),
 	/// Current executable MATCH profile.
-	Match(PhysicalMatchPlan),
+	Match(
+		/// Current executable MATCH profile.
+		PhysicalMatchPlan,
+	),
 	/// Streaming traversal VM.
-	Traversal(PhysicalTraversalPlan),
+	Traversal(
+		/// Streaming traversal VM.
+		PhysicalTraversalPlan,
+	),
 	/// DDL or DML phase sequence.
-	Write(PhysicalWritePlan),
+	Write(
+		/// DDL or DML phase sequence.
+		PhysicalWritePlan,
+	),
 	/// Owned graph assembly and optional named publication.
-	GraphResult(PhysicalGraphResultPlan),
+	GraphResult(
+		/// Owned graph assembly and optional named publication.
+		PhysicalGraphResultPlan,
+	),
 	/// Snapshot history read or logical metadata lookup without mutation
 	/// phases.
-	Changefeed(PhysicalChangefeedPlan),
+	Changefeed(
+		/// Snapshot history read or logical metadata lookup without mutation
+		/// phases.
+		PhysicalChangefeedPlan,
+	),
 	/// Logical LIVE catalog/read phases and snapshot-bound descriptor identity.
-	Live(PhysicalLivePlan),
+	Live(
+		/// Logical LIVE catalog/read phases and snapshot-bound descriptor
+		/// identity.
+		PhysicalLivePlan,
+	),
 }
 
 impl PhysicalPlan {

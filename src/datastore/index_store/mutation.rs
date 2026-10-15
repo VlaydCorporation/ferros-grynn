@@ -18,43 +18,66 @@ use crate::{
 };
 
 #[derive(Debug)]
+/// Prepared key state.
 struct PreparedKey {
+	/// Index associated with this prepared key.
 	index: IndexId,
+	/// Key associated with this prepared key.
 	key: Option<Vec<u8>>,
 }
 
 /// Validated index work for one new database-global atom.
 #[derive(Debug)]
-pub(crate) struct PreparedBaseInsert {
+pub struct PreparedBaseInsert {
+	/// Class associated with this prepared base insert.
 	class: ClassId,
+	/// Keys associated with this prepared base insert.
 	keys: Vec<PreparedKey>,
 }
 
 /// Validated index work for one new graph occurrence.
 #[derive(Debug)]
-pub(crate) struct PreparedOccurrenceInsert {
+pub struct PreparedOccurrenceInsert {
+	/// Class associated with this prepared occurrence insert.
 	class: ClassId,
+	/// Keys associated with this prepared occurrence insert.
 	keys: Vec<PreparedKey>,
 }
 
 #[derive(Debug)]
+/// Key change state.
 struct KeyChange {
+	/// Graph associated with this key change.
 	graph: Option<GraphId>,
+	/// Index associated with this key change.
 	index: IndexId,
+	/// Address associated with this key change.
 	address: Address,
+	/// Before associated with this key change.
 	before: Option<Vec<u8>>,
+	/// After associated with this key change.
 	after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Address alternatives.
 enum Address {
-	Global(GlobalAtomId),
-	Local(AtomId),
+	/// Global case of address.
+	Global(
+		/// Global case of address.
+		GlobalAtomId,
+	),
+	/// Local case of address.
+	Local(
+		/// Local case of address.
+		AtomId,
+	),
 }
 
 /// Validated scalar-index changes for one base or occurrence replacement.
 #[derive(Debug, Default)]
-pub(crate) struct PreparedReplace {
+pub struct PreparedReplace {
+	/// Changes associated with this prepared replace.
 	changes: Vec<KeyChange>,
 }
 
@@ -66,6 +89,7 @@ impl PreparedReplace {
 }
 
 impl IndexStoreRoot {
+	/// Registers class.
 	pub(crate) fn register_class(&mut self, class: &ClassSchema) -> FerrosGrynnResult<()> {
 		self.register_class_with_mode(class, false)
 	}
@@ -76,13 +100,14 @@ impl IndexStoreRoot {
 		self.register_class_with_mode(class, true)
 	}
 
+	/// Registers class with mode.
 	fn register_class_with_mode(
 		&mut self,
 		class: &ClassSchema,
 		deferred: bool,
 	) -> FerrosGrynnResult<()> {
 		let class_id = class.id().ok_or_else(|| invalid("index owner has no ClassId"))?;
-		if self.classes.insert(class_id, Default::default()).is_some() {
+		if self.classes.insert(class_id, BTreeSet::default()).is_some() {
 			return Err(invalid("class indexes are already registered"));
 		}
 		for index in class.indexes() {
@@ -121,6 +146,7 @@ impl IndexStoreRoot {
 		Ok(())
 	}
 
+	/// Prepares base insert.
 	pub(crate) fn prepare_base_insert(
 		&self,
 		class: &ClassSchema,
@@ -147,6 +173,7 @@ impl IndexStoreRoot {
 		})
 	}
 
+	/// Applies base insert.
 	pub(crate) fn apply_base_insert(
 		&mut self,
 		prepared: PreparedBaseInsert,
@@ -163,6 +190,7 @@ impl IndexStoreRoot {
 		Ok(())
 	}
 
+	/// Removes base.
 	pub(crate) fn remove_base(
 		&mut self,
 		atom: &BaseAtom,
@@ -183,6 +211,7 @@ impl IndexStoreRoot {
 		Ok(())
 	}
 
+	/// Prepares occurrence insert.
 	pub(crate) fn prepare_occurrence_insert(
 		&self,
 		graph: GraphId,
@@ -246,6 +275,7 @@ impl IndexStoreRoot {
 		})
 	}
 
+	/// Applies occurrence insert.
 	pub(crate) fn apply_occurrence_insert(
 		&mut self,
 		graph: GraphId,
@@ -281,6 +311,7 @@ impl IndexStoreRoot {
 		Ok(())
 	}
 
+	/// Prepares base replace.
 	pub(crate) fn prepare_base_replace(
 		&self,
 		before: &BaseAtom,
@@ -318,6 +349,7 @@ impl IndexStoreRoot {
 		Ok(prepared)
 	}
 
+	/// Prepares occurrence replace.
 	pub(crate) fn prepare_occurrence_replace(
 		&self,
 		graph: GraphId,
@@ -343,6 +375,7 @@ impl IndexStoreRoot {
 		Ok(prepared)
 	}
 
+	/// Applies replace.
 	pub(crate) fn apply_replace(&mut self, prepared: PreparedReplace) -> FerrosGrynnResult<()> {
 		for change in prepared.changes {
 			match (change.graph, change.address) {
@@ -370,11 +403,12 @@ impl IndexStoreRoot {
 					change.after,
 				),
 				_ => return Err(invalid("prepared index address and scope disagree")),
-			}?
+			}?;
 		}
 		Ok(())
 	}
 
+	/// Removes occurrence.
 	pub(crate) fn remove_occurrence(
 		&mut self,
 		graph: GraphId,
@@ -403,6 +437,7 @@ impl IndexStoreRoot {
 	}
 }
 
+/// Returns the binding result.
 fn binding<Address: Copy + Ord>(
 	class: &ClassSchema,
 	index: &ClassIndex,
@@ -436,6 +471,7 @@ fn binding<Address: Copy + Ord>(
 	})
 }
 
+/// Returns the index key result.
 fn index_key<'value, Address>(
 	binding: &IndexBinding<Address>,
 	mut value: impl FnMut(crate::values::PropertyKeyId) -> Option<&'value Value>,
@@ -453,6 +489,7 @@ fn index_key<'value, Address>(
 	crate::values::storage::encode_index_key(&components, context).map(Some)
 }
 
+/// Returns the effective index key result.
 fn effective_index_key(
 	binding: &IndexBinding<AtomId>,
 	atom: &BaseAtom,
@@ -462,7 +499,8 @@ fn effective_index_key(
 	index_key(binding, |key| occurrence.effective_value(atom.properties().get(key), key), context)
 }
 
-fn push_change<Address: Copy + Ord>(
+/// Pushes change.
+fn push_change<Address>(
 	prepared: &mut PreparedReplace,
 	graph: Option<GraphId>,
 	binding: &IndexBinding<Address>,
@@ -471,7 +509,7 @@ fn push_change<Address: Copy + Ord>(
 	after: Option<Vec<u8>>,
 ) -> FerrosGrynnResult<()>
 where
-	Address: IntoAddress,
+	Address: Copy + Ord + IntoAddress,
 {
 	if before == after {
 		return Ok(());
@@ -489,22 +527,27 @@ where
 	Ok(())
 }
 
+/// Operations required for into address.
 trait IntoAddress {
+	/// Converts this value into address.
 	fn into_address(self) -> Address;
 }
 
 impl IntoAddress for GlobalAtomId {
+	/// Converts this value into address for `GlobalAtomId`.
 	fn into_address(self) -> Address {
 		Address::Global(self)
 	}
 }
 
 impl IntoAddress for AtomId {
+	/// Converts this value into address for `AtomId`.
 	fn into_address(self) -> Address {
 		Address::Local(self)
 	}
 }
 
+/// Replaces the current state.
 fn replace<Address: Copy + Ord>(
 	entries: &mut IndexEntries<Address>,
 	address: Address,
@@ -523,7 +566,8 @@ fn replace<Address: Copy + Ord>(
 	Ok(())
 }
 
-pub(crate) fn index_context(
+/// Returns the index context result.
+pub fn index_context(
 	schema: &SchemaCatalog,
 	dictionary: &PropertyDictionary,
 ) -> FerrosGrynnResult<EncodeContext> {
@@ -543,6 +587,8 @@ pub(crate) fn index_context(
 	Ok(context)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
+use std::collections::BTreeSet;

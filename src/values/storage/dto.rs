@@ -39,13 +39,17 @@ use crate::{
 	},
 };
 
+/// Explicit decimal mantissa and scale used by the storage value format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StorageDecimal {
+	/// Signed integer coefficient of the stored decimal value.
 	pub(super) mantissa: i128,
+	/// Number of decimal fractional digits represented by the mantissa.
 	pub(super) scale: u8,
 }
 
 impl StorageDecimal {
+	/// Constructs from runtime for `StorageDecimal`.
 	fn from_runtime(value: Decimal) -> Self {
 		Self {
 			mantissa: value.mantissa(),
@@ -53,6 +57,7 @@ impl StorageDecimal {
 		}
 	}
 
+	/// Converts this value into runtime for `StorageDecimal`.
 	pub(super) fn into_runtime(self) -> FerrosGrynnResult<Decimal> {
 		Decimal::try_from_i128_with_scale(self.mantissa, u32::from(self.scale)).map_err(|source| {
 			FerrosGrynnError::decimal_precision_exceeded(
@@ -64,20 +69,28 @@ impl StorageDecimal {
 	}
 }
 
+/// Storage timestamp components and interned time-zone identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StorageDateTime {
+	/// Whole timestamp seconds retained by the storage representation.
 	pub(super) seconds: i64,
+	/// Subsecond nanoseconds retained by the storage representation.
 	pub(super) nanos: u32,
+	/// Interned time-zone identifier resolved through the conversion context.
 	pub(super) time_zone_id: u32,
 }
 
+/// Storage duration sign and explicit unit counters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StorageDuration {
+	/// Whether the stored duration has a negative sign.
 	pub(super) negative: bool,
+	/// Explicit duration-unit counters written by the canonical storage codec.
 	pub(super) units: [u64; 10],
 }
 
 impl StorageDuration {
+	/// Constructs from runtime for `StorageDuration`.
 	fn from_runtime(value: Duration) -> Self {
 		let span = value.into_inner();
 		let signed = [
@@ -98,6 +111,7 @@ impl StorageDuration {
 		}
 	}
 
+	/// Converts to span for `StorageDuration`.
 	pub(super) fn to_span(&self) -> FerrosGrynnResult<Span> {
 		let mut signed = [0_i64; 10];
 		for (target, magnitude) in signed.iter_mut().zip(self.units) {
@@ -131,22 +145,49 @@ impl StorageDuration {
 		})
 	}
 
+	/// Converts this value into runtime for `StorageDuration`.
 	fn into_runtime(self) -> FerrosGrynnResult<Duration> {
 		self.to_span().map(Duration::new)
 	}
 }
 
+/// Storage-compatible scalar or composite value inside a record key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRecordValue {
-	Int(i64),
-	String(Text),
-	Uuid(Uuid),
-	Ulid(Ulid),
-	Array(Vec<Self>),
-	Object(Vec<(Text, Self)>),
+	/// Storage representation of a signed integer.
+	Int(
+		/// Storage representation of a signed integer.
+		i64,
+	),
+	/// Storage representation of text.
+	String(
+		/// Storage representation of text.
+		Text,
+	),
+	/// Storage representation of a UUID.
+	Uuid(
+		/// Storage representation of a UUID.
+		Uuid,
+	),
+	/// Storage representation of a ULID.
+	Ulid(
+		/// Storage representation of a ULID.
+		Ulid,
+	),
+	/// Storage representation of an ordered sequence of values.
+	Array(
+		/// Storage representation of an ordered sequence of values.
+		Vec<Self>,
+	),
+	/// Storage representation of a text-keyed value map.
+	Object(
+		/// Storage representation of a text-keyed value map.
+		Vec<(Text, Self)>,
+	),
 }
 
 impl StorageRecordValue {
+	/// Constructs from runtime for `StorageRecordValue`.
 	fn from_runtime(value: Value) -> FerrosGrynnResult<Self> {
 		match value {
 			Value::Number(Number::Int(value)) => Ok(Self::Int(value)),
@@ -167,6 +208,7 @@ impl StorageRecordValue {
 		}
 	}
 
+	/// Converts this value into runtime for `StorageRecordValue`.
 	fn into_runtime(self) -> Value {
 		match self {
 			Self::Int(value) => Value::from(value),
@@ -183,26 +225,56 @@ impl StorageRecordValue {
 	}
 }
 
+/// Explicit storage representation of a scalar or composite record key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRecordIdPart {
-	Int(i64),
-	String(Text),
-	Uuid(Uuid),
-	Ulid(Ulid),
-	Array(Vec<StorageRecordValue>),
-	Object(Vec<(Text, StorageRecordValue)>),
+	/// Storage representation of a signed integer.
+	Int(
+		/// Storage representation of a signed integer.
+		i64,
+	),
+	/// Storage representation of text.
+	String(
+		/// Storage representation of text.
+		Text,
+	),
+	/// Storage representation of a UUID.
+	Uuid(
+		/// Storage representation of a UUID.
+		Uuid,
+	),
+	/// Storage representation of a ULID.
+	Ulid(
+		/// Storage representation of a ULID.
+		Ulid,
+	),
+	/// Storage representation of an ordered sequence of values.
+	Array(
+		/// Storage representation of an ordered sequence of values.
+		Vec<StorageRecordValue>,
+	),
+	/// Storage representation of a text-keyed value map.
+	Object(
+		/// Storage representation of a text-keyed value map.
+		Vec<(Text, StorageRecordValue)>,
+	),
 }
 
+/// Interned class identifier paired with its encoded record key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageRecordId {
+	/// Resolved class identifier associated with the stored record.
 	pub(super) class_id: u32,
+	/// Stable class-qualified record identity used by this operation.
 	pub(super) part: StorageRecordIdPart,
 }
 
 /// Canonical database-stable atom reference persisted inside a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageAtomRef {
+	/// Selected operation or representation discriminator.
 	pub(super) kind: AtomKind,
+	/// Stable class-qualified record identity used by this operation.
 	pub(super) record_id: StorageRecordId,
 }
 
@@ -211,46 +283,154 @@ impl StorageAtomRef {
 	pub const fn kind(&self) -> AtomKind {
 		self.kind
 	}
+
+	/// Constructs from runtime for `StorageAtomRef`.
+	fn from_runtime(value: AtomRef, context: &EncodeContext) -> FerrosGrynnResult<Self> {
+		Ok(Self {
+			kind: value.kind(),
+			record_id: StorageRecordId::from_runtime(value.id().clone(), context)?,
+		})
+	}
+
+	/// Converts this value into runtime for `StorageAtomRef`.
+	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<AtomRef> {
+		self.record_id.into_runtime(context).map(|id| AtomRef::new(self.kind, id))
+	}
 }
 
+/// Unbounded, inclusive or exclusive endpoint of a stored range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageBound {
+	/// No finite endpoint is stored.
 	Unbounded,
-	Included(Box<StorageValue>),
-	Excluded(Box<StorageValue>),
+	/// The stored endpoint belongs to the range.
+	Included(
+		/// The stored endpoint belongs to the range.
+		Box<StorageValue>,
+	),
+	/// The stored endpoint does not belong to the range.
+	Excluded(
+		/// The stored endpoint does not belong to the range.
+		Box<StorageValue>,
+	),
 }
 
+/// Stored range with independently represented start and end bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageRange {
+	/// Initial endpoint or lower range bound selected by the syntax element.
 	pub(super) start: StorageBound,
+	/// Final endpoint or upper range bound selected by the syntax element.
 	pub(super) end: StorageBound,
 }
 
 /// Persistable, dictionary-aware representation used by the canonical codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageValue {
+	/// Storage representation of an absent value.
 	None,
+	/// Storage representation of an explicit null value.
 	Null,
-	Bool(bool),
-	Int(i64),
-	Float(u64),
-	Decimal(StorageDecimal),
-	String(Text),
-	Bytes(Bytes),
-	DateTime(StorageDateTime),
-	Duration(StorageDuration),
-	Uuid(Uuid),
-	Ulid(Ulid),
-	Record(StorageRecordId),
-	Array(Vec<Self>),
-	Set(Vec<Self>),
-	Object(Vec<(PropertyKeyId, Self)>),
-	Range(StorageRange),
-	Geometry(Geometry),
-	Vector(Vector),
-	AtomRef(StorageAtomRef),
-	GraphRef(DiskGraphRef),
-	QualifiedAtomRef(QualifiedAtomRef),
+	/// Storage representation of a Boolean value.
+	Bool(
+		/// Storage representation of a Boolean value.
+		bool,
+	),
+	/// Storage representation of a signed integer.
+	Int(
+		/// Storage representation of a signed integer.
+		i64,
+	),
+	/// Storage representation of a floating-point number.
+	Float(
+		/// Storage representation of a floating-point number.
+		u64,
+	),
+	/// Storage representation of a decimal number.
+	Decimal(
+		/// Storage representation of a decimal number.
+		StorageDecimal,
+	),
+	/// Storage representation of text.
+	String(
+		/// Storage representation of text.
+		Text,
+	),
+	/// Storage representation of binary bytes.
+	Bytes(
+		/// Storage representation of binary bytes.
+		Bytes,
+	),
+	/// Storage representation of a time-zone-aware timestamp.
+	DateTime(
+		/// Storage representation of a time-zone-aware timestamp.
+		StorageDateTime,
+	),
+	/// Storage representation of a duration.
+	Duration(
+		/// Storage representation of a duration.
+		StorageDuration,
+	),
+	/// Storage representation of a UUID.
+	Uuid(
+		/// Storage representation of a UUID.
+		Uuid,
+	),
+	/// Storage representation of a ULID.
+	Ulid(
+		/// Storage representation of a ULID.
+		Ulid,
+	),
+	/// Storage representation of a class-qualified record identity.
+	Record(
+		/// Storage representation of a class-qualified record identity.
+		StorageRecordId,
+	),
+	/// Storage representation of an ordered sequence of values.
+	Array(
+		/// Storage representation of an ordered sequence of values.
+		Vec<Self>,
+	),
+	/// Storage representation of an ordered set of distinct values.
+	Set(
+		/// Storage representation of an ordered set of distinct values.
+		Vec<Self>,
+	),
+	/// Storage representation of a text-keyed value map.
+	Object(
+		/// Storage representation of a text-keyed value map.
+		Vec<(PropertyKeyId, Self)>,
+	),
+	/// Storage representation of a bounded or unbounded value interval.
+	Range(
+		/// Storage representation of a bounded or unbounded value interval.
+		StorageRange,
+	),
+	/// Storage representation of a geometry value.
+	Geometry(
+		/// Storage representation of a geometry value.
+		Geometry,
+	),
+	/// Storage representation of a numeric vector.
+	Vector(
+		/// Storage representation of a numeric vector.
+		Vector,
+	),
+	/// Storage representation of an atom reference.
+	AtomRef(
+		/// Storage representation of an atom reference.
+		StorageAtomRef,
+	),
+	/// Storage representation of a stable graph reference.
+	GraphRef(
+		/// Storage representation of a stable graph reference.
+		DiskGraphRef,
+	),
+	/// Storage representation of a graph-qualified atom reference.
+	QualifiedAtomRef(
+		/// Storage representation of a graph-qualified atom reference.
+		QualifiedAtomRef,
+	),
 }
 
 impl StorageValue {
@@ -328,6 +508,7 @@ impl StorageValue {
 		Ok(bytes)
 	}
 
+	/// Constructs from runtime for `StorageValue`.
 	pub fn from_runtime(value: Value, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
 		match value {
 			Value::None => Ok(Self::None),
@@ -390,10 +571,12 @@ impl StorageValue {
 		}
 	}
 
+	/// Constructs from graph ref for `StorageValue`.
 	pub fn from_graph_ref(value: &GraphRef, context: &EncodeContext) -> FerrosGrynnResult<Self> {
 		context.graph_to_disk(value).map(Self::GraphRef)
 	}
 
+	/// Converts this value into runtime for `StorageValue`.
 	pub fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<Value> {
 		match self {
 			Self::None => Ok(Value::None),
@@ -453,6 +636,7 @@ impl StorageValue {
 		}
 	}
 
+	/// Converts this value into graph ref for `StorageValue`.
 	pub fn into_graph_ref(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<GraphRef> {
 		match self {
 			Self::GraphRef(value) => context.graph_from_disk(value).cloned(),
@@ -460,10 +644,12 @@ impl StorageValue {
 		}
 	}
 
+	/// Returns the ref payload when this value has the matching variant.
 	pub const fn as_ref(&self) -> StorageValueRef<'_> {
 		StorageValueRef(self)
 	}
 
+	/// Returns type name for `StorageValue`.
 	fn type_name(&self) -> &'static str {
 		match self {
 			Self::None => "none",
@@ -492,11 +678,17 @@ impl StorageValue {
 	}
 }
 
+/// Borrowed storage-value representation used without taking ownership of its
+/// payload.
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
-pub struct StorageValueRef<'a>(&'a StorageValue);
+pub struct StorageValueRef<'a>(
+	/// Borrowed value represented without taking ownership of its payload.
+	&'a StorageValue,
+);
 
 impl<'a> StorageValueRef<'a> {
+	/// Constructs `StorageValueRef<'a>` from the supplied initial state.
 	pub const fn new(value: &'a StorageValue) -> Self {
 		Self(value)
 	}
@@ -505,12 +697,14 @@ impl<'a> StorageValueRef<'a> {
 impl Deref for StorageValueRef<'_> {
 	type Target = StorageValue;
 
+	/// Borrows the underlying value represented by this `StorageValueRef<'_>`.
 	fn deref(&self) -> &Self::Target {
 		self.0
 	}
 }
 
 impl StorageDateTime {
+	/// Constructs from runtime for `StorageDateTime`.
 	fn from_runtime(value: DateTime, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
 		let zoned = value.into_inner();
 		let timestamp = zoned.timestamp();
@@ -525,6 +719,7 @@ impl StorageDateTime {
 		})
 	}
 
+	/// Converts this value into runtime for `StorageDateTime`.
 	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<DateTime> {
 		if self.nanos >= 1_000_000_000 {
 			return Err(FerrosGrynnError::invalid_storage_value_encoding(
@@ -577,9 +772,10 @@ impl StorageRecordId {
 		Ok(bytes)
 	}
 
+	/// Constructs from runtime for `StorageRecordId`.
 	pub(crate) fn from_runtime(
 		value: RecordId,
-		context: &mut EncodeContext,
+		context: &EncodeContext,
 	) -> FerrosGrynnResult<Self> {
 		let (class, part) = value.into_parts();
 		let class_id =
@@ -610,6 +806,7 @@ impl StorageRecordId {
 		})
 	}
 
+	/// Converts this value into runtime for `StorageRecordId`.
 	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<RecordId> {
 		let class = context
 			.classes
@@ -667,20 +864,8 @@ fn record_value_allocation(value: &StorageRecordValue) -> FerrosGrynnResult<usiz
 	Ok(bytes)
 }
 
-impl StorageAtomRef {
-	fn from_runtime(value: AtomRef, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
-		Ok(Self {
-			kind: value.kind(),
-			record_id: StorageRecordId::from_runtime(value.id().clone(), context)?,
-		})
-	}
-
-	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<AtomRef> {
-		self.record_id.into_runtime(context).map(|id| AtomRef::new(self.kind, id))
-	}
-}
-
 impl StorageRange {
+	/// Constructs from runtime for `StorageRange`.
 	fn from_runtime(value: Range, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
 		let (start, end) = value.into_bounds();
 		Ok(Self {
@@ -689,6 +874,7 @@ impl StorageRange {
 		})
 	}
 
+	/// Converts this value into runtime for `StorageRange`.
 	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<Range> {
 		Range::new_with_diagnostic_admission(
 			self.start.into_runtime(context)?,
@@ -699,6 +885,7 @@ impl StorageRange {
 }
 
 impl StorageBound {
+	/// Constructs from runtime for `StorageBound`.
 	fn from_runtime(value: Bound<Value>, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
 		match value {
 			Bound::Unbounded => Ok(Self::Unbounded),
@@ -711,6 +898,7 @@ impl StorageBound {
 		}
 	}
 
+	/// Converts this value into runtime for `StorageBound`.
 	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<Bound<Value>> {
 		match self {
 			Self::Unbounded => Ok(Bound::Unbounded),

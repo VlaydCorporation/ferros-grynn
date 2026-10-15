@@ -65,68 +65,130 @@ use crate::{
 	values::{Vector, storage::DiskAtomRef},
 };
 
+/// Configured diskann page window value.
 const DISKANN_PAGE_WINDOW: usize = 32;
+/// Configured diskann page cache pages value.
 const DISKANN_PAGE_CACHE_PAGES: usize = MAX_READ_SCOPE_OPERATIONS;
+/// Shared next hnsw cache namespace value.
 static NEXT_HNSW_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 /// Generation-free address returned by one immutable physical index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PhysicalIndexAtom {
+pub struct PhysicalIndexAtom {
+	/// Kind associated with this physical index atom.
 	pub(crate) kind: AtomKind,
+	/// Slot associated with this physical index atom.
 	pub(crate) slot: u64,
 }
 
 /// One scalar key and its canonically ordered postings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PhysicalScalarGroup {
+pub struct PhysicalScalarGroup {
+	/// Key associated with this physical scalar group.
 	pub(crate) key: Vec<u8>,
+	/// Atoms associated with this physical scalar group.
 	pub(crate) atoms: Vec<PhysicalIndexAtom>,
 }
 
 /// Decoded immutable payload selected by the catalog index kind.
 #[derive(Debug)]
-pub(crate) enum PhysicalIndexEntries {
-	Scalar(Vec<PhysicalScalarGroup>),
-	Count(u64),
-	Fulltext(DecodedFulltextIndex),
-	Hnsw(DecodedHnswIndex),
-	Vector(DecodedVectorIndex),
-	Geometry(crate::storage::geometry_index::GeometryHeader),
+pub enum PhysicalIndexEntries {
+	/// Scalar case of physical index entries.
+	Scalar(
+		/// Scalar case of physical index entries.
+		Vec<PhysicalScalarGroup>,
+	),
+	/// Count case of physical index entries.
+	Count(
+		/// Count case of physical index entries.
+		u64,
+	),
+	/// Fulltext case of physical index entries.
+	Fulltext(
+		/// Fulltext case of physical index entries.
+		DecodedFulltextIndex,
+	),
+	/// Hnsw case of physical index entries.
+	Hnsw(
+		/// Hnsw case of physical index entries.
+		DecodedHnswIndex,
+	),
+	/// Vector case of physical index entries.
+	Vector(
+		/// Vector case of physical index entries.
+		DecodedVectorIndex,
+	),
+	/// Geometry case of physical index entries.
+	Geometry(
+		/// Geometry case of physical index entries.
+		crate::storage::geometry_index::GeometryHeader,
+	),
 }
 
 /// Exact replacement/tombstone generation attached to an immutable base.
 #[derive(Debug)]
-pub(crate) enum PhysicalIndexDelta {
-	Fulltext(DecodedFulltextDelta),
-	Vector(DecodedVectorDelta),
-	Geometry(crate::storage::geometry_index::DecodedGeometryDelta),
+pub enum PhysicalIndexDelta {
+	/// Fulltext case of physical index delta.
+	Fulltext(
+		/// Fulltext case of physical index delta.
+		DecodedFulltextDelta,
+	),
+	/// Vector case of physical index delta.
+	Vector(
+		/// Vector case of physical index delta.
+		DecodedVectorDelta,
+	),
+	/// Geometry case of physical index delta.
+	Geometry(
+		/// Geometry case of physical index delta.
+		crate::storage::geometry_index::DecodedGeometryDelta,
+	),
 }
 
 /// Exact logical metadata and lazily decoded payload of one durable index.
 #[derive(Debug)]
-pub(crate) struct PhysicalIndexRead {
+pub struct PhysicalIndexRead {
+	/// Identifier of the schema class.
 	pub(crate) class_id: ClassId,
+	/// Kind associated with this physical index read.
 	pub(crate) kind: ClassIndexKind,
+	/// Scope associated with this physical index read.
 	pub(crate) scope: IndexScope,
+	/// Entries associated with this physical index read.
 	pub(crate) entries: PhysicalIndexEntries,
+	/// Delta associated with this physical index read.
 	pub(crate) delta: Option<PhysicalIndexDelta>,
 }
 
 /// One current-generation file with a coalesced first decode.
 pub(super) struct PhysicalIndexFile {
+	/// Index id associated with this physical index file.
 	index_id: IndexId,
+	/// Version associated with this physical index file.
 	version: SchemaVersion,
+	/// Identifier of the schema class.
 	class_id: ClassId,
+	/// Kind associated with this physical index file.
 	kind: ClassIndexKind,
+	/// Scope associated with this physical index file.
 	scope: IndexScope,
+	/// Options associated with this physical index file.
 	options: ClassIndexOptions,
+	/// Fields associated with this physical index file.
 	fields: Vec<crate::values::PropertyKeyId>,
+	/// Build revision associated with this physical index file.
 	build_revision: u64,
+	/// Binding associated with this physical index file.
 	binding: PhysicalIndexBinding,
+	/// File associated with this physical index file.
 	file: Arc<RegisteredDataFile>,
+	/// Delta binding associated with this physical index file.
 	delta_binding: Option<PhysicalIndexBinding>,
+	/// Delta file associated with this physical index file.
 	delta_file: Option<Arc<RegisteredDataFile>>,
+	/// Hnsw cache namespace associated with this physical index file.
 	hnsw_cache_namespace: u64,
+	/// Decoded associated with this physical index file.
 	decoded: Mutex<Option<Arc<PhysicalIndexRead>>>,
 }
 
@@ -187,7 +249,7 @@ impl LocalStore {
 	}
 
 	/// Returns whether an exact immutable side-file belongs to this snapshot.
-	pub(crate) fn has_physical_index(&self, snapshot: &LocalQuerySnapshot, index: IndexId) -> bool {
+	pub(crate) fn has_physical_index(snapshot: &LocalQuerySnapshot, index: IndexId) -> bool {
 		snapshot.0.indexes.contains_key(&index)
 	}
 
@@ -250,6 +312,7 @@ impl LocalStore {
 }
 
 impl PhysicalIndexFile {
+	/// Returns whether the matches catalog condition holds.
 	fn matches_catalog(
 		&self,
 		class: ClassId,
@@ -268,6 +331,7 @@ impl PhysicalIndexFile {
 			&& self.delta_binding == index.delta
 	}
 
+	/// Returns the search hnsw result.
 	fn search_hnsw(
 		&self,
 		store: &LocalStore,
@@ -340,6 +404,7 @@ impl PhysicalIndexFile {
 		)
 	}
 
+	/// Returns the search diskann result.
 	fn search_diskann(
 		&self,
 		store: &LocalStore,
@@ -394,6 +459,7 @@ impl PhysicalIndexFile {
 		)
 	}
 
+	/// Reads physical index file.
 	fn read(
 		&self,
 		store: &LocalStore,
@@ -602,6 +668,8 @@ impl PhysicalIndexFile {
 }
 
 impl Drop for PhysicalIndexFile {
+	/// Runs cleanup for this `PhysicalIndexFile` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		purge_hnsw_vector_cache(self.hnsw_cache_namespace);
 	}
@@ -611,21 +679,31 @@ impl Drop for PhysicalIndexFile {
 /// It retains only a bounded query-local validated page window; the shared
 /// page cache, WAL view, and durable format remain owned by Ferros-Grynn.
 struct FerrosDiskAnnProvider<'store> {
+	/// Store associated with this ferros disk ann provider.
 	store: &'store LocalStore,
+	/// Snapshot associated with this ferros disk ann provider.
 	snapshot: &'store super::physical_traversal::LocalQuerySnapshotInner,
+	/// Space associated with this ferros disk ann provider.
 	space: DataSpaceId,
+	/// Binding associated with this ferros disk ann provider.
 	binding: PhysicalIndexBinding,
+	/// File associated with this ferros disk ann provider.
 	file: &'store Arc<RegisteredDataFile>,
+	/// Pages associated with this ferros disk ann provider.
 	pages: VecDeque<(PageNo, CachedVectorPage)>,
 }
 
 #[derive(Clone)]
+/// Cached vector page state.
 struct CachedVectorPage {
+	/// Page associated with this cached vector page.
 	page: Arc<AlignedPage>,
+	/// Header associated with this cached vector page.
 	header: PageHeader,
 }
 
 impl FerrosDiskAnnProvider<'_> {
+	/// Reads nodes.
 	fn read_nodes(
 		&mut self,
 		header: &crate::storage::vector_index::PagedVectorHeader,
@@ -641,7 +719,7 @@ impl FerrosDiskAnnProvider<'_> {
 			.iter()
 			.zip(&layouts)
 			.map(|(location, layout)| {
-				self.node_data_pages(header, *location, *layout, posting_limit)
+				Self::node_data_pages(header, *location, *layout, posting_limit)
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		let mut nodes = Vec::with_capacity(ordinals.len());
@@ -679,6 +757,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(nodes)
 	}
 
+	/// Reads locations.
 	fn read_locations(
 		&mut self,
 		header: &crate::storage::vector_index::PagedVectorHeader,
@@ -712,6 +791,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(locations)
 	}
 
+	/// Reads layouts.
 	fn read_layouts(
 		&mut self,
 		header: &crate::storage::vector_index::PagedVectorHeader,
@@ -742,8 +822,8 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(layouts)
 	}
 
+	/// Returns the node data pages result.
 	fn node_data_pages(
-		&self,
 		header: &crate::storage::vector_index::PagedVectorHeader,
 		location: VectorNodeLocation,
 		layout: VectorNodeRecordLayout,
@@ -756,6 +836,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(pages)
 	}
 
+	/// Decodes node from pages.
 	fn decode_node_from_pages(
 		header: &crate::storage::vector_index::PagedVectorHeader,
 		location: VectorNodeLocation,
@@ -774,6 +855,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(decoded)
 	}
 
+	/// Returns the node ranges result.
 	fn node_ranges(
 		location: VectorNodeLocation,
 		layout: VectorNodeRecordLayout,
@@ -810,6 +892,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok((posting_start, prefix_bytes, tail_offset, tail_length))
 	}
 
+	/// Reads node.
 	fn read_node(
 		&mut self,
 		header: &crate::storage::vector_index::PagedVectorHeader,
@@ -874,8 +957,9 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(decoded)
 	}
 
+	/// Reads page map.
 	fn read_page_map(
-		&mut self,
+		&self,
 		pages: &BTreeSet<PageNo>,
 	) -> FerrosGrynnResult<BTreeMap<PageNo, CachedVectorPage>> {
 		let mut output = BTreeMap::new();
@@ -916,6 +1000,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(output)
 	}
 
+	/// Performs the remember pages operation.
 	fn remember_pages(&mut self, pages: BTreeMap<PageNo, CachedVectorPage>) {
 		for (page_no, page) in pages {
 			if let Some(position) =
@@ -930,6 +1015,7 @@ impl FerrosDiskAnnProvider<'_> {
 		}
 	}
 
+	/// Returns the stream range pages result.
 	fn stream_range_pages(
 		stream: crate::storage::vector_index::StreamLocation,
 		start: u64,
@@ -966,6 +1052,7 @@ impl FerrosDiskAnnProvider<'_> {
 			.collect()
 	}
 
+	/// Reads stream range from pages.
 	fn read_stream_range_from_pages(
 		stream: crate::storage::vector_index::StreamLocation,
 		start: u64,
@@ -1016,6 +1103,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(bytes)
 	}
 
+	/// Reads stream range.
 	fn read_stream_range(
 		&mut self,
 		stream: crate::storage::vector_index::StreamLocation,
@@ -1104,6 +1192,7 @@ impl FerrosDiskAnnProvider<'_> {
 		Ok(record)
 	}
 
+	/// Reads page.
 	fn read_page(&mut self, page: PageNo) -> FerrosGrynnResult<&CachedVectorPage> {
 		if let Some(position) = self.pages.iter().position(|(candidate, _page)| *candidate == page)
 		{
@@ -1146,6 +1235,7 @@ impl FerrosDiskAnnProvider<'_> {
 	}
 }
 
+/// Reads all pages.
 fn read_all_pages(
 	store: &LocalStore,
 	snapshot: &LocalQuerySnapshot,
@@ -1226,6 +1316,7 @@ pub(super) fn bind_physical_indexes(
 	Ok(files)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

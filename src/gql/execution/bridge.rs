@@ -39,7 +39,7 @@ pub(super) fn resolve<Read: QueryRead>(
 			"adapter metadata differs from statement snapshot",
 		));
 	}
-	if mirror && !capabilities.mirror || !mirror && !capabilities.records {
+	if mirror && !capabilities.mirror() || !mirror && !capabilities.records() {
 		return Err(FerrosGrynnError::bridge_operation_error(
 			"adapter lacks the requested bridge capability",
 		));
@@ -105,14 +105,12 @@ pub(super) fn prefetch<Read: QueryRead>(
 		match value {
 			Value::Array(values) => pending.extend(values.iter()),
 			Value::Set(values) => pending.extend(values.iter()),
-			Value::Record(record) => {
-				if root.atom_by_record(record).is_some() {
-					records.push(
-						fetch_mapping(read, snapshot, record, graph, database.reference)?
-							.external
-							.record,
-					);
-				}
+			Value::Record(record) if root.atom_by_record(record).is_some() => {
+				records.push(
+					fetch_mapping(read, snapshot, record, graph, database.reference)?
+						.external
+						.record,
+				);
 			}
 			_ => {}
 		}
@@ -337,10 +335,10 @@ pub(super) fn recipes<Read: QueryRead>(
 			let occurrence = root.occurrence(*graph, local).ok_or_else(|| {
 				FerrosGrynnError::bridge_mapping_error("recipe edge occurrence is absent")
 			})?;
-			let crate::datastore::OccurrenceState::Edge {
+			let crate::datastore::OccurrenceStateRef::Edge {
 				topology,
 				..
-			} = occurrence.state()
+			} = occurrence.state().view()
 			else {
 				return Err(FerrosGrynnError::bridge_mapping_error(
 					"recipe subject is not an edge",

@@ -11,16 +11,30 @@ use super::*;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum TraverseSource {
-	Expression(Expr),
-	Match(Box<MatchStatement>),
-	Select(Box<SelectStatement>),
+	/// Start traversal from the evaluated expression value.
+	Expression(
+		/// Start traversal from the evaluated expression value.
+		Expr,
+	),
+	/// Start traversal from MATCH output.
+	Match(
+		/// Start traversal from MATCH output.
+		Box<MatchStatement>,
+	),
+	/// Start traversal from SELECT output.
+	Select(
+		/// Start traversal from SELECT output.
+		Box<SelectStatement>,
+	),
 }
 
 /// One `tv::` pipeline call in source order.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TraverseStep {
+	/// Expression evaluated to produce this clause or step value.
 	pub expression: Expr,
+	/// Source byte range used to report diagnostics for this syntax element.
 	pub span: TextSpan,
 }
 
@@ -28,14 +42,22 @@ pub struct TraverseStep {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TraverseStatement {
+	/// Whether graph traversal uses atom endpoints rather than node-only
+	/// endpoints.
 	pub atom: bool,
+	/// Structural or path constraints applied to the selected graph operation.
 	pub constraints: MatchConstraints,
+	/// Input source or initial endpoint selected by this syntax element.
 	pub source: TraverseSource,
+	/// Graph materialization or physical graph files retained by the operation.
 	pub graph: Option<Expr>,
 	/// Versioned PURE contribution for path-generating traversal operations.
 	pub custom_cost: Option<FunctionSignatureName>,
+	/// Traversal or pattern steps retained in execution order.
 	pub steps: Vec<TraverseStep>,
+	/// Optional projection of values returned after the data mutation.
 	pub returning: Option<ReturnStatement>,
+	/// Optional graph projection replacing the ordinary value projection.
 	pub return_graph: Option<ReturnGraph>,
 }
 

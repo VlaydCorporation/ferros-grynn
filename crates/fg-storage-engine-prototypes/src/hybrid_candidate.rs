@@ -41,7 +41,10 @@ use ferros_grynn::{
 
 /// Unique Direct-I/O file removed after a transport test.
 #[cfg(windows)]
-struct TestFile(std::path::PathBuf);
+struct TestFile(
+	/// Path retained for the lifetime of the temporary file owner.
+	std::path::PathBuf,
+);
 
 #[cfg(windows)]
 impl TestFile {
@@ -56,6 +59,7 @@ impl TestFile {
 
 #[cfg(windows)]
 impl Drop for TestFile {
+	/// Runs cleanup for this `TestFile` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_file(&self.0));
 	}
@@ -130,6 +134,13 @@ fn load_valid(key: PageCacheKey, target: &mut AlignedPage) -> FerrosGrynnResult<
 			ceiling,
 			..
 		} => PageLsn::new(ceiling.get()),
+
+		_ => {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				key.page_no().get(),
+				"unsupported cache-source version",
+			));
+		}
 	};
 	let mut page = AlignedPage::new(PageType::NodeHot, PageFlags::empty(), page_lsn, key.page_no());
 	page.as_bytes_mut()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + size_of::<u64>()]
@@ -140,13 +151,11 @@ fn load_valid(key: PageCacheKey, target: &mut AlignedPage) -> FerrosGrynnResult<
 	Ok(header)
 }
 
+/// Verifies route table uses only pre submission fallbacks.
 #[test]
 fn route_table_uses_only_pre_submission_fallbacks() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(4_096).ok_or("zero capacity")?);
-	let all = TransportCapabilities {
-		scatter: true,
-		io_ring: true,
-	};
+	let all = TransportCapabilities::new(true, true);
 
 	assert_eq!(
 		engine.route(true, ReadIntent::Point, ReadWindow::Single, PageIoMode::Sync, all),
@@ -199,6 +208,22 @@ fn route_table_uses_only_pre_submission_fallbacks() -> Result<(), Box<dyn Error>
 			PageIoMode::NativeAsync,
 			all,
 		),
+		// The scope bound prevents IoRing submission; index pages still enter the arena.
+		ReadRoute::SyncDirect {
+			admit: true,
+		}
+	);
+	assert_eq!(
+		engine.route(
+			false,
+			ReadIntent::SequentialScan,
+			ReadWindow::Sparse {
+				operations: MAX_READ_SCOPE_OPERATIONS + 1,
+				cold_pages: 32,
+			},
+			PageIoMode::NativeAsync,
+			all,
+		),
 		ReadRoute::SyncDirect {
 			admit: false,
 		}
@@ -206,6 +231,7 @@ fn route_table_uses_only_pre_submission_fallbacks() -> Result<(), Box<dyn Error>
 	Ok(())
 }
 
+/// Verifies transient budget is bounded by ten percent and 288 pages.
 #[test]
 fn transient_budget_is_bounded_by_ten_percent_and_288_pages() -> Result<(), Box<dyn Error>> {
 	assert_eq!(transient_pages(9), 0);
@@ -218,6 +244,7 @@ fn transient_budget_is_bounded_by_ten_percent_and_288_pages() -> Result<(), Box<
 	Ok(())
 }
 
+/// Verifies exact versions and files share one resident budget.
 #[test]
 fn exact_versions_and_files_share_one_resident_budget() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(3).ok_or("zero capacity")?);
@@ -231,6 +258,7 @@ fn exact_versions_and_files_share_one_resident_budget() -> Result<(), Box<dyn Er
 	Ok(())
 }
 
+/// Verifies database and graph pages never alias.
 #[test]
 fn database_and_graph_pages_never_alias() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -253,6 +281,7 @@ fn database_and_graph_pages_never_alias() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies production r8 coalesces one miss.
 #[test]
 fn production_r8_coalesces_one_miss() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -307,6 +336,7 @@ fn production_r8_coalesces_one_miss() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies production r8 waits for the last pin.
 #[test]
 fn production_r8_waits_for_the_last_pin() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::MIN);
@@ -341,6 +371,7 @@ fn production_r8_waits_for_the_last_pin() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies production r8 rolls back a panicking loader.
 #[test]
 fn production_r8_rolls_back_a_panicking_loader() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::MIN);
@@ -356,6 +387,7 @@ fn production_r8_rolls_back_a_panicking_loader() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies corrupted load is never published.
 #[test]
 fn corrupted_load_is_never_published() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
@@ -371,6 +403,7 @@ fn corrupted_load_is_never_published() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies stale handle fails after frame reuse.
 #[test]
 fn stale_handle_fails_after_frame_reuse() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
@@ -387,6 +420,7 @@ fn stale_handle_fails_after_frame_reuse() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Verifies read scope rotates at operation and source boundaries.
 #[test]
 fn read_scope_rotates_at_operation_and_source_boundaries() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -403,13 +437,18 @@ fn read_scope_rotates_at_operation_and_source_boundaries() -> Result<(), Box<dyn
 		assert_eq!(page.as_page().validate(first.page_no())?.page_no(), first.page_no());
 	}
 	assert_eq!(scope.operations(), MAX_READ_SCOPE_OPERATIONS);
-	drop(scope.get_resolved(&first_handle)?.ok_or("rotated page became stale")?);
+	{
+		let _page = scope.get_resolved(&first_handle)?.ok_or("rotated page became stale")?;
+	}
 	assert_eq!(scope.operations(), 1);
-	drop(scope.get_resolved(&second_handle)?.ok_or("second source became stale")?);
+	{
+		let _page = scope.get_resolved(&second_handle)?.ok_or("second source became stale")?;
+	}
 	assert_eq!(scope.operations(), 1);
 	Ok(())
 }
 
+/// Verifies resolved page window is ordered and source bounded.
 #[test]
 fn resolved_page_window_is_ordered_and_source_bounded() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(3).ok_or("zero capacity")?);
@@ -424,23 +463,28 @@ fn resolved_page_window_is_ordered_and_source_bounded() -> Result<(), Box<dyn Er
 	let foreign_handle = engine.resolve(foreign).ok_or("foreign key was not resolved")?;
 	let mut scope = engine.read_scope()?;
 	let mut table = scope.prepare_resolved_table(&[second_handle, first_handle])?;
-	let window =
-		scope.get_resolved_window(&mut table, 200)?.ok_or("resident window became stale")?;
-	assert_eq!(window.len(), 2);
-	assert_eq!(
-		window.page(0).ok_or("missing second page")?.validate(second.page_no())?.page_no(),
-		second.page_no()
-	);
-	assert_eq!(
-		window.page(1).ok_or("missing first page")?.validate(first.page_no())?.page_no(),
-		first.page_no()
-	);
-	drop(window);
+	{
+		let window =
+			scope.get_resolved_window(&mut table, 200)?.ok_or("resident window became stale")?;
+		assert_eq!(window.len(), 2);
+		assert_eq!(
+			window.page(0).ok_or("missing second page")?.validate(second.page_no())?.page_no(),
+			second.page_no()
+		);
+		assert_eq!(
+			window.page(1).ok_or("missing first page")?.validate(first.page_no())?.page_no(),
+			first.page_no()
+		);
+	}
 	assert_eq!(scope.operations(), 200);
 	let mut replacement = vec![first_handle];
 	scope.update_resolved_table_owned(&mut table, &mut replacement)?;
 	assert!(replacement.is_empty());
-	drop(scope.get_resolved_window(&mut table, 100)?.ok_or("repeated resident page became stale")?);
+	{
+		let _window = scope
+			.get_resolved_window(&mut table, 100)?
+			.ok_or("repeated resident page became stale")?;
+	}
 	assert_eq!(scope.operations(), 100);
 	assert!(scope.prepare_resolved_table(&[first_handle, foreign_handle]).is_err());
 	let mut empty = scope.prepare_resolved_table(&[])?;
@@ -448,6 +492,7 @@ fn resolved_page_window_is_ordered_and_source_bounded() -> Result<(), Box<dyn Er
 	Ok(())
 }
 
+/// Verifies reusable page table revalidates after eviction.
 #[test]
 fn reusable_page_table_revalidates_after_eviction() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
@@ -457,7 +502,10 @@ fn reusable_page_table_revalidates_after_eviction() -> Result<(), Box<dyn Error>
 	let handle = engine.resolve(first).ok_or("first key was not resolved")?;
 	let mut read_scope = engine.read_scope()?;
 	let mut table = read_scope.prepare_resolved_table(&[handle])?;
-	drop(read_scope.get_resolved_window(&mut table, 1)?.ok_or("initial page table was stale")?);
+	{
+		let _window =
+			read_scope.get_resolved_window(&mut table, 1)?.ok_or("initial page table was stale")?;
+	}
 
 	thread::scope(|threads| -> Result<(), Box<dyn Error>> {
 		let (done_tx, done_rx) = mpsc::channel();
@@ -481,6 +529,7 @@ fn reusable_page_table_revalidates_after_eviction() -> Result<(), Box<dyn Error>
 	Ok(())
 }
 
+/// Verifies home locator prunes stale slots and empty chunks.
 #[test]
 fn home_locator_prunes_stale_slots_and_empty_chunks() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
@@ -507,6 +556,7 @@ fn home_locator_prunes_stale_slots_and_empty_chunks() -> Result<(), Box<dyn Erro
 	Ok(())
 }
 
+/// Verifies source registry retires old home epoch but not active scope.
 #[test]
 fn source_registry_retires_old_home_epoch_but_not_active_scope() -> Result<(), Box<dyn Error>> {
 	let engine = HybridReadEngine::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
@@ -524,10 +574,13 @@ fn source_registry_retires_old_home_epoch_but_not_active_scope() -> Result<(), B
 	Ok(())
 }
 
+/// Verifies scatter prefetch is ordered bounded and bypasses resident frames.
 #[cfg(windows)]
 #[test]
 fn scatter_prefetch_is_ordered_bounded_and_bypasses_resident_frames() -> Result<(), Box<dyn Error>>
 {
+	/// Number of numbered pages streamed across multiple bounded scatter
+	/// windows.
 	const PAGE_COUNT: usize = 40;
 	let path = TestFile::new();
 	write_numbered_pages(&path.0, PAGE_COUNT)?;
@@ -556,10 +609,14 @@ fn scatter_prefetch_is_ordered_bounded_and_bypasses_resident_frames() -> Result<
 	Ok(())
 }
 
+/// Verifies scatter bypass preserves an existing resident hot set.
 #[cfg(windows)]
 #[test]
 fn scatter_bypass_preserves_an_existing_resident_hot_set() -> Result<(), Box<dyn Error>> {
+	/// Resident pages preloaded before the bypass scan to detect accidental
+	/// eviction.
 	const HOT_PAGES: usize = 4;
+	/// Total numbered pages in the resident-hot-set preservation fixture.
 	const PAGE_COUNT: usize = 12;
 	let path = TestFile::new();
 	write_numbered_pages(&path.0, PAGE_COUNT)?;
@@ -599,6 +656,7 @@ fn scatter_bypass_preserves_an_existing_resident_hot_set() -> Result<(), Box<dyn
 	Ok(())
 }
 
+/// Verifies scatter corruption is terminal before extent publication.
 #[cfg(windows)]
 #[test]
 fn scatter_corruption_is_terminal_before_extent_publication() -> Result<(), Box<dyn Error>> {
@@ -625,6 +683,8 @@ fn scatter_corruption_is_terminal_before_extent_publication() -> Result<(), Box<
 	Ok(())
 }
 
+/// Verifies sparse ioring preserves order duplicates and bypasses resident
+/// frames.
 #[cfg(all(windows, feature = "native-async-io"))]
 #[test]
 fn sparse_ioring_preserves_order_duplicates_and_bypasses_resident_frames()

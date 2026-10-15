@@ -1,6 +1,11 @@
+#![cfg(test)]
+
 //! Public reactive registry persistence, run separately for each local backend.
 
 #![cfg(windows)]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use ferros_grynn::{
 	datastore::{CheckpointMode, ClassField, ClassSchema, Datastore, IoMode, LocalOptions},
@@ -28,6 +33,8 @@ fn split_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		graph::GraphKind,
 		live::{LiveIdentity, LiveIdentityPart, LiveNext, LivePath, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-split-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -35,7 +42,7 @@ fn split_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut setup = store.begin();
 	setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
 		"tags",
@@ -85,14 +92,12 @@ fn split_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LivePayload::Batch(batch) = delivery.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("SPLIT delivery GAP"));
 	};
-	assert_eq!(batch.events().len(), 2);
+	(&(batch.events().len()), &(2)).assert_equal();
 	for event in batch.events() {
 		let LiveIdentity::Composite(parts) = event.identity() else {
 			return Err(FerrosGrynnError::invalid_argument("SPLIT qualified identity missing"));
 		};
-		assert!(
-			matches!(parts.as_slice(), [LiveIdentityPart::Occurrence(occurrence), LiveIdentityPart::Split(_)] if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record)
-		);
+		(matches!(parts.as_slice(), [LiveIdentityPart::Occurrence(occurrence), LiveIdentityPart::Split(_)] if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record)).assert_true();
 	}
 	let expected = batch.events().to_vec();
 	let token = delivery.token().clone();
@@ -102,30 +107,26 @@ fn split_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	drop(handle);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(cursor.live_id())?.query(), &query);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(cursor.live_id())?.query()), &(&query)).assert_equal();
 	let mut handle = store.resume_live(&cursor)?;
 	let LiveNext::Delivery(replay) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("SPLIT saved replay missing"));
 	};
-	assert_eq!(replay.token(), &token);
-	assert!(
-		matches!(replay.payload(), LivePayload::Batch(batch) if batch.versionstamp() == stamp && batch.events() == expected)
-	);
+	(&(replay.token()), &(&token)).assert_equal();
+	(matches!(replay.payload(), LivePayload::Batch(batch) if batch.versionstamp() == stamp && batch.events() == expected)).assert_true();
 	handle.ack(replay.token())?;
 	drop(handle);
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(cursor.live_id())?.cursor(), &token);
+	(&(store.begin().live_info(cursor.live_id())?.cursor()), &(&token)).assert_equal();
 	let mut handle = store.resume_live(&token)?;
 	let LiveNext::Delivery(tail) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("SPLIT saved tail missing"));
 	};
-	assert!(
-		matches!(tail.payload(), LivePayload::Batch(batch) if batch.versionstamp() == tail_stamp && batch.events().len() == 3 && batch.events().iter().all(|event| event.before().is_some() && event.after().is_none()))
-	);
+	(matches!(tail.payload(), LivePayload::Batch(batch) if batch.versionstamp() == tail_stamp && batch.events().len() == 3 && batch.events().iter().all(|event| event.before().is_some() && event.after().is_none()))).assert_true();
 	handle.ack(tail.token())?;
-	assert!(matches!(handle.next()?, LiveNext::Idle));
+	(matches!(handle.next()?, LiveNext::Idle)).assert_true();
 	handle.close()?;
 	drop(handle);
 	drop(store);
@@ -136,45 +137,32 @@ fn split_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live window split local sync.
 #[test]
 fn live_window_split_local_sync() -> FerrosGrynnResult<()> {
 	split_results_survive_reopen(IoMode::Sync)
 }
 
+/// Verifies live window split local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_window_split_local_native_async() -> FerrosGrynnResult<()> {
 	split_results_survive_reopen(IoMode::NativeAsync)
 }
 
-/// Owned comparison/window descriptors and exact membership images survive
-/// reopen.
-fn window_results_survive_reopen(
-	mode: IoMode,
-	output: ferros_grynn::live::LiveOutputMode,
-) -> FerrosGrynnResult<()> {
-	use std::collections::BTreeMap;
-
+/// Seeds the changefeed-backed class and records used by the window replay
+/// scenario.
+///
+/// # Errors
+/// Propagates the existing schema, property lookup and transaction failures in
+/// setup order.
+fn seed_window_fixture(
+	store: &Datastore,
+) -> FerrosGrynnResult<(ferros_grynn::datastore::ClassId, ferros_grynn::values::PropertyKeyId)> {
 	use ferros_grynn::{
 		changefeed::{ChangefeedConfig, ChangefeedSource},
 		gql_status::FerrosGrynnError,
-		live::{
-			LiveIdentity,
-			LiveNext,
-			LiveNullsOrder,
-			LiveOrder,
-			LiveOrderDirection,
-			LivePayload,
-		},
 	};
-	let directory = std::env::temp_dir().join(format!(
-		"fg-live-window-{:016x}",
-		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
-	));
-	let mut options = LocalOptions::default();
-	options.io_mode = mode;
-	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
 	let mut tx = store.begin();
 	let class = tx.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
 		"age",
@@ -197,6 +185,39 @@ fn window_results_survive_reopen(
 		)?;
 	}
 	tx.commit()?;
+	Ok((class, age))
+}
+
+/// Owned comparison/window descriptors and exact membership images survive
+/// reopen.
+fn window_results_survive_reopen(
+	mode: IoMode,
+	output: ferros_grynn::live::LiveOutputMode,
+) -> FerrosGrynnResult<()> {
+	use std::collections::BTreeMap;
+
+	use ferros_grynn::{
+		gql_status::FerrosGrynnError,
+		live::{
+			LiveIdentity,
+			LiveNext,
+			LiveNullsOrder,
+			LiveOrder,
+			LiveOrderDirection,
+			LivePayload,
+		},
+	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
+	let directory = std::env::temp_dir().join(format!(
+		"fg-live-window-{:016x}",
+		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
+	));
+	let mut options = LocalOptions::default();
+	options.io_mode = mode;
+	options.buffer_pool_pages = 16;
+	let store = Datastore::create_local(&directory, options)?;
+	let (class, age) = seed_window_fixture(&store)?;
 	let query = LiveQuery::new(LiveSource::Class(class))
 		.with_output(output)
 		.with_only(true)
@@ -226,22 +247,23 @@ fn window_results_survive_reopen(
 	let LivePayload::Batch(batch) = delivery.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("window delivery fault"));
 	};
-	assert_eq!(batch.events().len(), 2);
+	(&(batch.events().len()), &(2)).assert_equal();
 	let expected_output = batch
 		.events()
 		.iter()
 		.map(|event| (event.identity().clone(), event.output().cloned()))
 		.collect::<BTreeMap<_, _>>();
-	assert_eq!(
-		expected_output.values().all(Option::is_some),
-		output != ferros_grynn::live::LiveOutputMode::Full
-	);
+	(
+		&(expected_output.values().all(Option::is_some)),
+		&(output != ferros_grynn::live::LiveOutputMode::Full),
+	)
+		.assert_equal();
 	let expected = batch
 		.events()
 		.iter()
 		.map(|event| (event.identity().clone(), (event.before().cloned(), event.after().cloned())))
 		.collect::<BTreeMap<_, _>>();
-	assert!(expected[&LiveIdentity::Record(b.clone())].0.is_none());
+	(expected[&LiveIdentity::Record(b.clone())].0.is_none()).assert_true();
 	let mut tx = store.begin();
 	tx.set_base_property(&b, age, 5.into())?;
 	tx.commit()?;
@@ -249,8 +271,9 @@ fn window_results_survive_reopen(
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.query(), &query);
-	assert_eq!(store.live_statistics()?.published_batches, 0, "process counters reset on open");
+	(&(store.begin().live_info(id)?.query()), &(&query)).assert_equal();
+	(&(store.live_statistics()?.published_batches), &(0))
+		.assert_equal_with(|| "process counters reset on open".to_string());
 	let mut handle = store.resume_live(&cursor)?;
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("window replay missing"));
@@ -259,18 +282,19 @@ fn window_results_survive_reopen(
 		return Err(FerrosGrynnError::invalid_argument("window replay fault"));
 	};
 	let observed = store.live_statistics()?;
-	assert!(observed.history_page_reads > 0);
-	assert!(observed.admitted_replay_work > 0);
+	(observed.history_page_reads > 0).assert_true();
+	(observed.admitted_replay_work > 0).assert_true();
 	let LiveNext::Delivery(repeated) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("window repeated replay missing"));
 	};
-	assert_eq!(repeated.token(), delivery.token());
-	assert_eq!(store.live_statistics()?.history_page_reads, observed.history_page_reads);
-	assert_eq!(store.live_statistics()?.deliveries_issued, observed.deliveries_issued);
-	assert_eq!(batch.versionstamp(), stamp);
+	(&(repeated.token()), &(delivery.token())).assert_equal();
+	(&(store.live_statistics()?.history_page_reads), &(observed.history_page_reads)).assert_equal();
+	(&(store.live_statistics()?.deliveries_issued), &(observed.deliveries_issued)).assert_equal();
+	(&(batch.versionstamp()), &(stamp)).assert_equal();
 	for event in batch.events() {
-		assert_eq!((event.before().cloned(), event.after().cloned()), expected[event.identity()]);
-		assert_eq!(event.output(), expected_output[event.identity()].as_ref());
+		(&(event.before().cloned(), event.after().cloned()), &(expected[event.identity()]))
+			.assert_equal();
+		(&(event.output()), &(expected_output[event.identity()].as_ref())).assert_equal();
 	}
 	handle.ack(delivery.token())?;
 	handle.close()?;
@@ -283,22 +307,26 @@ fn window_results_survive_reopen(
 	Ok(())
 }
 
+/// Verifies live window local sync.
 #[test]
 fn live_window_local_sync() -> FerrosGrynnResult<()> {
 	window_results_survive_reopen(IoMode::Sync, ferros_grynn::live::LiveOutputMode::Full)
 }
 
+/// Verifies live window local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_window_local_native_async() -> FerrosGrynnResult<()> {
 	window_results_survive_reopen(IoMode::NativeAsync, ferros_grynn::live::LiveOutputMode::Full)
 }
 
+/// Verifies live patch window local sync.
 #[test]
 fn live_patch_window_local_sync() -> FerrosGrynnResult<()> {
 	window_results_survive_reopen(IoMode::Sync, ferros_grynn::live::LiveOutputMode::Patch)
 }
 
+/// Verifies live patch window local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_patch_window_local_native_async() -> FerrosGrynnResult<()> {
@@ -313,6 +341,8 @@ fn grouped_results_survive_reopen(mode: IoMode, constructors: bool) -> FerrosGry
 		graph::GraphKind,
 		live::{LiveIdentity, LiveNext, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-group-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -320,7 +350,7 @@ fn grouped_results_survive_reopen(mode: IoMode, constructors: bool) -> FerrosGry
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut tx = store.begin();
 	let graph = tx.define_graph("scope", GraphKind::Graph)?;
 	tx.configure_changefeed(
@@ -425,8 +455,8 @@ fn grouped_results_survive_reopen(mode: IoMode, constructors: bool) -> FerrosGry
 	drop(handle);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(id)?.query(), &query);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(id)?.query()), &(&query)).assert_equal();
 	let mut handle = store.resume_live(&saved)?;
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("group replay missing"));
@@ -434,13 +464,15 @@ fn grouped_results_survive_reopen(mode: IoMode, constructors: bool) -> FerrosGry
 	let LivePayload::Batch(batch) = delivery.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("group replay gap"));
 	};
-	assert_eq!(batch.events().len(), 2);
-	assert_eq!(batch.events()[0].identity(), &LiveIdentity::Aggregate(vec![Value::from(wide)]));
-	assert_eq!(batch.events()[0].before(), Some(&image(2)?));
-	assert_eq!(batch.events()[0].after(), Some(&image(1)?));
-	assert_eq!(batch.events()[1].identity(), &LiveIdentity::Aggregate(vec![Value::from(wide + 1)]));
-	assert_eq!(batch.events()[1].before(), None);
-	assert_eq!(batch.events()[1].after(), Some(&image(1)?));
+	(&(batch.events().len()), &(2)).assert_equal();
+	(&(batch.events()[0].identity()), &(&LiveIdentity::Aggregate(vec![Value::from(wide)])))
+		.assert_equal();
+	(&(batch.events()[0].before()), &(Some(&image(2)?))).assert_equal();
+	(&(batch.events()[0].after()), &(Some(&image(1)?))).assert_equal();
+	(&(batch.events()[1].identity()), &(&LiveIdentity::Aggregate(vec![Value::from(wide + 1)])))
+		.assert_equal();
+	(&(batch.events()[1].before()), &(None)).assert_equal();
+	(&(batch.events()[1].after()), &(Some(&image(1)?))).assert_equal();
 	handle.ack(delivery.token())?;
 	let saved = handle.cursor().clone();
 	let mut tx = store.begin();
@@ -459,9 +491,10 @@ fn grouped_results_survive_reopen(mode: IoMode, constructors: bool) -> FerrosGry
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("group tail missing"));
 	};
-	assert!(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events().len() == 1
+	(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events().len() == 1
 		&& batch.events()[0].identity() == &LiveIdentity::Aggregate(vec![Value::from(wide + 1)])
-		&& batch.events()[0].before() == Some(&image(1)?) && batch.events()[0].after().is_none()));
+		&& batch.events()[0].before() == Some(&image(1)?) && batch.events()[0].after().is_none()))
+	.assert_true();
 	handle.ack(delivery.token())?;
 	handle.close()?;
 	drop(handle);
@@ -473,22 +506,26 @@ fn grouped_results_survive_reopen(mode: IoMode, constructors: bool) -> FerrosGry
 	Ok(())
 }
 
+/// Verifies live group results local sync.
 #[test]
 fn live_group_results_local_sync() -> FerrosGrynnResult<()> {
 	grouped_results_survive_reopen(IoMode::Sync, false)
 }
 
+/// Verifies live group results local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_group_results_local_native_async() -> FerrosGrynnResult<()> {
 	grouped_results_survive_reopen(IoMode::NativeAsync, false)
 }
 
+/// Verifies live aggregate constructors local sync.
 #[test]
 fn live_aggregate_constructors_local_sync() -> FerrosGrynnResult<()> {
 	grouped_results_survive_reopen(IoMode::Sync, true)
 }
 
+/// Verifies live aggregate constructors local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_aggregate_constructors_local_native_async() -> FerrosGrynnResult<()> {
@@ -503,6 +540,8 @@ fn omit_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		gql_status::FerrosGrynnError,
 		live::{LiveIdentity, LiveNext, LivePath, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-omit-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -510,7 +549,7 @@ fn omit_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut tx = store.begin();
 	let class = tx.define_class(ClassSchema::new("item", AtomKind::Node, [
 		ClassField::new("k", Type::Int),
@@ -544,15 +583,15 @@ fn omit_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut tx = store.begin();
 	tx.set_base_property(&record, secret, 2.into())?;
 	tx.commit()?;
-	assert!(matches!(handle.next()?, LiveNext::Idle));
+	(matches!(handle.next()?, LiveNext::Idle)).assert_true();
 	let mut tx = store.begin();
 	tx.set_base_property(&record, key, (wide + 1).into())?;
 	tx.commit()?;
 	drop(handle);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(id)?.query(), &query);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(id)?.query()), &(&query)).assert_equal();
 	let mut handle = store.resume_live(&saved)?;
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("OMIT replay missing"));
@@ -560,15 +599,15 @@ fn omit_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LivePayload::Batch(batch) = delivery.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("OMIT replay gap"));
 	};
-	assert_eq!(batch.events().len(), 1);
+	(&(batch.events().len()), &(1)).assert_equal();
 	let event = &batch.events()[0];
-	assert_eq!(event.identity(), &LiveIdentity::Record(record.clone()));
+	(&(event.identity()), &(&LiveIdentity::Record(record.clone()))).assert_equal();
 	for (image, expected) in [(event.before(), wide), (event.after(), wide + 1)] {
 		let object = image
 			.and_then(Value::as_object)
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("OMIT replay image missing"))?;
-		assert_eq!(object.get("k"), Some(&expected.into()));
-		assert!(object.get("id").is_none() && object.get("secret").is_none());
+		(&(object.get("k")), &(Some(&expected.into()))).assert_equal();
+		(object.get("id").is_none() && object.get("secret").is_none()).assert_true();
 	}
 	let before_exit = event.after().cloned();
 	handle.ack(delivery.token())?;
@@ -583,9 +622,10 @@ fn omit_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("OMIT exit replay missing"));
 	};
-	assert!(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events().len() == 1
+	(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events().len() == 1
 		&& batch.events()[0].identity() == &LiveIdentity::Record(record)
-		&& batch.events()[0].before() == before_exit.as_ref() && batch.events()[0].after().is_none()));
+		&& batch.events()[0].before() == before_exit.as_ref() && batch.events()[0].after().is_none()))
+	.assert_true();
 	handle.ack(delivery.token())?;
 	handle.close()?;
 	drop(handle);
@@ -597,11 +637,13 @@ fn omit_results_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live omit local sync.
 #[test]
 fn live_omit_local_sync() -> FerrosGrynnResult<()> {
 	omit_results_survive_reopen(IoMode::Sync)
 }
 
+/// Verifies live omit local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_omit_local_native_async() -> FerrosGrynnResult<()> {
@@ -615,6 +657,8 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		gql_status::FerrosGrynnError,
 		live::{LiveId, LiveNext, LivePayload},
 	};
+
+	use crate::test_assertions::AssertComparison as _;
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-text-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -622,7 +666,7 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut session = store.session();
 	for result in session.execute(
 		"DEFINE CLASS person TYPE NODE; DEFINE FIELD age ON CLASS person TYPE int; DEFINE PURE \
@@ -671,7 +715,7 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	drop(session);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
+	let store = Datastore::open_local(&directory, options)?;
 	let mut handle = store.resume_live(&saved)?;
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("text fixture replay is absent"));
@@ -679,14 +723,14 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LivePayload::Batch(batch) = delivery.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("text fixture unexpected GAP"));
 	};
-	assert_eq!(batch.events().len(), 1);
-	assert_eq!(batch.events()[0].before(), Some(&0.into()));
-	assert_eq!(batch.events()[0].after(), Some(&1.into()));
+	(&(batch.events().len()), &(1)).assert_equal();
+	(&(batch.events()[0].before()), &(Some(&0.into()))).assert_equal();
+	(&(batch.events()[0].after()), &(Some(&1.into()))).assert_equal();
 	handle.ack(delivery.token())?;
 	drop(handle);
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(id)?.cursor(), delivery.token());
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(id)?.cursor()), &(delivery.token())).assert_equal();
 	let mut session = store.session();
 	let inputs = Object::from_iter([("sub", Value::from(id.as_uuid()))]);
 	let mut info = session.execute("INFO FOR LIVE $sub;", &inputs)?;
@@ -697,7 +741,7 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let Value::Object(row) = row.value() else {
 		return Err(FerrosGrynnError::invalid_argument("text fixture INFO row missing"));
 	};
-	assert_eq!(row.get("cursor"), Some(&Value::from(delivery.token().encode())));
+	(&(row.get("cursor")), &(Some(&Value::from(delivery.token().encode())))).assert_equal();
 	for result in session.execute("KILL $sub;", &inputs)? {
 		result.result?;
 	}
@@ -705,7 +749,7 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.state(), LiveState::Closed);
+	(&(store.begin().live_info(id)?.state()), &(LiveState::Closed)).assert_equal();
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
 		FerrosGrynnError::invalid_argument("text fixture cleanup failed")
@@ -714,11 +758,13 @@ fn gql_registration_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live gql registration local sync.
 #[test]
 fn live_gql_registration_local_sync() -> FerrosGrynnResult<()> {
 	gql_registration_survives_reopen(IoMode::Sync)
 }
 
+/// Verifies live gql registration local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_gql_registration_local_native_async() -> FerrosGrynnResult<()> {
@@ -731,6 +777,8 @@ fn gql_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		gql_status::FerrosGrynnError,
 		live::{LiveId, LiveNext},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-gack-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -738,7 +786,7 @@ fn gql_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut session = store.session();
 	for result in
 		session.execute("DEFINE CLASS person TYPE NODE CHANGEFEED 1d FULL;", &Object::new())?
@@ -769,27 +817,25 @@ fn gql_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	for result in session.execute("BEGIN; ACK LIVE $qid CURSOR $token; CANCEL;", &inputs)? {
 		result.result?;
 	}
-	assert_eq!(store.begin().live_info(id)?.cursor(), &before);
-	assert!(
-		matches!(session.next_live(id)?, LiveNext::Delivery(ref next) if next.token() == delivery.token())
-	);
+	(&(store.begin().live_info(id)?.cursor()), &(&before)).assert_equal();
+	(matches!(session.next_live(id)?, LiveNext::Delivery(ref next) if next.token() == delivery.token())).assert_true();
 	for result in session.execute(
 		"ACK LIVE $qid CURSOR IF true THEN $token ELSE $token END; DEFINE CLASS other TYPE NODE;",
 		&inputs,
 	)? {
 		result.result?;
 	}
-	assert!(matches!(session.next_live(id)?, LiveNext::Idle));
+	(matches!(session.next_live(id)?, LiveNext::Idle)).assert_true();
 	let handle = session.take_live_subscription(id)?;
-	assert_eq!(handle.cursor(), delivery.token());
+	(&(handle.cursor()), &(delivery.token())).assert_equal();
 	drop(handle);
 	drop(session);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.cursor(), delivery.token());
+	(&(store.begin().live_info(id)?.cursor()), &(delivery.token())).assert_equal();
 	let mut tail = store.resume_live(delivery.token())?;
-	assert!(matches!(tail.next()?, LiveNext::Idle));
+	(matches!(tail.next()?, LiveNext::Idle)).assert_true();
 	drop(tail);
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
@@ -799,11 +845,13 @@ fn gql_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live gql ack local sync.
 #[test]
 fn live_gql_ack_local_sync() -> FerrosGrynnResult<()> {
 	gql_ack_survives_reopen(IoMode::Sync)
 }
 
+/// Verifies live gql ack local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_gql_ack_local_native_async() -> FerrosGrynnResult<()> {
@@ -817,6 +865,8 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		gql_status::FerrosGrynnError,
 		live::{LiveId, LiveNext, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-bind-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX),
@@ -824,7 +874,7 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut session = store.session();
 	let mut output = session.execute(
 		"DEFINE CLASS person TYPE NODE CHANGEFEED 1d FULL; DEFINE FIELD age ON CLASS person TYPE \
@@ -858,20 +908,159 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LiveNext::Delivery(delivery) = session.next_live(id)? else {
 		return Err(FerrosGrynnError::invalid_argument("binding exit delivery missing"));
 	};
-	assert!(
-		matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events()[0].before() == Some(&19.into()) && batch.events()[0].after().is_none())
-	);
+	(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events()[0].before() == Some(&19.into()) && batch.events()[0].after().is_none())).assert_true();
 	for result in session.execute(
 		"ACK LIVE $sub CURSOR $token;",
 		&Object::from_iter([("token", Value::from(delivery.token().encode()))]),
 	)? {
 		result.result?;
 	}
+	let (duration_binding, zero) = exercise_live_deadline_binding(&store, &mut session)?;
+	let (navigation_binding, navigation_record) =
+		exercise_live_navigation_binding(&store, &mut session)?;
+	let counts = session.execute(
+		"LIVE LET $count = $initial; INFO FOR LIVE LET $count; TRAVERSE FROM [1, 1, 2] |>\x20
+		 tv::limit($count); TRAVERSE FROM [1, 1, 2] |> tv::skip($count);",
+		&Object::from_iter([("initial", Value::from(u64::MAX))]),
+	)?;
+	for result in &counts {
+		result.result.as_ref().map_err(Clone::clone)?;
+	}
+	let count_uuid = counts[1]
+		.result
+		.as_ref()
+		.map_err(Clone::clone)?
+		.value()
+		.as_object()
+		.and_then(|info| info.get("id"))
+		.and_then(Value::as_uuid)
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("count binding identity missing"))?;
+	let count_binding = ferros_grynn::live::LiveBindingId::from_uuid(*count_uuid)?;
+	(
+		&(counts[2].result.as_ref().map_err(Clone::clone)?.value()),
+		&(&Value::from(vec![Value::from(1), Value::from(1), Value::from(2)])),
+	)
+		.assert_equal();
+	(
+		&(counts[3].result.as_ref().map_err(Clone::clone)?.value()),
+		&(&Value::from(Vec::<Value>::new())),
+	)
+		.assert_equal();
+	for result in session.execute("ALTER LIVE LET $count VALUE 0 - 1;", &Object::new())? {
+		result.result?;
+	}
+	for query in ["TRAVERSE FROM [] |> tv::limit($count);", "TRAVERSE FROM [] |> tv::skip($count);"]
+	{
+		(session.execute(query, &Object::new())?[0].result.is_err())
+			.assert_true_with(|| query.to_string());
+	}
+	for result in session.execute(
+		"ALTER LIVE LET $count VALUE $initial;",
+		&Object::from_iter([("initial", Value::from(u64::MAX))]),
+	)? {
+		result.result?;
+	}
+	drop(session);
+	store.checkpoint(CheckpointMode::Restart)?;
+	drop(store);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_binding_value(binding)?), &(21.into())).assert_equal();
+	(&(store.begin().live_binding_value(duration_binding)?), &(zero)).assert_equal();
+	(&(store.begin().live_binding_value(count_binding)?), &(Value::from(u64::MAX))).assert_equal();
+	(&(store.begin().live_binding_info(binding)?.revision().definition().get()), &(2))
+		.assert_equal();
+	let mut handle = store.resume_live(delivery.token())?;
+	let mut session = store.session();
+	(&(store.begin().live_binding_value(navigation_binding)?), &(Value::from(navigation_record)))
+		.assert_equal();
+	let navigation = session.execute(
+		"LIVE LET $record = $restored; LET $read = | | -> any { RETURN $record.age; }; RETURN \
+		 $read(); TRAVERSE FROM [0] |> tv::map(|$x| $record.age);",
+		&Object::from_iter([("restored", store.begin().live_binding_value(navigation_binding)?)]),
+	)?;
+	for result in &navigation {
+		result.result.as_ref().map_err(Clone::clone)?;
+	}
+	(&(navigation[2].result.as_ref().map_err(Clone::clone)?.value()), &(&Value::from(20)))
+		.assert_equal();
+	(
+		&(navigation[3].result.as_ref().map_err(Clone::clone)?.value()),
+		&(&Value::from(vec![Value::from(20)])),
+	)
+		.assert_equal();
+	let counts = session.execute(
+		"LIVE LET $count = $restored; TRAVERSE FROM [1, 1, 2] |> tv::limit($count); TRAVERSE FROM \
+		 [1, 1, 2] |> tv::skip($count);",
+		&Object::from_iter([("restored", store.begin().live_binding_value(count_binding)?)]),
+	)?;
+	for result in &counts {
+		result.result.as_ref().map_err(Clone::clone)?;
+	}
+	(
+		&(counts[1].result.as_ref().map_err(Clone::clone)?.value()),
+		&(&Value::from(vec![Value::from(1), Value::from(1), Value::from(2)])),
+	)
+		.assert_equal();
+	(
+		&(counts[2].result.as_ref().map_err(Clone::clone)?.value()),
+		&(&Value::from(Vec::<Value>::new())),
+	)
+		.assert_equal();
+	let inputs = Object::from_iter([("minimum", Value::from(binding.as_uuid()))]);
+	for result in
+		session.execute("INFO FOR LIVE LET $minimum; ALTER LIVE LET $minimum VALUE 17;", &inputs)?
+	{
+		result.result?;
+	}
+	let LiveNext::Delivery(delivery) = handle.next()? else {
+		return Err(FerrosGrynnError::invalid_argument("reopened binding entry delivery missing"));
+	};
+	(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events()[0].before().is_none() && batch.events()[0].after() == Some(&19.into()))).assert_true();
+	handle.ack(delivery.token())?;
+	drop(handle);
+	for result in session.execute(
+		"KILL $sub; REMOVE LIVE LET $minimum;",
+		&Object::from_iter([
+			("sub", Value::from(id.as_uuid())),
+			("minimum", Value::from(binding.as_uuid())),
+		]),
+	)? {
+		result.result?;
+	}
+	drop(session);
+	store.checkpoint(CheckpointMode::Restart)?;
+	drop(store);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_binding_info(binding)?.state()), &(LiveState::Closed)).assert_equal();
+	drop(store);
+	std::fs::remove_dir_all(&directory).map_err(|error| {
+		FerrosGrynnError::invalid_argument("binding fixture cleanup failed")
+			.with_technical_source(error)
+	})?;
+	Ok(())
+}
+
+/// Runs the original deadline-binding queries before the shared reopen
+/// boundary.
+///
+/// # Errors
+/// Returns the original query, catalog or fixture error at the same scenario
+/// step.
+///
+/// # Panics
+/// Panics if an original deadline or rejected-publication assertion fails.
+fn exercise_live_deadline_binding(
+	store: &Datastore,
+	session: &mut ferros_grynn::datastore::GqlSession,
+) -> FerrosGrynnResult<(ferros_grynn::live::LiveBindingId, Value)> {
+	use ferros_grynn::gql_status::FerrosGrynnError;
+
+	use crate::test_assertions::AssertCondition as _;
 	let fixed_duration = Value::from("1s".parse::<ferros_grynn::values::Duration>()?);
 	let duration_results = session.execute(
 		"LIVE LET $deadline = $fixed; EXPLAIN SELECT VALUE age FROM person TIMEOUT $deadline; \
 		 INFO FOR LIVE LET $deadline; SELECT VALUE age FROM person TIMEOUT $deadline;",
-		&Object::from_iter([("fixed", fixed_duration.clone())]),
+		&Object::from_iter([("fixed", fixed_duration)]),
 	)?;
 	for result in &duration_results {
 		result.result.as_ref().map_err(Clone::clone)?;
@@ -919,21 +1108,21 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		 $deadline;",
 		&Object::from_iter([("zero", zero.clone())]),
 	)?;
-	assert!(rejected[0].result.is_ok());
-	assert!(rejected[1].result.is_err());
-	assert!(store.begin().atom(&"person:timed_out".parse()?)?.is_none());
+	(rejected[0].result.is_ok()).assert_true();
+	(rejected[1].result.is_err()).assert_true();
+	(store.begin().atom(&"person:timed_out".parse()?)?.is_none()).assert_true();
 	let rejected_import = session.execute(
 		"BEGIN IMPORT; CREATE person:import_timed_out SET age = 19 TIMEOUT $deadline; END IMPORT;",
 		&Object::new(),
 	)?;
-	assert!(rejected_import[0].result.is_err());
-	assert!(store.begin().atom(&"person:import_timed_out".parse()?)?.is_none());
+	(rejected_import[0].result.is_err()).assert_true();
+	(store.begin().atom(&"person:import_timed_out".parse()?)?.is_none()).assert_true();
 	let rejected_explain = session.execute(
 		"EXPLAIN ANALYZE CREATE person:explain_timed_out SET age = 19 TIMEOUT $deadline;",
 		&Object::new(),
 	)?;
-	assert!(rejected_explain[0].result.is_err());
-	assert!(store.begin().atom(&"person:explain_timed_out".parse()?)?.is_none());
+	(rejected_explain[0].result.is_err()).assert_true();
+	(store.begin().atom(&"person:explain_timed_out".parse()?)?.is_none()).assert_true();
 	for source in [
 		"TRAVERSE FROM MATCH (person AS n) IN GRAPH deadline_scope TIMEOUT $deadline RETURN n |> \
 		 tv::count();",
@@ -942,9 +1131,28 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		"BUILD GRAPH deadline_rejected FROM (MATCH (person AS n) IN GRAPH deadline_scope TIMEOUT \
 		 $deadline RETURN n) NODES n;",
 	] {
-		assert!(session.execute(source, &Object::new())?[0].result.is_err(), "{source}");
+		(session.execute(source, &Object::new())?[0].result.is_err())
+			.assert_true_with(|| source.to_string());
 	}
-	assert!(store.begin().named_graph("deadline_rejected")?.is_none());
+	(store.begin().named_graph("deadline_rejected")?.is_none()).assert_true();
+	Ok((duration_binding, zero))
+}
+
+/// Runs the original navigation/closure and small-budget binding checks.
+///
+/// # Errors
+/// Returns the original query, catalog or fixture error at the same scenario
+/// step.
+///
+/// # Panics
+/// Panics if an original snapshot, navigation or memory-bound assertion fails.
+fn exercise_live_navigation_binding(
+	store: &Datastore,
+	session: &mut ferros_grynn::datastore::GqlSession,
+) -> FerrosGrynnResult<(ferros_grynn::live::LiveBindingId, RecordId)> {
+	use ferros_grynn::gql_status::FerrosGrynnError;
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let navigation = session.execute(
 		"DEFINE CLASS navigation TYPE NODE; DEFINE FIELD age ON CLASS navigation TYPE int; DEFINE \
 		 FIELD payload ON CLASS navigation TYPE array<int>; CREATE navigation:a SET age = 19; \
@@ -977,7 +1185,7 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	)?;
 	populate.commit()?;
 	for result in session.execute("BEGIN READ ONLY; RETURN $read();", &Object::new())? {
-		assert!(result.result.is_ok());
+		(result.result.is_ok()).assert_true();
 	}
 	let mut update = store.begin();
 	let age = store
@@ -995,14 +1203,14 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		for result in &results {
 			result.result.as_ref().map_err(Clone::clone)?;
 		}
-		assert_eq!(
-			results
+		(
+			&(results
 				.last()
 				.and_then(|result| result.result.as_ref().ok())
-				.map(|result| result.value()),
-			Some(&expected),
-			"{query}"
-		);
+				.map(|result| result.value())),
+			&(Some(&expected)),
+		)
+			.assert_equal_with(|| query.to_string());
 	}
 	let mut navigation_options = ferros_grynn::gql::QueryExecutionOptions::default();
 	navigation_options.barrier_memory_bytes = std::num::NonZeroUsize::new(4096)
@@ -1012,128 +1220,15 @@ fn gql_binding_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		&Object::new(),
 		navigation_options.clone(),
 	)?;
-	assert_eq!(small[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(20));
+	(&(small[0].result.as_ref().map_err(Clone::clone)?.value()), &(&Value::from(20)))
+		.assert_equal();
 	let bounded =
 		session.execute_with_options("RETURN $large();", &Object::new(), navigation_options)?;
-	assert!(bounded[0].result.is_err());
-	let counts = session.execute(
-		"LIVE LET $count = $initial; INFO FOR LIVE LET $count; TRAVERSE FROM [1, 1, 2] |> 
-		 tv::limit($count); TRAVERSE FROM [1, 1, 2] |> tv::skip($count);",
-		&Object::from_iter([("initial", Value::from(u64::MAX))]),
-	)?;
-	for result in &counts {
-		result.result.as_ref().map_err(Clone::clone)?;
-	}
-	let count_uuid = counts[1]
-		.result
-		.as_ref()
-		.map_err(Clone::clone)?
-		.value()
-		.as_object()
-		.and_then(|info| info.get("id"))
-		.and_then(Value::as_uuid)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("count binding identity missing"))?;
-	let count_binding = ferros_grynn::live::LiveBindingId::from_uuid(*count_uuid)?;
-	assert_eq!(
-		counts[2].result.as_ref().map_err(Clone::clone)?.value(),
-		&Value::from(vec![Value::from(1), Value::from(1), Value::from(2)])
-	);
-	assert_eq!(
-		counts[3].result.as_ref().map_err(Clone::clone)?.value(),
-		&Value::from(Vec::<Value>::new())
-	);
-	for result in session.execute("ALTER LIVE LET $count VALUE 0 - 1;", &Object::new())? {
-		result.result?;
-	}
-	for query in ["TRAVERSE FROM [] |> tv::limit($count);", "TRAVERSE FROM [] |> tv::skip($count);"]
-	{
-		assert!(session.execute(query, &Object::new())?[0].result.is_err(), "{query}");
-	}
-	for result in session.execute(
-		"ALTER LIVE LET $count VALUE $initial;",
-		&Object::from_iter([("initial", Value::from(u64::MAX))]),
-	)? {
-		result.result?;
-	}
-	drop(session);
-	store.checkpoint(CheckpointMode::Restart)?;
-	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_binding_value(binding)?, 21.into());
-	assert_eq!(store.begin().live_binding_value(duration_binding)?, zero);
-	assert_eq!(store.begin().live_binding_value(count_binding)?, Value::from(u64::MAX));
-	assert_eq!(store.begin().live_binding_info(binding)?.revision().definition().get(), 2);
-	let mut handle = store.resume_live(delivery.token())?;
-	let mut session = store.session();
-	assert_eq!(
-		store.begin().live_binding_value(navigation_binding)?,
-		Value::from(navigation_record)
-	);
-	let navigation = session.execute(
-		"LIVE LET $record = $restored; LET $read = | | -> any { RETURN $record.age; }; RETURN \
-		 $read(); TRAVERSE FROM [0] |> tv::map(|$x| $record.age);",
-		&Object::from_iter([("restored", store.begin().live_binding_value(navigation_binding)?)]),
-	)?;
-	for result in &navigation {
-		result.result.as_ref().map_err(Clone::clone)?;
-	}
-	assert_eq!(navigation[2].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(20));
-	assert_eq!(
-		navigation[3].result.as_ref().map_err(Clone::clone)?.value(),
-		&Value::from(vec![Value::from(20)])
-	);
-	let counts = session.execute(
-		"LIVE LET $count = $restored; TRAVERSE FROM [1, 1, 2] |> tv::limit($count); TRAVERSE FROM \
-		 [1, 1, 2] |> tv::skip($count);",
-		&Object::from_iter([("restored", store.begin().live_binding_value(count_binding)?)]),
-	)?;
-	for result in &counts {
-		result.result.as_ref().map_err(Clone::clone)?;
-	}
-	assert_eq!(
-		counts[1].result.as_ref().map_err(Clone::clone)?.value(),
-		&Value::from(vec![Value::from(1), Value::from(1), Value::from(2)])
-	);
-	assert_eq!(
-		counts[2].result.as_ref().map_err(Clone::clone)?.value(),
-		&Value::from(Vec::<Value>::new())
-	);
-	let inputs = Object::from_iter([("minimum", Value::from(binding.as_uuid()))]);
-	for result in
-		session.execute("INFO FOR LIVE LET $minimum; ALTER LIVE LET $minimum VALUE 17;", &inputs)?
-	{
-		result.result?;
-	}
-	let LiveNext::Delivery(delivery) = handle.next()? else {
-		return Err(FerrosGrynnError::invalid_argument("reopened binding entry delivery missing"));
-	};
-	assert!(
-		matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events()[0].before().is_none() && batch.events()[0].after() == Some(&19.into()))
-	);
-	handle.ack(delivery.token())?;
-	drop(handle);
-	for result in session.execute(
-		"KILL $sub; REMOVE LIVE LET $minimum;",
-		&Object::from_iter([
-			("sub", Value::from(id.as_uuid())),
-			("minimum", Value::from(binding.as_uuid())),
-		]),
-	)? {
-		result.result?;
-	}
-	drop(session);
-	store.checkpoint(CheckpointMode::Restart)?;
-	drop(store);
-	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_binding_info(binding)?.state(), LiveState::Closed);
-	drop(store);
-	std::fs::remove_dir_all(&directory).map_err(|error| {
-		FerrosGrynnError::invalid_argument("binding fixture cleanup failed")
-			.with_technical_source(error)
-	})?;
-	Ok(())
+	(bounded[0].result.is_err()).assert_true();
+	Ok((navigation_binding, navigation_record))
 }
 
+/// Verifies live gql binding local sync.
 #[test]
 fn live_gql_binding_local_sync() -> FerrosGrynnResult<()> {
 	gql_binding_survives_reopen(IoMode::Sync)
@@ -1147,6 +1242,8 @@ fn sdk_recipe_collections_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> 
 		gql_status::FerrosGrynnError,
 		live::{LiveNext, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-arr-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -1154,7 +1251,7 @@ fn sdk_recipe_collections_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> 
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut tx = store.begin();
 	let class = tx.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
 	tx.configure_changefeed(
@@ -1321,7 +1418,7 @@ fn sdk_recipe_collections_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> 
 			),
 		])))
 	};
-	assert_eq!(store.begin().live_binding_value(composite)?, expected(5)?);
+	(&(store.begin().live_binding_value(composite)?), &(expected(5)?)).assert_equal();
 	let mut handle = store.subscribe_live(
 		LiveQuery::new(LiveSource::Class(class))
 			.with_projection(LiveProjection::Value(LiveExpr::Binding(composite))),
@@ -1334,23 +1431,19 @@ fn sdk_recipe_collections_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> 
 	let LiveNext::Delivery(delivery) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("SDK recipe delivery missing"));
 	};
-	assert!(
-		matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events().len() == 1 && batch.events()[0].before() == Some(&expected(5)?) && batch.events()[0].after() == Some(&expected(11)?))
-	);
+	(matches!(delivery.payload(), LivePayload::Batch(batch) if batch.events().len() == 1 && batch.events()[0].before() == Some(&expected(5)?) && batch.events()[0].after() == Some(&expected(11)?))).assert_true();
 	drop(handle);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_binding_value(composite)?, expected(11)?);
-	assert_eq!(store.begin().live_binding_info(composite)?.expression(), &recipe);
+	(&(store.begin().live_binding_value(composite)?), &(expected(11)?)).assert_equal();
+	(&(store.begin().live_binding_info(composite)?.expression()), &(&recipe)).assert_equal();
 	let mut handle = store.resume_live(&initial)?;
 	let LiveNext::Delivery(replayed) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("SDK recipe replay missing"));
 	};
-	assert_eq!(replayed.token(), delivery.token());
-	assert!(
-		matches!(replayed.payload(), LivePayload::Batch(batch) if batch.events().len() == 1 && batch.events()[0].before() == Some(&expected(5)?) && batch.events()[0].after() == Some(&expected(11)?))
-	);
+	(&(replayed.token()), &(delivery.token())).assert_equal();
+	(matches!(replayed.payload(), LivePayload::Batch(batch) if batch.events().len() == 1 && batch.events()[0].before() == Some(&expected(5)?) && batch.events()[0].after() == Some(&expected(11)?))).assert_true();
 	handle.ack(replayed.token())?;
 	let mut update = store.begin();
 	update.replace_live_binding_value(input, 0.into())?;
@@ -1358,9 +1451,7 @@ fn sdk_recipe_collections_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> 
 	let LiveNext::Delivery(next) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("SDK reopened recipe delivery missing"));
 	};
-	assert!(
-		matches!(next.payload(), LivePayload::Batch(batch) if batch.events()[0].before() == Some(&expected(11)?) && batch.events()[0].after() == Some(&expected(0)?))
-	);
+	(matches!(next.payload(), LivePayload::Batch(batch) if batch.events()[0].before() == Some(&expected(11)?) && batch.events()[0].after() == Some(&expected(0)?))).assert_true();
 	handle.ack(next.token())?;
 	drop(handle);
 	drop(store);
@@ -1371,6 +1462,7 @@ fn sdk_recipe_collections_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> 
 	Ok(())
 }
 
+/// Verifies live recipe sdk local sync.
 #[test]
 fn live_recipe_sdk_local_sync() -> FerrosGrynnResult<()> {
 	sdk_recipe_collections_survive_reopen(IoMode::Sync)
@@ -1385,6 +1477,8 @@ fn graph_record_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		graph::GraphKind,
 		live::{LiveIdentity, LiveNext, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-single-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -1392,7 +1486,7 @@ fn graph_record_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut setup = store.begin();
 	setup.define_class(ClassSchema::new("item", AtomKind::Node, [
 		ferros_grynn::datastore::ClassField::new("score", ferros_grynn::values::Type::Int),
@@ -1458,11 +1552,12 @@ fn graph_record_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(cursor.live_id())?.query(), &query);
+	(&(store.begin().live_info(cursor.live_id())?.query()), &(&query)).assert_equal();
 	let frozen_info = store.begin().live_info(frozen_cursor.live_id())?;
-	assert_eq!(frozen_info.query().source(), query.source());
-	assert_eq!(frozen_info.query().projection(), query.projection());
-	assert_eq!(frozen_info.query().parameters().get("scope"), Some(&Value::from(graph.clone())));
+	(&(frozen_info.query().source()), &(query.source())).assert_equal();
+	(&(frozen_info.query().projection()), &(query.projection())).assert_equal();
+	(&(frozen_info.query().parameters().get("scope")), &(Some(&Value::from(graph.clone()))))
+		.assert_equal();
 	let mut update = store.begin();
 	update.set_overlay(graph.id(), &record, score, (initial_value + 2).into())?;
 	update.commit()?;
@@ -1470,21 +1565,22 @@ fn graph_record_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LiveNext::Delivery(replay) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("graph record replay missing"));
 	};
-	assert_eq!(replay.token(), delivery.token());
+	(&(replay.token()), &(delivery.token())).assert_equal();
 	let LivePayload::Batch(batch) = replay.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("graph record replay GAP"));
 	};
-	assert_eq!(batch.events().len(), 1);
-	assert_eq!(batch.events()[0].before(), Some(&initial_value.into()));
-	assert_eq!(batch.events()[0].after(), Some(&(initial_value + 1).into()));
-	assert!(matches!(batch.events()[0].identity(), LiveIdentity::Occurrence(occurrence)
-		if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record));
+	(&(batch.events().len()), &(1)).assert_equal();
+	(&(batch.events()[0].before()), &(Some(&initial_value.into()))).assert_equal();
+	(&(batch.events()[0].after()), &(Some(&(initial_value + 1).into()))).assert_equal();
+	(matches!(batch.events()[0].identity(), LiveIdentity::Occurrence(occurrence)
+		if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record))
+	.assert_true();
 	handle.ack(replay.token())?;
 	let LiveNext::Delivery(tail) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("graph record tail missing"));
 	};
-	assert!(matches!(tail.payload(), LivePayload::Batch(batch)
-		if batch.events()[0].before() == Some(&(initial_value + 1).into()) && batch.events()[0].after() == Some(&(initial_value + 2).into())));
+	(matches!(tail.payload(), LivePayload::Batch(batch)
+		if batch.events()[0].before() == Some(&(initial_value + 1).into()) && batch.events()[0].after() == Some(&(initial_value + 2).into()))).assert_true();
 	handle.ack(tail.token())?;
 	handle.close()?;
 	drop(handle);
@@ -1492,21 +1588,22 @@ fn graph_record_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LiveNext::Delivery(replay) = frozen.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("frozen scope replay missing"));
 	};
-	assert_eq!(replay.token(), frozen_delivery.token());
+	(&(replay.token()), &(frozen_delivery.token())).assert_equal();
 	let LivePayload::Batch(batch) = replay.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("frozen scope replay GAP"));
 	};
-	assert_eq!(batch.events().len(), 1);
-	assert_eq!(batch.events()[0].before(), Some(&initial_value.into()));
-	assert_eq!(batch.events()[0].after(), Some(&(initial_value + 1).into()));
-	assert!(matches!(batch.events()[0].identity(), LiveIdentity::Occurrence(occurrence)
-		if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record));
+	(&(batch.events().len()), &(1)).assert_equal();
+	(&(batch.events()[0].before()), &(Some(&initial_value.into()))).assert_equal();
+	(&(batch.events()[0].after()), &(Some(&(initial_value + 1).into()))).assert_equal();
+	(matches!(batch.events()[0].identity(), LiveIdentity::Occurrence(occurrence)
+		if occurrence.graph().id() == graph.id() && occurrence.atom().id() == &record))
+	.assert_true();
 	frozen.ack(replay.token())?;
 	let LiveNext::Delivery(tail) = frozen.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("frozen scope tail missing"));
 	};
-	assert!(matches!(tail.payload(), LivePayload::Batch(batch)
-		if batch.events()[0].before() == Some(&(initial_value + 1).into()) && batch.events()[0].after() == Some(&(initial_value + 2).into())));
+	(matches!(tail.payload(), LivePayload::Batch(batch)
+		if batch.events()[0].before() == Some(&(initial_value + 1).into()) && batch.events()[0].after() == Some(&(initial_value + 2).into()))).assert_true();
 	frozen.ack(tail.token())?;
 	frozen.close()?;
 	drop(frozen);
@@ -1518,6 +1615,7 @@ fn graph_record_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live graph record local sync.
 #[test]
 fn live_graph_record_local_sync() -> FerrosGrynnResult<()> {
 	graph_record_survives_reopen(IoMode::Sync)
@@ -1532,6 +1630,8 @@ fn scope_expression_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		graph::GraphKind,
 		live::{LiveIdentity, LiveNext, LivePayload},
 	};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-scope-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -1539,7 +1639,7 @@ fn scope_expression_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut setup = store.begin();
 	let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [
 		ferros_grynn::datastore::ClassField::new("score", ferros_grynn::values::Type::Int),
@@ -1607,45 +1707,45 @@ fn scope_expression_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	drop(readers);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
+	let store = Datastore::open_local(&directory, options)?;
 	let mut change = store.begin();
 	change.set_overlay(second.id(), &record, score, 22.into())?;
 	change.commit()?;
 	for ((cursor, saved), query) in cursors.iter().zip(&deliveries).zip(&queries) {
-		assert_eq!(store.begin().live_info(cursor.live_id())?.query(), query);
+		(&(store.begin().live_info(cursor.live_id())?.query()), &(query)).assert_equal();
 		let mut reader = store.resume_live(cursor)?;
 		let LiveNext::Delivery(replay) = reader.next()? else {
 			return Err(FerrosGrynnError::invalid_argument("scope replay missing"));
 		};
-		assert_eq!(replay.token(), saved.token());
+		(&(replay.token()), &(saved.token())).assert_equal();
 		let LivePayload::Batch(batch) = replay.payload() else {
 			return Err(FerrosGrynnError::invalid_argument("scope replay GAP"));
 		};
 		let LivePayload::Batch(saved_batch) = saved.payload() else {
 			return Err(FerrosGrynnError::invalid_argument("scope saved payload is not a batch"));
 		};
-		assert_eq!(batch, saved_batch);
-		assert_eq!(batch.events().len(), 2);
+		(&(batch), &(saved_batch)).assert_equal();
+		(&(batch.events().len()), &(2)).assert_equal();
 		for event in batch.events() {
 			let LiveIdentity::Occurrence(occurrence) = event.identity() else {
 				return Err(FerrosGrynnError::invalid_argument("scope replay identity missing"));
 			};
-			assert_eq!(occurrence.atom().id(), &record);
+			(&(occurrence.atom().id()), &(&record)).assert_equal();
 			if occurrence.graph().id() == first.id() {
-				assert_eq!(event.before(), Some(&Value::from(10)));
-				assert_eq!(event.after(), None);
+				(&(event.before()), &(Some(&Value::from(10)))).assert_equal();
+				(&(event.after()), &(None)).assert_equal();
 			} else {
-				assert_eq!(occurrence.graph().id(), second.id());
-				assert_eq!(event.before(), None);
-				assert_eq!(event.after(), Some(&Value::from(21)));
+				(&(occurrence.graph().id()), &(second.id())).assert_equal();
+				(&(event.before()), &(None)).assert_equal();
+				(&(event.after()), &(Some(&Value::from(21)))).assert_equal();
 			}
 		}
 		reader.ack(replay.token())?;
 		let LiveNext::Delivery(tail) = reader.next()? else {
 			return Err(FerrosGrynnError::invalid_argument("scope tail missing"));
 		};
-		assert!(matches!(tail.payload(), LivePayload::Batch(batch) if batch.events().len() == 1
-			&& batch.events()[0].before() == Some(&Value::from(21)) && batch.events()[0].after() == Some(&Value::from(22))));
+		(matches!(tail.payload(), LivePayload::Batch(batch) if batch.events().len() == 1
+			&& batch.events()[0].before() == Some(&Value::from(21)) && batch.events()[0].after() == Some(&Value::from(22)))).assert_true();
 		reader.ack(tail.token())?;
 	}
 	let mut recreate = store.begin();
@@ -1658,7 +1758,8 @@ fn scope_expression_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
 	for cursor in &cursors {
-		assert_eq!(store.begin().live_info(cursor.live_id())?.state(), LiveState::Paused);
+		(&(store.begin().live_info(cursor.live_id())?.state()), &(LiveState::Paused))
+			.assert_equal();
 	}
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
@@ -1668,28 +1769,34 @@ fn scope_expression_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live scope expression local sync.
 #[test]
 fn live_scope_expression_local_sync() -> FerrosGrynnResult<()> {
 	scope_expression_survives_reopen(IoMode::Sync)
 }
 
-/// Independent computed JOIN scopes retain their owners through replay and
-/// generation replacement; recreating an unchanged name faults the query.
-fn join_scopes_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+/// Defines the JOIN fixture overlays and constructs the query with independent
+/// computed scopes.
+///
+/// # Errors
+/// Propagates the existing schema, graph, binding and query-construction
+/// failures in setup order.
+fn prepare_join_scope_query(
+	store: &Datastore,
+) -> FerrosGrynnResult<(
+	ferros_grynn::values::PropertyKeyId,
+	RecordId,
+	ferros_grynn::graph::GraphRef,
+	ferros_grynn::graph::GraphRef,
+	ferros_grynn::live::LiveBindingId,
+	LiveQuery,
+)> {
 	use ferros_grynn::{
 		changefeed::{ChangefeedConfig, ChangefeedSource},
 		gql_status::FerrosGrynnError,
 		graph::GraphKind,
-		live::{LiveJoin, LiveJoinKind, LiveNext, LivePath, LivePayload},
+		live::{LiveJoin, LiveJoinKind, LivePath},
 	};
-	let directory = std::env::temp_dir().join(format!(
-		"fg-live-join-{:016x}",
-		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
-	));
-	let mut options = LocalOptions::default();
-	options.io_mode = mode;
-	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
 	let mut setup = store.begin();
 	setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
 		"score",
@@ -1733,7 +1840,7 @@ fn join_scopes_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		Ok(LiveExpr::Field(LivePath::new(vec![alias.into(), "score".into()])?))
 	};
 	let query = LiveQuery::new(LiveSource::GraphRecord {
-		graph: first.clone(),
+		graph: first,
 		record: record.clone(),
 	})
 	.with_alias("p")?
@@ -1755,37 +1862,91 @@ fn join_scopes_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 		)?,
 	])
 	.with_projection(LiveProjection::Value(LiveExpr::Array(vec![field("a")?, field("b")?])));
-	let mut handle = store.subscribe_live(query.clone(), LiveOptions::default())?;
-	let cursor = handle.cursor().clone();
-	let id = handle.id();
+	Ok((score, record, second, third, left_scope, query))
+}
+
+/// Changes the fixture's left JOIN scope and retains the exact delivery used
+/// for replay checks.
+///
+/// # Errors
+/// Propagates the existing binding replacement and commit failures, then checks
+/// delivery presence.
+fn capture_join_scope_change(
+	store: &Datastore,
+	handle: &mut ferros_grynn::live::LiveSubscription,
+	left_scope: ferros_grynn::live::LiveBindingId,
+) -> FerrosGrynnResult<ferros_grynn::live::LiveDelivery> {
+	use ferros_grynn::{gql_status::FerrosGrynnError, live::LiveNext};
 	let mut change = store.begin();
 	change.replace_live_binding_value(left_scope, "join_c".into())?;
 	change.commit()?;
 	let LiveNext::Delivery(saved) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("JOIN saved delivery missing"));
 	};
-	drop(handle);
-	store.checkpoint(CheckpointMode::Restart)?;
-	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(id)?.query(), &query);
+	Ok(saved)
+}
+
+/// Publishes the class-generation change and scoped overlay update before JOIN
+/// replay.
+///
+/// # Errors
+/// Propagates the original class definition, overlay update and commit failures
+/// in order.
+fn publish_join_generation(
+	store: &Datastore,
+	third: &ferros_grynn::graph::GraphRef,
+	record: &RecordId,
+	score: ferros_grynn::values::PropertyKeyId,
+) -> FerrosGrynnResult<()> {
 	let mut change = store.begin();
 	change.define_class(ClassSchema::new("join_generation", AtomKind::Node, [
 		ClassField::new("score", Type::Int),
 	])?)?;
-	change.set_overlay(third.id(), &record, score, 31.into())?;
+	change.set_overlay(third.id(), record, score, 31.into())?;
 	change.commit()?;
+	Ok(())
+}
+
+/// Independent computed JOIN scopes retain their owners through replay and
+/// generation replacement; recreating an unchanged name faults the query.
+fn join_scopes_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+	use ferros_grynn::{
+		gql_status::FerrosGrynnError,
+		graph::GraphKind,
+		live::{LiveNext, LivePayload},
+	};
+
+	use crate::test_assertions::AssertComparison as _;
+	let directory = std::env::temp_dir().join(format!(
+		"fg-live-join-{:016x}",
+		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
+	));
+	let mut options = LocalOptions::default();
+	options.io_mode = mode;
+	options.buffer_pool_pages = 16;
+	let store = Datastore::create_local(&directory, options)?;
+	let (score, record, second, third, left_scope, query) = prepare_join_scope_query(&store)?;
+	let mut handle = store.subscribe_live(query.clone(), LiveOptions::default())?;
+	let cursor = handle.cursor().clone();
+	let id = handle.id();
+	let saved = capture_join_scope_change(&store, &mut handle, left_scope)?;
+	drop(handle);
+	store.checkpoint(CheckpointMode::Restart)?;
+	drop(store);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(id)?.query()), &(&query)).assert_equal();
+	publish_join_generation(&store, &third, &record, score)?;
 	let mut handle = store.resume_live(&cursor)?;
 	let LiveNext::Delivery(replay) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("JOIN replay delivery missing"));
 	};
-	assert_eq!(replay.token(), saved.token());
+	(&(replay.token()), &(saved.token())).assert_equal();
 	let (LivePayload::Batch(replayed), LivePayload::Batch(original)) =
 		(replay.payload(), saved.payload())
 	else {
 		return Err(FerrosGrynnError::invalid_argument("JOIN saved replay is not a batch"));
 	};
-	assert_eq!(replayed, original);
+	(&(replayed), &(original)).assert_equal();
 	handle.ack(replay.token())?;
 	let LiveNext::Delivery(tail) = handle.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("JOIN current delivery missing"));
@@ -1793,28 +1954,30 @@ fn join_scopes_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LivePayload::Batch(batch) = tail.payload() else {
 		return Err(FerrosGrynnError::invalid_argument("JOIN current payload is not a batch"));
 	};
-	assert_eq!(batch.events().len(), 1);
-	assert_eq!(batch.events()[0].before(), Some(&Value::from(vec![30.into(), 20.into()])));
-	assert_eq!(batch.events()[0].after(), Some(&Value::from(vec![31.into(), 20.into()])));
+	(&(batch.events().len()), &(1)).assert_equal();
+	(&(batch.events()[0].before()), &(Some(&Value::from(vec![30.into(), 20.into()]))))
+		.assert_equal();
+	(&(batch.events()[0].after()), &(Some(&Value::from(vec![31.into(), 20.into()]))))
+		.assert_equal();
 	handle.ack(tail.token())?;
 	let confirmed = handle.cursor().clone();
 	drop(handle);
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(id)?.cursor(), &confirmed);
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(id)?.cursor()), &(&confirmed)).assert_equal();
 	let mut replace = store.begin();
 	replace.remove_graph("join_b")?;
 	let replacement = replace.define_graph("join_b", GraphKind::Graph)?;
 	replace.attach_node(replacement.id(), &record, None, None)?;
 	replace.set_overlay(replacement.id(), &record, score, 99.into())?;
 	replace.commit()?;
-	assert_ne!(replacement.id(), second.id());
-	assert_eq!(store.begin().live_info(id)?.state(), LiveState::Paused);
+	(&(replacement.id()), &(second.id())).assert_different();
+	(&(store.begin().live_info(id)?.state()), &(LiveState::Paused)).assert_equal();
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.state(), LiveState::Paused);
+	(&(store.begin().live_info(id)?.state()), &(LiveState::Paused)).assert_equal();
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
 		FerrosGrynnError::invalid_argument("JOIN fixture cleanup failed")
@@ -1823,35 +1986,41 @@ fn join_scopes_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live join scopes local sync.
 #[test]
 fn live_join_scopes_local_sync() -> FerrosGrynnResult<()> {
 	join_scopes_survive_reopen(IoMode::Sync)
 }
 
+/// Verifies live join scopes local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_join_scopes_local_native_async() -> FerrosGrynnResult<()> {
 	join_scopes_survive_reopen(IoMode::NativeAsync)
 }
 
+/// Verifies live scope expression local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_scope_expression_local_native_async() -> FerrosGrynnResult<()> {
 	scope_expression_survives_reopen(IoMode::NativeAsync)
 }
 
+/// Verifies live graph record local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_graph_record_local_native_async() -> FerrosGrynnResult<()> {
 	graph_record_survives_reopen(IoMode::NativeAsync)
 }
 
+/// Verifies live recipe sdk local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_recipe_sdk_local_native_async() -> FerrosGrynnResult<()> {
 	sdk_recipe_collections_survive_reopen(IoMode::NativeAsync)
 }
 
+/// Verifies live gql binding local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_gql_binding_local_native_async() -> FerrosGrynnResult<()> {
@@ -1862,6 +2031,8 @@ fn live_gql_binding_local_native_async() -> FerrosGrynnResult<()> {
 /// their exact fallback and validate explicit EF before pulling rows.
 fn gql_search_snapshot_inputs(mode: IoMode) -> FerrosGrynnResult<()> {
 	use ferros_grynn::{datastore::GqlSession, gql_status::FerrosGrynnError, values::Vector};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-find-{:016x}",
@@ -1925,23 +2096,24 @@ fn gql_search_snapshot_inputs(mode: IoMode) -> FerrosGrynnResult<()> {
 		let fulltext =
 			"SELECT VALUE id FROM document WITH NOINDEX WHERE title @@ $needle ORDER BY id;";
 		let oracle = execute(&mut session, fulltext, &Object::new())?;
-		assert_eq!(
-			execute(
+		(
+			&(execute(
 				&mut session,
 				&fulltext.replace("WITH NOINDEX", "WITH INDEX by_title"),
-				&Object::new()
-			)?,
-			oracle
-		);
+				&Object::new(),
+			)?),
+			&(oracle),
+		)
+			.assert_equal();
 		let expected = Value::from(vec![Value::from(first.parse::<RecordId>()?)]);
-		assert_eq!(execute(&mut session, scan, &Object::new())?, expected);
-		assert_eq!(execute(&mut session, indexed, &Object::new())?, expected);
+		(&(execute(&mut session, scan, &Object::new())?), &(expected)).assert_equal();
+		(&(execute(&mut session, indexed, &Object::new())?), &(expected)).assert_equal();
 	}
 	execute(&mut session, "ALTER LIVE LET $ef VALUE 0;", &Object::new())?;
 	let invalid = execute(&mut session, indexed, &Object::new())
 		.err()
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("search fixture accepted zero EF"))?;
-	assert!(invalid.to_string().contains("positive integer"), "{invalid}");
+	(invalid.to_string().contains("positive integer")).assert_true_with(|| format!("{invalid}"));
 	execute(
 		&mut session,
 		"ALTER LIVE LET $ef VALUE 1; ALTER LIVE LET $k VALUE 2;",
@@ -1950,7 +2122,8 @@ fn gql_search_snapshot_inputs(mode: IoMode) -> FerrosGrynnResult<()> {
 	let invalid = execute(&mut session, indexed, &Object::new())
 		.err()
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("search fixture accepted EF below K"))?;
-	assert!(invalid.to_string().contains("EF must be at least K"), "{invalid}");
+	(invalid.to_string().contains("EF must be at least K"))
+		.assert_true_with(|| format!("{invalid}"));
 	drop(session);
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
@@ -1960,11 +2133,13 @@ fn gql_search_snapshot_inputs(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live gql search local sync.
 #[test]
 fn live_gql_search_local_sync() -> FerrosGrynnResult<()> {
 	gql_search_snapshot_inputs(IoMode::Sync)
 }
 
+/// Verifies live gql search local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_gql_search_local_native_async() -> FerrosGrynnResult<()> {
@@ -1974,6 +2149,8 @@ fn live_gql_search_local_native_async() -> FerrosGrynnResult<()> {
 /// Exercises actual catalog publication, checkpoint, generation rebuild and
 /// reopen.
 fn registry_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::test_assertions::AssertComparison as _;
+
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -1981,7 +2158,7 @@ fn registry_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut tx = store.begin();
 	let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
 	let query = LiveQuery::new(LiveSource::Class(class));
@@ -1989,11 +2166,11 @@ fn registry_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let registration = tx.commit()?.versionstamp();
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
+	let store = Datastore::open_local(&directory, options)?;
 	let info = store.begin().live_info(id)?;
-	assert_eq!(info.state(), LiveState::Active);
-	assert_eq!(info.defined_at(), registration);
-	assert_eq!(info.query(), &query);
+	(&(info.state()), &(LiveState::Active)).assert_equal();
+	(&(info.defined_at()), &(registration)).assert_equal();
+	(&(info.query()), &(&query)).assert_equal();
 	let mut schema = store.begin();
 	schema.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
 	schema.commit()?;
@@ -2002,8 +2179,8 @@ fn registry_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	replace.commit()?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.state(), LiveState::Closed);
-	assert_eq!(store.begin().live_info(next)?.state(), LiveState::Active);
+	(&(store.begin().live_info(id)?.state()), &(LiveState::Closed)).assert_equal();
+	(&(store.begin().live_info(next)?.state()), &(LiveState::Active)).assert_equal();
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
 		ferros_grynn::gql_status::FerrosGrynnError::invalid_argument(
@@ -2014,6 +2191,7 @@ fn registry_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live registry local sync.
 #[test]
 fn live_registry_local_sync() -> FerrosGrynnResult<()> {
 	registry_survives_reopen(IoMode::Sync)
@@ -2022,6 +2200,8 @@ fn live_registry_local_sync() -> FerrosGrynnResult<()> {
 /// Public pull/ACK publication survives both checkpoint and generation rebuild.
 fn subscription_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	use ferros_grynn::{gql_status::FerrosGrynnError, live::LiveNext};
+
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-ack-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -2029,7 +2209,7 @@ fn subscription_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut setup = store.begin();
 	let class = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
 	setup.commit()?;
@@ -2042,24 +2222,24 @@ fn subscription_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let LiveNext::Delivery(delivery) = subscription.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("missing local SDK delivery"));
 	};
-	assert_eq!(delivery.token().versionstamp(), stamp);
+	(&(delivery.token().versionstamp()), &(stamp)).assert_equal();
 	subscription.ack(delivery.token())?;
-	assert!(matches!(subscription.next()?, LiveNext::Idle));
+	(matches!(subscription.next()?, LiveNext::Idle)).assert_true();
 	store.checkpoint(CheckpointMode::Restart)?;
 	let mut generation = store.begin();
 	generation.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
 	generation.commit()?;
 	drop(subscription);
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_info(id)?.cursor(), delivery.token());
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_info(id)?.cursor()), &(delivery.token())).assert_equal();
 	let mut close = store.begin();
 	close.close_live(id)?;
 	close.commit()?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.state(), LiveState::Closed);
-	assert_eq!(store.begin().live_info(id)?.cursor(), delivery.token());
+	(&(store.begin().live_info(id)?.state()), &(LiveState::Closed)).assert_equal();
+	(&(store.begin().live_info(id)?.cursor()), &(delivery.token())).assert_equal();
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
 		FerrosGrynnError::invalid_argument("local SDK fixture cleanup failed")
@@ -2068,17 +2248,20 @@ fn subscription_ack_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live subscription ack local sync.
 #[test]
 fn live_subscription_ack_local_sync() -> FerrosGrynnResult<()> {
 	subscription_ack_survives_reopen(IoMode::Sync)
 }
 
+/// Verifies live subscription ack local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_subscription_ack_local_native_async() -> FerrosGrynnResult<()> {
 	subscription_ack_survives_reopen(IoMode::NativeAsync)
 }
 
+/// Verifies live registry local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_registry_local_native_async() -> FerrosGrynnResult<()> {
@@ -2087,6 +2270,8 @@ fn live_registry_local_native_async() -> FerrosGrynnResult<()> {
 
 /// Exercises exact values, final-state reevaluation and durable fault heads.
 fn bindings_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
+
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-b-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -2094,7 +2279,7 @@ fn bindings_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut tx = store.begin();
 	let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
 	let record: RecordId = "person:a".parse()?;
@@ -2135,25 +2320,26 @@ fn bindings_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	tx.commit()?;
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
-	assert_eq!(store.begin().live_binding_value(exact)?, Value::from(9_007_199_254_740_993_i64));
-	assert_eq!(store.begin().live_binding_value(record_count)?, Value::from(1_i64));
+	let store = Datastore::open_local(&directory, options)?;
+	(&(store.begin().live_binding_value(exact)?), &(Value::from(9_007_199_254_740_993_i64)))
+		.assert_equal();
+	(&(store.begin().live_binding_value(record_count)?), &(Value::from(1_i64))).assert_equal();
 	let mut tx = store.begin();
 	tx.delete_atom(&record)?;
 	tx.commit()?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
+	let store = Datastore::open_local(&directory, options)?;
 	let info = store.begin().live_binding_info(inverse)?;
-	assert_eq!(info.state(), LiveState::Paused);
+	(&(info.state()), &(LiveState::Paused)).assert_equal();
 	let diagnostic = info.diagnostic().ok_or_else(|| {
 		ferros_grynn::gql_status::FerrosGrynnError::invalid_argument(
 			"test expected a durable binding fault",
 		)
 	})?;
-	assert_eq!(diagnostic.status().code().to_string(), "FG-G1F09");
-	assert!(store.begin().atom(&record)?.is_none());
-	assert_eq!(store.begin().live_binding_value(count)?, Value::from(0_i64));
-	assert_eq!(store.begin().live_binding_value(record_count)?, Value::from(0_i64));
+	(&(diagnostic.status().code().to_string()), &("FG-G1F09")).assert_equal();
+	(store.begin().atom(&record)?.is_none()).assert_true();
+	(&(store.begin().live_binding_value(count)?), &(Value::from(0_i64))).assert_equal();
+	(&(store.begin().live_binding_value(record_count)?), &(Value::from(0_i64))).assert_equal();
 	let mut tx = store.begin();
 	// Schema publication builds a new generation and must preserve bindings.
 	tx.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
@@ -2162,9 +2348,11 @@ fn bindings_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_binding_value(inverse)?, Value::from(3_i64));
-	assert_eq!(store.begin().live_binding_info(inverse)?.revision().definition().get(), 2);
-	assert_eq!(store.begin().live_binding_value(exact)?, Value::from(9_007_199_254_740_993_i64));
+	(&(store.begin().live_binding_value(inverse)?), &(Value::from(3_i64))).assert_equal();
+	(&(store.begin().live_binding_info(inverse)?.revision().definition().get()), &(2))
+		.assert_equal();
+	(&(store.begin().live_binding_value(exact)?), &(Value::from(9_007_199_254_740_993_i64)))
+		.assert_equal();
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
 		ferros_grynn::gql_status::FerrosGrynnError::invalid_argument(
@@ -2175,11 +2363,13 @@ fn bindings_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live bindings local sync.
 #[test]
 fn live_bindings_local_sync() -> FerrosGrynnResult<()> {
 	bindings_survive_reopen(IoMode::Sync)
 }
 
+/// Verifies live bindings local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_bindings_local_native_async() -> FerrosGrynnResult<()> {
@@ -2188,6 +2378,8 @@ fn live_bindings_local_native_async() -> FerrosGrynnResult<()> {
 
 /// Concrete PURE/source captures and query faults survive WAL and checkpoint.
 fn query_captures_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::test_assertions::{AssertComparison as _, AssertCondition as _};
+
 	let directory = std::env::temp_dir().join(format!(
 		"fg-live-q-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
@@ -2195,7 +2387,7 @@ fn query_captures_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
 	options.buffer_pool_pages = 16;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut tx = store.begin();
 	let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
 	tx.define_class(ClassSchema::new("policy", AtomKind::Node, [])?)?;
@@ -2224,31 +2416,32 @@ fn query_captures_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	tx.commit()?;
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
+	let store = Datastore::open_local(&directory, options)?;
 	let mut old = store.begin();
-	assert_eq!(old.live_info(id)?.state(), LiveState::Active);
-	assert_eq!(old.live_info(id)?.query(), &query);
+	(&(old.live_info(id)?.state()), &(LiveState::Active)).assert_equal();
+	(&(old.live_info(id)?.query()), &(&query)).assert_equal();
 	let mut tx = store.begin();
 	tx.delete_atom(&record)?;
 	tx.commit()?;
-	assert!(store.begin().atom(&record)?.is_none());
-	assert_eq!(old.live_info(id)?.state(), LiveState::Active);
+	(store.begin().atom(&record)?.is_none()).assert_true();
+	(&(old.live_info(id)?.state()), &(LiveState::Active)).assert_equal();
 	drop(old);
 	drop(store);
-	let store = Datastore::open_local(&directory, options.clone())?;
+	let store = Datastore::open_local(&directory, options)?;
 	let info = store.begin().live_info(id)?;
-	assert_eq!(info.state(), LiveState::Paused);
-	assert_eq!(
-		info.diagnostic().map(|error| error.status().code().to_string()),
-		Some("FG-G1F09".into())
-	);
+	(&(info.state()), &(LiveState::Paused)).assert_equal();
+	(
+		&(info.diagnostic().map(|error| error.status().code().to_string())),
+		&(Some("FG-G1F09".into())),
+	)
+		.assert_equal();
 	let mut tx = store.begin();
 	tx.define_class(ClassSchema::new("generation", AtomKind::Node, [])?)?;
 	tx.commit()?;
 	store.checkpoint(CheckpointMode::Restart)?;
 	drop(store);
 	let store = Datastore::open_local(&directory, options)?;
-	assert_eq!(store.begin().live_info(id)?.state(), LiveState::Paused);
+	(&(store.begin().live_info(id)?.state()), &(LiveState::Paused)).assert_equal();
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
 		ferros_grynn::gql_status::FerrosGrynnError::invalid_argument(
@@ -2259,11 +2452,13 @@ fn query_captures_survive_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live query captures local sync.
 #[test]
 fn live_query_captures_local_sync() -> FerrosGrynnResult<()> {
 	query_captures_survive_reopen(IoMode::Sync)
 }
 
+/// Verifies live query captures local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_query_captures_local_native_async() -> FerrosGrynnResult<()> {
@@ -2274,13 +2469,15 @@ fn live_query_captures_local_native_async() -> FerrosGrynnResult<()> {
 /// registration.
 fn registration_only_after_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	use ferros_grynn::gql_status::FerrosGrynnError;
+
+	use crate::test_assertions::AssertComparison as _;
 	let directory = std::env::temp_dir().join(format!(
 		"fg-lreg-{:016x}",
 		Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
 	));
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
-	let store = Datastore::create_local(&directory, options.clone())?;
+	let store = Datastore::create_local(&directory, options)?;
 	let mut setup = store.begin();
 	let class =
 		setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
@@ -2305,18 +2502,19 @@ fn registration_only_after_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let attempts = store.live_statistics()?.query_evaluation_attempts;
 	let second =
 		store.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-	assert_eq!(store.live_statistics()?.query_evaluation_attempts - attempts, 1);
-	assert_eq!(store.begin().live_info(first_id)?.state(), LiveState::Active);
+	(&(store.live_statistics()?.query_evaluation_attempts - attempts), &(1)).assert_equal();
+	(&(store.begin().live_info(first_id)?.state()), &(LiveState::Active)).assert_equal();
 	let mut write = store.begin();
 	write.set_base_property(&"item:a".parse()?, key, 2.into())?;
 	write.commit()?;
-	assert_eq!(
-		store
+	(
+		&(store
 			.begin()
 			.atom(&"item:a".parse()?)?
-			.and_then(|atom| atom.properties().get(key).cloned()),
-		Some(2.into())
-	);
+			.and_then(|atom| atom.properties().get(key).cloned())),
+		&(Some(2.into())),
+	)
+		.assert_equal();
 	drop(second);
 	drop(store);
 	std::fs::remove_dir_all(&directory).map_err(|error| {
@@ -2326,11 +2524,13 @@ fn registration_only_after_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies live registration only local sync.
 #[test]
 fn live_registration_only_local_sync() -> FerrosGrynnResult<()> {
 	registration_only_after_reopen(IoMode::Sync)
 }
 
+/// Verifies live registration only local native async.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn live_registration_only_local_native_async() -> FerrosGrynnResult<()> {

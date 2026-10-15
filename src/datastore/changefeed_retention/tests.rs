@@ -37,7 +37,10 @@ use crate::{
 const TTL: i128 = 86_400_000_000_000;
 
 /// Restores the calling thread's clock even when a regression fails.
-struct Clock(Option<i128>);
+struct Clock(
+	/// Previous injected timestamp restored when the test guard is dropped.
+	Option<i128>,
+);
 impl Clock {
 	/// Uses deterministic expiration without changing the worker thread clock.
 	fn new(time: i128) -> Self {
@@ -45,13 +48,17 @@ impl Clock {
 	}
 }
 impl Drop for Clock {
+	/// Runs cleanup for this `Clock` before its fields are released.
 	fn drop(&mut self) {
 		TEST_TIME.set(self.0);
 	}
 }
 
 /// Releases files only after their datastore handles and transactions.
-struct Directory(std::path::PathBuf);
+struct Directory(
+	/// Releases files only after their datastore handles and transactions.
+	std::path::PathBuf,
+);
 impl Directory {
 	/// Creates a canonical unique name within the existing database-name cap.
 	fn new() -> Self {
@@ -62,6 +69,7 @@ impl Directory {
 	}
 }
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}
@@ -98,15 +106,18 @@ fn purge(store: &Datastore, time: i128) -> FerrosGrynnResult<()> {
 /// The same TTL publisher retires computed groups while old replay pins stay
 /// valid.
 fn live_prefix_purge(store: &Datastore) -> FerrosGrynnResult<()> {
-	use crate::live::{
-		LiveExpr,
-		LiveGapReason,
-		LiveNext,
-		LiveOptions,
-		LivePayload,
-		LiveProjection,
-		LiveQuery,
-		LiveSource,
+	use crate::{
+		live::{
+			LiveExpr,
+			LiveGapReason,
+			LiveNext,
+			LiveOptions,
+			LivePayload,
+			LiveProjection,
+			LiveQuery,
+			LiveSource,
+		},
+		test_assertions::{AssertComparison as _, AssertCondition as _},
 	};
 	let (feed, record, key) = fixture(store)?;
 	let class = store.begin().changefeed_info(feed)?.source();
@@ -129,71 +140,75 @@ fn live_prefix_purge(store: &Datastore) -> FerrosGrynnResult<()> {
 	update.set_base_property(&record, key, 3.into())?;
 	let second = update.commit()?.versionstamp();
 	let second_time = store.inner.current_root().committed_at_ns;
-	assert!(second_time > first_time, "separate commits provide a partial TTL boundary");
+	(second_time > first_time)
+		.assert_true_with(|| "separate commits provide a partial TTL boundary".to_string());
 	let mut pinned = store.resume_live(&saved)?;
 	purge(store, first_time + TTL)?;
 	let current = store.inner.current_root();
-	assert_eq!(current.live_catalog().histories[&saved.live_id()].purged_through, first.get());
+	(&(current.live_catalog().histories[&saved.live_id()].purged_through), &(first.get()))
+		.assert_equal();
 	let info = store.begin().live_info(saved.live_id())?;
 	let history = info.history().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("public partial purge metadata missing")
 	})?;
-	assert_eq!(history.purged_through(), first);
-	assert_eq!(history.last_stamp(), second);
-	assert_eq!(
-		history.purged_at().map(|time| time.as_inner().timestamp().as_nanosecond()),
-		Some(first_time)
-	);
+	(&(history.purged_through()), &(first)).assert_equal();
+	(&(history.last_stamp()), &(second)).assert_equal();
+	(
+		&(history.purged_at().map(|time| time.as_inner().timestamp().as_nanosecond())),
+		&(Some(first_time)),
+	)
+		.assert_equal();
 	let LiveNext::Delivery(old) = pinned.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("pinned replay disappeared"));
 	};
-	assert_eq!(old.token().versionstamp(), first);
-	assert!(matches!(old.payload(), LivePayload::Batch(_)));
+	(&(old.token().versionstamp()), &(first)).assert_equal();
+	(matches!(old.payload(), LivePayload::Batch(_))).assert_true();
 	drop(pinned);
 	let mut fresh = store.resume_live(&saved)?;
 	let LiveNext::Delivery(gap) = fresh.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("missing retention GAP"));
 	};
-	assert!(
-		matches!(gap.payload(), LivePayload::Gap(gap) if gap.reason() == LiveGapReason::Retention && gap.through() == Some(first))
-	);
+	(matches!(gap.payload(), LivePayload::Gap(gap) if gap.reason() == LiveGapReason::Retention && gap.through() == Some(first))).assert_true();
 	fresh.ack(gap.token())?;
 	let LiveNext::Delivery(tail) = fresh.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("missing retained tail"));
 	};
-	assert_eq!(tail.token().versionstamp(), second);
-	assert!(matches!(tail.payload(), LivePayload::Batch(_)));
+	(&(tail.token().versionstamp()), &(second)).assert_equal();
+	(matches!(tail.payload(), LivePayload::Batch(_))).assert_true();
 	drop(fresh);
 	purge(store, second_time + TTL)?;
 	let current = store.inner.current_root();
-	assert_eq!(current.live_catalog().histories[&saved.live_id()].purged_through, second.get());
-	assert!(!current.live_segments().contains_key(&saved.live_id()));
-	assert!(!current.live_history().keys().any(|(id, _)| *id == saved.live_id()));
+	(&(current.live_catalog().histories[&saved.live_id()].purged_through), &(second.get()))
+		.assert_equal();
+	(!current.live_segments().contains_key(&saved.live_id())).assert_true();
+	(!current.live_history().keys().any(|(id, _)| *id == saved.live_id())).assert_true();
 	let info = store.begin().live_info(saved.live_id())?;
 	let history = info.history().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("public complete purge metadata missing")
 	})?;
-	assert_eq!(history.purged_through(), second);
-	assert_eq!(history.last_stamp(), second, "purge does not lower the recorded watermark");
-	assert_eq!(
-		history.purged_at().map(|time| time.as_inner().timestamp().as_nanosecond()),
-		Some(second_time)
-	);
+	(&(history.purged_through()), &(second)).assert_equal();
+	(&(history.last_stamp()), &(second))
+		.assert_equal_with(|| "purge does not lower the recorded watermark".to_string());
+	(
+		&(history.purged_at().map(|time| time.as_inner().timestamp().as_nanosecond())),
+		&(Some(second_time)),
+	)
+		.assert_equal();
 	let mut empty = store.resume_live(&saved)?;
 	let LiveNext::Delivery(gap) = empty.next()? else {
 		return Err(FerrosGrynnError::invalid_argument("empty catalog lost its floor"));
 	};
-	assert!(
-		matches!(gap.payload(), LivePayload::Gap(gap) if gap.reason() == LiveGapReason::Retention && gap.through() == Some(second))
-	);
+	(matches!(gap.payload(), LivePayload::Gap(gap) if gap.reason() == LiveGapReason::Retention && gap.through() == Some(second))).assert_true();
 	Ok(())
 }
 
+/// Verifies live retention ram prefix and pins.
 #[test]
 fn live_retention_ram_prefix_and_pins() -> FerrosGrynnResult<()> {
 	live_prefix_purge(&Datastore::in_memory())
 }
 
+/// Verifies live retention local sync prefix and pins.
 #[cfg(windows)]
 #[test]
 fn live_retention_local_sync_prefix_and_pins() -> FerrosGrynnResult<()> {
@@ -204,51 +219,69 @@ fn live_retention_local_sync_prefix_and_pins() -> FerrosGrynnResult<()> {
 /// Shortened capture TTL can drain the final page through the partial path.
 #[cfg(windows)]
 #[test]
-fn live_retention_local_ttl_change_drains_partial_segment_and_reopens() -> FerrosGrynnResult<()> {
-	use crate::live::{LiveNext, LiveOptions, LivePayload, LiveQuery, LiveSource};
-	let directory = Directory::new();
-	let store = Datastore::create_local(&directory.0, LocalOptions::default())?;
-	let (feed, record, key) = fixture(&store)?;
-	let ChangefeedSource::Class(class) = store.begin().changefeed_info(feed)?.source() else {
-		return Err(FerrosGrynnError::invalid_argument("expected class source"));
+fn live_retention_local_ttl_change_drains_partial_segment_and_reopens() {
+	use crate::{
+		live::{LiveNext, LiveOptions, LivePayload, LiveQuery, LiveSource},
+		test_assertions::AssertResult as _,
 	};
-	let initial =
-		store.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+	let directory = Directory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).assert_ok();
+	let (feed, record, key) = fixture(&store).assert_ok();
+	let ChangefeedSource::Class(class) = store.begin().changefeed_info(feed).assert_ok().source()
+	else {
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("expected class source"));
+			test_result.assert_ok();
+		};
+	};
+	let initial = store
+		.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+		.assert_ok();
 	let saved = initial.cursor().clone();
 	drop(initial);
 	let short = 60_000_000_000;
 	let mut update = store.begin();
-	update.configure_changefeed(
-		ChangefeedSource::Class(class),
-		ChangefeedConfig::from_nanoseconds(short)?,
-	)?;
-	update.set_base_property(&record, key, 2.into())?;
-	let stamp = update.commit()?.versionstamp();
+	update
+		.configure_changefeed(
+			ChangefeedSource::Class(class),
+			ChangefeedConfig::from_nanoseconds(short).assert_ok(),
+		)
+		.assert_ok();
+	update.set_base_property(&record, key, 2.into()).assert_ok();
+	let stamp = update.commit().assert_ok().versionstamp();
 	let time = store.inner.current_root().committed_at_ns;
 	assert!(store.inner.current_root().live_segments().contains_key(&saved.live_id()));
-	purge(&store, time + short)?;
+	purge(&store, time + short).assert_ok();
 	assert!(!store.inner.current_root().live_segments().contains_key(&saved.live_id()));
 	assert_eq!(
 		store.inner.current_root().live_catalog().histories[&saved.live_id()].retained_page,
 		0
 	);
-	store.checkpoint(CheckpointMode::Restart)?;
+	store.checkpoint(CheckpointMode::Restart).assert_ok();
 	drop(store);
-	let store = Datastore::open_local(&directory.0, LocalOptions::default())?;
-	let mut resumed = store.resume_live(&saved)?;
-	let LiveNext::Delivery(gap) = resumed.next()? else {
-		return Err(FerrosGrynnError::invalid_argument("missing reopened purge floor"));
+	let store = Datastore::open_local(&directory.0, LocalOptions::default()).assert_ok();
+	let mut resumed = store.resume_live(&saved).assert_ok();
+	let LiveNext::Delivery(gap) = resumed.next().assert_ok() else {
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("missing reopened purge floor"));
+			test_result.assert_ok();
+		};
 	};
 	assert!(matches!(gap.payload(), LivePayload::Gap(gap) if gap.through() == Some(stamp)));
-	Ok(())
 }
 
+/// Verifies live retention local native async prefix and pins.
 #[cfg(all(windows, feature = "native-async-io"))]
 #[test]
 fn live_retention_local_native_async_prefix_and_pins() -> FerrosGrynnResult<()> {
 	let directory = Directory::new();
-	let mut options = LocalOptions::default();
-	options.io_mode = crate::datastore::IoMode::NativeAsync;
+	let defaults = LocalOptions::default();
+	let options = LocalOptions {
+		io_mode: crate::datastore::IoMode::NativeAsync,
+		..defaults
+	};
 	live_prefix_purge(&Datastore::create_local(&directory.0, options)?)
 }
 
@@ -265,53 +298,64 @@ fn batch(
 	Ok(batch)
 }
 
+/// Verifies changefeed ram retention keeps floor then retires source with
+/// terminal gap.
 #[test]
-fn changefeed_ram_retention_keeps_floor_then_retires_source_with_terminal_gap()
--> FerrosGrynnResult<()> {
+fn changefeed_ram_retention_keeps_floor_then_retires_source_with_terminal_gap() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let (feed, record, key) = fixture(&store)?;
-	let original = batch(&mut store.begin(), feed)?;
+	let (feed, record, key) = fixture(&store).assert_ok();
+	let original = batch(&mut store.begin(), feed).assert_ok();
 	let mut old = store.begin();
-	let info = old.changefeed_info(feed)?;
+	let info = old.changefeed_info(feed).assert_ok();
 	let cursor = ChangefeedCursor::new(
 		info.database_id(),
 		feed,
 		ChangefeedReadMode::Full,
 		original.versionstamp(),
-	)?;
+	)
+	.assert_ok();
 	let mut tx = store.begin();
-	tx.set_base_property(&record, key, 2.into())?;
-	let changed = tx.commit()?.versionstamp();
+	tx.set_base_property(&record, key, 2.into()).assert_ok();
+	let changed = tx.commit().assert_ok().versionstamp();
 	let time = original.committed_at().as_inner().timestamp().as_nanosecond();
-	purge(&store, time + TTL)?;
-	assert_eq!(store.begin().changefeed_info(feed)?.purged_through(), original.versionstamp());
+	purge(&store, time + TTL).assert_ok();
+	assert_eq!(
+		store.begin().changefeed_info(feed).assert_ok().purged_through(),
+		original.versionstamp()
+	);
 	let mut current = store.begin();
 	let mut reader = current
-		.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))?;
+		.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))
+		.assert_ok();
 	assert!(
-		matches!(reader.next_batch()?, Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::Retention)
+		matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::Retention)
 	);
 	assert!(
-		matches!(reader.next_batch()?, Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == changed)
+		matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == changed)
 	);
-	assert!(reader.next_batch()?.is_none());
+	assert!(reader.next_batch().assert_ok().is_none());
 	drop(reader);
-	assert_eq!(batch(&mut old, feed)?, original);
+	assert_eq!(batch(&mut old, feed).assert_ok(), original);
 	let mut dropper = store.begin();
-	dropper.drop_changefeed(info.source())?;
-	dropper.commit()?;
+	dropper.drop_changefeed(info.source()).assert_ok();
+	dropper.commit().assert_ok();
 	let close_time = store.inner.current_root().changefeeds().definitions[&feed]
 		.closed_time_ns
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("close time missing"))?;
-	purge(&store, close_time + TTL)?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("close time missing"))
+		.assert_ok();
+	purge(&store, close_time + TTL).assert_ok();
 	assert!(store.begin().changefeed_info(feed).is_err());
-	let mut reader = current.changes(
-		feed,
-		ChangefeedReadOptions::new(ChangefeedSince::Cursor(cursor))
-			.with_mode(ChangefeedReadMode::Full),
-	)?;
+	let mut reader = current
+		.changes(
+			feed,
+			ChangefeedReadOptions::new(ChangefeedSince::Cursor(cursor))
+				.with_mode(ChangefeedReadMode::Full),
+		)
+		.assert_ok();
 	// The earlier transaction retains its original history despite retirement.
-	assert!(reader.next_batch()?.is_some());
+	assert!(reader.next_batch().assert_ok().is_some());
 	drop(reader);
 	let mut tx = store.begin();
 	let expired = ChangefeedCursor::new(
@@ -319,41 +363,50 @@ fn changefeed_ram_retention_keeps_floor_then_retires_source_with_terminal_gap()
 		feed,
 		ChangefeedReadMode::Full,
 		original.versionstamp(),
-	)?;
-	let mut reader = tx.changes(
-		feed,
-		ChangefeedReadOptions::new(ChangefeedSince::Cursor(expired))
-			.with_mode(ChangefeedReadMode::Full),
-	)?;
+	)
+	.assert_ok();
+	let mut reader = tx
+		.changes(
+			feed,
+			ChangefeedReadOptions::new(ChangefeedSince::Cursor(expired))
+				.with_mode(ChangefeedReadMode::Full),
+		)
+		.assert_ok();
 	assert!(
-		matches!(reader.next_batch()?, Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::FeedExpiredOrRetired && gap.from().is_none() && gap.through().is_none())
+		matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::FeedExpiredOrRetired && gap.from().is_none() && gap.through().is_none())
 	);
-	assert!(reader.next_batch()?.is_none());
+	assert!(reader.next_batch().assert_ok().is_none());
 	drop(reader);
 	assert_eq!(
-		tx.atom(&record)?.and_then(|atom| atom.properties().get(key).cloned()),
+		tx.atom(&record).assert_ok().and_then(|atom| atom.properties().get(key).cloned()),
 		Some(2.into())
 	);
-	assert_ne!(tx.configure_changefeed(info.source(), info.configuration())?, feed);
-	Ok(())
+	assert_ne!(tx.configure_changefeed(info.source(), info.configuration()).assert_ok(), feed);
 }
 
+/// Verifies changefeed retention has bounded passes and no partial resource
+/// publication.
 #[test]
-fn changefeed_retention_has_bounded_passes_and_no_partial_resource_publication()
--> FerrosGrynnResult<()> {
+fn changefeed_retention_has_bounded_passes_and_no_partial_resource_publication() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let (feed, record, key) = fixture(&store)?;
+	let (feed, record, key) = fixture(&store).assert_ok();
 	for _ in 0..1028 {
 		let mut tx = store.begin();
-		tx.set_base_property(&record, key, 1.into())?;
-		tx.commit()?;
+		tx.set_base_property(&record, key, 1.into()).assert_ok();
+		tx.commit().assert_ok();
 	}
 	let snapshot = store.inner.current_root();
 	let time = snapshot.committed_at_ns + TTL;
 	let _clock = Clock::new(time);
-	let mut small = MaintenanceOptions::default();
-	small.max_memory_bytes = NonZeroUsize::new(4096)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("test budget is zero"))?;
+	let small_defaults = MaintenanceOptions::default();
+	let small = MaintenanceOptions {
+		max_memory_bytes: NonZeroUsize::new(4096)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("test budget is zero"))
+			.assert_ok(),
+		..small_defaults
+	};
 	assert!(
 		store
 			.inner
@@ -376,28 +429,33 @@ fn changefeed_retention_has_bounded_passes_and_no_partial_resource_publication()
 		.is_err()
 	);
 	assert_eq!(store.inner.current_root().change_history().len(), 1029);
-	purge(&store, time)?;
+	purge(&store, time).assert_ok();
 	assert_eq!(store.inner.current_root().change_history().len(), 5);
-	purge(&store, time)?;
+	purge(&store, time).assert_ok();
 	assert!(store.inner.current_root().change_history().is_empty());
-	assert_eq!(store.begin().changefeed_info(feed)?.purged_through().get(), snapshot.commit_ts);
-	Ok(())
+	assert_eq!(
+		store.begin().changefeed_info(feed).assert_ok().purged_through().get(),
+		snapshot.commit_ts
+	);
 }
 
+/// Verifies changefeed local partial purge preserves multi generation pins and
+/// reopens floor.
 #[test]
-fn changefeed_local_partial_purge_preserves_multi_generation_pins_and_reopens_floor()
--> FerrosGrynnResult<()> {
+fn changefeed_local_partial_purge_preserves_multi_generation_pins_and_reopens_floor() {
+	use crate::test_assertions::AssertResult as _;
+
 	let directory = Directory::new();
-	let store = Datastore::create_local(&directory.0, LocalOptions::default())?;
-	let (feed, record, key) = fixture(&store)?;
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).assert_ok();
+	let (feed, record, key) = fixture(&store).assert_ok();
 	let mut oldest = store.begin();
-	let original = batch(&mut oldest, feed)?;
+	let original = batch(&mut oldest, feed).assert_ok();
 	let mut update = store.begin();
-	update.set_base_property(&record, key, 2.into())?;
-	let second_stamp = update.commit()?.versionstamp();
+	update.set_base_property(&record, key, 2.into()).assert_ok();
+	let second_stamp = update.commit().assert_ok().versionstamp();
 	let mut ddl = store.begin();
-	ddl.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
-	ddl.commit()?;
+	ddl.define_class(ClassSchema::new("other", AtomKind::Node, []).assert_ok()).assert_ok();
+	ddl.commit().assert_ok();
 	let root = store.inner.current_root();
 	let second_time = root.changefeed_segments()[&feed][0].bounds().3;
 	let first_time = original.committed_at().as_inner().timestamp().as_nanosecond();
@@ -406,15 +464,18 @@ fn changefeed_local_partial_purge_preserves_multi_generation_pins_and_reopens_fl
 	let path = std::fs::read_dir(&feed_directory)
 		.map_err(|error| {
 			FerrosGrynnError::storage_io_failure("test feed directory").with_technical_source(error)
-		})?
+		})
+		.assert_ok()
 		.next()
 		.transpose()
 		.map_err(|error| {
 			FerrosGrynnError::storage_io_failure("test feed file").with_technical_source(error)
-		})?
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("feed file missing"))?
+		})
+		.assert_ok()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("feed file missing"))
+		.assert_ok()
 		.path();
-	purge(&store, first_time + TTL)?;
+	purge(&store, first_time + TTL).assert_ok();
 	let retained = store.inner.current_root();
 	assert_eq!(
 		retained.changefeeds().definitions[&feed].purged_through,
@@ -422,101 +483,121 @@ fn changefeed_local_partial_purge_preserves_multi_generation_pins_and_reopens_fl
 	);
 	assert!(retained.changefeeds().definitions[&feed].retained_page > 1);
 	let mut tx = store.begin();
-	let mut reader =
-		tx.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))?;
-	assert!(matches!(reader.next_batch()?, Some(ChangefeedReadItem::Gap(_))));
+	let mut reader = tx
+		.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))
+		.assert_ok();
+	assert!(matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Gap(_))));
 	assert!(
-		matches!(reader.next_batch()?, Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == second_stamp)
+		matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == second_stamp)
 	);
-	assert!(reader.next_batch()?.is_none());
+	assert!(reader.next_batch().assert_ok().is_none());
 	drop(reader);
 	drop(tx);
-	purge(&store, second_time + TTL)?;
+	purge(&store, second_time + TTL).assert_ok();
 	assert!(path.exists());
-	assert_eq!(batch(&mut oldest, feed)?, original);
+	assert_eq!(batch(&mut oldest, feed).assert_ok(), original);
 	drop(oldest);
 	store.inner.sweep_retired_changefeeds();
 	assert!(!path.exists());
 	let mut update = store.begin();
-	update.set_base_property(&record, key, 3.into())?;
-	let tail = update.commit()?.versionstamp();
-	assert!(store.checkpoint(CheckpointMode::Restart)?);
+	update.set_base_property(&record, key, 3.into()).assert_ok();
+	let tail = update.commit().assert_ok().versionstamp();
+	assert!(store.checkpoint(CheckpointMode::Restart).assert_ok());
 	drop(store);
-	let reopened = Datastore::open_local(&directory.0, LocalOptions::default())?;
-	assert_eq!(reopened.begin().changefeed_info(feed)?.purged_through(), second_stamp);
+	let reopened = Datastore::open_local(&directory.0, LocalOptions::default()).assert_ok();
+	assert_eq!(reopened.begin().changefeed_info(feed).assert_ok().purged_through(), second_stamp);
 	let mut tx = reopened.begin();
-	let mut reader =
-		tx.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))?;
-	assert!(matches!(reader.next_batch()?, Some(ChangefeedReadItem::Gap(_))));
+	let mut reader = tx
+		.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))
+		.assert_ok();
+	assert!(matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Gap(_))));
 	assert!(
-		matches!(reader.next_batch()?, Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == tail)
+		matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == tail)
 	);
-	assert!(reader.next_batch()?.is_none());
+	assert!(reader.next_batch().assert_ok().is_none());
 	drop(reader);
 	drop(tx);
-	let info = reopened.begin().changefeed_info(feed)?;
+	let info = reopened.begin().changefeed_info(feed).assert_ok();
 	let old_cursor =
-		ChangefeedCursor::new(info.database_id(), feed, ChangefeedReadMode::Full, tail)?;
+		ChangefeedCursor::new(info.database_id(), feed, ChangefeedReadMode::Full, tail).assert_ok();
 	let mut oldest = reopened.begin();
 	let mut dropper = reopened.begin();
-	dropper.drop_changefeed(info.source())?;
-	dropper.commit()?;
+	dropper.drop_changefeed(info.source()).assert_ok();
+	dropper.commit().assert_ok();
 	let close_time = reopened.inner.current_root().changefeeds().definitions[&feed]
 		.closed_time_ns
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("local close time missing"))?;
-	purge(&reopened, close_time + TTL)?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("local close time missing"))
+		.assert_ok();
+	purge(&reopened, close_time + TTL).assert_ok();
 	assert!(reopened.begin().changefeed_info(feed).is_err());
-	assert!(oldest.changes(feed, ChangefeedReadOptions::default())?.next_batch()?.is_some());
+	assert!(
+		oldest
+			.changes(feed, ChangefeedReadOptions::default())
+			.assert_ok()
+			.next_batch()
+			.assert_ok()
+			.is_some()
+	);
 	drop(oldest);
 	reopened.inner.sweep_retired_changefeeds();
-	assert!(reopened.checkpoint(CheckpointMode::Restart)?);
+	assert!(reopened.checkpoint(CheckpointMode::Restart).assert_ok());
 	drop(reopened);
-	let expired = Datastore::open_local(&directory.0, LocalOptions::default())?;
+	let expired = Datastore::open_local(&directory.0, LocalOptions::default()).assert_ok();
 	let mut tx = expired.begin();
-	let mut reader = tx.changes(
-		feed,
-		ChangefeedReadOptions::new(ChangefeedSince::Cursor(old_cursor))
-			.with_mode(ChangefeedReadMode::Full),
-	)?;
+	let mut reader = tx
+		.changes(
+			feed,
+			ChangefeedReadOptions::new(ChangefeedSince::Cursor(old_cursor))
+				.with_mode(ChangefeedReadMode::Full),
+		)
+		.assert_ok();
 	assert!(
-		matches!(reader.next_batch()?, Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::FeedExpiredOrRetired)
+		matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::FeedExpiredOrRetired)
 	);
-	assert!(reader.next_batch()?.is_none());
-	Ok(())
+	assert!(reader.next_batch().assert_ok().is_none());
 }
 
+/// Verifies changefeed idle worker expires history without new commits.
 #[test]
-fn changefeed_idle_worker_expires_history_without_new_commits() -> FerrosGrynnResult<()> {
+fn changefeed_idle_worker_expires_history_without_new_commits() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let (feed, _, _) = fixture(&store)?;
-	let info = store.begin().changefeed_info(feed)?;
+	let (feed, _, _) = fixture(&store).assert_ok();
+	let info = store.begin().changefeed_info(feed).assert_ok();
 	let mut tx = store.begin();
 	tx.configure_changefeed(
 		info.source(),
-		ChangefeedConfig::from_nanoseconds(20_000_000)?.with_full(true),
-	)?;
-	tx.commit()?;
+		ChangefeedConfig::from_nanoseconds(20_000_000).assert_ok().with_full(true),
+	)
+	.assert_ok();
+	tx.commit().assert_ok();
 	let deadline = Instant::now() + Duration::from_secs(5);
 	loop {
-		if store.begin().changefeed_info(feed)?.purged_through().get() != 0 {
+		if store.begin().changefeed_info(feed).assert_ok().purged_through().get() != 0 {
 			break;
 		}
 		if Instant::now() >= deadline {
-			return Err(FerrosGrynnError::invalid_argument("idle purge did not run"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("idle purge did not run"));
+				test_result.assert_ok();
+			};
 		}
 		std::thread::sleep(Duration::from_millis(10));
 	}
-	let job = store.purge_changefeeds(None)?;
-	assert!(store.job(job)?.is_some());
-	Ok(())
+	let job = store.purge_changefeeds(None).assert_ok();
+	assert!(store.job(job).assert_ok().is_some());
 }
 
 /// A failed WAL barrier preserves the old floor and files until recovery proves
 /// whether the complete catalog publication reached the durable log.
 #[test]
-fn changefeed_purge_wal_boundaries_recover_partial_and_whole_segment_floors()
--> FerrosGrynnResult<()> {
-	use crate::storage::{CommitFailureGuard, CommitFailurePoint};
+fn changefeed_purge_wal_boundaries_recover_partial_and_whole_segment_floors() {
+	use crate::{
+		storage::{CommitFailureGuard, CommitFailurePoint},
+		test_assertions::AssertResult as _,
+	};
 	for whole in [false, true] {
 		for point in [
 			CommitFailurePoint::BeforeAppend,
@@ -525,13 +606,13 @@ fn changefeed_purge_wal_boundaries_recover_partial_and_whole_segment_floors()
 			CommitFailurePoint::AfterSync,
 		] {
 			let directory = Directory::new();
-			let store = Datastore::create_local(&directory.0, LocalOptions::default())?;
-			let (feed, record, key) = fixture(&store)?;
-			let original = batch(&mut store.begin(), feed)?;
+			let store = Datastore::create_local(&directory.0, LocalOptions::default()).assert_ok();
+			let (feed, record, key) = fixture(&store).assert_ok();
+			let original = batch(&mut store.begin(), feed).assert_ok();
 			let first_time = original.committed_at().as_inner().timestamp().as_nanosecond();
 			let mut tx = store.begin();
-			tx.set_base_property(&record, key, 2.into())?;
-			let second = tx.commit()?.versionstamp();
+			tx.set_base_property(&record, key, 2.into()).assert_ok();
+			let second = tx.commit().assert_ok().versionstamp();
 			let root = store.inner.current_root();
 			assert!(root.committed_at_ns > first_time);
 			let deadline = if whole {
@@ -543,19 +624,20 @@ fn changefeed_purge_wal_boundaries_recover_partial_and_whole_segment_floors()
 			assert!(purge(&store, deadline).is_err());
 			drop(failure);
 			assert_eq!(store.inner.current_root().commit_ts, root.commit_ts);
-			assert_eq!(store.begin().changefeed_info(feed)?.purged_through().get(), 0);
+			assert_eq!(store.begin().changefeed_info(feed).assert_ok().purged_through().get(), 0);
 			let files = directory.0.join("changefeed").join(feed.as_uuid().to_string());
 			assert_eq!(
 				std::fs::read_dir(&files)
 					.map_err(|error| {
 						FerrosGrynnError::storage_io_failure("purge failure files")
 							.with_technical_source(error)
-					})?
+					})
+					.assert_ok()
 					.count(),
 				1
 			);
 			drop(store);
-			let reopened = Datastore::open_local(&directory.0, LocalOptions::default())?;
+			let reopened = Datastore::open_local(&directory.0, LocalOptions::default()).assert_ok();
 			let committed = point != CommitFailurePoint::BeforeAppend;
 			let expected = if !committed {
 				0
@@ -564,44 +646,46 @@ fn changefeed_purge_wal_boundaries_recover_partial_and_whole_segment_floors()
 			} else {
 				original.versionstamp().get()
 			};
-			assert_eq!(reopened.begin().changefeed_info(feed)?.purged_through().get(), expected);
+			assert_eq!(
+				reopened.begin().changefeed_info(feed).assert_ok().purged_through().get(),
+				expected
+			);
 			let mut tx = reopened.begin();
 			assert_eq!(
-				tx.atom(&record)?.and_then(|atom| atom.properties().get(key).cloned()),
+				tx.atom(&record).assert_ok().and_then(|atom| atom.properties().get(key).cloned()),
 				Some(2.into())
 			);
-			let mut reader = tx.changes(
-				feed,
-				ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full),
-			)?;
+			let mut reader = tx
+				.changes(feed, ChangefeedReadOptions::default().with_mode(ChangefeedReadMode::Full))
+				.assert_ok();
 			if committed {
 				assert!(
-					matches!(reader.next_batch()?, Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::Retention)
+					matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Gap(gap)) if gap.reason() == ChangefeedGapReason::Retention)
 				);
 			}
 			if !committed {
 				assert!(
-					matches!(reader.next_batch()?, Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == original.versionstamp())
+					matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == original.versionstamp())
 				);
 			}
 			if !committed || !whole {
 				assert!(
-					matches!(reader.next_batch()?, Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == second)
+					matches!(reader.next_batch().assert_ok(), Some(ChangefeedReadItem::Commit(batch)) if batch.versionstamp() == second)
 				);
 			}
-			assert!(reader.next_batch()?.is_none());
+			assert!(reader.next_batch().assert_ok().is_none());
 			if committed && whole {
 				assert_eq!(
 					std::fs::read_dir(&files)
 						.map_err(|error| {
 							FerrosGrynnError::storage_io_failure("recovered purge files")
 								.with_technical_source(error)
-						})?
+						})
+						.assert_ok()
 						.count(),
 					0
 				);
 			}
 		}
 	}
-	Ok(())
 }

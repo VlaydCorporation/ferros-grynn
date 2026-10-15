@@ -28,7 +28,10 @@ const MAX_PATH_BYTES: usize = 1024;
 
 /// Validated slash-separated path below one trusted database root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::storage) struct CatalogPath(Box<str>);
+pub(in crate::storage) struct CatalogPath(
+	/// Validated slash-separated path below one trusted database root.
+	Box<str>,
+);
 
 impl CatalogPath {
 	/// Parses one canonical relative path without accepting Windows aliases.
@@ -399,6 +402,7 @@ fn validate_changefeed_path(space: DataSpaceId, path: &str) -> FerrosGrynnResult
 	Ok(())
 }
 
+/// Validates quarantine path.
 fn validate_quarantine_path(space: DataSpaceId, path: &str) -> FerrosGrynnResult<()> {
 	let id = path
 		.strip_prefix("admin/quarantine/")
@@ -555,14 +559,20 @@ impl<'a> Decoder<'a> {
 }
 
 #[cfg(test)]
+/// Regression tests for file behavior.
 mod tests {
 	use super::*;
 	use crate::graph::GraphId;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 
+	/// Verifies fgfc v7 has exact auxiliary roles and rejects v6.
 	#[test]
-	fn fgfc_v7_has_exact_auxiliary_roles_and_rejects_v6() -> FerrosGrynnResult<()> {
-		let catalog = FileCatalog::bootstrap()?;
-		let bytes = catalog.encode()?;
+	fn fgfc_v7_has_exact_auxiliary_roles_and_rejects_v6() {
+		use crate::test_assertions::AssertResult as _;
+
+		let catalog = FileCatalog::bootstrap().assert_ok();
+		let bytes = catalog.encode().assert_ok();
 		let mut expected = vec![
 			b'F', b'G', b'F', b'C', 7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
 		];
@@ -584,7 +594,7 @@ mod tests {
 		expected.extend_from_slice(&[0; 5]);
 		expected.extend_from_slice(b"admin/jobs.fgb");
 		assert_eq!(bytes, expected);
-		assert_eq!(FileCatalog::decode(&bytes)?, catalog);
+		assert_eq!(FileCatalog::decode(&bytes).assert_ok(), catalog);
 		assert_eq!(catalog.registrations(Path::new("db")).len(), 1);
 
 		let mut old = bytes;
@@ -593,86 +603,99 @@ mod tests {
 			FileCatalog::decode(&old).err().map(|error| error.status().code().to_string()),
 			Some("FG-51S01".to_owned())
 		);
-		Ok(())
 	}
 
+	/// Verifies companions are exact and space local.
 	#[test]
-	fn companions_are_exact_and_space_local() -> FerrosGrynnResult<()> {
-		let graph = DataSpaceId::Graph(GraphId::new(7).unwrap());
+	fn companions_are_exact_and_space_local() {
+		use crate::test_assertions::AssertResult as _;
+
+		let graph = DataSpaceId::Graph(GraphId::new(7).assert_some());
 		let atoms =
-			file(1, DataFileKind::AtomsHot, DataSpaceId::Database, "atoms/g/atoms_hot.fgb", None)?;
+			file(1, DataFileKind::AtomsHot, DataSpaceId::Database, "atoms/g/atoms_hot.fgb", None)
+				.assert_ok();
 		let atom_free = file(
 			2,
 			DataFileKind::Freelist,
 			DataSpaceId::Database,
 			"atoms/g/freelist_atoms.fgb",
 			Some(atoms.file_id),
-		)?;
+		)
+		.assert_ok();
 		let props = file(
 			3,
 			DataFileKind::Properties,
 			DataSpaceId::Database,
 			"atoms/g/properties.fgb",
 			None,
-		)?;
+		)
+		.assert_ok();
 		let prop_free = file(
 			4,
 			DataFileKind::Freelist,
 			DataSpaceId::Database,
 			"atoms/g/freelist_props.fgb",
 			Some(props.file_id),
-		)?;
-		let nodes = file(5, DataFileKind::NodesHot, graph, "graphs/7/g/nodes_hot.fgb", None)?;
+		)
+		.assert_ok();
+		let nodes =
+			file(5, DataFileKind::NodesHot, graph, "graphs/7/g/nodes_hot.fgb", None).assert_ok();
 		let node_free = file(
 			6,
 			DataFileKind::Freelist,
 			graph,
 			"graphs/7/g/freelist_nodes.fgb",
 			Some(nodes.file_id),
-		)?;
+		)
+		.assert_ok();
 		let node_free_id = node_free.file_id;
-		let mut catalog = FileCatalog::bootstrap()?;
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
 		let mut files = vec![atoms, atom_free, props, prop_free, nodes, node_free];
 		files.append(&mut catalog.files);
 		files.sort_unstable_by_key(|file| (file.space_id, file.file_id));
 		catalog.next_file_instance_id = 7;
 		catalog.files = files;
-		assert_eq!(FileCatalog::decode(&catalog.encode()?)?, catalog);
+		assert_eq!(FileCatalog::decode(&catalog.encode().assert_ok()).assert_ok(), catalog);
 
 		let mut wrong_space = catalog;
 		let freelist = wrong_space
 			.files
 			.iter_mut()
 			.find(|file| file.file_id == node_free_id)
-			.ok_or_else(|| invalid("test freelist is absent"))?;
+			.ok_or_else(|| invalid("test freelist is absent"))
+			.assert_ok();
 		freelist.space_id = DataSpaceId::Database;
 		wrong_space.files.sort_unstable_by_key(|file| (file.space_id, file.file_id));
 		assert!(wrong_space.encode().is_err());
-		Ok(())
 	}
 
+	/// Verifies property dictionary is database global and has no freelist.
 	#[test]
-	fn property_dictionary_is_database_global_and_has_no_freelist() -> FerrosGrynnResult<()> {
-		let mut catalog = FileCatalog::bootstrap()?;
+	fn property_dictionary_is_database_global_and_has_no_freelist() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
 		let dictionary = file(
 			1,
 			DataFileKind::PropertyDictionary,
 			DataSpaceId::Database,
 			"atoms/g/property_keys.fgb",
 			None,
-		)?;
+		)
+		.assert_ok();
 		let dictionary_id = dictionary.file_id;
 		catalog.next_file_instance_id = 2;
 		catalog.files.push(dictionary);
 		catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));
-		assert_eq!(FileCatalog::decode(&catalog.encode()?)?, catalog);
+		assert_eq!(FileCatalog::decode(&catalog.encode().assert_ok()).assert_ok(), catalog);
 
 		let mut companion = catalog.clone();
 		companion
 			.files
 			.iter_mut()
 			.find(|entry| entry.file_id == dictionary_id)
-			.ok_or_else(|| invalid("test property dictionary is absent"))?
+			.ok_or_else(|| invalid("test property dictionary is absent"))
+			.assert_ok()
 			.companion_of = Some(DataFileId::for_kind(DataFileKind::SystemCatalog));
 		assert!(companion.encode().is_err());
 
@@ -681,15 +704,16 @@ mod tests {
 			.files
 			.iter_mut()
 			.find(|entry| entry.file_id == dictionary_id)
-			.ok_or_else(|| invalid("test property dictionary is absent"))?
+			.ok_or_else(|| invalid("test property dictionary is absent"))
+			.assert_ok()
 			.space_id = DataSpaceId::Graph(
-			GraphId::new(1).ok_or_else(|| invalid("test graph identity is invalid"))?,
+			GraphId::new(1).ok_or_else(|| invalid("test graph identity is invalid")).assert_ok(),
 		);
 		graph_local.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));
 		assert!(graph_local.encode().is_err());
-		Ok(())
 	}
 
+	/// Returns file for this module.
 	fn file(
 		instance: u64,
 		kind: DataFileKind,
@@ -707,13 +731,17 @@ mod tests {
 		})
 	}
 
+	/// Verifies changefeed kind is database wal backfilled with canonical
+	/// segment path.
 	#[test]
-	fn changefeed_kind_is_database_wal_backfilled_with_canonical_segment_path()
-	-> FerrosGrynnResult<()> {
+	fn changefeed_kind_is_database_wal_backfilled_with_canonical_segment_path() {
+		use crate::test_assertions::AssertResult as _;
+
 		let path = "changefeed/00000000-0000-0000-0000-000000000001/\
 		            00000000-0000-0000-0000-000000000002.fcf";
-		let mut catalog = FileCatalog::bootstrap()?;
-		let entry = file(1, DataFileKind::Changefeed, DataSpaceId::Database, path, None)?;
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
+		let entry =
+			file(1, DataFileKind::Changefeed, DataSpaceId::Database, path, None).assert_ok();
 		assert_eq!(entry.file_id.get().to_le_bytes(), [0x17, 1, 0, 0, 0, 0, 0, 0]);
 		assert_eq!(DataFileKind::from_raw(0x17), Some(DataFileKind::Changefeed));
 		assert_eq!(DataFileKind::from_raw(0x18), Some(DataFileKind::EventOutbox));
@@ -721,7 +749,7 @@ mod tests {
 		catalog.next_file_instance_id = 2;
 		catalog.files.push(entry);
 		catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));
-		assert_eq!(FileCatalog::decode(&catalog.encode()?)?, catalog);
+		assert_eq!(FileCatalog::decode(&catalog.encode().assert_ok()).assert_ok(), catalog);
 		for role in
 			[DataFileRole::Superblock, DataFileRole::MetadataCow, DataFileRole::AuxiliaryImmutable]
 		{
@@ -730,7 +758,8 @@ mod tests {
 				.files
 				.iter_mut()
 				.find(|entry| entry.file_id.kind() == Some(DataFileKind::Changefeed))
-				.ok_or_else(|| invalid("fixture changefeed file is absent"))?;
+				.ok_or_else(|| invalid("fixture changefeed file is absent"))
+				.assert_ok();
 			entry.role = role;
 			assert!(wrong.encode().is_err());
 		}
@@ -747,15 +776,17 @@ mod tests {
 		assert!(
 			validate_changefeed_path(
 				DataSpaceId::Graph(
-					GraphId::new(1).ok_or_else(|| invalid("fixture graph identity is invalid"))?
+					GraphId::new(1)
+						.ok_or_else(|| invalid("fixture graph identity is invalid"))
+						.assert_ok()
 				),
 				path
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 
+	/// Verifies path rejects traversal and windows aliases.
 	#[test]
 	fn path_rejects_traversal_and_windows_aliases() {
 		for invalid_path in [

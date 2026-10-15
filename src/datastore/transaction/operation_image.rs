@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
 	changefeed::{ChangeEndpoint, ChangeGraphState, ChangeIdentity, ChangeImage, ChangeOverlay},
-	datastore::{DatabaseRoot, GlobalAtomId, OccurrenceState, OverlayValue},
+	datastore::{DatabaseRoot, GlobalAtomId, OccurrenceStateRef, OverlayValue},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomOccurrenceRef, AtomRef, EdgeEndpoint, GraphId, GraphRef},
 	values::Object,
@@ -138,15 +138,15 @@ pub(super) fn image(
 	budget.admit(label.map_or(0, |label| label.len()))?;
 	let graph_state = occurrence
 		.map(|occurrence| -> FerrosGrynnResult<_> {
-			match occurrence.state() {
-				OccurrenceState::Node {
+			match occurrence.state().view() {
+				OccurrenceStateRef::Node {
 					nested_graph,
 				} => Ok(ChangeGraphState::Node {
 					nested_graph: nested_graph
 						.map(|graph| graph_reference(root, graph))
 						.transpose()?,
 				}),
-				OccurrenceState::Edge {
+				OccurrenceStateRef::Edge {
 					topology,
 					weight,
 					transition_graph,

@@ -1,3 +1,7 @@
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{DatabaseRoot, Datastore, GraphRoot, InMemoryOptions},
 	gql::QueryExecutionOptions,
@@ -6,10 +10,13 @@ use crate::{
 	values::{Object, RecordId, Value},
 };
 
+/// Returns value for this module.
 fn value(store: &Datastore, source: &str) -> Value {
-	store.execute(source, &Object::new()).unwrap()[0].result.as_ref().unwrap().value().clone()
+	store.execute(source, &Object::new()).assert_ok()[0].result.as_ref().assert_ok().value().clone()
 }
 
+/// Verifies geometry predicates conversions and quantifiers use the exact
+/// oracle.
 #[test]
 fn geometry_predicates_conversions_and_quantifiers_use_the_exact_oracle() {
 	let store = Datastore::in_memory();
@@ -54,6 +61,7 @@ fn geometry_predicates_conversions_and_quantifiers_use_the_exact_oracle() {
 	}
 }
 
+/// Verifies evaluates collections ranges idioms and builtins.
 #[test]
 fn evaluates_collections_ranges_idioms_and_builtins() {
 	let store = Datastore::in_memory();
@@ -88,14 +96,14 @@ fn evaluates_collections_ranges_idioms_and_builtins() {
 		Value::Object([("city", "Moscow")].into_iter().collect())
 	);
 	assert_eq!(value(&store, "RETURN none?.city;"), Value::None);
-	let unsafe_null_access = store.execute("RETURN none.city;", &Object::new()).unwrap();
+	let unsafe_null_access = store.execute("RETURN none.city;", &Object::new()).assert_ok();
 	assert!(unsafe_null_access[0].result.is_err());
 	assert!(store.execute("RETURN none?.{city};", &Object::new()).is_err());
-	let invalid = store.execute("RETURN string::upper(1);", &Object::new()).unwrap();
+	let invalid = store.execute("RETURN string::upper(1);", &Object::new()).assert_ok();
 	assert!(invalid[0].result.is_err());
 
-	let lossy = store.execute("RETURN math::sqrt(0.1dec);", &Object::new()).unwrap();
-	let outcome = lossy[0].result.as_ref().unwrap();
+	let lossy = store.execute("RETURN math::sqrt(0.1dec);", &Object::new()).assert_ok();
+	let outcome = lossy[0].result.as_ref().assert_ok();
 	assert!(outcome.statuses().iter().any(|status| status.code().to_string() == "FG-01F02"));
 	assert_eq!(
 		value(&store, "RETURN time::diff(time::now(), time::now());"),
@@ -103,9 +111,11 @@ fn evaluates_collections_ranges_idioms_and_builtins() {
 	);
 }
 
+/// Verifies stage21 string and random builtins follow runtime contract.
 #[test]
-fn stage21_string_and_random_builtins_follow_runtime_contract()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn stage21_string_and_random_builtins_follow_runtime_contract() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	assert_eq!(value(&store, "RETURN string::matches('graph', '^gr(a|y)ph$');"), Value::Bool(true));
 	assert_eq!(value(&store, "RETURN string::slice('aЖ🙂z', 1, 3);"), Value::from("Ж🙂"));
@@ -113,43 +123,52 @@ fn stage21_string_and_random_builtins_follow_runtime_contract()
 	assert_eq!(value(&store, "RETURN meta::type(ulid());"), Value::from("ulid"));
 	let random = value(&store, "RETURN rand::id(64);");
 	let Value::String(random) = random else {
-		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-			"rand::id must return a string",
-		));
+		return {
+			let test_result: crate::gql_status::FerrosGrynnResult<()> =
+				Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+					"rand::id must return a string",
+				));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(random.len(), 64);
 	assert!(random.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
 	for source in ["RETURN rand::id(0);", "RETURN string::slice('x', 0, 2);"] {
-		let result = store.execute(source, &Object::new())?;
+		let result = store.execute(source, &Object::new()).assert_ok();
 		assert!(result[0].result.is_err(), "{source}");
 	}
 
 	let mut session = store.session();
 	let begun = session
-		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())
+		.assert_ok();
 	assert!(begun[0].result.is_ok());
-	assert!(session.execute("RETURN uuid();", &Object::new())?[0].result.is_err());
-	Ok(())
+	assert!(session.execute("RETURN uuid();", &Object::new()).assert_ok()[0].result.is_err());
 }
 
+/// Verifies matcher shares state and reports unicode scalar offsets.
 #[test]
-fn matcher_shares_state_and_reports_unicode_scalar_offsets()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn matcher_shares_state_and_reports_unicode_scalar_offsets() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let results = store.execute(
-		"LET $matcher = regex::matcher('Жа Алла Анна', 'А.+?а'); RETURN [$matcher.start, \
-		 $matcher.end]; RETURN regex::next($matcher); RETURN [$matcher.start, $matcher.end]; \
-		 RETURN regex::next($matcher); RETURN [$matcher.start, $matcher.end]; RETURN \
-		 regex::next($matcher); RETURN [$matcher.start, $matcher.end];",
-		&Object::new(),
-	)?;
+	let results = store
+		.execute(
+			"LET $matcher = regex::matcher('Жа Алла Анна', 'А.+?а'); RETURN [$matcher.start, \
+			 $matcher.end]; RETURN regex::next($matcher); RETURN [$matcher.start, $matcher.end]; \
+			 RETURN regex::next($matcher); RETURN [$matcher.start, $matcher.end]; RETURN \
+			 regex::next($matcher); RETURN [$matcher.start, $matcher.end];",
+			&Object::new(),
+		)
+		.assert_ok();
 	let values = results
 		.iter()
 		.skip(1)
 		.map(|result| {
 			result.result.as_ref().map(|outcome| outcome.value().clone()).map_err(Clone::clone)
 		})
-		.collect::<crate::gql_status::FerrosGrynnResult<Vec<_>>>()?;
+		.collect::<crate::gql_status::FerrosGrynnResult<Vec<_>>>()
+		.assert_ok();
 	assert_eq!(values, vec![
 		Value::Array(vec![Value::None, Value::None].into()),
 		Value::Bool(true),
@@ -161,28 +180,38 @@ fn matcher_shares_state_and_reports_unicode_scalar_offsets()
 	],);
 	let mut session = store.session();
 	session
-		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())
+		.assert_ok();
 	assert!(
-		session.execute("RETURN regex::matcher('x', 'x');", &Object::new())?[0].result.is_err()
+		session.execute("RETURN regex::matcher('x', 'x');", &Object::new()).assert_ok()[0]
+			.result
+			.is_err()
 	);
-	Ok(())
 }
 
+/// Verifies mutable collection helpers require and update lexical bindings.
 #[test]
-fn mutable_collection_helpers_require_and_update_lexical_bindings()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn mutable_collection_helpers_require_and_update_lexical_bindings() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut session = store.session();
-	let declared_array = session.execute("LET $a = [1];", &Object::new()).map_err(|error| {
-		crate::gql_status::FerrosGrynnError::invalid_argument(format!(
-			"array binding declaration failed: {error}"
-		))
-	})?;
-	let declared_set = session.execute("LET $s = SET[1];", &Object::new()).map_err(|error| {
-		crate::gql_status::FerrosGrynnError::invalid_argument(format!(
-			"set binding declaration failed: {error}"
-		))
-	})?;
+	let declared_array = session
+		.execute("LET $a = [1];", &Object::new())
+		.map_err(|error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"array binding declaration failed: {error}"
+			))
+		})
+		.assert_ok();
+	let declared_set = session
+		.execute("LET $s = SET[1];", &Object::new())
+		.map_err(|error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"set binding declaration failed: {error}"
+			))
+		})
+		.assert_ok();
 	assert!(declared_array.iter().all(|result| result.result.is_ok()));
 	assert!(declared_set.iter().all(|result| result.result.is_ok()));
 
@@ -197,13 +226,15 @@ fn mutable_collection_helpers_require_and_update_lexical_bindings()
 			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
 				"collection mutation program failed: {error}"
 			))
-		})?;
+		})
+		.assert_ok();
 	let values = results
 		.iter()
 		.map(|result| {
 			result.result.as_ref().map(|outcome| outcome.value().clone()).map_err(Clone::clone)
 		})
-		.collect::<crate::gql_status::FerrosGrynnResult<Vec<_>>>()?;
+		.collect::<crate::gql_status::FerrosGrynnResult<Vec<_>>>()
+		.assert_ok();
 	assert_eq!(values, vec![
 		Value::from(2_i64),
 		Value::from(2_i64),
@@ -221,9 +252,9 @@ fn mutable_collection_helpers_require_and_update_lexical_bindings()
 	let mut parameters = Object::new();
 	parameters.insert("a", Value::Array(vec![1_i64].into()));
 	let immutable_parameter = store.execute("RETURN array::push($a, 2);", &parameters);
-	assert!(immutable_parameter.is_err() || immutable_parameter.unwrap()[0].result.is_err());
+	assert!(immutable_parameter.is_err() || immutable_parameter.assert_ok()[0].result.is_err());
 	let expression_target = store.execute("RETURN array::push([1], 2);", &Object::new());
-	assert!(expression_target.is_err() || expression_target.unwrap()[0].result.is_err());
+	assert!(expression_target.is_err() || expression_target.assert_ok()[0].result.is_err());
 	let durable = store
 		.execute(
 			"DEFINE PARAM $durable VALUE [1]; RETURN array::push($durable, 2);",
@@ -233,7 +264,8 @@ fn mutable_collection_helpers_require_and_update_lexical_bindings()
 			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
 				"durable mutable-binding probe did not parse: {error}"
 			))
-		})?;
+		})
+		.assert_ok();
 	assert!(durable[0].result.is_ok());
 	assert!(durable[1].result.is_err());
 
@@ -247,18 +279,20 @@ fn mutable_collection_helpers_require_and_update_lexical_bindings()
 			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
 				"mutable UDF probe did not parse: {error}"
 			))
-		})?;
+		})
+		.assert_ok();
 	assert!(function[0].result.is_ok());
 	assert_eq!(
-		function[1].result.as_ref().map_err(Clone::clone)?.value(),
+		function[1].result.as_ref().map_err(Clone::clone).assert_ok().value(),
 		&Value::Array(vec![1_i64, 2].into())
 	);
-	Ok(())
 }
 
+/// Verifies object conversion merges collections without silent overwrite.
 #[test]
-fn object_conversion_merges_collections_without_silent_overwrite()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn object_conversion_merges_collections_without_silent_overwrite() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	assert_eq!(
 		value(&store, "RETURN type::to<object>([{b: 2}, {a: 1}]);"),
@@ -272,59 +306,72 @@ fn object_conversion_merges_collections_without_silent_overwrite()
 	for source in
 		["RETURN type::to<object>([{a: 1}, {a: 2}]);", "RETURN type::to<object>([{a: 1}, 2]);"]
 	{
-		let result = store.execute(source, &Object::new())?;
+		let result = store.execute(source, &Object::new()).assert_ok();
 		assert!(result[0].result.is_err(), "{source}");
 	}
-	Ok(())
 }
 
+/// Verifies sleep is cooperative and rejected in deterministic mode.
 #[test]
-fn sleep_is_cooperative_and_rejected_in_deterministic_mode()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn sleep_is_cooperative_and_rejected_in_deterministic_mode() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let zero = store.execute("SLEEP 0ms;", &Object::new())?;
+	let zero = store.execute("SLEEP 0ms;", &Object::new()).assert_ok();
 	assert_eq!(zero[0].kind, crate::gql::QueryStatementKind::Sleep);
-	assert_eq!(zero[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::None);
+	assert_eq!(zero[0].result.as_ref().map_err(Clone::clone).assert_ok().value(), &Value::None);
 
 	let mut bindings = Object::new();
-	let delay = "1ms".parse::<crate::values::Duration>().map_err(|error| {
-		crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-	})?;
+	let delay = "1ms"
+		.parse::<crate::values::Duration>()
+		.map_err(|error| crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string()))
+		.assert_ok();
 	bindings.insert("delay", Value::from(delay));
-	let parameter = store.execute("SLEEP $delay;", &bindings)?;
+	let parameter = store.execute("SLEEP $delay;", &bindings).assert_ok();
 	assert!(parameter[0].result.is_ok());
 
-	let mut options = QueryExecutionOptions::default();
-	options.statement_timeout = Some(std::time::Duration::from_millis(5));
-	let timed_out = store.execute_with_options("SLEEP 100ms;", &Object::new(), options)?;
+	let options = QueryExecutionOptions {
+		statement_timeout: Some(std::time::Duration::from_millis(5)),
+		..Default::default()
+	};
+	let timed_out = store.execute_with_options("SLEEP 100ms;", &Object::new(), options).assert_ok();
 	assert!(timed_out[0].result.is_err());
 
 	let mut session = store.session();
 	let begun = session
-		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())
+		.assert_ok();
 	assert!(begun[0].result.is_ok());
-	let deterministic = session.execute("SLEEP 0ms;", &Object::new())?;
+	let deterministic = session.execute("SLEEP 0ms;", &Object::new()).assert_ok();
 	assert!(deterministic[0].result.is_err());
-	Ok(())
 }
 
 /// Duration operands resolve the current lexical frame rather than raw
 /// execute parameters captured before an enclosing block.
 #[test]
-fn duration_operands_use_lexical_and_live_values() -> crate::gql_status::FerrosGrynnResult<()> {
+fn duration_operands_use_lexical_and_live_values() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let setup = store.execute(
-		"DEFINE CLASS duration_probe TYPE NODE; CREATE duration_probe:seed;",
-		&Object::new(),
-	)?;
+	let setup = store
+		.execute(
+			"DEFINE CLASS duration_probe TYPE NODE; CREATE duration_probe:seed;",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 	let mut inputs = Object::new();
 	for (name, duration) in [("zero", "0ms"), ("second", "1s")] {
 		inputs.insert(
 			name,
-			Value::from(duration.parse::<crate::values::Duration>().map_err(|error| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-			})?),
+			Value::from(
+				duration
+					.parse::<crate::values::Duration>()
+					.map_err(|error| {
+						crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+					})
+					.assert_ok(),
+			),
 		);
 	}
 	for source in [
@@ -339,7 +386,7 @@ fn duration_operands_use_lexical_and_live_values() -> crate::gql_status::FerrosG
 		"LET $bounded = |$limit| { IF true { SELECT VALUE 7 FROM duration_probe TIMEOUT $limit; \
 		 }; RETURN 7; }; RETURN $bounded($second);",
 	] {
-		let results = store.execute(source, &inputs)?;
+		let results = store.execute(source, &inputs).assert_ok();
 		assert!(results.iter().all(|result| result.result.is_ok()), "{source}: {results:?}");
 		assert_eq!(
 			results
@@ -355,45 +402,56 @@ fn duration_operands_use_lexical_and_live_values() -> crate::gql_status::FerrosG
 		"ALTER LIVE LET $delay VALUE $second; IF true { SELECT VALUE 7 FROM duration_probe \
 		 TIMEOUT $delay; RETURN 7; };",
 	] {
-		let results = session.execute(source, &inputs)?;
+		let results = session.execute(source, &inputs).assert_ok();
 		assert!(results.iter().all(|result| result.result.is_ok()), "{source}: {results:?}");
 	}
-	let timed_out = session.execute(
-		"ALTER LIVE LET $delay VALUE $zero; IF true { SELECT VALUE 7 FROM duration_probe TIMEOUT \
-		 $delay; };",
-		&inputs,
-	)?;
+	let timed_out = session
+		.execute(
+			"ALTER LIVE LET $delay VALUE $zero; IF true { SELECT VALUE 7 FROM duration_probe \
+			 TIMEOUT $delay; };",
+			&inputs,
+		)
+		.assert_ok();
 	assert!(timed_out[0].result.is_ok());
 	assert!(timed_out[1].result.is_err());
 	let mut transaction = store.begin();
-	let direct = transaction.execute(
-		"LIVE LET $direct = $zero; IF true { SLEEP $direct; SELECT VALUE 7 FROM duration_probe \
-		 TIMEOUT $second; };",
-		&inputs,
-	)?;
+	let direct = transaction
+		.execute(
+			"LIVE LET $direct = $zero; IF true { SLEEP $direct; SELECT VALUE 7 FROM \
+			 duration_probe TIMEOUT $second; };",
+			&inputs,
+		)
+		.assert_ok();
 	assert!(direct.iter().all(|result| result.result.is_ok()), "{direct:?}");
-	transaction.commit()?;
-	Ok(())
+	transaction.commit().assert_ok();
 }
 
 /// Top-level clauses use the predeclaration lexical frame and reactive value.
 #[test]
-fn duration_top_level_resolves_live_and_shadowed_bindings()
--> crate::gql_status::FerrosGrynnResult<()> {
+fn duration_top_level_resolves_live_and_shadowed_bindings() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut inputs = Object::new();
 	for (name, duration) in [("zero", "0ms"), ("second", "1s")] {
 		inputs.insert(
 			name,
-			Value::from(duration.parse::<crate::values::Duration>().map_err(|error| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-			})?),
+			Value::from(
+				duration
+					.parse::<crate::values::Duration>()
+					.map_err(|error| {
+						crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+					})
+					.assert_ok(),
+			),
 		);
 	}
-	let setup = store.execute(
-		"DEFINE CLASS duration_probe TYPE NODE; CREATE duration_probe:seed;",
-		&Object::new(),
-	)?;
+	let setup = store
+		.execute(
+			"DEFINE CLASS duration_probe TYPE NODE; CREATE duration_probe:seed;",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 	let mut session = store.session();
 	for source in [
@@ -402,7 +460,7 @@ fn duration_top_level_resolves_live_and_shadowed_bindings()
 		"LET $outer = $second; BEGIN; LET $outer = BUILD GRAPH FROM [] TIMEOUT $outer; CANCEL;",
 		"ALTER LIVE LET $limit VALUE $zero; CREATE duration_probe:rejected TIMEOUT $limit;",
 	] {
-		let results = session.execute(source, &inputs)?;
+		let results = session.execute(source, &inputs).assert_ok();
 		if source.contains("rejected") {
 			assert!(results[0].result.is_ok());
 			assert!(results[1].result.is_err());
@@ -410,20 +468,27 @@ fn duration_top_level_resolves_live_and_shadowed_bindings()
 			assert!(results.iter().all(|result| result.result.is_ok()), "{source}: {results:?}");
 		}
 	}
-	assert!(store.begin().atom(&"duration_probe:rejected".parse::<RecordId>()?)?.is_none());
+	assert!(
+		store
+			.begin()
+			.atom(&"duration_probe:rejected".parse::<RecordId>().assert_ok())
+			.assert_ok()
+			.is_none()
+	);
 	let mut transaction = store.begin();
-	let direct = transaction.execute(
-		"LIVE LET $direct = $second; CREATE duration_probe:direct TIMEOUT $direct;",
-		&inputs,
-	)?;
+	let direct = transaction
+		.execute(
+			"LIVE LET $direct = $second; CREATE duration_probe:direct TIMEOUT $direct;",
+			&inputs,
+		)
+		.assert_ok();
 	assert!(direct.iter().all(|result| result.result.is_ok()), "{direct:?}");
-	transaction.commit()?;
-	Ok(())
+	transaction.commit().assert_ok();
 }
 
 /// A resolved top-level deadline also bounds LIVE BLOCK publication waits.
 #[test]
-fn duration_top_level_reaches_block_publication() -> crate::gql_status::FerrosGrynnResult<()> {
+fn duration_top_level_reaches_block_publication() {
 	use std::{sync::mpsc, thread, time::Duration};
 
 	use crate::{
@@ -432,6 +497,7 @@ fn duration_top_level_reaches_block_publication() -> crate::gql_status::FerrosGr
 		gql_status::FerrosGrynnError,
 		graph::AtomKind,
 		live::{LiveNext, LiveOptions, LiveOverflowPolicy, LiveQuery, LiveSource},
+		test_assertions::AssertResult as _,
 		values::PropertyMap,
 	};
 
@@ -445,17 +511,30 @@ fn duration_top_level_reaches_block_publication() -> crate::gql_status::FerrosGr
 	] {
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("duration_probe", AtomKind::Node, [])?)?;
-		setup.commit()?;
-		let mut subscription = store.subscribe_live(
-			LiveQuery::new(LiveSource::Class(class)),
-			LiveOptions::default().with_queue(1, 1 << 20)?.with_overflow(LiveOverflowPolicy::Block),
-		)?;
+		let class = setup
+			.define_class(ClassSchema::new("duration_probe", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
+		let mut subscription = store
+			.subscribe_live(
+				LiveQuery::new(LiveSource::Class(class)),
+				LiveOptions::default()
+					.with_queue(1, 1 << 20)
+					.assert_ok()
+					.with_overflow(LiveOverflowPolicy::Block),
+			)
+			.assert_ok();
 		let mut first = store.begin();
-		first.create_atom("duration_probe:seed".parse()?, PropertyMap::new())?;
-		first.commit()?;
-		let LiveNext::Delivery(delivery) = subscription.next()? else {
-			return Err(FerrosGrynnError::invalid_argument("missing BLOCK seed"));
+		first
+			.create_atom("duration_probe:seed".parse().assert_ok(), PropertyMap::new())
+			.assert_ok();
+		first.commit().assert_ok();
+		let LiveNext::Delivery(delivery) = subscription.next().assert_ok() else {
+			return {
+				let test_result: crate::gql_status::FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("missing BLOCK seed"));
+				test_result.assert_ok();
+			};
 		};
 		let cancellation = QueryCancellation::default();
 		let options = QueryExecutionOptions {
@@ -494,63 +573,86 @@ fn duration_top_level_reaches_block_publication() -> crate::gql_status::FerrosGr
 						.with_technical_source(error)
 				})?
 				.map_err(FerrosGrynnError::invalid_argument)
-		})?;
+		})
+		.assert_ok();
 		assert!(error.to_ascii_lowercase().contains("timeout"), "{error}");
-		let rejected = "duration_probe:rejected".parse::<RecordId>()?;
-		assert!(store.begin().atom(&rejected)?.is_none());
-		subscription.ack(delivery.token())?;
-		let retry = store.execute("CREATE duration_probe:rejected TIMEOUT 1s;", &Object::new())?;
+		let rejected = "duration_probe:rejected".parse::<RecordId>().assert_ok();
+		assert!(store.begin().atom(&rejected).assert_ok().is_none());
+		subscription.ack(delivery.token()).assert_ok();
+		let retry =
+			store.execute("CREATE duration_probe:rejected TIMEOUT 1s;", &Object::new()).assert_ok();
 		assert!(retry[0].result.is_ok(), "{retry:?}");
-		assert!(store.begin().atom(&rejected)?.is_some());
+		assert!(store.begin().atom(&rejected).assert_ok().is_some());
 	}
-	Ok(())
 }
 
 /// Invalid durations fail before a nested operation can mutate or publish.
 #[test]
-fn duration_operands_reject_invalid_values_and_overflow() -> crate::gql_status::FerrosGrynnResult<()>
-{
+fn duration_operands_reject_invalid_values_and_overflow() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let schema = store.execute("DEFINE CLASS duration_probe TYPE NODE;", &Object::new())?;
+	let schema =
+		store.execute("DEFINE CLASS duration_probe TYPE NODE;", &Object::new()).assert_ok();
 	assert!(schema[0].result.is_ok());
 	for (duration, expected) in
 		[("P1M", "calendar"), ("-PT1S", "negative"), ("PT20000000000S", "too large")]
 	{
 		let inputs = Object::from_iter([(
 			"limit",
-			Value::from(duration.parse::<crate::values::Duration>().map_err(|error| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-			})?),
+			Value::from(
+				duration
+					.parse::<crate::values::Duration>()
+					.map_err(|error| {
+						crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+					})
+					.assert_ok(),
+			),
 		)]);
 		for source in [
 			"IF true { SLEEP $limit; };",
 			"IF true { CREATE duration_probe:x TIMEOUT $limit; };",
 			"CREATE duration_probe:x TIMEOUT $limit;",
 		] {
-			let results = store.execute(source, &inputs)?;
-			let error = results[0].result.as_ref().err().ok_or_else(|| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(
-					"invalid duration was accepted",
-				)
-			})?;
+			let results = store.execute(source, &inputs).assert_ok();
+			let error = results[0]
+				.result
+				.as_ref()
+				.err()
+				.ok_or_else(|| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(
+						"invalid duration was accepted",
+					)
+				})
+				.assert_ok();
 			assert!(error.to_string().contains(expected), "{source}: {error}");
 		}
 	}
-	let huge = store.execute(
-		"IF true { CREATE duration_probe:x TIMEOUT 18446744073709549568s; };",
-		&Object::new(),
-	)?;
+	let huge = store
+		.execute(
+			"IF true { CREATE duration_probe:x TIMEOUT 18446744073709549568s; };",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(huge[0].result.is_err());
-	let huge_top =
-		store.execute("CREATE duration_probe:x TIMEOUT 18446744073709549568s;", &Object::new())?;
+	let huge_top = store
+		.execute("CREATE duration_probe:x TIMEOUT 18446744073709549568s;", &Object::new())
+		.assert_ok();
 	assert!(huge_top[0].result.is_err());
-	assert!(store.begin().atom(&"duration_probe:x".parse::<RecordId>()?)?.is_none());
-	Ok(())
+	assert!(
+		store
+			.begin()
+			.atom(&"duration_probe:x".parse::<RecordId>().assert_ok())
+			.assert_ok()
+			.is_none()
+	);
 }
 
 /// Reactive duration reads retain old snapshot values and participate in SSI.
 #[test]
-fn duration_operands_snapshot_and_ssi() -> crate::gql_status::FerrosGrynnResult<()> {
+fn duration_operands_snapshot_and_ssi() {
+	use crate::test_assertions::AssertResult as _;
+
 	for (initial, source) in [
 		("0ms", "SLEEP $duration;"),
 		("1s", "SELECT * FROM duration_probe TIMEOUT $duration;"),
@@ -569,88 +671,112 @@ fn duration_operands_snapshot_and_ssi() -> crate::gql_status::FerrosGrynnResult<
 		for isolation in ["SNAPSHOT", "READ COMMITTED", "SERIALIZABLE"] {
 			let store = Datastore::in_memory();
 			let mut setup = store.begin();
-			let graph = setup.define_graph("duration_scope", GraphKind::Graph)?;
-			let record = "duration_probe:seed".parse::<RecordId>()?;
-			setup.define_class(crate::datastore::ClassSchema::new(
-				"duration_probe",
-				crate::graph::AtomKind::Node,
-				[],
-			)?)?;
-			setup.create_atom(record.clone(), crate::values::PropertyMap::new())?;
-			setup.attach_node(graph.id(), &record, None, None)?;
-			setup.commit()?;
+			let graph = setup.define_graph("duration_scope", GraphKind::Graph).assert_ok();
+			let record = "duration_probe:seed".parse::<RecordId>().assert_ok();
+			setup
+				.define_class(
+					crate::datastore::ClassSchema::new(
+						"duration_probe",
+						crate::graph::AtomKind::Node,
+						[],
+					)
+					.assert_ok(),
+				)
+				.assert_ok();
+			setup.create_atom(record.clone(), crate::values::PropertyMap::new()).assert_ok();
+			setup.attach_node(graph.id(), &record, None, None).assert_ok();
+			setup.commit().assert_ok();
 			let mut session = store.session();
-			let initial = initial.parse::<crate::values::Duration>().map_err(|error| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-			})?;
+			let initial = initial
+				.parse::<crate::values::Duration>()
+				.map_err(|error| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+				})
+				.assert_ok();
 			let parameters = Object::from_iter([
 				("initial", Value::from(initial)),
 				("graph", Value::from(graph)),
 			]);
-			let registered = session.execute(
-				"LIVE LET $duration = $initial; INFO FOR LIVE LET $duration; LET $scope = $graph;",
-				&parameters,
-			)?;
+			let registered = session
+				.execute(
+					"LIVE LET $duration = $initial; INFO FOR LIVE LET $duration; LET $scope = \
+					 $graph;",
+					&parameters,
+				)
+				.assert_ok();
 			let Some(Value::Uuid(uuid)) = registered[1]
 				.result
 				.as_ref()
-				.map_err(Clone::clone)?
+				.map_err(Clone::clone)
+				.assert_ok()
 				.value()
 				.as_object()
 				.and_then(|row| row.get("id"))
 			else {
-				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-					"duration binding has no UUID",
-				));
+				return {
+					let test_result: crate::gql_status::FerrosGrynnResult<()> =
+						Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+							"duration binding has no UUID",
+						));
+					test_result.assert_ok();
+				};
 			};
-			let id = crate::live::LiveBindingId::from_uuid(*uuid)?;
+			let id = crate::live::LiveBindingId::from_uuid(*uuid).assert_ok();
 			let begun = session
-				.execute(&format!("BEGIN ISOLATION LEVEL {isolation}; {source}"), &Object::new())?;
+				.execute(&format!("BEGIN ISOLATION LEVEL {isolation}; {source}"), &Object::new())
+				.assert_ok();
 			assert!(begun.iter().all(|result| result.result.is_ok()), "{begun:?}");
-			let negative = "-PT1S".parse::<crate::values::Duration>().map_err(|error| {
-				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
-			})?;
+			let negative = "-PT1S"
+				.parse::<crate::values::Duration>()
+				.map_err(|error| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+				})
+				.assert_ok();
 			let mut writer = store.begin();
-			writer.replace_live_binding_value(id, Value::from(negative))?;
-			writer.commit()?;
+			writer.replace_live_binding_value(id, Value::from(negative)).assert_ok();
+			writer.commit().assert_ok();
 			if isolation == "READ COMMITTED" {
-				let latest = session.execute(source, &Object::new())?;
+				let latest = session.execute(source, &Object::new()).assert_ok();
 				assert!(latest[0].result.is_err());
 			} else {
-				let old = session.execute(source, &Object::new())?;
+				let old = session.execute(source, &Object::new()).assert_ok();
 				assert!(old.iter().all(|result| result.result.is_ok()), "{old:?}");
 				if isolation == "SERIALIZABLE" {
 					let commit = session
-						.execute("CREATE duration_probe:written; COMMIT;", &Object::new())?;
+						.execute("CREATE duration_probe:written; COMMIT;", &Object::new())
+						.assert_ok();
 					assert!(commit[0].result.is_ok());
 					assert!(commit[1].result.is_err());
 					assert!(
 						store
 							.begin()
-							.atom(&"duration_probe:written".parse::<RecordId>()?)?
+							.atom(&"duration_probe:written".parse::<RecordId>().assert_ok())
+							.assert_ok()
 							.is_none()
 					);
 				} else {
-					assert!(session.execute("CANCEL;", &Object::new())?[0].result.is_ok());
+					assert!(
+						session.execute("CANCEL;", &Object::new()).assert_ok()[0].result.is_ok()
+					);
 				}
 			}
-			assert!(session.execute(source, &Object::new())?[0].result.is_err());
+			assert!(session.execute(source, &Object::new()).assert_ok()[0].result.is_err());
 		}
 	}
-	Ok(())
 }
 
+/// Verifies enforces numeric coercion and power contract.
 #[test]
 fn enforces_numeric_coercion_and_power_contract() {
 	let store = Datastore::in_memory();
 	assert_eq!(value(&store, "RETURN 2 + 3.5;"), Value::from(5.5_f64));
 	assert_eq!(
 		value(&store, "RETURN 2 + 3.5dec;"),
-		Value::from("5.5dec".parse::<crate::values::Number>().unwrap())
+		Value::from("5.5dec".parse::<crate::values::Number>().assert_ok())
 	);
 	assert_eq!(
 		value(&store, "RETURN math::pow(2dec, -2);"),
-		Value::from("0.25dec".parse::<crate::values::Number>().unwrap())
+		Value::from("0.25dec".parse::<crate::values::Number>().assert_ok())
 	);
 
 	for source in [
@@ -659,11 +785,12 @@ fn enforces_numeric_coercion_and_power_contract() {
 		"RETURN math::pow(2dec, 0.5dec);",
 		"RETURN 9223372036854775807 + 1;",
 	] {
-		let result = store.execute(source, &Object::new()).unwrap();
+		let result = store.execute(source, &Object::new()).assert_ok();
 		assert!(result[0].result.is_err(), "{source}");
 	}
 }
 
+/// Verifies evaluates collection operators and range boundaries.
 #[test]
 fn evaluates_collection_operators_and_range_boundaries() {
 	let store = Datastore::in_memory();
@@ -693,11 +820,12 @@ fn evaluates_collection_operators_and_range_boundaries() {
 	assert_eq!(value(&store, "FOR $x IN 1..3 { $x; };"), Value::from(2_i64));
 	assert_eq!(value(&store, "FOR $x IN SET[3, 1, 2] { $x; };"), Value::from(3_i64));
 	for source in ["FOR $x IN ..3 { $x; };", "FOR $x IN 1.. { $x; };"] {
-		let result = store.execute(source, &Object::new()).unwrap();
+		let result = store.execute(source, &Object::new()).assert_ok();
 		assert!(result[0].result.is_err(), "{source}");
 	}
 }
 
+/// Verifies executes the static builtin catalog.
 #[test]
 fn executes_the_static_builtin_catalog() {
 	let store = Datastore::in_memory();
@@ -757,7 +885,9 @@ fn executes_the_static_builtin_catalog() {
 			.is_some_and(|year| year.len() == 4)
 	);
 
-	store.execute("DEFINE CLASS person TYPE NODE; CREATE person:alice;", &Object::new()).unwrap();
+	store
+		.execute("DEFINE CLASS person TYPE NODE; CREATE person:alice;", &Object::new())
+		.assert_ok();
 	assert_eq!(
 		value(&store, "SELECT VALUE meta::class(id) FROM person:alice;"),
 		Value::Array(vec!["person"].into())
@@ -774,11 +904,12 @@ fn executes_the_static_builtin_catalog() {
 		"RETURN string::len();",
 		"RETURN set::union(SET[1], [2]);",
 	] {
-		let result = store.execute(source, &Object::new()).unwrap();
+		let result = store.execute(source, &Object::new()).assert_ok();
 		assert!(result[0].result.is_err(), "{source}");
 	}
 }
 
+/// Verifies executes if case for and bounded while.
 #[test]
 fn executes_if_case_for_and_bounded_while() {
 	let store = Datastore::in_memory();
@@ -793,29 +924,36 @@ fn executes_if_case_for_and_bounded_while() {
 	);
 	assert_eq!(value(&store, "WHILE (true) { BREAK; };"), Value::None);
 
-	let mut options = QueryExecutionOptions::default();
-	options.max_loop_iterations = 2;
+	let options = QueryExecutionOptions {
+		max_loop_iterations: 2,
+		..Default::default()
+	};
 	let result =
-		store.execute_with_options("FOR $x IN 1..=3 { $x; };", &Object::new(), options).unwrap();
+		store.execute_with_options("FOR $x IN 1..=3 { $x; };", &Object::new(), options).assert_ok();
 	assert!(result[0].result.is_err());
 
-	let mut options = QueryExecutionOptions::default();
-	options.max_loop_iterations = 1;
+	let options = QueryExecutionOptions {
+		max_loop_iterations: 1,
+		..Default::default()
+	};
 	let result = store
 		.execute_with_options("FOR $x IN 1..=9223372036854775807 { $x; };", &Object::new(), options)
-		.unwrap();
+		.assert_ok();
 	assert!(result[0].result.is_err());
 }
 
+/// Verifies try restores all mutations and exposes error value.
 #[test]
 fn try_restores_all_mutations_and_exposes_error_value() {
 	let store = Datastore::in_memory();
-	store.execute("DEFINE CLASS person TYPE NODE; CREATE person:alice;", &Object::new()).unwrap();
+	store
+		.execute("DEFINE CLASS person TYPE NODE; CREATE person:alice;", &Object::new())
+		.assert_ok();
 	let result =
 		value(&store, "TRY { CREATE person:bob; CREATE person:alice; } CATCH |$e| { $e.code; };");
 	assert!(result.as_str().is_some_and(|code| code.starts_with("FG-")));
 	let mut transaction = store.begin();
-	assert!(transaction.atom(&"person:bob".parse::<RecordId>().unwrap()).unwrap().is_none());
+	assert!(transaction.atom(&"person:bob".parse::<RecordId>().assert_ok()).assert_ok().is_none());
 	assert_eq!(
 		value(&store, "TRY { THROW 'boom'; } CATCH |$e| { $e.message; };"),
 		Value::from("boom")
@@ -828,18 +966,21 @@ fn try_restores_all_mutations_and_exposes_error_value() {
 		),
 		Value::from("second")
 	);
-	let mut options = QueryExecutionOptions::default();
-	options.max_loop_iterations = 1;
+	let options = QueryExecutionOptions {
+		max_loop_iterations: 1,
+		..Default::default()
+	};
 	let result = store
 		.execute_with_options(
 			"TRY { FOR $x IN 1..=2 { $x; }; } CATCH |$error| { 'caught'; };",
 			&Object::new(),
 			options,
 		)
-		.unwrap();
-	assert_eq!(result[0].result.as_ref().unwrap_err().status().code().to_string(), "FG-54F09");
+		.assert_ok();
+	assert_eq!(result[0].result.as_ref().assert_err().status().code().to_string(), "FG-54F09");
 }
 
+/// Verifies assert invariants reads private root.
 #[test]
 fn assert_invariants_reads_private_root() {
 	let store = Datastore::in_memory();
@@ -848,29 +989,30 @@ fn assert_invariants_reads_private_root() {
 			"BEGIN; DEFINE GRAPH social TYPE DAG; ASSERT INVARIANTS REPORT 10; COMMIT;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(result.len(), 4, "{result:#?}");
-	let report = result[2].result.as_ref().unwrap().value().as_object().unwrap();
+	let report = result[2].result.as_ref().assert_ok().value().as_object().assert_some();
 	assert_eq!(report.get("checked_graphs"), Some(&Value::from(1_i64)));
 	assert_eq!(report.get("violation_total"), Some(&Value::from(0_i64)));
 	assert_eq!(report.get("violation_totals"), Some(&Value::Object(Object::new())));
 	assert_eq!(report.get("violation_details"), Some(&Value::Array(Vec::<Value>::new().into())));
 }
 
+/// Verifies assert invariants reports complete totals with bounded details.
 #[test]
 fn assert_invariants_reports_complete_totals_with_bounded_details() {
 	let mut root = DatabaseRoot::default();
 	let reference = GraphRef::new(
-		GraphId::new(1).unwrap(),
+		GraphId::new(1).assert_some(),
 		"orphan",
 		GraphKind::Graph,
 		GraphStorageMode::InMemory,
 	)
-	.unwrap();
+	.assert_ok();
 	root.graphs.insert(reference.id(), std::sync::Arc::new(GraphRoot::new(reference)));
 	let store = Datastore::from_root_for_test(InMemoryOptions::default(), root);
-	let results = store.execute("ASSERT INVARIANTS REPORT 0;", &Object::new()).unwrap();
-	let error = results[0].result.as_ref().unwrap_err();
+	let results = store.execute("ASSERT INVARIANTS REPORT 0;", &Object::new()).assert_ok();
+	let error = results[0].result.as_ref().assert_err();
 	let extensions = error.status().diagnostic().extensions();
 	assert_eq!(extensions.get("violation_total"), Some(&DiagnosticValue::Unsigned(1)));
 	assert_eq!(extensions.get("violation_details"), Some(&DiagnosticValue::List(Vec::new())));
@@ -880,25 +1022,30 @@ fn assert_invariants_reports_complete_totals_with_bounded_details() {
 	);
 }
 
+/// Verifies loop does not retain results per iteration.
 #[cfg(feature = "allocation-tracking")]
 #[test]
 fn loop_does_not_retain_results_per_iteration() {
+	/// Returns retained after for this module.
 	fn retained_after(iterations: u64) -> usize {
 		let store = Datastore::in_memory();
-		let mut options = QueryExecutionOptions::default();
-		options.max_loop_iterations = iterations;
-		crate::memory::ALLOC.flush_local_allocations();
-		let before = crate::memory::ALLOC.memory_allocated();
+		let defaults = QueryExecutionOptions::default();
+		let options = QueryExecutionOptions {
+			max_loop_iterations: iterations,
+			..defaults
+		};
+		crate::memory::flush_local_allocations();
+		let before = crate::memory::allocated_bytes();
 		let source = format!("FOR $x IN 0..{iterations} {{ $x; }};");
-		let results = store.execute_with_options(&source, &Object::new(), options).unwrap();
+		let results = store.execute_with_options(&source, &Object::new(), options).assert_ok();
 		assert_eq!(
-			results[0].result.as_ref().unwrap().value(),
+			results[0].result.as_ref().assert_ok().value(),
 			&Value::from(iterations as i64 - 1)
 		);
 		drop(results);
 		drop(store);
-		crate::memory::ALLOC.flush_local_allocations();
-		crate::memory::ALLOC.memory_allocated().saturating_sub(before)
+		crate::memory::flush_local_allocations();
+		crate::memory::allocated_bytes().saturating_sub(before)
 	}
 
 	let small = retained_after(10);

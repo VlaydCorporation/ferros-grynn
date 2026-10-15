@@ -3,6 +3,11 @@
 use std::{collections::BTreeMap, path::Path};
 
 use super::ReverseMembershipFile;
+#[cfg(test)]
+use crate::storage::{
+	image_io::{backfill_pages, stage_pages},
+	wal::{CheckpointTicket, TxHandle},
+};
 use crate::{
 	datastore::{DataSpaceId, DatabaseRoot, GlobalAtomId},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -10,11 +15,11 @@ use crate::{
 	storage::{
 		file_registry::FileRegistry,
 		graph_index::{BuiltPrimaryIndex, SortedIndexRecords, scan_primary_index},
-		image_io::{backfill_pages, read_pages, read_pages_cached, stage_pages},
+		image_io::{read_pages, read_pages_cached},
 		membership_index::{build_reverse_membership_index, sort_reverse_membership_index},
 		page::{AlignedPage, PageLsn, PageNo},
 		types::StorageSnapshot,
-		wal::{CheckpointTicket, FrameWal, TxHandle},
+		wal::FrameWal,
 	},
 	values::storage::DiskAtomRef,
 };
@@ -36,6 +41,7 @@ pub(in crate::storage) fn build_import_reverse_membership_image(
 
 /// Stages the reverse membership image in the caller's database WAL
 /// transaction.
+#[cfg(test)]
 pub(in crate::storage) fn stage_reverse_membership_image(
 	tx: &mut TxHandle,
 	binding: ReverseMembershipFile,
@@ -85,6 +91,7 @@ pub(in crate::storage) fn open_reverse_membership_image(
 
 /// Backfills the database-global reverse membership index selected by a
 /// checkpoint.
+#[cfg(test)]
 pub(in crate::storage) fn backfill_reverse_membership_checkpoint(
 	wal: &FrameWal,
 	registry: &FileRegistry,
@@ -158,6 +165,7 @@ fn copy_page(
 }
 
 /// Checks that the immutable image matches its catalog root binding.
+#[cfg(test)]
 fn validate_root(
 	binding: ReverseMembershipFile,
 	image: &BuiltPrimaryIndex,
@@ -170,6 +178,7 @@ fn validate_root(
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

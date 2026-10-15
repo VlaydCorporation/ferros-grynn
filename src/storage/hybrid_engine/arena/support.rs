@@ -11,19 +11,16 @@ use std::{
 use parking_lot::{Condvar, Mutex, RwLock};
 use rapidhash::{HashMapExt, RapidHashMap};
 
-use super::{
-	AtomicArenaBufferPool,
-	AtomicPageGuard,
-	Lifecycle,
-	directory_shard,
-	locator::FrameLocator,
-	pack_state,
-};
+#[cfg(feature = "storage-engine-prototype-api")]
+use super::{AtomicArenaBufferPool, AtomicPageGuard, directory_shard};
+use super::{Lifecycle, locator::FrameLocator, pack_state};
+#[cfg(feature = "storage-engine-prototype-api")]
+use crate::storage::page_cache::validate_loaded_header;
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
 		page::{AlignedPage, PageHeader},
-		page_cache::{PageCacheKey, validate_loaded_header},
+		page_cache::PageCacheKey,
 	},
 };
 
@@ -37,7 +34,10 @@ pub(super) enum DirectoryEntry {
 		signal: Arc<LoadSignal>,
 	},
 	/// Fully validated and atomically published frame.
-	Resident(FrameLocator),
+	Resident(
+		/// Fully validated and atomically published frame.
+		FrameLocator,
+	),
 }
 
 impl DirectoryEntry {
@@ -74,9 +74,15 @@ pub(super) enum DirectoryLookup {
 	/// No exact key is mapped.
 	Absent,
 	/// A load is in progress and may be awaited without a directory lock.
-	Loading(Arc<LoadSignal>),
+	Loading(
+		/// A load is in progress and may be awaited without a directory lock.
+		Arc<LoadSignal>,
+	),
 	/// A resident locator may be atomically pinned.
-	Resident(FrameLocator),
+	Resident(
+		/// A resident locator may be atomically pinned.
+		FrameLocator,
+	),
 }
 
 /// One independently locked, cache-line-separated directory partition.
@@ -193,6 +199,7 @@ pub(super) struct LoadReservation {
 }
 
 /// RAII group of disjoint loading frames for direct-to-frame transports.
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct AtomicBatchReservation<'pool> {
 	/// Arena that owns every loading frame.
 	pub(super) pool: &'pool AtomicArenaBufferPool,
@@ -202,6 +209,7 @@ pub struct AtomicBatchReservation<'pool> {
 	pub(super) published: bool,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl<'pool> AtomicBatchReservation<'pool> {
 	/// Returns disjoint writable aligned frames in key order.
 	///
@@ -288,6 +296,7 @@ impl<'pool> AtomicBatchReservation<'pool> {
 	}
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl Drop for AtomicBatchReservation<'_> {
 	/// Aborts every frame unless all were published together.
 	fn drop(&mut self) {
@@ -329,11 +338,21 @@ impl Drop for CapacityWaiter<'_> {
 /// Result of serialized miss admission.
 pub(super) enum ReserveDecision {
 	/// Another caller published a resident mapping before replacement locked.
-	Resident(FrameLocator),
+	Resident(
+		/// Another caller published a resident mapping before replacement
+		/// locked.
+		FrameLocator,
+	),
 	/// Another caller started a load before replacement locked.
-	Loading(Arc<LoadSignal>),
+	Loading(
+		/// Another caller started a load before replacement locked.
+		Arc<LoadSignal>,
+	),
 	/// This caller owns the new loading frame.
-	Reserved(LoadReservation),
+	Reserved(
+		/// This caller owns the new loading frame.
+		LoadReservation,
+	),
 }
 
 /// Evidence returned by the unique frame writer before authoritative arena
@@ -341,10 +360,16 @@ pub(super) enum ReserveDecision {
 pub(super) enum LoadReceipt {
 	/// A normal I/O loader already parsed the header it observed. The arena
 	/// revalidates current bytes and requires the two observations to match.
-	Reported(PageHeader),
+	Reported(
+		/// A normal I/O loader already parsed the header it observed. The arena
+		/// revalidates current bytes and requires the two observations to
+		/// match.
+		PageHeader,
+	),
 	/// Bytes were copied from an already validated resident frame. The copy
 	/// path deliberately does not parse the destination before arena
 	/// validation.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	Copied,
 }
 

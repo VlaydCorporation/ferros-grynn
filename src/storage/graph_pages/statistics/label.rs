@@ -2,7 +2,19 @@
 
 use std::collections::BTreeMap;
 
-use super::{checked_page_no, codec::*};
+use super::{
+	checked_page_no,
+	codec::{
+		invalid_page,
+		read_optional_page,
+		read_u32,
+		read_u64,
+		validate_zero,
+		write_optional_page,
+		write_u32,
+		write_u64,
+	},
+};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::AtomKind,
@@ -13,20 +25,34 @@ use crate::{
 	},
 };
 
+/// Physical sort key paired with the logical label count restored from disk.
+type LabelStatisticEntry = ((LabelKind, u32), LabelStatisticKey, LabelStatistic);
+
+/// Configured next page value.
 const NEXT_PAGE: usize = 32;
+/// Configured count value.
 const COUNT: usize = 40;
+/// Configured reserved value.
 const RESERVED: usize = 44;
+/// Configured entries value.
 const ENTRIES: usize = 48;
+/// Configured entry bytes value.
 const ENTRY_BYTES: usize = 24;
+/// Configured per page value.
 const PER_PAGE: usize = (PAGE_SIZE - ENTRIES) / ENTRY_BYTES;
 
 #[derive(Clone, Copy)]
+/// Encoded entry state.
 struct EncodedEntry<'entry> {
+	/// Kind associated with this encoded entry.
 	kind: LabelKind,
+	/// Label id associated with this encoded entry.
 	label_id: u32,
+	/// Statistic associated with this encoded entry.
 	statistic: &'entry LabelStatistic,
 }
 
+/// Encodes label statistics.
 pub(super) fn encode_label_statistics(
 	statistics: &GraphStatistics,
 	dictionary: &LabelDictionary,
@@ -58,6 +84,7 @@ pub(super) fn encode_label_statistics(
 	Ok(pages)
 }
 
+/// Decodes label statistics.
 pub(in crate::storage) fn decode_label_statistics<ReadPage>(
 	mut read_page: ReadPage,
 	layout: super::StatisticsLayout,
@@ -88,6 +115,7 @@ where
 	Ok(result)
 }
 
+/// Encodes page.
 fn encode_page(
 	page_no: PageNo,
 	next: Option<PageNo>,
@@ -115,12 +143,13 @@ fn encode_page(
 	Ok(page)
 }
 
+/// Decodes page.
 fn decode_page(
 	page: &AlignedPage,
 	page_no: PageNo,
 	expected_next: Option<PageNo>,
 	dictionary: &LabelDictionary,
-) -> FerrosGrynnResult<Vec<((LabelKind, u32), LabelStatisticKey, LabelStatistic)>> {
+) -> FerrosGrynnResult<Vec<LabelStatisticEntry>> {
 	let header = page.validate(page_no)?;
 	if header.page_type() != PageType::LabelStatistic || !header.flags().is_empty() {
 		return Err(invalid_page(page_no, "invalid LabelStatistic page header"));
@@ -173,6 +202,7 @@ fn decode_page(
 	Ok(result)
 }
 
+/// Returns the storage kind result.
 const fn storage_kind(kind: AtomKind) -> LabelKind {
 	match kind {
 		AtomKind::Node => LabelKind::Node,
@@ -180,6 +210,7 @@ const fn storage_kind(kind: AtomKind) -> LabelKind {
 	}
 }
 
+/// Returns the runtime kind result.
 const fn runtime_kind(kind: LabelKind) -> AtomKind {
 	match kind {
 		LabelKind::Node => AtomKind::Node,
@@ -187,6 +218,7 @@ const fn runtime_kind(kind: LabelKind) -> AtomKind {
 	}
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

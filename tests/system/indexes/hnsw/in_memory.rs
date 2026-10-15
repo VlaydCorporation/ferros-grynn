@@ -2,6 +2,7 @@ use crate::support::in_memory as database;
 
 include!("cases.rs");
 
+/// Verifies forced hnsw hint reports that ram has no physical binding.
 #[test]
 fn forced_hnsw_hint_reports_that_ram_has_no_physical_binding() {
 	let db = database();

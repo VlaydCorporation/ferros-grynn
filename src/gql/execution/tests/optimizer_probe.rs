@@ -7,11 +7,16 @@ use std::{
 };
 
 use super::select::{profile_usize, stage13_resource_store};
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::Datastore,
 	values::{Object, Value},
 };
 
+/// Verifies gql stage 14 optimizer probe.
 #[test]
 #[ignore = "stage-14 optimizer performance and profiling gate"]
 fn gql_stage_14_optimizer_probe() {
@@ -26,7 +31,7 @@ fn gql_stage_14_optimizer_probe() {
 			 by_department_code ON CLASS department FIELDS code UNIQUE SCOPE BASE;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
 
 	let scan = format!("SELECT VALUE score FROM person WITH NOINDEX WHERE score < {threshold};");
@@ -71,17 +76,17 @@ fn gql_stage_14_optimizer_probe() {
 	let explain = format!("EXPLAIN FULL FORMAT JSON {automatic}");
 	let mut planning_ns = Vec::with_capacity(planning_samples);
 	for _ in 0..planning_samples {
-		let Value::Object(value) = execute_value(&store, &explain) else {
-			panic!("EXPLAIN FULL JSON must return an object");
-		};
-		let Some(value) = value
+		let value = match execute_value(&store, &explain) {
+			Value::Object(value) => Some(value),
+			_ => None,
+		}
+		.assert_some_with("EXPLAIN FULL JSON must return an object");
+		let value = value
 			.get("planning_elapsed_ns")
 			.and_then(Value::as_number)
 			.and_then(|number| number.as_i64())
-		else {
-			panic!("EXPLAIN must report planning_elapsed_ns");
-		};
-		planning_ns.push(u128::try_from(value).unwrap());
+			.assert_some_with("EXPLAIN must report planning_elapsed_ns");
+		planning_ns.push(u128::try_from(value).assert_ok());
 	}
 
 	let (join_auto_ns, join_forced_ns) =
@@ -116,63 +121,94 @@ fn gql_stage_14_optimizer_probe() {
 	emit_result(&result);
 }
 
+/// Timing samples and chosen operators reported by the optimizer performance
+/// probe.
 struct ProbeResult {
+	/// Configured row count of the fixture or measurement.
 	rows: usize,
+	/// Selected-row fraction expressed in basis points.
 	selectivity_bps: usize,
+	/// Number of repeated observations included in the reported measurement.
 	samples: usize,
+	/// Chosen physical source operator reported by the optimizer probe.
 	operator: &'static str,
+	/// Elapsed time for the scan measurement, in nanoseconds.
 	scan_ns: u128,
+	/// Elapsed time for the forced measurement, in nanoseconds.
 	forced_ns: u128,
+	/// Elapsed time for the automatic measurement, in nanoseconds.
 	automatic_ns: u128,
+	/// Elapsed time for the order scan measurement, in nanoseconds.
 	order_scan_ns: u128,
+	/// Elapsed time for the order index measurement, in nanoseconds.
 	order_index_ns: u128,
+	/// Elapsed time for the planning p95 measurement, in nanoseconds.
 	planning_p95_ns: u128,
+	/// Elapsed time for the join auto measurement, in nanoseconds.
 	join_auto_ns: u128,
+	/// Elapsed time for the join forced measurement, in nanoseconds.
 	join_forced_ns: u128,
 }
 
+/// Executes value for this module.
 fn execute_value(store: &Datastore, query: &str) -> Value {
-	let value =
-		store.execute(query, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0;
+	let value = store
+		.execute(query, &Object::new())
+		.assert_ok()
+		.remove(0)
+		.result
+		.assert_ok()
+		.into_parts()
+		.0;
 	black_box(value.clone());
 	value
 }
 
+/// Returns time query for this module.
 fn time_query(store: &Datastore, query: &str) -> u128 {
 	let started = Instant::now();
 	black_box(execute_value(store, query));
 	started.elapsed().as_nanos()
 }
 
+/// Returns explain operator for this module.
 fn explain_operator(store: &Datastore, query: &str) -> &'static str {
-	let Value::Object(explain) = execute_value(store, &format!("EXPLAIN FULL FORMAT JSON {query}"))
-	else {
-		panic!("EXPLAIN FULL JSON must return an object");
-	};
-	let Some(Value::Array(nodes)) = explain.get("nodes") else {
-		panic!("EXPLAIN must contain physical nodes");
-	};
-	let Some(Value::Object(node)) = nodes.iter().next() else {
-		panic!("EXPLAIN must contain one source node");
-	};
-	match node.get("operator").and_then(Value::as_str) {
-		Some("ScalarIndexScan") => "ScalarIndexScan",
-		Some("ClassScan") => "ClassScan",
-		Some(other) => panic!("unexpected source operator {other}"),
-		None => panic!("source operator is missing"),
+	let explain = match execute_value(store, &format!("EXPLAIN FULL FORMAT JSON {query}")) {
+		Value::Object(explain) => Some(explain),
+		_ => None,
 	}
+	.assert_some_with("EXPLAIN FULL JSON must return an object");
+	let nodes = match explain.get("nodes") {
+		Some(Value::Array(nodes)) => Some(nodes),
+		_ => None,
+	}
+	.assert_some_with("EXPLAIN must contain physical nodes");
+	let node = match nodes.iter().next() {
+		Some(Value::Object(node)) => Some(node),
+		_ => None,
+	}
+	.assert_some_with("EXPLAIN must contain one source node");
+	match node.get("operator").and_then(Value::as_str) {
+		Some("ScalarIndexScan") => Some("ScalarIndexScan"),
+		Some("ClassScan") => Some("ClassScan"),
+		_ => None,
+	}
+	.assert_some_with("source operator must be ScalarIndexScan or ClassScan")
 }
 
+/// Returns median for this module.
 fn median(values: Vec<u128>) -> u128 {
 	percentile(values, 50)
 }
 
+/// Returns percentile for this module.
 fn percentile(mut values: Vec<u128>, percentile: usize) -> u128 {
 	values.sort_unstable();
 	let index = values.len().saturating_sub(1).saturating_mul(percentile).div_ceil(100);
 	values[index]
 }
 
+/// Returns emit result for this module.
 fn emit_result(result: &ProbeResult) {
 	let row = format!(
 		"{},{},{},{},{},{},{},{},{},{},{},{}",
@@ -195,10 +231,10 @@ fn emit_result(result: &ProbeResult) {
 	};
 	let path = Path::new(&path);
 	if let Some(parent) = path.parent() {
-		fs::create_dir_all(parent).unwrap();
+		fs::create_dir_all(parent).assert_ok();
 	}
 	let write_header = path.metadata().map_or(true, |metadata| metadata.len() == 0);
-	let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+	let mut file = OpenOptions::new().create(true).append(true).open(path).assert_ok();
 	if write_header {
 		writeln!(
 			file,
@@ -206,7 +242,7 @@ fn emit_result(result: &ProbeResult) {
 			 automatic_median_ns,order_scan_median_ns,order_index_median_ns,planning_p95_ns,\
 			 join_auto_median_ns,join_forced_median_ns"
 		)
-		.unwrap();
+		.assert_ok();
 	}
-	writeln!(file, "{row}").unwrap();
+	writeln!(file, "{row}").assert_ok();
 }

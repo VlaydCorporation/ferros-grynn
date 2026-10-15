@@ -306,11 +306,15 @@ fn decode_function_effect(value: u8) -> FerrosGrynnResult<FunctionEffect> {
 }
 
 #[cfg(test)]
+/// Regression tests for function behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies event frozen function counts are checked before allocation.
 	#[test]
-	fn event_frozen_function_counts_are_checked_before_allocation() -> FerrosGrynnResult<()> {
+	fn event_frozen_function_counts_are_checked_before_allocation() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut function = SchemaFunction::new(
 			"fn",
 			"a",
@@ -320,21 +324,24 @@ mod tests {
 			false,
 			None,
 			"{ RETURN 1; }",
-		)?;
-		function.id = Some(FunctionId::from_storage(1)?);
-		let bytes = encode_source(&function, &mut CodecBudget::new(1 << 20, 0)?)?;
+		)
+		.assert_ok();
+		function.id = Some(FunctionId::from_storage(1).assert_ok());
+		let bytes =
+			encode_source(&function, &mut CodecBudget::new(1 << 20, 0).assert_ok()).assert_ok();
 		let mut parameters = bytes.clone();
 		parameters[20..22].copy_from_slice(&u16::MAX.to_le_bytes());
-		let error = decode_source(&parameters, &mut CodecBudget::new(16 * 1024, 0)?)
+		let error = decode_source(&parameters, &mut CodecBudget::new(16 * 1024, 0).assert_ok())
 			.err()
-			.ok_or_else(|| invalid("malformed parameter count was accepted"))?;
+			.ok_or_else(|| invalid("malformed parameter count was accepted"))
+			.assert_ok();
 		assert!(error.to_string().contains("parameter count exceeds remaining bytes"));
 		let mut members = bytes;
 		members[36..38].copy_from_slice(&4096_u16.to_le_bytes());
-		let error = decode_source(&members, &mut CodecBudget::new(16 * 1024, 0)?)
+		let error = decode_source(&members, &mut CodecBudget::new(16 * 1024, 0).assert_ok())
 			.err()
-			.ok_or_else(|| invalid("malformed type count was accepted"))?;
+			.ok_or_else(|| invalid("malformed type count was accepted"))
+			.assert_ok();
 		assert!(error.to_string().contains("member count exceeds remaining bytes"));
-		Ok(())
 	}
 }

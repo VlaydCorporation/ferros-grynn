@@ -109,10 +109,13 @@ macro_rules! family_state {
 			type Mutable = $family<Mutable>;
 			type State = $state;
 
+			/// Returns the structural family used by this LIVE graph adapter.
 			fn family_kind() -> GraphKind {
 				GraphKind::$family
 			}
 
+			/// Extracts this concrete frozen family from an owned materialization,
+			/// rejecting other families.
 			fn from_materialized(graph: MaterializedGraph) -> FerrosGrynnResult<Self::Frozen> {
 				match graph {
 					MaterializedGraph::$family(graph) => Ok(graph),
@@ -124,6 +127,8 @@ macro_rules! family_state {
 				}
 			}
 
+			/// Wraps the concrete frozen family in its matching owned materialization
+			/// variant.
 			fn into_materialized(graph: Self::Frozen) -> MaterializedGraph {
 				MaterializedGraph::$family(graph)
 			}
@@ -179,6 +184,8 @@ macro_rules! family_state {
 				graph.clear_live_dirty();
 			}
 
+			/// Checks shared topology constraints before the concrete family's
+			/// structural invariants.
 			fn validate(&self) -> FerrosGrynnResult<()> {
 				validate_topology_constraints(self, self.topology_constraints())?;
 				($validate)(self)

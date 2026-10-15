@@ -32,13 +32,25 @@ pub struct ChangefeedClause {
 #[non_exhaustive]
 pub enum ShowChangesTarget {
 	/// Class name, including a retained historical name.
-	Class(Identifier),
+	Class(
+		/// Class name, including a retained historical name.
+		Identifier,
+	),
 	/// Graph name, including a retained historical name.
-	GraphName(Identifier),
+	GraphName(
+		/// Graph name, including a retained historical name.
+		Identifier,
+	),
 	/// Runtime qualified graph reference or graph-name string.
-	Graph(Expr),
+	Graph(
+		/// Runtime qualified graph reference or graph-name string.
+		Expr,
+	),
 	/// Runtime UUID or UUID string.
-	Changefeed(Expr),
+	Changefeed(
+		/// Runtime UUID or UUID string.
+		Expr,
+	),
 }
 
 /// Whole-commit history read.

@@ -3,6 +3,7 @@
 mod root;
 
 #[cfg(test)]
+/// Regression tests for base statistics behavior.
 mod tests;
 
 pub(super) use root::{BaseStatisticsLayout, decode_base_statistics_root};
@@ -87,6 +88,7 @@ where
 	Ok(properties)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

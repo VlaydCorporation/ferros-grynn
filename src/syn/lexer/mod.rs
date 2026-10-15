@@ -3,6 +3,7 @@ pub(super) mod keywords;
 use super::token::{Symbol, Token, TokenKind};
 use crate::gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan};
 
+/// Parses the lex syntax.
 pub(super) fn lex(source: &str) -> FerrosGrynnResult<Vec<Token>> {
 	Lexer {
 		source,
@@ -11,15 +12,21 @@ pub(super) fn lex(source: &str) -> FerrosGrynnResult<Vec<Token>> {
 	.run()
 }
 
+/// Lexer state.
 struct Lexer<'a> {
+	/// Source associated with this lexer.
 	source: &'a str,
+	/// Cursor associated with this lexer.
 	cursor: usize,
 }
 
 impl Lexer<'_> {
+	/// Parses the run syntax.
 	fn run(mut self) -> FerrosGrynnResult<Vec<Token>> {
 		let mut tokens = Vec::new();
 		loop {
+			// Preserve comments and whitespace as a gap: adjacency is
+			// significant to graph syntax.
 			let gap_before = self.skip_gap()?;
 			let start = self.cursor;
 			let Some(character) = self.peek() else {
@@ -58,6 +65,7 @@ impl Lexer<'_> {
 		}
 	}
 
+	/// Parses the skip gap syntax.
 	fn skip_gap(&mut self) -> FerrosGrynnResult<bool> {
 		let start = self.cursor;
 		loop {
@@ -88,6 +96,7 @@ impl Lexer<'_> {
 		Ok(self.cursor != start)
 	}
 
+	/// Parses the word syntax.
 	fn word(&mut self, quoted: bool) -> TokenKind {
 		let start = self.cursor;
 		self.bump();
@@ -100,6 +109,7 @@ impl Lexer<'_> {
 		}
 	}
 
+	/// Parses the quoted identifier syntax.
 	fn quoted_identifier(&mut self) -> FerrosGrynnResult<Box<str>> {
 		let start = self.cursor;
 		self.bump();
@@ -123,6 +133,7 @@ impl Lexer<'_> {
 		}
 	}
 
+	/// Parses the parameter syntax.
 	fn parameter(&mut self) -> FerrosGrynnResult<TokenKind> {
 		let start = self.cursor;
 		self.bump();
@@ -152,6 +163,7 @@ impl Lexer<'_> {
 		Ok(TokenKind::Parameter(value))
 	}
 
+	/// Parses the number syntax.
 	fn number(&mut self) -> TokenKind {
 		let start = self.cursor;
 		while self.peek().is_some_and(|value| value.is_ascii_digit() || value == '_') {
@@ -178,6 +190,7 @@ impl Lexer<'_> {
 		TokenKind::Number(self.source[start..self.cursor].into())
 	}
 
+	/// Parses the string syntax.
 	fn string(&mut self, quote: char) -> FerrosGrynnResult<Box<str>> {
 		let start = self.cursor;
 		self.bump();
@@ -198,6 +211,7 @@ impl Lexer<'_> {
 		}
 	}
 
+	/// Parses the escape syntax.
 	fn escape(&mut self, start: usize) -> FerrosGrynnResult<char> {
 		match self.bump() {
 			Some('n') => Ok('\n'),
@@ -233,6 +247,7 @@ impl Lexer<'_> {
 		}
 	}
 
+	/// Parses the full text or symbol syntax.
 	fn full_text_or_symbol(&mut self) -> FerrosGrynnResult<TokenKind> {
 		let start = self.cursor;
 		self.bump();
@@ -257,6 +272,7 @@ impl Lexer<'_> {
 		Ok(TokenKind::GraphRef(self.source[start + 1..self.cursor].into()))
 	}
 
+	/// Parses the symbol syntax.
 	fn symbol(&mut self) -> FerrosGrynnResult<Symbol> {
 		for (text, symbol) in [
 			("<->", Symbol::ArrowBoth),
@@ -325,14 +341,17 @@ impl Lexer<'_> {
 		Ok(symbol)
 	}
 
+	/// Parses the rest syntax.
 	fn rest(&self) -> &str {
 		&self.source[self.cursor..]
 	}
 
+	/// Parses the peek syntax.
 	fn peek(&self) -> Option<char> {
 		self.rest().chars().next()
 	}
 
+	/// Parses the bump syntax.
 	fn bump(&mut self) -> Option<char> {
 		let character = self.peek()?;
 		self.cursor += character.len_utf8();
@@ -340,18 +359,22 @@ impl Lexer<'_> {
 	}
 }
 
+/// Returns whether this value is ident start.
 fn is_ident_start(value: char) -> bool {
 	value == '_' || value.is_alphabetic()
 }
 
+/// Returns whether this value is ident continue.
 fn is_ident_continue(value: char) -> bool {
 	is_ident_start(value) || value.is_numeric()
 }
 
+/// Parses the span syntax.
 const fn span(start: usize, end: usize) -> TextSpan {
 	TextSpan::new(start as u32, (end - start) as u32)
 }
 
+/// Parses error.
 fn parse_error(source: &str, span: TextSpan, message: &str) -> FerrosGrynnError {
 	let error = FerrosGrynnError::query_parse_error(message).with_phase(ExecutionPhase::Parsing);
 	Location::from_source(None, source, span)
@@ -359,13 +382,16 @@ fn parse_error(source: &str, span: TextSpan, message: &str) -> FerrosGrynnError 
 }
 
 #[cfg(test)]
+/// Regression tests for lexer behavior.
 mod tests {
 	use super::{Symbol, TokenKind, lex};
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies keeps utf8 byte spans and greedy operators.
 	#[test]
 	fn keeps_utf8_byte_spans_and_greedy_operators() {
-		let tokens =
-			lex("α /* gap */ |> <| -> <- <-> ~> ~~ ~[ ]~ <~[ ]~> @@ @12@").expect("valid tokens");
+		let tokens = lex("α /* gap */ |> <| -> <- <-> ~> ~~ ~[ ]~ <~[ ]~> @@ @12@")
+			.assert_ok_with("valid tokens");
 		assert_eq!(tokens[0].span.len, 2);
 		assert!(tokens[1].gap_before);
 		assert_eq!(tokens[1].kind, TokenKind::Symbol(Symbol::Pipeline));
@@ -378,9 +404,10 @@ mod tests {
 		assert_eq!(tokens[13].kind, TokenKind::FullText("@12@".into()));
 	}
 
+	/// Verifies decodes quoted names parameters and string escapes.
 	#[test]
 	fn decodes_quoted_names_parameters_and_string_escapes() {
-		let tokens = lex("`им``я` $параметр 'line\\n\\u03b1'").expect("valid tokens");
+		let tokens = lex("`им``я` $параметр 'line\\n\\u03b1'").assert_ok_with("valid tokens");
 		assert_eq!(tokens[0].kind, TokenKind::Word {
 			value: "им`я".into(),
 			quoted: true,

@@ -1,9 +1,14 @@
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{ClassIndexKind, ClassSchemaMode, Datastore, FunctionEffect, IndexScope},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{AtomKind, Object, Type, Value},
 };
 
+/// Verifies graph index ddl validates projection budgets versions and info.
 #[test]
 fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
 	let store = Datastore::in_memory();
@@ -18,13 +23,13 @@ fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
 		 REBUILD INDEX path ON GRAPH network;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	for (ordinal, result) in results.iter().enumerate() {
 		assert!(result.result.is_ok(), "statement {ordinal}: {:?}", result.result);
 	}
 	let catalog = store.schema_catalog();
-	let graph = catalog.named_graph("network").unwrap();
-	let index = graph.indexes().find(|index| index.name().as_str() == "reach").unwrap();
+	let graph = catalog.named_graph("network").assert_some();
+	let index = graph.indexes().find(|index| index.name().as_str() == "reach").assert_some();
 	assert_eq!(index.mode(), crate::graph::TraversalSemantics::Atom);
 	assert_eq!(index.direction(), crate::graph::TraversalDirection::Both);
 	assert_eq!(index.definition(), &crate::datastore::GraphIndexDefinition::Reachability {
@@ -32,8 +37,8 @@ fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
 	});
 	let id = index.id();
 	let version = index.version();
-	let fingerprint = index.fingerprint().unwrap();
-	let info = results[4].result.as_ref().unwrap().value().as_object().unwrap();
+	let fingerprint = index.fingerprint().assert_ok();
+	let info = results[4].result.as_ref().assert_ok().value().as_object().assert_some();
 	assert_eq!(info.get("mode"), Some(&Value::from("ATOM")));
 	assert_eq!(info.get("fingerprint"), Some(&Value::from(fingerprint)));
 	let overwritten = store
@@ -41,11 +46,11 @@ fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
 			"DEFINE INDEX OVERWRITE reach ON GRAPH network REACHABILITY ALGORITHM BFL;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(overwritten[0].result.is_ok());
 	let catalog = store.schema_catalog();
-	let graph = catalog.named_graph("network").unwrap();
-	let index = graph.indexes().find(|index| index.name().as_str() == "reach").unwrap();
+	let graph = catalog.named_graph("network").assert_some();
+	let index = graph.indexes().find(|index| index.name().as_str() == "reach").assert_some();
 	assert_eq!(index.id(), id);
 	assert!(index.version() > version);
 	for query in [
@@ -59,7 +64,7 @@ fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
 		"DEFINE INDEX adjacency ON GRAPH network REACHABILITY ALGORITHM ON_DEMAND;",
 		"REMOVE INDEX adjacency ON GRAPH network;",
 	] {
-		assert!(store.execute(query, &Object::new()).unwrap()[0].result.is_err(), "{query}");
+		assert!(store.execute(query, &Object::new()).assert_ok()[0].result.is_err(), "{query}");
 	}
 	assert!(
 		store
@@ -74,10 +79,12 @@ fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
 			"REMOVE INDEX reach ON GRAPH network; REMOVE INDEX IF EXISTS reach ON GRAPH network;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(removed.iter().all(|result| result.result.is_ok()));
 }
 
+/// Verifies graph index function versions invalidate atomically and keep old
+/// snapshots.
 #[test]
 fn graph_index_function_versions_invalidate_atomically_and_keep_old_snapshots() {
 	let store = Datastore::in_memory();
@@ -87,10 +94,16 @@ fn graph_index_function_versions_invalidate_atomically_and_keep_old_snapshots() 
 			 1; }; DEFINE INDEX path ON GRAPH network PATH ALGORITHM ON_DEMAND COST fn::cost;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(defined.iter().all(|result| result.result.is_ok()), "{defined:?}");
-	let before =
-		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap().clone();
+	let before = store
+		.schema_catalog()
+		.named_graph("network")
+		.assert_some()
+		.indexes()
+		.next()
+		.assert_some()
+		.clone();
 	assert_eq!(before.state(), crate::datastore::ClassIndexState::Ready);
 	let mut old = store.begin();
 	let mut session = store.session();
@@ -100,14 +113,14 @@ fn graph_index_function_versions_invalidate_atomically_and_keep_old_snapshots() 
 			 network; CANCEL;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(private.iter().all(|result| result.result.is_ok()), "{private:?}");
 	assert_eq!(
-		private[2].result.as_ref().unwrap().value().as_object().unwrap().get("state"),
+		private[2].result.as_ref().assert_ok().value().as_object().assert_some().get("state"),
 		Some(&Value::from("stale"))
 	);
 	assert_eq!(
-		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap(),
+		store.schema_catalog().named_graph("network").assert_some().indexes().next().assert_some(),
 		&before
 	);
 	let mut competing = store.begin();
@@ -121,33 +134,47 @@ fn graph_index_function_versions_invalidate_atomically_and_keep_old_snapshots() 
 				},
 				None,
 			)
-			.unwrap(),
+			.assert_ok(),
 		)
-		.unwrap();
+		.assert_ok();
 	let changed =
-		store.execute("ALTER FUNCTION fn::cost(any) { RETURN 3; };", &Object::new()).unwrap();
+		store.execute("ALTER FUNCTION fn::cost(any) { RETURN 3; };", &Object::new()).assert_ok();
 	assert!(changed[0].result.is_ok());
 	assert!(competing.commit().is_err());
-	let after =
-		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap().clone();
+	let after = store
+		.schema_catalog()
+		.named_graph("network")
+		.assert_some()
+		.indexes()
+		.next()
+		.assert_some()
+		.clone();
 	assert_eq!(after.id(), before.id());
 	assert!(after.version() > before.version());
 	assert_eq!(after.state(), crate::datastore::ClassIndexState::Stale);
-	assert_ne!(after.fingerprint().unwrap(), before.fingerprint().unwrap());
-	assert_eq!(old.graphs().unwrap()[0].indexes().next().unwrap(), &before);
+	assert_ne!(after.fingerprint().assert_ok(), before.fingerprint().assert_ok());
+	assert_eq!(old.graphs().assert_ok()[0].indexes().next().assert_some(), &before);
 	let removed = store
 		.execute(
 			"REMOVE FUNCTION fn::cost(any); INFO FOR INDEX path ON GRAPH network;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(removed.iter().all(|result| result.result.is_ok()), "{removed:?}");
 	assert_eq!(
-		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap().state(),
+		store
+			.schema_catalog()
+			.named_graph("network")
+			.assert_some()
+			.indexes()
+			.next()
+			.assert_some()
+			.state(),
 		crate::datastore::ClassIndexState::Stale
 	);
 }
 
+/// Verifies geometry index ddl preserves type scope and info.
 #[test]
 fn geometry_index_ddl_preserves_type_scope_and_info() {
 	let store = Datastore::in_memory();
@@ -158,16 +185,16 @@ fn geometry_index_ddl_preserves_type_scope_and_info() {
 			 SCOPE BASE; INFO FOR INDEX by_shape ON CLASS place;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	for result in &results {
 		assert!(result.result.is_ok(), "{:?}", result.result);
 	}
 	let catalog = store.schema_catalog();
-	let class = catalog.class("place").unwrap();
-	let index = class.indexes().next().unwrap();
+	let class = catalog.class("place").assert_some();
+	let index = class.indexes().next().assert_some();
 	assert_eq!(index.kind(), ClassIndexKind::Geometry);
 	assert_eq!(
-		index.geometry_options().unwrap().geometry_type(),
+		index.geometry_options().assert_some().geometry_type(),
 		Some(crate::values::GeometryKind::Polygon)
 	);
 	assert_eq!(index.scope(), IndexScope::Base);
@@ -176,193 +203,297 @@ fn geometry_index_ddl_preserves_type_scope_and_info() {
 			"DEFINE INDEX wrong ON CLASS place FIELDS shape GEOMETRY TYPE Rectangle SCOPE BASE;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(result[0].result.is_err());
 }
 
+/// Verifies durable named function supports ddl overloads and calls.
 #[test]
-fn durable_named_function_supports_ddl_overloads_and_calls() -> FerrosGrynnResult<()> {
+fn durable_named_function_supports_ddl_overloads_and_calls() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let defined = store.execute(
-		"DEFINE PURE FUNCTION fn::increment(value: int) -> int { RETURN $value + 1; } COMMENT \
-		 'integer';",
-		&Object::new(),
-	)?;
+	let defined = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::increment(value: int) -> int { RETURN $value + 1; } COMMENT \
+			 'integer';",
+			&Object::new(),
+		)
+		.assert_ok();
 	if let Some(error) = defined.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"named function definition returned a statement error: {error}"
-		)));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("named function definition returned a statement error: {error}"),
+			));
+			test_result.assert_ok();
+		};
 	}
-	let results = store.execute(
-		"RETURN fn::increment(41); INFO FOR FUNCTION fn::increment(int);",
-		&Object::new(),
-	)?;
+	let results = store
+		.execute("RETURN fn::increment(41); INFO FOR FUNCTION fn::increment(int);", &Object::new())
+		.assert_ok();
 	if let Some(error) = results.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"named function invocation returned a statement error: {error}"
-		)));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("named function invocation returned a statement error: {error}"),
+			));
+			test_result.assert_ok();
+		};
 	}
-	if results[0].result.as_ref().map_err(Clone::clone)?.value() != &Value::from(42_i64) {
-		return Err(FerrosGrynnError::invalid_argument(
-			"named function returned an unexpected value",
-		));
+	if results[0].result.as_ref().map_err(Clone::clone).assert_ok().value() != &Value::from(42_i64)
+	{
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				"named function returned an unexpected value",
+			));
+			test_result.assert_ok();
+		};
 	}
-	let info =
-		results[1].result.as_ref().map_err(Clone::clone)?.value().as_object().ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("INFO FUNCTION returned no object")
-		})?;
+	let info = results[1]
+		.result
+		.as_ref()
+		.map_err(Clone::clone)
+		.assert_ok()
+		.value()
+		.as_object()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("INFO FUNCTION returned no object"))
+		.assert_ok();
 	if info.get("effect") != Some(&Value::from("pure"))
 		|| info.get("comment") != Some(&Value::from("integer"))
 	{
-		return Err(FerrosGrynnError::invalid_argument("function metadata was not retained"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("function metadata was not retained"));
+			test_result.assert_ok();
+		};
 	}
 
 	let catalog = store.schema_catalog();
-	let before = catalog.functions().next().cloned().ok_or_else(|| {
-		FerrosGrynnError::invalid_argument("function was not published in the schema catalog")
-	})?;
-	let altered = store.execute(
-		"ALTER FUNCTION fn::increment(int) { RETURN $value + 2; }; RETURN fn::increment(40);",
-		&Object::new(),
-	)?;
+	let before = catalog
+		.functions()
+		.next()
+		.cloned()
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("function was not published in the schema catalog")
+		})
+		.assert_ok();
+	let altered = store
+		.execute(
+			"ALTER FUNCTION fn::increment(int) { RETURN $value + 2; }; RETURN fn::increment(40);",
+			&Object::new(),
+		)
+		.assert_ok();
 	if altered.iter().any(|result| result.result.is_err())
-		|| altered[1].result.as_ref().map_err(Clone::clone)?.value() != &Value::from(42_i64)
+		|| altered[1].result.as_ref().map_err(Clone::clone).assert_ok().value()
+			!= &Value::from(42_i64)
 	{
-		return Err(FerrosGrynnError::invalid_argument("ALTER FUNCTION did not replace its body"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("ALTER FUNCTION did not replace its body"));
+			test_result.assert_ok();
+		};
 	}
 	let after = store
 		.schema_catalog()
 		.functions()
 		.next()
 		.cloned()
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("altered function disappeared"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("altered function disappeared"))
+		.assert_ok();
 	if before.id() != after.id() || before.version() >= after.version() {
-		return Err(FerrosGrynnError::invalid_argument(
-			"ALTER FUNCTION did not preserve identity and advance version",
-		));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				"ALTER FUNCTION did not preserve identity and advance version",
+			));
+			test_result.assert_ok();
+		};
 	}
 	if after.effect() != FunctionEffect::Pure {
-		return Err(FerrosGrynnError::invalid_argument("ALTER FUNCTION changed its effect"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("ALTER FUNCTION changed its effect"));
+			test_result.assert_ok();
+		};
 	}
-	let invalid_alter = store.execute(
-		"ALTER FUNCTION fn::increment(int) { LET $_ = time::now(); RETURN $value; };",
-		&Object::new(),
-	)?;
+	let invalid_alter = store
+		.execute(
+			"ALTER FUNCTION fn::increment(int) { LET $_ = time::now(); RETURN $value; };",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(invalid_alter[0].result.is_err());
-	let unchanged = store.execute("RETURN fn::increment(40);", &Object::new())?;
-	assert_eq!(unchanged[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(42_i64));
+	let unchanged = store.execute("RETURN fn::increment(40);", &Object::new()).assert_ok();
+	assert_eq!(
+		unchanged[0].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::from(42_i64)
+	);
 
-	let removed = store.execute(
-		"REMOVE FUNCTION fn::increment(int); INFO FOR FUNCTION fn::increment(int);",
-		&Object::new(),
-	)?;
+	let removed = store
+		.execute(
+			"REMOVE FUNCTION fn::increment(int); INFO FOR FUNCTION fn::increment(int);",
+			&Object::new(),
+		)
+		.assert_ok();
 	if removed[0].result.is_err() || removed[1].result.is_ok() {
-		return Err(FerrosGrynnError::invalid_argument("REMOVE FUNCTION did not remove overload"));
+		{
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("REMOVE FUNCTION did not remove overload"));
+			test_result.assert_ok();
+		}
 	}
-	Ok(())
 }
 
+/// Verifies named function arguments bind by declared name.
 #[test]
-fn named_function_arguments_bind_by_declared_name() -> FerrosGrynnResult<()> {
+fn named_function_arguments_bind_by_declared_name() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let defined = store.execute(
-		"DEFINE PURE FUNCTION fn::subtract(left: int, right: int) -> int { RETURN $left - $right; \
-		 };",
-		&Object::new(),
-	)?;
+	let defined = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::subtract(left: int, right: int) -> int { RETURN $left - \
+			 $right; };",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(defined[0].result.is_ok());
 
-	let called = store.execute(
-		"RETURN fn::subtract(right = 2, left = 5); RETURN fn::subtract(8, right = 3);",
-		&Object::new(),
-	)?;
-	assert_eq!(called[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(3_i64));
-	assert_eq!(called[1].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(5_i64));
+	let called = store
+		.execute(
+			"RETURN fn::subtract(right = 2, left = 5); RETURN fn::subtract(8, right = 3);",
+			&Object::new(),
+		)
+		.assert_ok();
+	assert_eq!(
+		called[0].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::from(3_i64)
+	);
+	assert_eq!(
+		called[1].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::from(5_i64)
+	);
 
-	let unknown = store.execute("RETURN fn::subtract(other = 2, left = 5);", &Object::new())?;
+	let unknown =
+		store.execute("RETURN fn::subtract(other = 2, left = 5);", &Object::new()).assert_ok();
 	assert!(unknown[0].result.is_err());
 	assert!(store.execute("RETURN fn::subtract(left = 5, left = 2);", &Object::new()).is_err());
 	assert!(store.execute("RETURN fn::subtract(left = 5, 2);", &Object::new()).is_err());
-	Ok(())
 }
 
+/// Verifies named function effects are transitive and deterministic requires
+/// pure.
 #[test]
-fn named_function_effects_are_transitive_and_deterministic_requires_pure() -> FerrosGrynnResult<()>
-{
-	let store = Datastore::in_memory();
-	let defined = store.execute(
-		"DEFINE PURE FUNCTION fn::increment(value: int) -> int { RETURN $value + 1; }; DEFINE \
-		 PURE FUNCTION fn::twice(value: int) -> int { RETURN \
-		 fn::increment(fn::increment($value)); }; DEFINE STABLE FUNCTION fn::clock() -> datetime \
-		 { RETURN time::now(); };",
-		&Object::new(),
-	)?;
-	if let Some(error) = defined.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"transitive named-function definition failed: {error}"
-		)));
-	}
-	let called = store.execute("RETURN fn::twice(40);", &Object::new())?;
-	assert_eq!(called[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(42_i64));
+fn named_function_effects_are_transitive_and_deterministic_requires_pure() {
+	use crate::test_assertions::AssertResult as _;
 
-	let invalid = store.execute(
-		"DEFINE PURE FUNCTION fn::invalid_clock() -> datetime { RETURN time::now(); };",
-		&Object::new(),
-	)?;
+	let store = Datastore::in_memory();
+	let defined = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::increment(value: int) -> int { RETURN $value + 1; }; DEFINE \
+			 PURE FUNCTION fn::twice(value: int) -> int { RETURN \
+			 fn::increment(fn::increment($value)); }; DEFINE STABLE FUNCTION fn::clock() -> \
+			 datetime { RETURN time::now(); };",
+			&Object::new(),
+		)
+		.assert_ok();
+	if let Some(error) = defined.iter().find_map(|result| result.result.as_ref().err()) {
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("transitive named-function definition failed: {error}"),
+			));
+			test_result.assert_ok();
+		};
+	}
+	let called = store.execute("RETURN fn::twice(40);", &Object::new()).assert_ok();
+	assert_eq!(
+		called[0].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::from(42_i64)
+	);
+
+	let invalid = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::invalid_clock() -> datetime { RETURN time::now(); };",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(invalid[0].result.is_err());
 
 	let mut session = store.session();
 	let begun = session
-		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())
+		.assert_ok();
 	assert!(begun[0].result.is_ok());
-	let stable = session.execute("RETURN fn::clock();", &Object::new())?;
+	let stable = session.execute("RETURN fn::clock();", &Object::new()).assert_ok();
 	assert!(stable[0].result.is_err());
-	Ok(())
 }
 
+/// Verifies named function recursion requires and enforces max depth.
 #[test]
-fn named_function_recursion_requires_and_enforces_max_depth() -> FerrosGrynnResult<()> {
+fn named_function_recursion_requires_and_enforces_max_depth() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let missing_bound = store.execute(
-		"DEFINE PURE FUNCTION fn::unbounded(value: int) -> int { RETURN fn::unbounded($value); };",
-		&Object::new(),
-	)?;
+	let missing_bound = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::unbounded(value: int) -> int { RETURN \
+			 fn::unbounded($value); };",
+			&Object::new(),
+		)
+		.assert_ok();
 	assert!(missing_bound[0].result.is_err());
 
-	let defined = store.execute(
-		"DEFINE PURE FUNCTION fn::sum_down(value: int) -> int MAXDEPTH 8 { IF $value <= 0 { \
-		 RETURN 0; }; RETURN $value + fn::sum_down($value - 1); };",
-		&Object::new(),
-	)?;
+	let defined = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::sum_down(value: int) -> int MAXDEPTH 8 { IF $value <= 0 { \
+			 RETURN 0; }; RETURN $value + fn::sum_down($value - 1); };",
+			&Object::new(),
+		)
+		.assert_ok();
 	if let Some(error) = defined.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"recursive function definition failed: {error}"
-		)));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("recursive function definition failed: {error}"),
+			));
+			test_result.assert_ok();
+		};
 	}
-	let called = store.execute("RETURN fn::sum_down(5);", &Object::new())?;
-	assert_eq!(called[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::from(15_i64));
+	let called = store.execute("RETURN fn::sum_down(5);", &Object::new()).assert_ok();
+	assert_eq!(
+		called[0].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::from(15_i64)
+	);
 
-	let exceeded = store.execute("RETURN fn::sum_down(9);", &Object::new())?;
+	let exceeded = store.execute("RETURN fn::sum_down(9);", &Object::new()).assert_ok();
 	assert!(exceeded[0].result.is_err());
 
-	let mutual = store.execute(
-		"DEFINE PURE FUNCTION fn::is_even(value: int) -> bool MAXDEPTH 16 { RETURN true; }; \
-		 DEFINE PURE FUNCTION fn::is_odd(value: int) -> bool MAXDEPTH 16 { IF $value <= 0 { \
-		 RETURN false; }; RETURN fn::is_even($value - 1); }; ALTER FUNCTION fn::is_even(int) { IF \
-		 $value <= 0 { RETURN true; }; RETURN fn::is_odd($value - 1); }; RETURN fn::is_even(6); \
-		 RETURN fn::is_odd(6);",
-		&Object::new(),
-	)?;
+	let mutual = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::is_even(value: int) -> bool MAXDEPTH 16 { RETURN true; }; \
+			 DEFINE PURE FUNCTION fn::is_odd(value: int) -> bool MAXDEPTH 16 { IF $value <= 0 { \
+			 RETURN false; }; RETURN fn::is_even($value - 1); }; ALTER FUNCTION fn::is_even(int) \
+			 { IF $value <= 0 { RETURN true; }; RETURN fn::is_odd($value - 1); }; RETURN \
+			 fn::is_even(6); RETURN fn::is_odd(6);",
+			&Object::new(),
+		)
+		.assert_ok();
 	if let Some(error) = mutual.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"mutually recursive function failed: {error}"
-		)));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("mutually recursive function failed: {error}"),
+			));
+			test_result.assert_ok();
+		};
 	}
-	assert_eq!(mutual[3].result.as_ref().map_err(Clone::clone)?.value(), &Value::Bool(true));
-	assert_eq!(mutual[4].result.as_ref().map_err(Clone::clone)?.value(), &Value::Bool(false));
-	Ok(())
+	assert_eq!(
+		mutual[3].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::Bool(true)
+	);
+	assert_eq!(
+		mutual[4].result.as_ref().map_err(Clone::clone).assert_ok().value(),
+		&Value::Bool(false)
+	);
 }
 
+/// Verifies durable parameters support ddl precedence and transaction rollback.
 #[test]
 fn durable_parameters_support_ddl_precedence_and_transaction_rollback() -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
@@ -416,90 +547,130 @@ fn durable_parameters_support_ddl_precedence_and_transaction_rollback() -> Ferro
 	Ok(())
 }
 
+/// Verifies durable analyzers support inline mapper alter info and rollback.
 #[test]
-fn durable_analyzers_support_inline_mapper_alter_info_and_rollback() -> FerrosGrynnResult<()> {
+fn durable_analyzers_support_inline_mapper_alter_info_and_rollback() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let defined = store.execute(
-		"DEFINE ANALYZER english TOKENIZERS blank, punct FILTERS lowercase, mapper({driven: \
-		 'drive', stop_word: null}) COMMENT 'base';",
-		&Object::new(),
-	)?;
+	let defined = store
+		.execute(
+			"DEFINE ANALYZER english TOKENIZERS blank, punct FILTERS lowercase, mapper({driven: \
+			 'drive', stop_word: null}) COMMENT 'base';",
+			&Object::new(),
+		)
+		.assert_ok();
 	if let Some(error) = defined.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"analyzer definition failed: {error}"
-		)));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("analyzer definition failed: {error}"),
+			));
+			test_result.assert_ok();
+		};
 	}
-	let info_result = store.execute("INFO FOR ANALYZER english;", &Object::new())?;
-	let info =
-		info_result[0].result.as_ref().map_err(Clone::clone)?.value().as_object().ok_or_else(
-			|| FerrosGrynnError::invalid_argument("INFO FOR ANALYZER returned no object"),
-		)?;
+	let info_result = store.execute("INFO FOR ANALYZER english;", &Object::new()).assert_ok();
+	let info = info_result[0]
+		.result
+		.as_ref()
+		.map_err(Clone::clone)
+		.assert_ok()
+		.value()
+		.as_object()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("INFO FOR ANALYZER returned no object"))
+		.assert_ok();
 	if info.get("comment") != Some(&Value::from("base")) {
-		return Err(FerrosGrynnError::invalid_argument("analyzer comment was not retained"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("analyzer comment was not retained"));
+			test_result.assert_ok();
+		};
 	}
 	let before = store
 		.schema_catalog()
 		.analyzer("english")
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("analyzer was not published"))?;
-	let altered = store.execute(
-		"ALTER ANALYZER english DROP TOKENIZERS FILTERS nfkc COMMENT 'changed';",
-		&Object::new(),
-	)?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("analyzer was not published"))
+		.assert_ok();
+	let altered = store
+		.execute(
+			"ALTER ANALYZER english DROP TOKENIZERS FILTERS nfkc COMMENT 'changed';",
+			&Object::new(),
+		)
+		.assert_ok();
 	if altered[0].result.is_err() {
-		return Err(FerrosGrynnError::invalid_argument("ALTER ANALYZER failed"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("ALTER ANALYZER failed"));
+			test_result.assert_ok();
+		};
 	}
 	let after = store
 		.schema_catalog()
 		.analyzer("english")
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("altered analyzer disappeared"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("altered analyzer disappeared"))
+		.assert_ok();
 	if before.id() != after.id()
 		|| before.version() >= after.version()
 		|| after.tokenizers().len() != 0
 		|| after.comment().is_none_or(|comment| comment.as_str() != "changed")
 	{
-		return Err(FerrosGrynnError::invalid_argument(
-			"ALTER ANALYZER did not preserve identity and replace the definition",
-		));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				"ALTER ANALYZER did not preserve identity and replace the definition",
+			));
+			test_result.assert_ok();
+		};
 	}
 
 	let mut transaction = store.begin();
-	let changed =
-		transaction.execute("ALTER ANALYZER english COMMENT 'rolled-back';", &Object::new())?;
+	let changed = transaction
+		.execute("ALTER ANALYZER english COMMENT 'rolled-back';", &Object::new())
+		.assert_ok();
 	if changed[0].result.is_err() {
-		return Err(FerrosGrynnError::invalid_argument("transactional ALTER ANALYZER failed"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("transactional ALTER ANALYZER failed"));
+			test_result.assert_ok();
+		};
 	}
 	drop(transaction);
 	let visible = store
 		.schema_catalog()
 		.analyzer("english")
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("analyzer disappeared after rollback"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("analyzer disappeared after rollback"))
+		.assert_ok();
 	if visible.comment().is_none_or(|comment| comment.as_str() != "changed") {
-		return Err(FerrosGrynnError::invalid_argument(
-			"rolled-back analyzer change became visible",
-		));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				"rolled-back analyzer change became visible",
+			));
+			test_result.assert_ok();
+		};
 	}
 
-	let invalid =
-		store.execute("DEFINE ANALYZER bad FILTERS mapper('dictionary.txt');", &Object::new())?;
+	let invalid = store
+		.execute("DEFINE ANALYZER bad FILTERS mapper('dictionary.txt');", &Object::new())
+		.assert_ok();
 	assert!(invalid[0].result.is_err());
-	let removed = store.execute("REMOVE ANALYZER english;", &Object::new())?;
+	let removed = store.execute("REMOVE ANALYZER english;", &Object::new()).assert_ok();
 	assert!(removed[0].result.is_ok());
 	assert!(store.schema_catalog().analyzer("english").is_none());
-	Ok(())
 }
 
+/// Verifies search analyze executes builtin and span aware function pipelines.
 #[test]
-fn search_analyze_executes_builtin_and_span_aware_function_pipelines() -> FerrosGrynnResult<()> {
+fn search_analyze_executes_builtin_and_span_aware_function_pipelines() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let defined = store.execute(
-		"DEFINE ANALYZER words TOKENIZERS blank, punct FILTERS lowercase;",
-		&Object::new(),
-	)?;
+	let defined = store
+		.execute("DEFINE ANALYZER words TOKENIZERS blank, punct FILTERS lowercase;", &Object::new())
+		.assert_ok();
 	assert!(defined[0].result.is_ok());
-	let results =
-		store.execute("RETURN search::analyze('words', 'Hello World!');", &Object::new())?;
+	let results = store
+		.execute("RETURN search::analyze('words', 'Hello World!');", &Object::new())
+		.assert_ok();
 	assert_eq!(
-		results[0].result.as_ref().map_err(Clone::clone)?.value(),
+		results[0].result.as_ref().map_err(Clone::clone).assert_ok().value(),
 		&Value::Array(crate::values::Array::from_iter([
 			Value::from("hello"),
 			Value::from("world"),
@@ -507,19 +678,24 @@ fn search_analyze_executes_builtin_and_span_aware_function_pipelines() -> Ferros
 		])),
 	);
 
-	let function_results = store.execute(
-		"DEFINE PURE FUNCTION fn::whole(value: string) -> array<object> { RETURN [{term: $value, \
-		 start: 0, end: string::len($value)}]; }; DEFINE ANALYZER whole FUNCTION fn::whole \
-		 FILTERS uppercase; RETURN search::analyze('whole', 'граф');",
-		&Object::new(),
-	)?;
+	let function_results = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::whole(value: string) -> array<object> { RETURN [{term: \
+			 $value, start: 0, end: string::len($value)}]; }; DEFINE ANALYZER whole FUNCTION \
+			 fn::whole FILTERS uppercase; RETURN search::analyze('whole', 'граф');",
+			&Object::new(),
+		)
+		.assert_ok();
 	if function_results.iter().any(|result| result.result.is_err()) {
-		return Err(FerrosGrynnError::invalid_argument(
-			"function-backed search::analyze pipeline failed",
-		));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				"function-backed search::analyze pipeline failed",
+			));
+			test_result.assert_ok();
+		};
 	}
 	assert_eq!(
-		function_results[2].result.as_ref().map_err(Clone::clone)?.value(),
+		function_results[2].result.as_ref().map_err(Clone::clone).assert_ok().value(),
 		&Value::Array(crate::values::Array::from_iter([Value::from("ГРАФ")])),
 	);
 	for invalid in [
@@ -529,50 +705,60 @@ fn search_analyze_executes_builtin_and_span_aware_function_pipelines() -> Ferros
 		"DEFINE PURE FUNCTION fn::wrong_tokens(value: string) -> string { RETURN $value; }; \
 		 DEFINE ANALYZER invalid_signature FUNCTION fn::wrong_tokens;",
 	] {
-		let results = store.execute(invalid, &Object::new())?;
+		let results = store.execute(invalid, &Object::new()).assert_ok();
 		assert!(results[0].result.is_ok());
 		assert!(results[1].result.is_err());
 	}
-	Ok(())
 }
 
+/// Verifies specialized index definitions publish checked options.
 #[test]
-fn specialized_index_definitions_publish_checked_options() -> FerrosGrynnResult<()> {
+fn specialized_index_definitions_publish_checked_options() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
-	let results = store.execute(
-		"DEFINE ANALYZER english TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
-		 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
-		 embedding ON CLASS document TYPE vector<f32>; DEFINE FIELD compact ON CLASS document \
-		 TYPE vector<f16>; DEFINE INDEX title_search ON CLASS document FIELDS title FULLTEXT \
-		 ANALYZER english BM25(1.4, 0.6) HIGHLIGHTS SCOPE BASE DEFER; DEFINE INDEX embedding_hnsw \
-		 ON CLASS document FIELDS embedding HNSW DIMENSION 128 TYPE F32 DIST COSINE EFC 180 M 16 \
-		 SCOPE BASE; DEFINE INDEX compact_disk ON CLASS document FIELDS compact DISKANN DIMENSION \
-		 768 TYPE F16 DIST COSINE_NORMALIZED DEGREE 48 L_BUILD 120 ALPHA 1.3 HASHED_VECTOR SCOPE \
-		 BASE CONCURRENTLY;",
-		&Object::new(),
-	)?;
+	let results = store
+		.execute(
+			"DEFINE ANALYZER english TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document \
+			 TYPE NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
+			 embedding ON CLASS document TYPE vector<f32>; DEFINE FIELD compact ON CLASS document \
+			 TYPE vector<f16>; DEFINE INDEX title_search ON CLASS document FIELDS title FULLTEXT \
+			 ANALYZER english BM25(1.4, 0.6) HIGHLIGHTS SCOPE BASE DEFER; DEFINE INDEX \
+			 embedding_hnsw ON CLASS document FIELDS embedding HNSW DIMENSION 128 TYPE F32 DIST \
+			 COSINE EFC 180 M 16 SCOPE BASE; DEFINE INDEX compact_disk ON CLASS document FIELDS \
+			 compact DISKANN DIMENSION 768 TYPE F16 DIST COSINE_NORMALIZED DEGREE 48 L_BUILD 120 \
+			 ALPHA 1.3 HASHED_VECTOR SCOPE BASE CONCURRENTLY;",
+			&Object::new(),
+		)
+		.assert_ok();
 	if let Some(error) = results.iter().find_map(|result| result.result.as_ref().err()) {
-		return Err(FerrosGrynnError::invalid_argument(format!(
-			"specialized index definition failed: {error}"
-		)));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				format!("specialized index definition failed: {error}"),
+			));
+			test_result.assert_ok();
+		};
 	}
 	let class = store
 		.schema_catalog()
 		.class("document")
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("document class is absent"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("document class is absent"))
+		.assert_ok();
 	let fulltext = class
 		.indexes()
 		.find(|index| index.name().as_str() == "title_search")
 		.and_then(crate::datastore::ClassIndex::fulltext_options)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("Fulltext options are absent"))?;
-	assert_eq!(fulltext.k1(), 1.4);
-	assert_eq!(fulltext.b(), 0.6);
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("Fulltext options are absent"))
+		.assert_ok();
+	assert_eq!(fulltext.k1().partial_cmp(&1.4), Some(std::cmp::Ordering::Equal));
+	assert_eq!(fulltext.b().partial_cmp(&0.6), Some(std::cmp::Ordering::Equal));
 	assert!(fulltext.highlights());
 	let hnsw = class
 		.indexes()
 		.find(|index| index.name().as_str() == "embedding_hnsw")
 		.and_then(crate::datastore::ClassIndex::hnsw_options)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("HNSW options are absent"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("HNSW options are absent"))
+		.assert_ok();
 	assert_eq!(hnsw.dimension().get(), 128);
 	assert_eq!(hnsw.m().get(), 16);
 	assert_eq!(hnsw.m0().get(), 32);
@@ -580,32 +766,36 @@ fn specialized_index_definitions_publish_checked_options() -> FerrosGrynnResult<
 		.indexes()
 		.find(|index| index.name().as_str() == "compact_disk")
 		.and_then(crate::datastore::ClassIndex::disk_ann_options)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("DiskANN options are absent"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("DiskANN options are absent"))
+		.assert_ok();
 	assert_eq!(disk_ann.dimension().get(), 768);
 	assert_eq!(disk_ann.degree().get(), 48);
 	assert_eq!(disk_ann.build_list_size().get(), 120);
 	assert!(disk_ann.hashed_vector());
-	Ok(())
 }
 
+/// Verifies durable parameter overwrite preserves identity and rejects runtime
+/// values.
 #[test]
 fn durable_parameter_overwrite_preserves_identity_and_rejects_runtime_values() {
 	let store = Datastore::in_memory();
-	let first = store.execute("DEFINE PARAM $value VALUE 1;", &Object::new()).unwrap();
+	let first = store.execute("DEFINE PARAM $value VALUE 1;", &Object::new()).assert_ok();
 	assert!(first[0].result.is_ok());
-	let before = store.schema_catalog().parameter("value").unwrap();
+	let before = store.schema_catalog().parameter("value").assert_some();
 	let overwritten =
-		store.execute("DEFINE PARAM OVERWRITE $value VALUE 2;", &Object::new()).unwrap();
+		store.execute("DEFINE PARAM OVERWRITE $value VALUE 2;", &Object::new()).assert_ok();
 	assert!(overwritten[0].result.is_ok());
-	let after = store.schema_catalog().parameter("value").unwrap();
+	let after = store.schema_catalog().parameter("value").assert_some();
 	assert_eq!(before.id(), after.id());
 	assert!(after.version() > before.version());
 	assert_eq!(after.value(), &Value::from(2_i64));
 
-	let runtime = store.execute("DEFINE PARAM $callable VALUE |$x| $x;", &Object::new()).unwrap();
+	let runtime =
+		store.execute("DEFINE PARAM $callable VALUE |$x| $x;", &Object::new()).assert_ok();
 	assert!(runtime[0].result.is_err());
 }
 
+/// Verifies deferred index is stale inside mutation and never serves old rows.
 #[test]
 fn deferred_index_is_stale_inside_mutation_and_never_serves_old_rows() -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
@@ -651,6 +841,7 @@ fn deferred_index_is_stale_inside_mutation_and_never_serves_old_rows() -> Ferros
 	Ok(())
 }
 
+/// Verifies info for index exposes deferred query visibility.
 #[test]
 fn info_for_index_exposes_deferred_query_visibility() -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
@@ -682,13 +873,14 @@ fn info_for_index_exposes_deferred_query_visibility() -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies class field index and info share one transaction visible catalog.
 #[test]
 fn class_field_index_and_info_share_one_transaction_visible_catalog() {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
 	let definitions = transaction
 		.execute("DEFINE GRAPH social; DEFINE CLASS person TYPE NODE SCHEMAFULL;", &Object::new())
-		.unwrap();
+		.assert_ok();
 	assert!(definitions.iter().all(|result| result.result.is_ok()));
 	let results = transaction
 		.execute(
@@ -696,33 +888,35 @@ fn class_field_index_and_info_share_one_transaction_visible_catalog() {
 			 person FIELDS email UNIQUE SCOPE EFFECTIVE IN GRAPH social; INFO FOR CLASS person;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(results.len(), 3);
 	assert!(results.iter().all(|result| result.result.is_ok()));
-	let info = results[2].result.as_ref().unwrap().value().as_object().unwrap();
+	let info = results[2].result.as_ref().assert_ok().value().as_object().assert_some();
 	assert!(info.get("definition").is_some());
-	assert!(info.get("indexes").and_then(Value::as_object).unwrap().contains_key("by_email"));
-	transaction.commit().unwrap();
+	assert!(info.get("indexes").and_then(Value::as_object).assert_some().contains_key("by_email"));
+	transaction.commit().assert_ok();
 
-	let class = store.class("person").unwrap();
+	let class = store.class("person").assert_some();
 	assert_eq!(class.kind(), AtomKind::Node);
 	assert_eq!(class.schema_mode(), ClassSchemaMode::Schemafull);
-	assert_eq!(class.fields().next().unwrap().value_type(), &Type::String);
-	let index = class.indexes().next().unwrap();
+	assert_eq!(class.fields().next().assert_some().value_type(), &Type::String);
+	let index = class.indexes().next().assert_some();
 	assert_eq!(index.kind(), ClassIndexKind::Unique);
 	assert!(matches!(index.scope(), IndexScope::Effective { .. }));
 }
 
+/// Verifies overwrite cannot change class kind.
 #[test]
 fn overwrite_cannot_change_class_kind() {
 	let store = Datastore::in_memory();
 	let mut transaction = store.begin();
-	transaction.execute("DEFINE CLASS person TYPE NODE;", &Object::new()).unwrap();
+	transaction.execute("DEFINE CLASS person TYPE NODE;", &Object::new()).assert_ok();
 	let results =
-		transaction.execute("DEFINE CLASS OVERWRITE person TYPE EDGE;", &Object::new()).unwrap();
+		transaction.execute("DEFINE CLASS OVERWRITE person TYPE EDGE;", &Object::new()).assert_ok();
 	assert!(results[0].result.is_err());
 }
 
+/// Verifies graph properties are transactional and use nested paths.
 #[test]
 fn graph_properties_are_transactional_and_use_nested_paths() {
 	let store = Datastore::in_memory();
@@ -732,7 +926,7 @@ fn graph_properties_are_transactional_and_use_nested_paths() {
 			 {city: 'Paris'}};",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(defined[0].result.is_ok());
 	let updated = store
 		.execute(
@@ -740,10 +934,10 @@ fn graph_properties_are_transactional_and_use_nested_paths() {
 			 RETURN AFTER; UPDATE GRAPH sales UNSET properties.region RETURN DIFF;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(updated.iter().all(|result| result.result.is_ok()));
-	let after = updated[0].result.as_ref().unwrap().value().as_object().unwrap();
-	let properties = after.get("properties").and_then(Value::as_object).unwrap();
+	let after = updated[0].result.as_ref().assert_ok().value().as_object().assert_some();
+	let properties = after.get("properties").and_then(Value::as_object).assert_some();
 	assert_eq!(properties.get("owner"), Some(&Value::from("risk")));
 	assert_eq!(
 		properties
@@ -752,45 +946,48 @@ fn graph_properties_are_transactional_and_use_nested_paths() {
 			.and_then(|address| address.get("city")),
 		Some(&Value::from("Berlin")),
 	);
-	let schema = store.schema_catalog().named_graph("sales").unwrap();
+	let schema = store.schema_catalog().named_graph("sales").assert_some();
 	let dictionary = store.property_dictionary();
 	assert_eq!(
-		schema.properties().get(dictionary.get("owner").unwrap()),
+		schema.properties().get(dictionary.get("owner").assert_some()),
 		Some(&Value::from("risk")),
 	);
-	assert!(!schema.properties().contains_key(dictionary.get("region").unwrap()));
+	assert!(!schema.properties().contains_key(dictionary.get("region").assert_some()));
 
 	let mut rolled_back = store.begin();
 	let result = rolled_back
 		.execute("UPDATE GRAPH sales SET properties.owner = 'temporary';", &Object::new())
-		.unwrap();
+		.assert_ok();
 	assert!(result[0].result.is_ok());
 	drop(rolled_back);
-	let schema = store.schema_catalog().named_graph("sales").unwrap();
+	let schema = store.schema_catalog().named_graph("sales").assert_some();
 	assert_eq!(
-		schema.properties().get(dictionary.get("owner").unwrap()),
+		schema.properties().get(dictionary.get("owner").assert_some()),
 		Some(&Value::from("risk")),
 	);
 }
 
+/// Verifies concurrent graph property writers conflict.
 #[test]
 fn concurrent_graph_property_writers_conflict() {
 	let store = Datastore::in_memory();
-	store.execute("DEFINE GRAPH sales CONTENT {owner: 'first'};", &Object::new()).unwrap();
+	store.execute("DEFINE GRAPH sales CONTENT {owner: 'first'};", &Object::new()).assert_ok();
 	let mut first = store.begin();
 	let mut second = store.begin();
 	assert!(
-		first.execute("UPDATE GRAPH sales SET properties.owner = 'one';", &Object::new()).unwrap()
-			[0]
-		.result
-		.is_ok()
+		first
+			.execute("UPDATE GRAPH sales SET properties.owner = 'one';", &Object::new())
+			.assert_ok()[0]
+			.result
+			.is_ok()
 	);
 	assert!(
-		second.execute("UPDATE GRAPH sales SET properties.owner = 'two';", &Object::new()).unwrap()
-			[0]
-		.result
-		.is_ok()
+		second
+			.execute("UPDATE GRAPH sales SET properties.owner = 'two';", &Object::new())
+			.assert_ok()[0]
+			.result
+			.is_ok()
 	);
-	first.commit().unwrap();
+	first.commit().assert_ok();
 	assert!(second.commit().is_err());
 }

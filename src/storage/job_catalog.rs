@@ -25,22 +25,32 @@ use crate::{
 	values::Uuid,
 };
 
+/// Configured magic value.
 const MAGIC: [u8; 4] = *b"FGJB";
+/// Configured version value.
 const VERSION: u16 = 1;
+/// Configured header bytes value.
 const HEADER_BYTES: usize = 32;
+/// Byte offset of checksum in its encoded layout.
 const CHECKSUM_OFFSET: usize = 24;
+/// Configured max job catalog bytes value.
 pub(super) const MAX_JOB_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+/// Configured max job count value.
 const MAX_JOB_COUNT: usize = 16_384;
+/// Configured max diagnostic bytes value.
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Durable job records plus the metadata-COW authority clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct JobCatalog {
+	/// Generation identifying this version of the data.
 	pub(super) generation: u64,
+	/// Jobs associated with this job catalog.
 	pub(super) jobs: Vec<MaintenanceJobInfo>,
 }
 
 impl Default for JobCatalog {
+	/// Constructs the default initial state of `JobCatalog`.
 	fn default() -> Self {
 		Self {
 			generation: 1,
@@ -122,6 +132,7 @@ impl JobCatalog {
 	}
 }
 
+/// Encodes job.
 fn encode_job(output: &mut Vec<u8>, job: &MaintenanceJobInfo) -> FerrosGrynnResult<()> {
 	if job.event.is_some()
 		|| job.kind == MaintenanceJobKind::EventInvocation
@@ -195,6 +206,7 @@ fn encode_job(output: &mut Vec<u8>, job: &MaintenanceJobInfo) -> FerrosGrynnResu
 	Ok(())
 }
 
+/// Decodes job.
 fn decode_job(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<MaintenanceJobInfo> {
 	let mut uuid = [0; 16];
 	uuid.copy_from_slice(decoder.read_exact(16)?);
@@ -321,6 +333,7 @@ fn decode_job(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<MaintenanceJobInfo
 	})
 }
 
+/// Validates job target.
 fn validate_job_target(
 	kind: MaintenanceJobKind,
 	target: MaintenanceTarget,
@@ -351,6 +364,7 @@ fn validate_job_target(
 	}
 }
 
+/// Encodes analyze mode.
 fn encode_analyze_mode(job: &MaintenanceJobInfo) -> FerrosGrynnResult<(u8, u32)> {
 	match (job.kind, job.analyze_mode) {
 		(MaintenanceJobKind::Analyze, Some(MaintenanceAnalyzeMode::Automatic)) => Ok((1, 0)),
@@ -369,6 +383,7 @@ fn encode_analyze_mode(job: &MaintenanceJobInfo) -> FerrosGrynnResult<(u8, u32)>
 	}
 }
 
+/// Decodes analyze mode.
 fn decode_analyze_mode(
 	kind: MaintenanceJobKind,
 	mode: u8,
@@ -392,6 +407,7 @@ fn decode_analyze_mode(
 	}
 }
 
+/// Writes time.
 fn write_time(output: &mut Vec<u8>, value: SystemTime) -> FerrosGrynnResult<()> {
 	let duration = value
 		.duration_since(UNIX_EPOCH)
@@ -401,6 +417,7 @@ fn write_time(output: &mut Vec<u8>, value: SystemTime) -> FerrosGrynnResult<()> 
 	Ok(())
 }
 
+/// Reads time.
 fn read_time(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<SystemTime> {
 	let seconds = decoder.read_u64()?;
 	let nanos = decoder.read_u32()?;
@@ -412,6 +429,7 @@ fn read_time(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<SystemTime> {
 		.ok_or_else(|| invalid("job timestamp is outside the platform domain"))
 }
 
+/// Returns the kind byte result.
 const fn kind_byte(kind: MaintenanceJobKind) -> u8 {
 	match kind {
 		MaintenanceJobKind::EventInvocation => 8,
@@ -426,6 +444,7 @@ const fn kind_byte(kind: MaintenanceJobKind) -> u8 {
 	}
 }
 
+/// Decodes kind.
 fn decode_kind(value: u8) -> FerrosGrynnResult<MaintenanceJobKind> {
 	match value {
 		0 => Ok(MaintenanceJobKind::BuildIndex),
@@ -440,6 +459,7 @@ fn decode_kind(value: u8) -> FerrosGrynnResult<MaintenanceJobKind> {
 	}
 }
 
+/// Returns the state byte result.
 const fn state_byte(state: MaintenanceJobState) -> u8 {
 	match state {
 		MaintenanceJobState::Running => 8,
@@ -454,6 +474,7 @@ const fn state_byte(state: MaintenanceJobState) -> u8 {
 	}
 }
 
+/// Decodes state.
 fn decode_state(value: u8) -> FerrosGrynnResult<MaintenanceJobState> {
 	match value {
 		0 => Ok(MaintenanceJobState::Queued),
@@ -468,30 +489,37 @@ fn decode_state(value: u8) -> FerrosGrynnResult<MaintenanceJobState> {
 	}
 }
 
+/// Returns the catalog checksum result.
 fn catalog_checksum(bytes: &[u8]) -> u64 {
 	let mut canonical = bytes.to_vec();
 	canonical[CHECKSUM_OFFSET..HEADER_BYTES].fill(0);
 	rapidhash_v3(&canonical)
 }
 
+/// Writes u16.
 fn write_u16(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResult<()> {
 	let value = u16::try_from(value).map_err(|_error| invalid(format!("{field} overflows u16")))?;
 	output.extend_from_slice(&value.to_le_bytes());
 	Ok(())
 }
 
+/// Writes u32.
 fn write_u32(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResult<()> {
 	let value = u32::try_from(value).map_err(|_error| invalid(format!("{field} overflows u32")))?;
 	output.extend_from_slice(&value.to_le_bytes());
 	Ok(())
 }
 
+/// Decoder state.
 struct Decoder<'a> {
+	/// Bytes associated with this decoder.
 	bytes: &'a [u8],
+	/// Position relative to the beginning of the associated buffer.
 	offset: usize,
 }
 
 impl<'a> Decoder<'a> {
+	/// Creates a new `Decoder<'a>` value.
 	const fn new(bytes: &'a [u8]) -> Self {
 		Self {
 			bytes,
@@ -499,6 +527,7 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
+	/// Reads exact.
 	fn read_exact(&mut self, length: usize) -> FerrosGrynnResult<&'a [u8]> {
 		let end = self
 			.offset
@@ -510,32 +539,38 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Returns the skip result.
 	fn skip(&mut self, length: usize) -> FerrosGrynnResult<()> {
 		self.read_exact(length).map(|_bytes| ())
 	}
 
+	/// Reads u8.
 	fn read_u8(&mut self) -> FerrosGrynnResult<u8> {
 		Ok(self.read_exact(1)?[0])
 	}
 
+	/// Reads u16.
 	fn read_u16(&mut self) -> FerrosGrynnResult<u16> {
 		let mut bytes = [0; 2];
 		bytes.copy_from_slice(self.read_exact(2)?);
 		Ok(u16::from_le_bytes(bytes))
 	}
 
+	/// Reads u32.
 	fn read_u32(&mut self) -> FerrosGrynnResult<u32> {
 		let mut bytes = [0; 4];
 		bytes.copy_from_slice(self.read_exact(4)?);
 		Ok(u32::from_le_bytes(bytes))
 	}
 
+	/// Reads u64.
 	fn read_u64(&mut self) -> FerrosGrynnResult<u64> {
 		let mut bytes = [0; 8];
 		bytes.copy_from_slice(self.read_exact(8)?);
 		Ok(u64::from_le_bytes(bytes))
 	}
 
+	/// Reads count.
 	fn read_count(&mut self, field: &str, maximum: usize) -> FerrosGrynnResult<usize> {
 		let value = usize::try_from(self.read_u32()?)
 			.map_err(|_error| invalid(format!("{field} exceeds this platform")))?;
@@ -545,6 +580,7 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Returns the expect zero result.
 	fn expect_zero(&mut self, length: usize, field: &str) -> FerrosGrynnResult<()> {
 		if self.read_exact(length)?.iter().any(|byte| *byte != 0) {
 			return Err(invalid(format!("{field} are non-zero")));
@@ -552,19 +588,23 @@ impl<'a> Decoder<'a> {
 		Ok(())
 	}
 
+	/// Returns whether there are no logical elements.
 	fn is_empty(&self) -> bool {
 		self.offset == self.bytes.len()
 	}
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for job catalog behavior.
 mod tests {
 	use super::*;
 
+	/// Returns sample for this module.
 	fn sample() -> FerrosGrynnResult<MaintenanceJobInfo> {
 		let now = UNIX_EPOCH + Duration::new(1_700_000_000, 123);
 		Ok(MaintenanceJobInfo {
@@ -595,6 +635,7 @@ mod tests {
 		})
 	}
 
+	/// Returns sample analyze for this module.
 	fn sample_analyze() -> FerrosGrynnResult<MaintenanceJobInfo> {
 		let now = UNIX_EPOCH + Duration::new(1_700_000_001, 456);
 		Ok(MaintenanceJobInfo {
@@ -626,16 +667,19 @@ mod tests {
 		})
 	}
 
+	/// Verifies fg jb v1 round trips and rejects corruption.
 	#[test]
-	fn fg_jb_v1_round_trips_and_rejects_corruption() -> FerrosGrynnResult<()> {
+	fn fg_jb_v1_round_trips_and_rejects_corruption() {
+		use crate::test_assertions::AssertResult as _;
+
 		let catalog = JobCatalog {
 			generation: 3,
-			jobs: vec![sample()?, sample_analyze()?],
+			jobs: vec![sample().assert_ok(), sample_analyze().assert_ok()],
 		};
-		let bytes = catalog.encode()?;
+		let bytes = catalog.encode().assert_ok();
 		assert_eq!(&bytes[..4], b"FGJB");
 		assert_eq!(&bytes[4..6], &1_u16.to_le_bytes());
-		assert_eq!(JobCatalog::decode(&bytes)?, catalog);
+		assert_eq!(JobCatalog::decode(&bytes).assert_ok(), catalog);
 
 		let mut old = bytes.clone();
 		old[4..6].copy_from_slice(&0_u16.to_le_bytes());
@@ -645,7 +689,7 @@ mod tests {
 		corrupt[last] ^= 1;
 		assert!(JobCatalog::decode(&corrupt).is_err());
 
-		let mut invalid_mode = sample_analyze()?;
+		let mut invalid_mode = sample_analyze().assert_ok();
 		invalid_mode.analyze_mode = None;
 		assert!(
 			JobCatalog {
@@ -656,7 +700,7 @@ mod tests {
 			.is_err()
 		);
 
-		let mut invalid_target = sample()?;
+		let mut invalid_target = sample().assert_ok();
 		invalid_target.target = MaintenanceTarget::Database;
 		assert!(
 			JobCatalog {
@@ -666,29 +710,30 @@ mod tests {
 			.encode()
 			.is_err()
 		);
-		Ok(())
 	}
 
+	/// Verifies graph index job target round trips and rejects reserved owner.
 	#[test]
-	fn graph_index_job_target_round_trips_and_rejects_reserved_owner() -> FerrosGrynnResult<()> {
-		let mut job = sample()?;
+	fn graph_index_job_target_round_trips_and_rejects_reserved_owner() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut job = sample().assert_ok();
 		job.target = MaintenanceTarget::GraphIndex {
-			graph: GraphId::new(7).ok_or_else(|| invalid("test graph identity"))?,
-			index: IndexId::new(9).ok_or_else(|| invalid("test index identity"))?,
+			graph: GraphId::new(7).ok_or_else(|| invalid("test graph identity")).assert_ok(),
+			index: IndexId::new(9).ok_or_else(|| invalid("test index identity")).assert_ok(),
 			version: SchemaVersion::INITIAL,
 		};
 		let catalog = JobCatalog {
 			generation: 1,
 			jobs: vec![job.clone()],
 		};
-		let bytes = catalog.encode()?;
-		assert_eq!(JobCatalog::decode(&bytes)?, catalog);
+		let bytes = catalog.encode().assert_ok();
+		assert_eq!(JobCatalog::decode(&bytes).assert_ok(), catalog);
 		let mut record = Vec::new();
-		encode_job(&mut record, &job)?;
+		encode_job(&mut record, &job).assert_ok();
 		assert_eq!(record[18], 5);
 		assert_eq!(&record[25..37], &[0, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0]);
 		record[41..49].fill(0);
 		assert!(decode_job(&mut Decoder::new(&record)).is_err());
-		Ok(())
 	}
 }

@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::graph::{AtomId, AtomKind};
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 
 /// Builds checked CSR from row-major optional nonnegative integer costs.
 fn relation(costs: &[Option<u64>], vertices: usize) -> (ProjectedRelation, Vec<Number>) {
@@ -12,7 +16,7 @@ fn relation(costs: &[Option<u64>], vertices: usize) -> (ProjectedRelation, Vec<N
 		for (target, weight) in row.iter().enumerate() {
 			if let Some(weight) = weight {
 				targets.push(target);
-				weights.push(Number::Int(i64::try_from(*weight).unwrap()));
+				weights.push(Number::Int(i64::try_from(*weight).assert_ok()));
 			}
 		}
 		offsets.push(targets.len());
@@ -28,7 +32,7 @@ fn relation(costs: &[Option<u64>], vertices: usize) -> (ProjectedRelation, Vec<N
 				ordinal as u64,
 				0,
 			)
-			.unwrap()
+			.assert_ok()
 		})
 		.collect();
 	let relation = ProjectedRelation::from_csr(
@@ -41,7 +45,7 @@ fn relation(costs: &[Option<u64>], vertices: usize) -> (ProjectedRelation, Vec<N
 		1 << 20,
 		&mut || Ok(()),
 	)
-	.unwrap();
+	.assert_ok();
 	(relation, weights)
 }
 
@@ -86,6 +90,8 @@ fn limits() -> LandmarkBuildLimits {
 	}
 }
 
+/// Verifies directed landmark all pairs match integer oracle and alt is
+/// admissible.
 #[test]
 fn directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible() {
 	let mut random = 0x1234_5678_u64;
@@ -96,7 +102,7 @@ fn directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible() {
 			random ^= random << 13;
 			random ^= random >> 7;
 			random ^= random << 17;
-			costs.push((random % 5 == 0).then_some(if sample % 3 == 0 {
+			costs.push(random.is_multiple_of(5).then_some(if sample % 3 == 0 {
 				(1_u64 << 53) + random % 7
 			} else {
 				random % 8
@@ -112,7 +118,7 @@ fn directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible() {
 				limits(),
 				&mut || Ok(()),
 			)
-			.unwrap();
+			.assert_ok();
 			assert_eq!(built.landmarks.len(), vertices);
 			for (row, landmark) in built.landmarks.iter().copied().enumerate() {
 				for vertex in 0..vertices {
@@ -134,7 +140,7 @@ fn directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible() {
 								if distance == u128::MAX {
 									assert_eq!(interval, DistanceInterval::INFINITY);
 								} else {
-									let exact = Number::Int(i64::try_from(distance).unwrap());
+									let exact = Number::Int(i64::try_from(distance).assert_ok());
 									assert!(
 										Number::Float(interval.lower) <= exact,
 										"{interval:?} {exact:?}"
@@ -149,11 +155,11 @@ fn directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible() {
 			for source in 0..vertices {
 				for target in 0..vertices {
 					let distance = oracle[source * vertices + target];
-					let lower = built.lower_bound(source, target).unwrap();
+					let lower = built.lower_bound(source, target).assert_ok();
 					assert!(lower >= Number::Int(0));
 					if distance != u128::MAX {
 						assert!(
-							lower <= Number::Int(i64::try_from(distance).unwrap()),
+							lower <= Number::Int(i64::try_from(distance).assert_ok()),
 							"ALT overestimates {source}->{target}: {lower:?}, distance {distance}"
 						);
 					}
@@ -163,22 +169,27 @@ fn directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible() {
 	}
 }
 
+/// Verifies directed landmark selection and asymmetric terms are deterministic.
 #[test]
 fn directed_landmark_selection_and_asymmetric_terms_are_deterministic() {
 	let mut costs = vec![None; 16];
 	costs[1] = Some(1);
 	costs[6] = Some(1);
 	let (relation, _) = relation(&costs, 4);
-	let first = DirectedLandmarks::build(&relation, None, 256, limits(), &mut || Ok(())).unwrap();
-	let second = DirectedLandmarks::build(&relation, None, 256, limits(), &mut || Ok(())).unwrap();
+	let first =
+		DirectedLandmarks::build(&relation, None, 256, limits(), &mut || Ok(())).assert_ok();
+	let second =
+		DirectedLandmarks::build(&relation, None, 256, limits(), &mut || Ok(())).assert_ok();
 	assert_eq!(first.landmarks, [0, 3, 2, 1]);
 	assert_eq!(first.landmarks, second.landmarks);
-	assert_eq!(first.lower_bound(0, 2).unwrap(), Number::Int(2));
-	assert_eq!(first.lower_bound(1, 2).unwrap(), Number::Int(1));
-	assert_eq!(first.lower_bound(2, 0).unwrap(), Number::Int(0));
+	assert_eq!(first.lower_bound(0, 2).assert_ok(), Number::Int(2));
+	assert_eq!(first.lower_bound(1, 2).assert_ok(), Number::Int(1));
+	assert_eq!(first.lower_bound(2, 0).assert_ok(), Number::Int(0));
 	assert!(first.lower_bound(4, 0).is_err());
 }
 
+/// Verifies landmark intervals preserve large integer decimal float and zero
+/// boundaries.
 #[test]
 fn landmark_intervals_preserve_large_integer_decimal_float_and_zero_boundaries() {
 	use rust_decimal::Decimal;
@@ -192,7 +203,7 @@ fn landmark_intervals_preserve_large_integer_decimal_float_and_zero_boundaries()
 		Number::Float(f64::MAX),
 		Number::Float(-0.0),
 	] {
-		let interval = DistanceInterval::from_number(number).unwrap();
+		let interval = DistanceInterval::from_number(number).assert_ok();
 		assert!(Number::Float(interval.lower) <= number);
 		assert!(Number::Float(interval.upper) >= number);
 		assert_eq!(interval.add(DistanceInterval::ZERO), interval);
@@ -203,28 +214,38 @@ fn landmark_intervals_preserve_large_integer_decimal_float_and_zero_boundaries()
 	for (lower, upper) in [(1.0, 0.0), (-0.0, 1.0), (0.0, -0.0), (f64::NAN, 0.0), (0.0, f64::NAN)] {
 		assert!(DistanceInterval::new(lower, upper).is_err());
 	}
-	let large = DistanceInterval::from_number(Number::Float(1.0e100)).unwrap();
-	let tiny = DistanceInterval::from_number(Number::Float(f64::from_bits(1))).unwrap();
+	let large = DistanceInterval::from_number(Number::Float(1.0e100)).assert_ok();
+	let tiny = DistanceInterval::from_number(Number::Float(f64::from_bits(1))).assert_ok();
 	assert!(large.add(tiny).lower >= large.lower);
-	assert_eq!(DistanceInterval::INFINITY.lower_difference(large), 0.0);
-	assert_eq!(large.lower_difference(DistanceInterval::INFINITY), 0.0);
+	assert_eq!(
+		DistanceInterval::INFINITY.lower_difference(large).partial_cmp(&0.0),
+		Some(std::cmp::Ordering::Equal)
+	);
+	assert_eq!(
+		large.lower_difference(DistanceInterval::INFINITY).partial_cmp(&0.0),
+		Some(std::cmp::Ordering::Equal)
+	);
 	let overflow = DistanceInterval::from_number(Number::Float(f64::MAX))
-		.unwrap()
-		.add(DistanceInterval::from_number(Number::Float(f64::MAX)).unwrap());
-	assert_eq!(overflow.lower, f64::MAX);
-	assert_eq!(overflow.upper, f64::INFINITY);
+		.assert_ok()
+		.add(DistanceInterval::from_number(Number::Float(f64::MAX)).assert_ok());
+	assert_eq!(overflow.lower.partial_cmp(&f64::MAX), Some(std::cmp::Ordering::Equal));
+	assert_eq!(overflow.upper.partial_cmp(&f64::INFINITY), Some(std::cmp::Ordering::Equal));
 	let (relation, mut weights) =
 		relation(&[None, Some(1), None, None, None, Some(1), None, None, None], 3);
 	weights[0] = Number::Float(0.1);
 	weights[1] = Number::Float(0.2);
-	let built =
-		DirectedLandmarks::build(&relation, Some(&weights), 3, limits(), &mut || Ok(())).unwrap();
-	let LandmarkDistanceRows::Intervals(rows) = &built.from else {
-		panic!("weighted rows expected");
-	};
+	let built = DirectedLandmarks::build(&relation, Some(&weights), 3, limits(), &mut || Ok(()))
+		.assert_ok();
+	let rows = match &built.from {
+		LandmarkDistanceRows::Intervals(rows) => Some(rows),
+		LandmarkDistanceRows::Hops(_) => None,
+	}
+	.assert_some_with("weighted rows expected");
 	assert!(rows[2].lower <= 0.1 + 0.2 && rows[2].upper >= 0.1 + 0.2);
 }
 
+/// Verifies directed landmark budgets malformed relations and cancellation fail
+/// closed.
 #[test]
 fn directed_landmark_budgets_malformed_relations_and_cancellation_fail_closed() {
 	let (mut relation, weights) = relation(&[None, Some(1), None, None], 2);
@@ -271,10 +292,10 @@ fn directed_landmark_budgets_malformed_relations_and_cancellation_fail_closed() 
 		1024,
 		&mut || Ok(()),
 	)
-	.unwrap();
+	.assert_ok();
 	assert!(
 		DirectedLandmarks::build(&empty, None, 1, limits(), &mut || Ok(()))
-			.unwrap()
+			.assert_ok()
 			.landmarks
 			.is_empty()
 	);

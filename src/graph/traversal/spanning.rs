@@ -12,32 +12,45 @@ use crate::{
 	values::Number,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+/// Selected spanning edges, combined weight and connected-component count.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanningForest {
+	/// Edges associated with this spanning forest.
 	edges: Box<[AtomId]>,
+	/// Total weight associated with this spanning forest.
 	total_weight: Number,
+	/// Components associated with this spanning forest.
 	components: usize,
 }
 
 impl SpanningForest {
+	/// Borrows the stored edges of this `SpanningForest`.
 	pub fn edges(&self) -> &[AtomId] {
 		&self.edges
 	}
 
+	/// Returns the stored total weight of this `SpanningForest`.
 	pub const fn total_weight(&self) -> Number {
 		self.total_weight
 	}
 
+	/// Returns the stored components of this `SpanningForest`.
 	pub const fn component_count(&self) -> usize {
 		self.components
 	}
 }
 
+/// Returns minimum spanning forest for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn minimum_spanning_forest<R: GraphRead>(graph: &R) -> FerrosGrynnResult<SpanningForest> {
 	minimum_spanning_forest_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn minimum_spanning_forest_with_check<R: GraphRead, Check>(
+/// Returns the minimum spanning forest with check result.
+pub fn minimum_spanning_forest_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<SpanningForest>
@@ -89,6 +102,11 @@ where
 	})
 }
 
+/// Returns minimum spanning tree for this module.
+///
+/// # Errors
+///
+/// Propagates errors returned by the underlying operation.
 pub fn minimum_spanning_tree<R: GraphRead>(graph: &R) -> FerrosGrynnResult<SpanningForest> {
 	let result = minimum_spanning_forest(graph)?;
 	if result.component_count() > 1 {
@@ -101,19 +119,27 @@ pub fn minimum_spanning_tree<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Spann
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Binary edge state.
 pub(super) struct BinaryEdge {
+	/// Edge associated with this binary edge.
 	pub(super) edge: AtomId,
+	/// Left associated with this binary edge.
 	pub(super) left: AtomId,
+	/// Right associated with this binary edge.
 	pub(super) right: AtomId,
 }
 
 #[derive(Debug, Clone)]
+/// Disjoint sets state.
 pub(super) struct DisjointSets {
+	/// Parents associated with this disjoint sets.
 	parents: Vec<usize>,
+	/// Ranks associated with this disjoint sets.
 	ranks: Vec<u8>,
 }
 
 impl DisjointSets {
+	/// Creates a new `DisjointSets` value.
 	pub(super) fn new(len: usize) -> Self {
 		Self {
 			parents: (0..len).collect(),
@@ -121,6 +147,7 @@ impl DisjointSets {
 		}
 	}
 
+	/// Finds disjoint sets.
 	fn find(&mut self, mut value: usize) -> usize {
 		let mut root = value;
 		while self.parents[root] != root {
@@ -134,6 +161,7 @@ impl DisjointSets {
 		root
 	}
 
+	/// Returns whether the union condition holds.
 	pub(super) fn union(&mut self, left: usize, right: usize) -> bool {
 		let mut left = self.find(left);
 		let mut right = self.find(right);
@@ -151,6 +179,7 @@ impl DisjointSets {
 	}
 }
 
+/// Returns the binary edges with check result.
 pub(super) fn binary_edges_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
@@ -188,6 +217,7 @@ where
 	Ok(edges)
 }
 
+/// Checks candidate.
 fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
 where
 	Check: FnMut() -> FerrosGrynnResult<()>,

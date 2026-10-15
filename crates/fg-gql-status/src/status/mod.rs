@@ -8,9 +8,13 @@
 	          `define_status_codes` macro."
 )]
 
+/// Validated status-code parsing, display and serialization.
 mod code;
+/// Authoritative declarations expanded into typed statuses and constructors.
 mod definitions;
+/// Status instances paired with diagnostics and validated severity overrides.
 mod object;
+/// Conditions, domains, classifications and allowed status kinds.
 mod taxonomy;
 
 pub use code::{StatusCode, StatusCodeParseError};
@@ -27,6 +31,7 @@ pub use taxonomy::{
 };
 
 #[cfg(test)]
+/// Regression tests for status behavior.
 mod tests {
 	use super::*;
 	use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult, formatting::DiagnosticValue};
@@ -66,6 +71,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Tests the `parses_and_formats_status_code` scenario and its
+	/// diagnostic outcome.
 	#[test]
 	fn parses_and_formats_status_code() {
 		let code = "FG-22N28".parse::<StatusCode>().unwrap();
@@ -74,6 +81,8 @@ mod tests {
 		assert!("22N28".parse::<StatusCode>().is_err());
 	}
 
+	/// Tests the `named_parameter_may_be_used_twice` scenario and its
+	/// diagnostic outcome.
 	#[test]
 	fn named_parameter_may_be_used_twice() {
 		let status = Status::conversion_error("42", "integer");
@@ -84,12 +93,16 @@ mod tests {
 		assert_eq!(status.parameters().len(), 2);
 	}
 
+	/// Tests the `status_object_builds_full_description` scenario and its
+	/// diagnostic outcome.
 	#[test]
 	fn status_object_builds_full_description() {
 		let status = StatusObject::new(Status::division_by_zero());
 		assert_eq!(status.to_string(), "FG-22012: error: data exception - division by zero");
 	}
 
+	/// Tests the `value_and_graph_limits_have_structured_domains` scenario and
+	/// its diagnostic outcome.
 	#[test]
 	fn value_and_graph_limits_have_structured_domains() {
 		let value = StatusObject::new(Status::invalid_text_boundary(1, 4));

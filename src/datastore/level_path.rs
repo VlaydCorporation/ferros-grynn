@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{DatabaseRoot, GlobalAtomId, GraphOccurrence, OccurrenceState};
+use super::{DatabaseRoot, GlobalAtomId, GraphOccurrence, OccurrenceStateRef};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomRef, EdgeEndpoint, GraphId, GraphRef},
@@ -17,9 +17,12 @@ use crate::{
 /// Reserved graph-local overlay property managed by graph DML.
 pub const LEVEL_PATH_PROPERTY: &str = "levelpath";
 
+/// Graph occurrence and owning atom forming one nested-containment boundary.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ContainmentOwner {
+	/// Owned graph reference identifying the operation scope.
 	graph: GraphRef,
+	/// Stable atom reference identifying the owner of the nested graph.
 	owner: AtomRef,
 }
 
@@ -51,8 +54,8 @@ impl DatabaseRoot {
 				"reverse membership references an absent LevelPath occurrence",
 			)
 		})?;
-		match occurrence.state() {
-			OccurrenceState::Node {
+		match occurrence.state().view() {
+			OccurrenceStateRef::Node {
 				..
 			} => {
 				let mut value = Object::new();
@@ -60,7 +63,7 @@ impl DatabaseRoot {
 				value.insert("chains", self.containment_chains_value(graph, admit)?);
 				Ok(Value::Object(value))
 			}
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				topology,
 				..
 			} => {
@@ -94,6 +97,7 @@ impl DatabaseRoot {
 		}
 	}
 
+	/// Returns endpoint level path for `DatabaseRoot`.
 	fn endpoint_level_path(
 		&self,
 		graph: GraphId,
@@ -110,6 +114,7 @@ impl DatabaseRoot {
 		Ok(Value::Object(value))
 	}
 
+	/// Returns containment chains value for `DatabaseRoot`.
 	fn containment_chains_value(
 		&self,
 		child: GraphId,
@@ -147,6 +152,7 @@ impl DatabaseRoot {
 		)))
 	}
 
+	/// Returns containment chains for `DatabaseRoot`.
 	fn containment_chains(
 		&self,
 		child: GraphId,
@@ -216,6 +222,7 @@ impl DatabaseRoot {
 		Ok(chains.into_iter().collect())
 	}
 
+	/// Returns containment parents for `DatabaseRoot`.
 	fn containment_parents(
 		&self,
 		child: GraphId,
@@ -247,6 +254,7 @@ impl DatabaseRoot {
 		Ok(parents)
 	}
 
+	/// Returns atom ref for `DatabaseRoot`.
 	fn atom_ref(
 		&self,
 		occurrence: &GraphOccurrence,
@@ -263,9 +271,11 @@ impl DatabaseRoot {
 }
 
 #[cfg(test)]
+/// Regression tests for level path behavior.
 mod tests {
 	use super::LEVEL_PATH_PROPERTY;
 
+	/// Verifies reserves the canonical property name.
 	#[test]
 	fn reserves_the_canonical_property_name() {
 		assert_eq!(LEVEL_PATH_PROPERTY, "levelpath");

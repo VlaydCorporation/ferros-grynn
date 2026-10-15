@@ -8,30 +8,39 @@ use slotmap::{DefaultKey, DenseSlotMap, SlotMap};
 use smallvec::SmallVec;
 use tinyvec::TinyVec;
 
+/// Large collection population used by the registered benchmark cases.
 const N: usize = 1_000_000;
 
+/// Strides used by stepped collection traversal measurements.
 const STEPS: [usize; 6] = [2, 4, 10, 16, 32, 64];
 
+/// Padded payload used to compare collection behavior with larger elements.
 #[derive(Clone, Copy, PartialEq, Ord, PartialOrd, Eq, Hash, Default)]
 struct LargeData {
+	/// Primary value retained by the collection fixture.
 	pub v: u32,
+	/// Additional scalar payload contributing to the benchmark element size.
 	_v: u32,
+	/// Payload bytes, elements or retained storage backing this representation.
 	data: [u64; 31], // 256 bytes
 }
 
 impl From<LargeData> for u32 {
+	/// Converts `LargeData` into `u32`.
 	fn from(value: LargeData) -> Self {
 		value.v
 	}
 }
 
 impl From<&LargeData> for u32 {
+	/// Converts `&LargeData` into `u32`.
 	fn from(value: &LargeData) -> Self {
-		value.v as u32
+		value.v
 	}
 }
 
 impl From<u32> for LargeData {
+	/// Converts `u32` into `LargeData`.
 	fn from(v: u32) -> Self {
 		Self {
 			v,
@@ -41,6 +50,7 @@ impl From<u32> for LargeData {
 	}
 }
 
+/// Returns random indices for this module.
 fn random_indices(n: usize) -> Vec<usize> {
 	let mut rng = StdRng::seed_from_u64(42);
 	(0..n).map(|_| rng.random_range(0..n)).collect()
@@ -52,14 +62,15 @@ fn random_indices(n: usize) -> Vec<usize> {
 // impl TestData for u32 {}
 // impl TestData for LargeData {}
 
+/// Measures push raw with the benchmark harness.
 fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criterion) {
 	let mut group = c.benchmark_group("push_raw");
 
 	group.bench_function("Vec<u32>", |b| {
 		b.iter_batched(
-			|| Vec::<u32>::new(),
+			Vec::<u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push(i);
 				}
 				black_box(v)
@@ -70,7 +81,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("Vec<LargeData>", |b| {
 		b.iter_batched(
-			|| Vec::<LargeData>::new(),
+			Vec::<LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					v.push(i);
@@ -83,9 +94,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("VecDeque<u32>", |b| {
 		b.iter_batched(
-			|| VecDeque::<u32>::new(),
+			VecDeque::<u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push_back(i);
 				}
 				black_box(v)
@@ -96,7 +107,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("VecDeque<LargeData>", |b| {
 		b.iter_batched(
-			|| VecDeque::<LargeData>::new(),
+			VecDeque::<LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					v.push_back(i);
@@ -109,9 +120,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("BinaryHeap<u32>", |b| {
 		b.iter_batched(
-			|| BinaryHeap::<u32>::new(),
+			BinaryHeap::<u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push(i);
 				}
 				black_box(v)
@@ -122,7 +133,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("BinaryHeap<LargeData>", |b| {
 		b.iter_batched(
-			|| BinaryHeap::<LargeData>::new(),
+			BinaryHeap::<LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					v.push(i);
@@ -135,9 +146,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("LinkedList<u32> front", |b| {
 		b.iter_batched(
-			|| LinkedList::<u32>::new(),
+			LinkedList::<u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push_front(i);
 				}
 				black_box(v)
@@ -148,7 +159,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("LinkedList<LargeData> front", |b| {
 		b.iter_batched(
-			|| LinkedList::<LargeData>::new(),
+			LinkedList::<LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					v.push_front(i);
@@ -161,9 +172,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("LinkedList<u32> back", |b| {
 		b.iter_batched(
-			|| LinkedList::<u32>::new(),
+			LinkedList::<u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push_back(i);
 				}
 				black_box(v)
@@ -174,7 +185,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("LinkedList<LargeData> back", |b| {
 		b.iter_batched(
-			|| LinkedList::<LargeData>::new(),
+			LinkedList::<LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					v.push_back(i);
@@ -187,10 +198,10 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("HashMap<u32, u32> insert", |b| {
 		b.iter_batched(
-			|| HashMap::<u32, u32>::new(),
+			HashMap::<u32, u32>::new,
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i, i.into());
+					v.insert(i, i);
 				}
 				black_box(v)
 			},
@@ -200,7 +211,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("HashMap<u32, LargeData> insert", |b| {
 		b.iter_batched(
-			|| HashMap::<u32, LargeData>::new(),
+			HashMap::<u32, LargeData>::new,
 			|mut v| {
 				for i in 0..N as u32 {
 					v.insert(i, i.into());
@@ -213,10 +224,10 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("RapidHashMap<u32, u32> insert", |b| {
 		b.iter_batched(
-			|| RapidHashMap::<u32, u32>::new(),
+			RapidHashMap::<u32, u32>::new,
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i, i.into());
+					v.insert(i, i);
 				}
 				black_box(v)
 			},
@@ -226,7 +237,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("RapidHashMap<u32, LargeData> insert", |b| {
 		b.iter_batched(
-			|| RapidHashMap::<u32, LargeData>::new(),
+			RapidHashMap::<u32, LargeData>::new,
 			|mut v| {
 				for i in 0..N as u32 {
 					v.insert(i, i.into());
@@ -239,10 +250,10 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("HashSet<u32> insert", |b| {
 		b.iter_batched(
-			|| HashSet::<u32>::new(),
+			HashSet::<u32>::new,
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i.into());
+					v.insert(i);
 				}
 				black_box(v)
 			},
@@ -252,7 +263,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("HashSet<LargeData> insert", |b| {
 		b.iter_batched(
-			|| HashSet::<LargeData>::new(),
+			HashSet::<LargeData>::new,
 			|mut v| {
 				for i in 0..N as u32 {
 					v.insert(i.into());
@@ -265,10 +276,10 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("RapidHashSet<u32> insert", |b| {
 		b.iter_batched(
-			|| RapidHashSet::<u32>::new(),
+			RapidHashSet::<u32>::new,
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i.into());
+					v.insert(i);
 				}
 				black_box(v)
 			},
@@ -278,7 +289,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("RapidHashSet<LargeData> insert", |b| {
 		b.iter_batched(
-			|| RapidHashSet::<LargeData>::new(),
+			RapidHashSet::<LargeData>::new,
 			|mut v| {
 				for i in 0..N as u32 {
 					v.insert(i.into());
@@ -291,9 +302,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("SlotMap<u32>", |b| {
 		b.iter_batched(
-			|| SlotMap::<DefaultKey, u32>::new(),
+			SlotMap::<DefaultKey, u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					black_box(v.insert(i));
 				}
 				black_box(v)
@@ -304,7 +315,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("SlotMap<LargeData>", |b| {
 		b.iter_batched(
-			|| SlotMap::<DefaultKey, LargeData>::new(),
+			SlotMap::<DefaultKey, LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					black_box(v.insert(i));
@@ -317,9 +328,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("DenseSlotMap<u32>", |b| {
 		b.iter_batched(
-			|| DenseSlotMap::<DefaultKey, u32>::new(),
+			DenseSlotMap::<DefaultKey, u32>::new,
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					black_box(v.insert(i));
 				}
 				black_box(v)
@@ -330,7 +341,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 	group.bench_function("DenseSlotMap<LargeData>", |b| {
 		b.iter_batched(
-			|| DenseSlotMap::<DefaultKey, LargeData>::new(),
+			DenseSlotMap::<DefaultKey, LargeData>::new,
 			|mut v| {
 				for i in (0..N as u32).map(|i| i.into()) {
 					black_box(v.insert(i));
@@ -344,9 +355,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 	for n in [K, M, N] {
 		group.bench_function(format!("SmallVec<u32, {K}> push {n}"), |b| {
 			b.iter_batched(
-				|| SmallVec::<u32, K>::new(),
+				SmallVec::<u32, K>::new,
 				|mut v| {
-					for i in (0..n as u32).map(|i| i.into()) {
+					for i in 0..n as u32 {
 						v.push(i);
 					}
 					black_box(v)
@@ -357,7 +368,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 		group.bench_function(format!("SmallVec<LargeData, {K}> push {n}"), |b| {
 			b.iter_batched(
-				|| SmallVec::<LargeData, K>::new(),
+				SmallVec::<LargeData, K>::new,
 				|mut v| {
 					for i in (0..n as u32).map(|i| i.into()) {
 						v.push(i);
@@ -370,9 +381,9 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 		group.bench_function(format!("TinyVec<[u32; {K}]> push {n}"), |b| {
 			b.iter_batched(
-				|| TinyVec::<[u32; K]>::new(),
+				TinyVec::<[u32; K]>::new,
 				|mut v| {
-					for i in (0..n as u32).map(|i| i.into()) {
+					for i in 0..n as u32 {
 						v.push(i);
 					}
 					black_box(v)
@@ -383,7 +394,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 
 		group.bench_function(format!("TinyVec<[LargeData; {K}]> push {n}"), |b| {
 			b.iter_batched(
-				|| TinyVec::<[LargeData; K]>::new(),
+				TinyVec::<[LargeData; K]>::new,
 				|mut v| {
 					for i in (0..n as u32).map(|i| i.into()) {
 						v.push(i);
@@ -399,7 +410,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 		b.iter_batched(
 			|| ArrayVec::<u32, K>::new(),
 			|mut v| {
-				for i in (0..K as u32).map(|i| i.into()) {
+				for i in 0..K as u32 {
 					v.push(i);
 				}
 				black_box(v)
@@ -422,6 +433,7 @@ fn bench_push_raw<const K: usize, const M: usize, const N: usize>(c: &mut Criter
 	});
 }
 
+/// Measures push preallocated with the benchmark harness.
 fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &mut Criterion) {
 	let mut group = c.benchmark_group("push_preallocated");
 
@@ -429,7 +441,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 		b.iter_batched(
 			|| Vec::<u32>::with_capacity(N),
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push(i);
 				}
 				black_box(v)
@@ -455,7 +467,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 		b.iter_batched(
 			|| VecDeque::<u32>::with_capacity(N),
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push_back(i);
 				}
 				black_box(v)
@@ -481,7 +493,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 		b.iter_batched(
 			|| BinaryHeap::<u32>::with_capacity(N),
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					v.push(i);
 				}
 				black_box(v)
@@ -508,7 +520,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 			|| HashMap::<u32, u32>::with_capacity(N),
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i, i.into());
+					v.insert(i, i);
 				}
 				black_box(v)
 			},
@@ -534,7 +546,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 			|| RapidHashMap::<u32, u32>::with_capacity(N),
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i, i.into());
+					v.insert(i, i);
 				}
 				black_box(v)
 			},
@@ -560,7 +572,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 			|| HashSet::<u32>::with_capacity(N),
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i.into());
+					v.insert(i);
 				}
 				black_box(v)
 			},
@@ -586,7 +598,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 			|| RapidHashSet::<u32>::with_capacity(N),
 			|mut v| {
 				for i in 0..N as u32 {
-					v.insert(i.into());
+					v.insert(i);
 				}
 				black_box(v)
 			},
@@ -611,7 +623,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 		b.iter_batched(
 			|| SlotMap::<DefaultKey, u32>::with_capacity(N),
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					black_box(v.insert(i));
 				}
 				black_box(v)
@@ -637,7 +649,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 		b.iter_batched(
 			|| DenseSlotMap::<DefaultKey, u32>::with_capacity(N),
 			|mut v| {
-				for i in (0..N as u32).map(|i| i.into()) {
+				for i in 0..N as u32 {
 					black_box(v.insert(i));
 				}
 				black_box(v)
@@ -665,7 +677,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 				b.iter_batched(
 					|| SmallVec::<u32, K>::with_capacity(m),
 					|mut v| {
-						for i in (0..n as u32).map(|i| i.into()) {
+						for i in 0..n as u32 {
 							v.push(i);
 						}
 						black_box(v)
@@ -694,7 +706,7 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 				b.iter_batched(
 					|| TinyVec::<[u32; K]>::with_capacity(m),
 					|mut v| {
-						for i in (0..n as u32).map(|i| i.into()) {
+						for i in 0..n as u32 {
 							v.push(i);
 						}
 						black_box(v)
@@ -722,12 +734,13 @@ fn bench_push_preallocated<const K: usize, const M: usize, const N: usize>(c: &m
 	}
 }
 
+/// Measures collect with the benchmark harness.
 fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criterion) {
 	let mut group = c.benchmark_group("collect");
 
 	group.bench_function("Vec<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()),
+			|| 0..N as u32,
 			|data| black_box(data.collect::<Vec<u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -743,7 +756,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("VecDeque<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()),
+			|| 0..N as u32,
 			|data| black_box(data.collect::<VecDeque<u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -759,7 +772,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("BinaryHeap<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()),
+			|| 0..N as u32,
 			|data| black_box(data.collect::<BinaryHeap<u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -775,7 +788,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("LinkedList<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()),
+			|| 0..N as u32,
 			|data| black_box(data.collect::<LinkedList<u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -791,7 +804,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("HashMap<u32, u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| (i, i.into())),
+			|| (0..N as u32).map(|i| (i, i)),
 			|data| black_box(data.collect::<HashMap<u32, u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -807,7 +820,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("RapidHashMap<u32, u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| (i, i.into())),
+			|| (0..N as u32).map(|i| (i, i)),
 			|data| black_box(data.collect::<RapidHashMap<u32, u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -823,7 +836,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("HashSet<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()),
+			|| 0..N as u32,
 			|data| black_box(data.collect::<HashSet<u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -839,7 +852,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function("RapidHashSet<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()),
+			|| 0..N as u32,
 			|data| black_box(data.collect::<RapidHashSet<u32>>()),
 			BatchSize::PerIteration,
 		)
@@ -856,7 +869,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 	for n in [K, M, N] {
 		group.bench_function(format!("SmallVec<u32, {K}> collect {n}"), |b| {
 			b.iter_batched(
-				|| (0..n as u32).map(|i| i.into()),
+				|| 0..n as u32,
 				|data| black_box(data.collect::<SmallVec<u32, K>>()),
 				BatchSize::PerIteration,
 			)
@@ -872,7 +885,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 		group.bench_function(format!("TinyVec<[u32; {K}]> collect {n}"), |b| {
 			b.iter_batched(
-				|| (0..n as u32).map(|i| i.into()),
+				|| 0..n as u32,
 				|data| black_box(data.collect::<TinyVec<[u32; K]>>()),
 				BatchSize::PerIteration,
 			)
@@ -889,7 +902,7 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 
 	group.bench_function(format!("ArrayVec<u32, {K}>"), |b| {
 		b.iter_batched(
-			|| (0..K as u32).map(|i| i.into()),
+			|| 0..K as u32,
 			|data| black_box(data.collect::<ArrayVec<u32, K>>()),
 			BatchSize::PerIteration,
 		)
@@ -904,12 +917,13 @@ fn bench_collect<const K: usize, const M: usize, const N: usize>(c: &mut Criteri
 	});
 }
 
+/// Measures iter sequential owned with the benchmark harness.
 fn bench_iter_sequential_owned(c: &mut Criterion) {
 	let mut group = c.benchmark_group("iter_sequential_owned");
 
 	group.bench_function("Vec<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<Vec<u32>>(),
+			|| (0..N as u32).collect::<Vec<u32>>(),
 			|vec| {
 				let mut sum = 0u32;
 				for v in vec {
@@ -937,7 +951,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 
 	group.bench_function("VecDeque<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<VecDeque<u32>>(),
+			|| (0..N as u32).collect::<VecDeque<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for v in vec {
@@ -965,7 +979,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 
 	group.bench_function("BinaryHeap<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<BinaryHeap<u32>>(),
+			|| (0..N as u32).collect::<BinaryHeap<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for v in vec {
@@ -993,7 +1007,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 
 	group.bench_function("LinkedList<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<LinkedList<u32>>(),
+			|| (0..N as u32).collect::<LinkedList<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for v in vec {
@@ -1024,7 +1038,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 			|| {
 				let mut map = HashMap::<u32, u32>::with_capacity(N);
 				for i in 0..N {
-					map.insert(i as u32, (i as u32).into());
+					map.insert(i as u32, i as u32);
 				}
 				map
 			},
@@ -1064,7 +1078,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 			|| {
 				let mut map = RapidHashMap::<u32, u32>::with_capacity(N);
 				for i in 0..N {
-					map.insert(i as u32, (i as u32).into());
+					map.insert(i as u32, i as u32);
 				}
 				map
 			},
@@ -1104,7 +1118,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 			|| {
 				let mut set = HashSet::<u32>::with_capacity(N);
 				for i in 0..N {
-					set.insert((i as u32).into());
+					set.insert(i as u32);
 				}
 				set
 			},
@@ -1144,7 +1158,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 			|| {
 				let mut set = RapidHashSet::<u32>::with_capacity(N);
 				for i in 0..N {
-					set.insert((i as u32).into());
+					set.insert(i as u32);
 				}
 				set
 			},
@@ -1184,7 +1198,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 			|| {
 				let mut slot: SlotMap<DefaultKey, u32> = SlotMap::with_capacity(N);
 				for i in 0..N as u32 {
-					slot.insert(i.into());
+					slot.insert(i);
 				}
 				slot
 			},
@@ -1224,7 +1238,7 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 			|| {
 				let mut slot: DenseSlotMap<DefaultKey, u32> = DenseSlotMap::with_capacity(N);
 				for i in 0..N as u32 {
-					slot.insert(i.into());
+					slot.insert(i);
 				}
 				slot
 			},
@@ -1264,12 +1278,13 @@ fn bench_iter_sequential_owned(c: &mut Criterion) {
 	// and with large elements number in heap it will be similar to Vec.
 }
 
+/// Measures iter sequential borrowed with the benchmark harness.
 fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 	let mut group = c.benchmark_group("iter_sequential_borrowed");
 
 	group.bench_function("Vec<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<Vec<u32>>(),
+			|| (0..N as u32).collect::<Vec<u32>>(),
 			|vec| {
 				let mut sum = 0u32;
 				for v in vec.iter() {
@@ -1297,7 +1312,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 
 	group.bench_function("VecDeque<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<VecDeque<u32>>(),
+			|| (0..N as u32).collect::<VecDeque<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for v in vec.iter() {
@@ -1325,7 +1340,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 
 	group.bench_function("BinaryHeap<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<BinaryHeap<u32>>(),
+			|| (0..N as u32).collect::<BinaryHeap<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for v in vec.iter() {
@@ -1353,7 +1368,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 
 	group.bench_function("LinkedList<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<LinkedList<u32>>(),
+			|| (0..N as u32).collect::<LinkedList<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for v in vec.iter() {
@@ -1384,13 +1399,13 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			|| {
 				let mut map = HashMap::<u32, u32>::with_capacity(N);
 				for i in 0..N {
-					map.insert(i as u32, (i as u32).into());
+					map.insert(i as u32, i as u32);
 				}
 				map
 			},
 			|map| {
 				let mut sum = 0;
-				for (_k, v) in map.iter() {
+				for v in map.values() {
 					sum += v;
 				}
 				black_box(sum)
@@ -1410,7 +1425,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			},
 			|map| {
 				let mut sum = 0;
-				for (_k, v) in map.iter() {
+				for v in map.values() {
 					sum += v.v;
 				}
 				black_box(sum)
@@ -1424,13 +1439,13 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			|| {
 				let mut map = RapidHashMap::<u32, u32>::with_capacity(N);
 				for i in 0..N {
-					map.insert(i as u32, (i as u32).into());
+					map.insert(i as u32, i as u32);
 				}
 				map
 			},
 			|map| {
 				let mut sum = 0;
-				for (_k, v) in map.iter() {
+				for v in map.values() {
 					sum += v;
 				}
 				black_box(sum)
@@ -1450,7 +1465,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			},
 			|map| {
 				let mut sum = 0;
-				for (_k, v) in map.iter() {
+				for v in map.values() {
 					sum += v.v;
 				}
 				black_box(sum)
@@ -1464,7 +1479,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			|| {
 				let mut set = HashSet::<u32>::with_capacity(N);
 				for i in 0..N {
-					set.insert((i as u32).into());
+					set.insert(i as u32);
 				}
 				set
 			},
@@ -1504,7 +1519,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			|| {
 				let mut set = RapidHashSet::<u32>::with_capacity(N);
 				for i in 0..N {
-					set.insert((i as u32).into());
+					set.insert(i as u32);
 				}
 				set
 			},
@@ -1544,7 +1559,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			|| {
 				let mut slot: SlotMap<DefaultKey, u32> = SlotMap::with_capacity(N);
 				for i in 0..N as u32 {
-					slot.insert(i.into());
+					slot.insert(i);
 				}
 				slot
 			},
@@ -1584,7 +1599,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 			|| {
 				let mut slot: DenseSlotMap<DefaultKey, u32> = DenseSlotMap::with_capacity(N);
 				for i in 0..N as u32 {
-					slot.insert(i.into());
+					slot.insert(i);
 				}
 				slot
 			},
@@ -1624,6 +1639,7 @@ fn bench_iter_sequential_borrowed(c: &mut Criterion) {
 	// and with large elements number in heap it will be similar to Vec.
 }
 
+/// Measures iter sequential with step with the benchmark harness.
 fn bench_iter_sequential_with_step(c: &mut Criterion) {
 	let mut group = c.benchmark_group("iter_sequential_with_step");
 
@@ -1631,7 +1647,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 		group.bench_with_input(BenchmarkId::new("Vec<u32>", step), &step, |b, &step| {
 			b.iter_batched(
 				|| {
-					let vec = (0..N as u32).map(|i| i.into()).collect::<Vec<u32>>();
+					let vec = (0..N as u32).collect::<Vec<u32>>();
 					let range = (0..vec.len()).step_by(step);
 					(vec, range)
 				},
@@ -1667,7 +1683,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 		group.bench_with_input(BenchmarkId::new("VecDeque<u32>", step), &step, |b, &step| {
 			b.iter_batched(
 				|| {
-					let vec = (0..N as u32).map(|i| i.into()).collect::<VecDeque<u32>>();
+					let vec = (0..N as u32).collect::<VecDeque<u32>>();
 					let range = (0..vec.len()).step_by(step);
 					(vec, range)
 				},
@@ -1705,7 +1721,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 				|| {
 					let mut set = HashSet::<u32>::with_capacity(N);
 					for i in 0..N {
-						set.insert((i as u32).into());
+						set.insert(i as u32);
 					}
 					let range = (0..set.len()).step_by(step);
 					(set, range)
@@ -1713,7 +1729,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 				|(set, steps)| {
 					let mut sum = 0;
 					for i in steps {
-						sum += set.get(&((i as u32).into())).unwrap();
+						sum += set.get(&(i as u32)).unwrap();
 					}
 					black_box(sum)
 				},
@@ -1747,7 +1763,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 				|| {
 					let mut set = RapidHashSet::<u32>::with_capacity(N);
 					for i in 0..N {
-						set.insert((i as u32).into());
+						set.insert(i as u32);
 					}
 					let range = (0..set.len()).step_by(step);
 					(set, range)
@@ -1755,7 +1771,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 				|(set, steps)| {
 					let mut sum = 0;
 					for i in steps {
-						sum += set.get(&((i as u32).into())).unwrap();
+						sum += set.get(&(i as u32)).unwrap();
 					}
 					black_box(sum)
 				},
@@ -1790,7 +1806,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 					let mut slot: SlotMap<DefaultKey, u32> = SlotMap::with_capacity(N);
 					let mut keys = Vec::with_capacity(N);
 					for i in 0..N as u32 {
-						keys.push(slot.insert(i.into()));
+						keys.push(slot.insert(i));
 					}
 					let range = (0..slot.len()).step_by(step);
 					(slot, keys, range)
@@ -1834,7 +1850,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 					let mut slot: DenseSlotMap<DefaultKey, u32> = DenseSlotMap::with_capacity(N);
 					let mut keys = Vec::with_capacity(N);
 					for i in 0..N as u32 {
-						keys.push(slot.insert(i.into()));
+						keys.push(slot.insert(i));
 					}
 					let range = (0..slot.len()).step_by(step);
 					(slot, keys, range)
@@ -1879,6 +1895,7 @@ fn bench_iter_sequential_with_step(c: &mut Criterion) {
 	}
 }
 
+/// Returns batch random access for this module.
 fn batch_random_access(c: &mut Criterion) {
 	let mut group = c.benchmark_group("random_access");
 
@@ -1886,7 +1903,7 @@ fn batch_random_access(c: &mut Criterion) {
 
 	group.bench_function("Vec<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<Vec<u32>>(),
+			|| (0..N as u32).collect::<Vec<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for &i in &random {
@@ -1914,7 +1931,7 @@ fn batch_random_access(c: &mut Criterion) {
 
 	group.bench_function("VecDeque<u32>", |b| {
 		b.iter_batched(
-			|| (0..N as u32).map(|i| i.into()).collect::<VecDeque<u32>>(),
+			|| (0..N as u32).collect::<VecDeque<u32>>(),
 			|vec| {
 				let mut sum = 0;
 				for &i in &random {
@@ -1945,7 +1962,7 @@ fn batch_random_access(c: &mut Criterion) {
 			|| {
 				let mut map = HashMap::<u32, u32>::with_capacity(N);
 				for i in 0..N {
-					map.insert(i as u32, (i as u32).into());
+					map.insert(i as u32, i as u32);
 				}
 				map
 			},
@@ -1985,7 +2002,7 @@ fn batch_random_access(c: &mut Criterion) {
 			|| {
 				let mut map = RapidHashMap::<u32, u32>::with_capacity(N);
 				for i in 0..N {
-					map.insert(i as u32, (i as u32).into());
+					map.insert(i as u32, i as u32);
 				}
 				map
 			},
@@ -2025,14 +2042,14 @@ fn batch_random_access(c: &mut Criterion) {
 			|| {
 				let mut set = HashSet::<u32>::with_capacity(N);
 				for i in 0..N {
-					set.insert((i as u32).into());
+					set.insert(i as u32);
 				}
 				set
 			},
 			|set| {
 				let mut sum = 0;
 				for &i in &random {
-					sum += set.get(&((i as u32).into())).unwrap();
+					sum += set.get(&(i as u32)).unwrap();
 				}
 				black_box(sum)
 			},
@@ -2065,14 +2082,14 @@ fn batch_random_access(c: &mut Criterion) {
 			|| {
 				let mut set = RapidHashSet::<u32>::with_capacity(N);
 				for i in 0..N {
-					set.insert((i as u32).into());
+					set.insert(i as u32);
 				}
 				set
 			},
 			|set| {
 				let mut sum = 0;
 				for &i in &random {
-					sum += set.get(&((i as u32).into())).unwrap();
+					sum += set.get(&(i as u32)).unwrap();
 				}
 				black_box(sum)
 			},
@@ -2106,7 +2123,7 @@ fn batch_random_access(c: &mut Criterion) {
 				let mut slot: SlotMap<DefaultKey, u32> = SlotMap::with_capacity(N);
 				let mut keys = Vec::with_capacity(N);
 				for i in 0..N as u32 {
-					keys.push(slot.insert(i.into()));
+					keys.push(slot.insert(i));
 				}
 				(slot, keys)
 			},
@@ -2148,7 +2165,7 @@ fn batch_random_access(c: &mut Criterion) {
 				let mut slot: DenseSlotMap<DefaultKey, u32> = DenseSlotMap::with_capacity(N);
 				let mut keys = Vec::with_capacity(N);
 				for i in 0..N as u32 {
-					keys.push(slot.insert(i.into()));
+					keys.push(slot.insert(i));
 				}
 				(slot, keys)
 			},

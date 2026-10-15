@@ -53,16 +53,28 @@ pub enum LiveGraphNext {
 	Idle,
 	/// The complete graph was accepted and its delivery confirmed.
 	Updated {
+		/// Committed remote version associated with the live delivery.
 		revision: Versionstamp,
 	},
 	/// Application and ACK pause until the caller explicitly resolves this
 	/// state.
-	Conflict(Arc<super::LiveGraphConflict>),
+	Conflict(
+		/// Application and ACK pause until the caller explicitly resolves this
+		/// state.
+		Arc<super::LiveGraphConflict>,
+	),
 	/// Coverage is unavailable; the last agreed materialization remains pinned.
-	Gap(LiveGap),
+	Gap(
+		/// Coverage is unavailable; the last agreed materialization remains
+		/// pinned.
+		LiveGap,
+	),
 	/// Evaluation failed while primary data committed successfully.
 	Fault {
+		/// Structured diagnostic explaining why live delivery could not
+		/// continue normally.
 		diagnostic: FerrosGrynnError,
+		/// Gap metadata identifying unavailable live history.
 		gap: LiveGap,
 	},
 	/// The consumer has terminated; retained read guards remain valid.
@@ -91,9 +103,9 @@ where
 	/// IDs.
 	pub(crate) names: BTreeMap<PropertyKeyId, Text>,
 	/// Retains the unresolved whole incoming delta without acknowledgement.
-	pub(crate) pending: Option<PendingConflict>,
+	pending: Option<PendingConflict>,
 	/// Retains exact source-commit feedback until ordered result adoption.
-	pub(crate) flush: Option<PendingFlush>,
+	flush: Option<PendingFlush>,
 }
 
 impl<State, G: LiveFamily<State = State>> LiveGraphSubscription<State, G> {

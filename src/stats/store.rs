@@ -6,14 +6,20 @@ use crate::{datastore::ClassId, graph::GraphId};
 /// Statistics owned by one immutable database MVCC root.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatisticsStore {
+	/// Base associated with this statistics store.
 	base: BaseStatistics,
+	/// Graphs associated with this statistics store.
 	graphs: BTreeMap<GraphId, GraphStatistics>,
+	/// Base touched associated with this statistics store.
 	pub(super) base_touched: bool,
+	/// Graphs touched associated with this statistics store.
 	pub(super) graphs_touched: BTreeSet<GraphId>,
+	/// Auxiliary deferred associated with this statistics store.
 	auxiliary_deferred: bool,
 }
 
 impl Default for StatisticsStore {
+	/// Constructs the default initial state of `StatisticsStore`.
 	fn default() -> Self {
 		Self {
 			base: BaseStatistics::default(),
@@ -36,14 +42,17 @@ impl StatisticsStore {
 		self.graphs.get(&graph)
 	}
 
+	/// Returns the base mut result.
 	pub(crate) fn base_mut(&mut self) -> &mut BaseStatistics {
 		&mut self.base
 	}
 
+	/// Returns the graph mut result.
 	pub(crate) fn graph_mut(&mut self, graph: GraphId) -> Option<&mut GraphStatistics> {
 		self.graphs.get_mut(&graph)
 	}
 
+	/// Registers class.
 	pub(crate) fn register_class(&mut self, class: ClassId) {
 		self.base.classes.entry(class).or_default();
 		for statistics in self.graphs.values_mut() {
@@ -51,6 +60,7 @@ impl StatisticsStore {
 		}
 	}
 
+	/// Registers graph.
 	pub(crate) fn register_graph(
 		&mut self,
 		graph: GraphId,
@@ -62,6 +72,7 @@ impl StatisticsStore {
 		}
 	}
 
+	/// Replaces graph.
 	pub(crate) fn replace_graph(&mut self, graph: GraphId, statistics: GraphStatistics) {
 		self.graphs.insert(graph, statistics);
 	}
@@ -88,6 +99,7 @@ impl StatisticsStore {
 		self.base_touched || !self.graphs_touched.is_empty()
 	}
 
+	/// Publishes revision.
 	pub(crate) fn publish_revision(&mut self, revision: u64) {
 		if self.base_touched {
 			self.base.revision = revision;

@@ -15,22 +15,35 @@ use ferros_grynn::{
 	values::{Object, PropertyMap, RecordId, Value, Vector},
 };
 
+/// Default record population for text and vector search measurements.
 const DEFAULT_ROWS: usize = 10_000;
+/// Default number of scalar components in each benchmark vector.
 const DEFAULT_DIMENSION: usize = 32;
+/// Number of nearest neighbours requested and used to calculate recall.
 const K: usize = 10;
+/// Number of query vectors used by the recall comparison.
 const RECALL_QUERIES: usize = 20;
+/// Process-local suffix counter that separates temporary benchmark directories.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Seeded local datastore and query parameters used by search benchmarks.
 struct SearchFixture {
+	/// Datastore retained by the fixture or operation.
 	store: Datastore,
+	/// Directory retaining the local files used by the scenario.
 	directory: PathBuf,
+	/// Declared parameters or bound values supplied to this operation.
 	parameters: Object,
+	/// Configured row count of the fixture or measurement.
 	rows: usize,
+	/// Number of scalar coordinates in each indexed vector.
 	dimension: usize,
+	/// Page count used when configuring the benchmark buffer pool.
 	buffer_pool_pages: usize,
 }
 
 impl SearchFixture {
+	/// Constructs `SearchFixture` from the supplied initial state.
 	fn new() -> Self {
 		let rows = environment_usize("FG_STAGE_GATE_ROWS", DEFAULT_ROWS).max(K);
 		let dimension = environment_usize("FG_STAGE_GATE_DIMENSION", DEFAULT_DIMENSION).max(1);
@@ -153,6 +166,7 @@ impl SearchFixture {
 		fixture
 	}
 
+	/// Returns verify and record for `SearchFixture`.
 	fn verify_and_record(
 		&self,
 		import_elapsed: Duration,
@@ -208,11 +222,13 @@ impl SearchFixture {
 		assert_eq!(hashed, diskann, "HASHED_VECTOR must not change the result");
 	}
 
+	/// Returns query for `SearchFixture`.
 	fn query(&self, query: &str) -> Value {
 		assert_query(&self.store, query, &self.parameters)
 	}
 }
 
+/// Measures index recall for this module.
 fn measure_index_recall(store: &Datastore, index: &str, rows: usize, dimension: usize) -> f64 {
 	let query = format!(
 		"SELECT VALUE embedding FROM document WITH INDEX {index} WHERE embedding <| 10, EUCLIDEAN \
@@ -237,15 +253,18 @@ fn measure_index_recall(store: &Datastore, index: &str, rows: usize, dimension: 
 }
 
 impl Drop for SearchFixture {
+	/// Runs cleanup for this `SearchFixture` before its fields are released.
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.directory));
 	}
 }
 
+/// Returns environment usize for this module.
 fn environment_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
+/// Returns artifact path for this module.
 fn artifact_path(stage: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 		.parent()
@@ -255,8 +274,9 @@ fn artifact_path(stage: &str) -> PathBuf {
 		.join("setup.csv")
 }
 
+/// Returns deterministic vector for this module.
 fn deterministic_vector(ordinal: usize, dimension: usize) -> Vec<f32> {
-	let source = if ordinal % 5 == 0 {
+	let source = if ordinal.is_multiple_of(5) {
 		ordinal % 100
 	} else {
 		ordinal
@@ -275,6 +295,7 @@ fn deterministic_vector(ordinal: usize, dimension: usize) -> Vec<f32> {
 		.collect()
 }
 
+/// Returns assert query for this module.
 fn assert_query(store: &Datastore, query: &str, parameters: &Object) -> Value {
 	let results = store.execute(query, parameters).expect("gate query must execute");
 	if let Some(error) = results.iter().find_map(|result| result.result.as_ref().err()) {
@@ -287,6 +308,7 @@ fn assert_query(store: &Datastore, query: &str, parameters: &Object) -> Value {
 		.unwrap_or(Value::None)
 }
 
+/// Returns recall at k for this module.
 fn recall_at_k(exact: &Value, approximate: &Value, k: usize) -> f64 {
 	let exact = exact.as_array().expect("exact KNN must return an array");
 	let approximate = approximate.as_array().expect("ANN must return an array");
@@ -305,10 +327,12 @@ fn recall_at_k(exact: &Value, approximate: &Value, k: usize) -> f64 {
 	matched as f64 / exact.len().min(k).max(1) as f64
 }
 
+/// Returns millis for this module.
 fn millis(duration: Duration) -> f64 {
 	duration.as_secs_f64() * 1_000.0
 }
 
+/// Writes metrics for this module.
 fn write_metrics(path: PathBuf, metrics: &[(&str, f64)]) {
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent).expect("stage artifact directory must be created");
@@ -320,6 +344,7 @@ fn write_metrics(path: PathBuf, metrics: &[(&str, f64)]) {
 	fs::write(path, output).expect("stage setup metrics must be written");
 }
 
+/// Measures search with the benchmark harness.
 fn benchmark_search(criterion: &mut Criterion) {
 	let fixture = SearchFixture::new();
 

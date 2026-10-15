@@ -26,6 +26,7 @@ use crate::{
 	},
 };
 
+/// Validates the current state.
 pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	if let Some(binding) = catalog.bridges {
 		let roots = [binding.heap, binding.primary, binding.direct, binding.reverse];
@@ -44,125 +45,17 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	if catalog.database_uuid.is_nil() {
 		return Err(invalid("database origin UUID is nil"));
 	}
-	jiff::Timestamp::from_nanosecond(catalog.committed_at_ns)
-		.map_err(|_| invalid("database commit UTC time is outside its supported domain"))?;
+	jiff::Timestamp::from_nanosecond(catalog.committed_at_ns).map_err(|_conversion_error| {
+		invalid("database commit UTC time is outside its supported domain")
+	})?;
 	super::live::validate_entries(catalog)?;
 	let mut feed_ids = BTreeSet::new();
 	let mut feed_sources = BTreeSet::new();
 	let mut feed_files = BTreeSet::new();
 	let mut feed_segments = BTreeSet::new();
 	for entry in &catalog.changefeeds {
-		let first =
-			entry.epochs.first().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
-		let last =
-			entry.epochs.last().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
-		if first.started_at().get() < entry.defined_at
-			|| last.started_at().get() != entry.published_at
-			|| last.revision() != entry.version
-			|| entry.epochs.iter().any(|epoch| epoch.revision() > entry.version)
-			|| entry.epochs.windows(2).any(|pair| pair[0].started_at() >= pair[1].started_at())
-			|| entry.epochs.windows(2).any(|pair| pair[0].revision() > pair[1].revision())
-		{
-			return Err(invalid("changefeed capture epoch bounds are invalid"));
-		}
-		let final_configuration =
-			(entry.state == crate::changefeed::ChangefeedState::Active).then_some(entry.config);
-		if last.configuration() != final_configuration {
-			return Err(invalid("changefeed final capture epoch disagrees with lifecycle"));
-		}
-		let below_clock = match entry.source {
-			crate::changefeed::ChangefeedSource::Class(id) => {
-				u64::from(id.get()) < catalog.next_schema_id
-			}
-			crate::changefeed::ChangefeedSource::Graph(id) => id.get() < catalog.next_graph_id,
-		};
-		if !below_clock {
-			return Err(invalid("retained changefeed source exceeds its owner identity clock"));
-		}
-		if entry.name.as_str().is_empty() || entry.name.as_str().contains('\0') {
-			return Err(invalid("retained changefeed source name is invalid"));
-		}
-		if !feed_ids.insert(entry.id) || !feed_sources.insert(entry.source) {
-			return Err(invalid("changefeed catalog has duplicate identities or sources"));
-		}
-		if entry.defined_at > entry.published_at || entry.purged_through > entry.last_stamp {
-			return Err(invalid("changefeed catalog bounds are reversed"));
-		}
-		if entry.purged_through == 0 && entry.purged_time_ns != 0
-			|| entry.purged_through != 0 && entry.purged_time_ns > catalog.committed_at_ns
-			|| jiff::Timestamp::from_nanosecond(entry.purged_time_ns).is_err()
-		{
-			return Err(invalid("changefeed purge time contradicts its trusted bounds"));
-		}
-		if (entry.state == crate::changefeed::ChangefeedState::Active) != entry.closed_at.is_none()
-			|| entry.closed_at.is_some() != entry.closed_time_ns.is_some()
-		{
-			return Err(invalid("changefeed lifecycle and close stamp disagree"));
-		}
-		if entry.closed_time_ns.is_some_and(|time| {
-			time > catalog.committed_at_ns || jiff::Timestamp::from_nanosecond(time).is_err()
-		}) {
-			return Err(invalid("changefeed close time contradicts the database clock"));
-		}
-		let partial = entry.retained_page != 0 || entry.retained_groups != 0;
-		if partial
-			&& !entry.segments.first().is_some_and(|segment| {
-				entry.retained_page > 1
-					&& entry.retained_page < segment.header.pages
-					&& entry.retained_groups > 0
-					&& entry.retained_groups < segment.header.commits
-					&& entry.purged_through >= segment.header.first_stamp
-					&& entry.purged_through < segment.header.last_stamp
-					&& entry.purged_time_ns >= segment.header.first_time
-					&& entry.purged_time_ns <= segment.header.last_time
-			}) {
-			return Err(invalid("changefeed retained prefix position is invalid"));
-		}
-		if entry
-			.closed_at
-			.is_some_and(|closed| closed < entry.defined_at || closed > entry.published_at)
-		{
-			return Err(invalid("changefeed close stamp is outside descriptor bounds"));
-		}
-		if entry.state == crate::changefeed::ChangefeedState::Active {
-			let present = match entry.source {
-				crate::changefeed::ChangefeedSource::Class(id) => {
-					catalog.classes.iter().any(|class| class.id == id)
-				}
-				crate::changefeed::ChangefeedSource::Graph(id) => {
-					catalog.graphs.iter().any(|graph| graph.id == id)
-				}
-			};
-			if !present {
-				return Err(invalid("active changefeed owner is absent"));
-			}
-		}
-		let mut previous_segment = None;
-		for (ordinal, segment) in entry.segments.iter().enumerate() {
-			let header = segment.header;
-			header.validate()?;
-			if segment.file.kind() != Some(DataFileKind::Changefeed)
-				|| !feed_files.insert(segment.file)
-				|| !feed_segments.insert(header.segment)
-				|| header.database != catalog.database_uuid
-				|| header.owner != crate::storage::HistoryOwner::Changefeed(entry.id)
-				|| (!partial || ordinal != 0) && header.first_stamp <= entry.purged_through
-				|| header.first_stamp < entry.defined_at
-				|| header.last_stamp > entry.last_stamp
-				|| header.last_time > catalog.committed_at_ns
-				|| entry.purged_through != 0
-					&& (!partial || ordinal != 0)
-					&& header.first_time < entry.purged_time_ns
-			{
-				return Err(invalid("changefeed segment identities or catalog bounds disagree"));
-			}
-			if previous_segment.is_some_and(|(stamp, time)| {
-				stamp >= header.first_stamp || time > header.first_time
-			}) {
-				return Err(invalid("changefeed segments overlap or are out of order"));
-			}
-			previous_segment = Some((header.last_stamp, header.last_time));
-		}
+		let partial = validate_changefeed_entry(catalog, entry, &mut feed_ids, &mut feed_sources)?;
+		validate_changefeed_segments(catalog, entry, partial, &mut feed_files, &mut feed_segments)?;
 	}
 	super::live_history::validate_entries(catalog, &mut feed_files, &mut feed_segments)?;
 	if catalog.next_graph_id == 0 {
@@ -199,117 +92,14 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		.collect::<BTreeMap<_, _>>();
 	let mut schema_ids = BTreeSet::new();
 	let mut class_ids = BTreeSet::new();
-	let mut class_names = BTreeSet::new();
-	let mut previous_class = None;
-	for class in &catalog.classes {
-		if previous_class.is_some_and(|previous| previous >= class.id)
-			|| u64::from(class.id.get()) >= catalog.next_schema_id
-			|| class.published_at == 0
-			|| class.name.is_empty()
-			|| class.name.as_str().contains('\0')
-			|| !class_ids.insert(class.id)
-			|| !class_names.insert(class.name.as_str())
-		{
-			return Err(invalid("class catalog ordering or identity is invalid"));
-		}
-		insert_schema(&mut schema_ids, class.id.into(), catalog.next_schema_id)?;
-		let mut field_ids = BTreeSet::new();
-		let mut field_names = BTreeSet::new();
-		let mut field_keys = BTreeSet::new();
-		for field in &class.fields {
-			insert_schema(&mut schema_ids, field.id, catalog.next_schema_id)?;
-			if !field_ids.insert(field.id)
-				|| !field_names.insert(field.name.as_str())
-				|| !field_keys.insert(field.property_key)
-				|| field.name.is_empty()
-				|| field.name.as_str().contains('\0')
-			{
-				return Err(invalid("class fields contain duplicate or invalid metadata"));
-			}
-		}
-		let mut index_ids = BTreeSet::new();
-		let mut index_names = BTreeSet::new();
-		for index in &class.indexes {
-			insert_schema(&mut schema_ids, index.id.into(), catalog.next_schema_id)?;
-			if !index_ids.insert(index.id)
-				|| !index_names.insert(index.name.as_str())
-				|| index.name.is_empty()
-				|| index.name.as_str().contains('\0')
-			{
-				return Err(invalid("class indexes contain duplicate or invalid metadata"));
-			}
-			match index.kind {
-				ClassIndexKind::Count if !index.fields.is_empty() => {
-					return Err(invalid("Count index contains fields"));
-				}
-				ClassIndexKind::Standard | ClassIndexKind::Unique if index.fields.is_empty() => {
-					return Err(invalid("scalar index contains no fields"));
-				}
-				ClassIndexKind::Fulltext
-				| ClassIndexKind::Hnsw
-				| ClassIndexKind::DiskAnn
-				| ClassIndexKind::Geometry
-					if index.fields.len() != 1 =>
-				{
-					return Err(invalid("specialized index must contain exactly one field"));
-				}
-				_ => {}
-			}
-			match (index.kind, index.options) {
-				(ClassIndexKind::Geometry, ClassIndexOptions::Geometry(_)) => {}
-				(
-					ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count,
-					ClassIndexOptions::Scalar,
-				) => {}
-				(ClassIndexKind::Fulltext, ClassIndexOptions::Fulltext(options)) => {
-					let analyzer = analyzer_by_id
-						.get(&options.analyzer())
-						.ok_or_else(|| invalid("Fulltext index references an absent analyzer"))?;
-					if analyzer.version != options.analyzer_version() {
-						return Err(invalid("Fulltext analyzer version is stale"));
-					}
-				}
-				(ClassIndexKind::Hnsw, ClassIndexOptions::Hnsw(options)) => {
-					validate_custom_distance(options.distance(), &function_by_id)?;
-				}
-				(ClassIndexKind::DiskAnn, ClassIndexOptions::DiskAnn(options)) => {
-					if matches!(options.distance(), VectorDistance::Custom { .. }) {
-						return Err(invalid("DiskANN cannot use a custom distance"));
-					}
-				}
-				_ => return Err(invalid("index kind-specific options do not match its kind")),
-			}
-			if index.maintenance == IndexMaintenanceMode::Deferred
-				&& index.kind == ClassIndexKind::Unique
-			{
-				return Err(invalid("Unique index cannot use deferred maintenance"));
-			}
-			let mut keys = BTreeSet::new();
-			if index.fields.iter().any(|key| !field_keys.contains(key) || !keys.insert(*key)) {
-				return Err(invalid("class index references an absent or duplicate field"));
-			}
-			if let IndexScope::Effective {
-				graph,
-			} = index.scope
-				&& !graph_ids.contains(&graph)
-			{
-				return Err(invalid("effective index references an absent graph"));
-			}
-			if index.state == ClassIndexState::Ready && index.physical.is_none() {
-				return Err(invalid("ready class index has no physical binding"));
-			}
-			if index.state == ClassIndexState::Ready && index.build_revision == 0 {
-				return Err(invalid("ready class index has no published build revision"));
-			}
-			if let Some(binding) = index.physical {
-				validate_binding(binding)?;
-			}
-			if let Some(binding) = index.delta {
-				validate_binding(binding)?;
-			}
-		}
-		previous_class = Some(class.id);
-	}
+	validate_class_catalog(
+		catalog,
+		&mut schema_ids,
+		&mut class_ids,
+		&graph_ids,
+		&analyzer_by_id,
+		&function_by_id,
+	)?;
 
 	let mut previous_graph = None;
 	let mut graph_names = BTreeSet::new();
@@ -650,6 +440,277 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Validates class identities, fields and index bindings against the shared
+/// catalog namespaces.
+///
+/// # Errors
+/// Returns the first existing class, field, index or dependency inconsistency
+/// in the original order.
+fn validate_class_catalog(
+	catalog: &DatabaseCatalog,
+	schema_ids: &mut BTreeSet<SchemaId>,
+	class_ids: &mut BTreeSet<crate::datastore::ClassId>,
+	graph_ids: &BTreeSet<crate::graph::GraphId>,
+	analyzer_by_id: &BTreeMap<crate::datastore::AnalyzerId, &super::AnalyzerCatalogEntry>,
+	function_by_id: &BTreeMap<crate::datastore::FunctionId, &super::FunctionCatalogEntry>,
+) -> FerrosGrynnResult<()> {
+	let mut class_names = BTreeSet::new();
+	let mut previous_class = None;
+	for class in &catalog.classes {
+		if previous_class.is_some_and(|previous| previous >= class.id)
+			|| u64::from(class.id.get()) >= catalog.next_schema_id
+			|| class.published_at == 0
+			|| class.name.is_empty()
+			|| class.name.as_str().contains('\0')
+			|| !class_ids.insert(class.id)
+			|| !class_names.insert(class.name.as_str())
+		{
+			return Err(invalid("class catalog ordering or identity is invalid"));
+		}
+		insert_schema(schema_ids, class.id.into(), catalog.next_schema_id)?;
+		let mut field_ids = BTreeSet::new();
+		let mut field_names = BTreeSet::new();
+		let mut field_keys = BTreeSet::new();
+		for field in &class.fields {
+			insert_schema(schema_ids, field.id, catalog.next_schema_id)?;
+			if !field_ids.insert(field.id)
+				|| !field_names.insert(field.name.as_str())
+				|| !field_keys.insert(field.property_key)
+				|| field.name.is_empty()
+				|| field.name.as_str().contains('\0')
+			{
+				return Err(invalid("class fields contain duplicate or invalid metadata"));
+			}
+		}
+		let mut index_ids = BTreeSet::new();
+		let mut index_names = BTreeSet::new();
+		for index in &class.indexes {
+			insert_schema(schema_ids, index.id.into(), catalog.next_schema_id)?;
+			if !index_ids.insert(index.id)
+				|| !index_names.insert(index.name.as_str())
+				|| index.name.is_empty()
+				|| index.name.as_str().contains('\0')
+			{
+				return Err(invalid("class indexes contain duplicate or invalid metadata"));
+			}
+			match index.kind {
+				ClassIndexKind::Count if !index.fields.is_empty() => {
+					return Err(invalid("Count index contains fields"));
+				}
+				ClassIndexKind::Standard | ClassIndexKind::Unique if index.fields.is_empty() => {
+					return Err(invalid("scalar index contains no fields"));
+				}
+				ClassIndexKind::Fulltext
+				| ClassIndexKind::Hnsw
+				| ClassIndexKind::DiskAnn
+				| ClassIndexKind::Geometry
+					if index.fields.len() != 1 =>
+				{
+					return Err(invalid("specialized index must contain exactly one field"));
+				}
+				_ => {}
+			}
+			match (index.kind, index.options) {
+				(ClassIndexKind::Geometry, ClassIndexOptions::Geometry(_)) => {}
+				(
+					ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count,
+					ClassIndexOptions::Scalar,
+				) => {}
+				(ClassIndexKind::Fulltext, ClassIndexOptions::Fulltext(options)) => {
+					let analyzer = analyzer_by_id
+						.get(&options.analyzer())
+						.ok_or_else(|| invalid("Fulltext index references an absent analyzer"))?;
+					if analyzer.version != options.analyzer_version() {
+						return Err(invalid("Fulltext analyzer version is stale"));
+					}
+				}
+				(ClassIndexKind::Hnsw, ClassIndexOptions::Hnsw(options)) => {
+					validate_custom_distance(options.distance(), function_by_id)?;
+				}
+				(ClassIndexKind::DiskAnn, ClassIndexOptions::DiskAnn(options)) => {
+					if matches!(options.distance(), VectorDistance::Custom { .. }) {
+						return Err(invalid("DiskANN cannot use a custom distance"));
+					}
+				}
+				_ => return Err(invalid("index kind-specific options do not match its kind")),
+			}
+			if index.maintenance == IndexMaintenanceMode::Deferred
+				&& index.kind == ClassIndexKind::Unique
+			{
+				return Err(invalid("Unique index cannot use deferred maintenance"));
+			}
+			let mut keys = BTreeSet::new();
+			if index.fields.iter().any(|key| !field_keys.contains(key) || !keys.insert(*key)) {
+				return Err(invalid("class index references an absent or duplicate field"));
+			}
+			if let IndexScope::Effective {
+				graph,
+			} = index.scope
+				&& !graph_ids.contains(&graph)
+			{
+				return Err(invalid("effective index references an absent graph"));
+			}
+			if index.state == ClassIndexState::Ready && index.physical.is_none() {
+				return Err(invalid("ready class index has no physical binding"));
+			}
+			if index.state == ClassIndexState::Ready && index.build_revision == 0 {
+				return Err(invalid("ready class index has no published build revision"));
+			}
+			if let Some(binding) = index.physical {
+				validate_binding(binding)?;
+			}
+			if let Some(binding) = index.delta {
+				validate_binding(binding)?;
+			}
+		}
+		previous_class = Some(class.id);
+	}
+
+	Ok(())
+}
+
+/// Validates one retained feed's lifecycle and source before examining
+/// segments.
+///
+/// # Errors
+/// Returns the first existing catalog inconsistency in the original check
+/// order.
+fn validate_changefeed_entry(
+	catalog: &DatabaseCatalog,
+	entry: &super::ChangefeedCatalogEntry,
+	feed_ids: &mut BTreeSet<crate::changefeed::ChangefeedId>,
+	feed_sources: &mut BTreeSet<crate::changefeed::ChangefeedSource>,
+) -> FerrosGrynnResult<bool> {
+	let first =
+		entry.epochs.first().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
+	let last = entry.epochs.last().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
+	if first.started_at().get() < entry.defined_at
+		|| last.started_at().get() != entry.published_at
+		|| last.revision() != entry.version
+		|| entry.epochs.iter().any(|epoch| epoch.revision() > entry.version)
+		|| entry.epochs.windows(2).any(|pair| pair[0].started_at() >= pair[1].started_at())
+		|| entry.epochs.windows(2).any(|pair| pair[0].revision() > pair[1].revision())
+	{
+		return Err(invalid("changefeed capture epoch bounds are invalid"));
+	}
+	let final_configuration =
+		(entry.state == crate::changefeed::ChangefeedState::Active).then_some(entry.config);
+	if last.configuration() != final_configuration {
+		return Err(invalid("changefeed final capture epoch disagrees with lifecycle"));
+	}
+	let below_clock = match entry.source {
+		crate::changefeed::ChangefeedSource::Class(id) => {
+			u64::from(id.get()) < catalog.next_schema_id
+		}
+		crate::changefeed::ChangefeedSource::Graph(id) => id.get() < catalog.next_graph_id,
+	};
+	if !below_clock {
+		return Err(invalid("retained changefeed source exceeds its owner identity clock"));
+	}
+	if entry.name.as_str().is_empty() || entry.name.as_str().contains('\0') {
+		return Err(invalid("retained changefeed source name is invalid"));
+	}
+	if !feed_ids.insert(entry.id) || !feed_sources.insert(entry.source) {
+		return Err(invalid("changefeed catalog has duplicate identities or sources"));
+	}
+	if entry.defined_at > entry.published_at || entry.purged_through > entry.last_stamp {
+		return Err(invalid("changefeed catalog bounds are reversed"));
+	}
+	if entry.purged_through == 0 && entry.purged_time_ns != 0
+		|| entry.purged_through != 0 && entry.purged_time_ns > catalog.committed_at_ns
+		|| jiff::Timestamp::from_nanosecond(entry.purged_time_ns).is_err()
+	{
+		return Err(invalid("changefeed purge time contradicts its trusted bounds"));
+	}
+	if (entry.state == crate::changefeed::ChangefeedState::Active) != entry.closed_at.is_none()
+		|| entry.closed_at.is_some() != entry.closed_time_ns.is_some()
+	{
+		return Err(invalid("changefeed lifecycle and close stamp disagree"));
+	}
+	if entry.closed_time_ns.is_some_and(|time| {
+		time > catalog.committed_at_ns || jiff::Timestamp::from_nanosecond(time).is_err()
+	}) {
+		return Err(invalid("changefeed close time contradicts the database clock"));
+	}
+	let partial = entry.retained_page != 0 || entry.retained_groups != 0;
+	if partial
+		&& !entry.segments.first().is_some_and(|segment| {
+			entry.retained_page > 1
+				&& entry.retained_page < segment.header.pages
+				&& entry.retained_groups > 0
+				&& entry.retained_groups < segment.header.commits
+				&& entry.purged_through >= segment.header.first_stamp
+				&& entry.purged_through < segment.header.last_stamp
+				&& entry.purged_time_ns >= segment.header.first_time
+				&& entry.purged_time_ns <= segment.header.last_time
+		}) {
+		return Err(invalid("changefeed retained prefix position is invalid"));
+	}
+	if entry
+		.closed_at
+		.is_some_and(|closed| closed < entry.defined_at || closed > entry.published_at)
+	{
+		return Err(invalid("changefeed close stamp is outside descriptor bounds"));
+	}
+	if entry.state == crate::changefeed::ChangefeedState::Active {
+		let present = match entry.source {
+			crate::changefeed::ChangefeedSource::Class(id) => {
+				catalog.classes.iter().any(|class| class.id == id)
+			}
+			crate::changefeed::ChangefeedSource::Graph(id) => {
+				catalog.graphs.iter().any(|graph| graph.id == id)
+			}
+		};
+		if !present {
+			return Err(invalid("active changefeed owner is absent"));
+		}
+	}
+	Ok(partial)
+}
+
+/// Validates one feed's ordered history while sharing file identities across
+/// owners.
+///
+/// # Errors
+/// Returns the first existing header, identity, boundary or segment-order
+/// error.
+fn validate_changefeed_segments(
+	catalog: &DatabaseCatalog,
+	entry: &super::ChangefeedCatalogEntry,
+	partial: bool,
+	feed_files: &mut BTreeSet<crate::storage::types::DataFileId>,
+	feed_segments: &mut BTreeSet<uuid::Uuid>,
+) -> FerrosGrynnResult<()> {
+	let mut previous_segment = None;
+	for (ordinal, segment) in entry.segments.iter().enumerate() {
+		let header = segment.header;
+		header.validate()?;
+		if segment.file.kind() != Some(DataFileKind::Changefeed)
+			|| !feed_files.insert(segment.file)
+			|| !feed_segments.insert(header.segment)
+			|| header.database != catalog.database_uuid
+			|| header.owner != crate::storage::HistoryOwner::Changefeed(entry.id)
+			|| (!partial || ordinal != 0) && header.first_stamp <= entry.purged_through
+			|| header.first_stamp < entry.defined_at
+			|| header.last_stamp > entry.last_stamp
+			|| header.last_time > catalog.committed_at_ns
+			|| entry.purged_through != 0
+				&& (!partial || ordinal != 0)
+				&& header.first_time < entry.purged_time_ns
+		{
+			return Err(invalid("changefeed segment identities or catalog bounds disagree"));
+		}
+		if previous_segment
+			.is_some_and(|(stamp, time)| stamp >= header.first_stamp || time > header.first_time)
+		{
+			return Err(invalid("changefeed segments overlap or are out of order"));
+		}
+		previous_segment = Some((header.last_stamp, header.last_time));
+	}
+	Ok(())
+}
+
+/// Validates custom distance.
 fn validate_custom_distance(
 	distance: VectorDistance,
 	functions: &BTreeMap<crate::datastore::FunctionId, &super::FunctionCatalogEntry>,
@@ -675,10 +736,12 @@ fn validate_custom_distance(
 	Ok(())
 }
 
+/// Returns the internal graph name result.
 fn internal_graph_name(owner: crate::graph::GraphId, child: crate::graph::GraphId) -> String {
 	format!("$fg$build_{:016x}_{:016x}", owner.get(), child.get())
 }
 
+/// Validates binding.
 fn validate_binding(binding: PhysicalIndexBinding) -> FerrosGrynnResult<()> {
 	validate_binding_kind(binding, DataFileKind::Index)
 }
@@ -694,6 +757,7 @@ fn validate_binding_kind(
 	Ok(())
 }
 
+/// Inserts schema.
 fn insert_schema(
 	seen: &mut BTreeSet<SchemaId>,
 	id: SchemaId,

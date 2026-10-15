@@ -10,8 +10,10 @@ use super::{
 };
 use crate::{graph::AtomKind, storage::atom_page::PropertyRef};
 
+/// Largest slot generation accepted by the production 23-bit AtomId layout.
 const MAX_GENERATION: u32 = (1 << 23) - 1;
 
+/// Validates node slot.
 pub(super) fn validate_node_slot(value: &NodeHotSlot) -> crate::gql_status::FerrosGrynnResult<()> {
 	validate_generation(value.generation)?;
 	if value.flags.contains(NodeSlotFlags::TOMBSTONE) {
@@ -51,6 +53,7 @@ pub(super) fn validate_node_slot(value: &NodeHotSlot) -> crate::gql_status::Ferr
 	)
 }
 
+/// Validates edge slot.
 pub(super) fn validate_edge_slot(value: &EdgeHotSlot) -> crate::gql_status::FerrosGrynnResult<()> {
 	validate_generation(value.generation)?;
 	if value.flags.contains(EdgeSlotFlags::TOMBSTONE) {
@@ -148,6 +151,7 @@ pub(super) fn validate_edge_slot(value: &EdgeHotSlot) -> crate::gql_status::Ferr
 	Ok(())
 }
 
+/// Validates generation.
 fn validate_generation(generation: u32) -> crate::gql_status::FerrosGrynnResult<()> {
 	if generation > MAX_GENERATION {
 		return Err(invalid_page(0, "hot-slot generation exceeds 23 bits"));
@@ -155,6 +159,7 @@ fn validate_generation(generation: u32) -> crate::gql_status::FerrosGrynnResult<
 	Ok(())
 }
 
+/// Validates overlay.
 fn validate_overlay(flag: bool, overlay: PropertyRef) -> crate::gql_status::FerrosGrynnResult<()> {
 	if flag != (overlay != PropertyRef::None) {
 		return Err(invalid_page(0, "HAS_OVERLAY disagrees with overlay reference"));
@@ -162,6 +167,7 @@ fn validate_overlay(flag: bool, overlay: PropertyRef) -> crate::gql_status::Ferr
 	Ok(())
 }
 
+/// Validates inline.
 fn validate_inline<const N: usize>(
 	count: u32,
 	inline: &[Option<DiskAtomRef>; N],
@@ -180,6 +186,7 @@ fn validate_inline<const N: usize>(
 	Ok(())
 }
 
+/// Validates cross level.
 fn validate_cross_level<const N: usize>(
 	count: u32,
 	inline: &[Option<DiskAtomRef>; N],

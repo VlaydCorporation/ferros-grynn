@@ -49,17 +49,23 @@ use crate::{
 	},
 };
 
+/// Type used to represent class counts.
 type ClassCounts = BTreeMap<ClassId, u64>;
+/// Type used to represent label counts.
 type LabelCounts = BTreeMap<LabelStatisticKey, LabelStatistic>;
+/// Type used to represent degree histograms.
 type DegreeHistograms = BTreeMap<DegreeHistogramKey, DegreeHistogram>;
+/// Type used to represent property histograms.
 type PropertyHistograms = BTreeMap<PropertyHistogramKey, PropertyHistogram>;
 
 /// One immutable decoded auxiliary part shared by snapshots of one generation.
 struct CachedPart<T> {
+	/// Value associated with this cached part.
 	value: Mutex<Option<Arc<T>>>,
 }
 
 impl<T> Default for CachedPart<T> {
+	/// Constructs the default initial state of `CachedPart<T>`.
 	fn default() -> Self {
 		Self {
 			value: Mutex::new(None),
@@ -85,8 +91,11 @@ impl<T> CachedPart<T> {
 
 /// Exact immutable file selected by a statistics root.
 struct SnapshotFile {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: DataFileId,
+	/// File associated with this snapshot file.
 	file: Arc<RegisteredDataFile>,
+	/// Visible pages associated with this snapshot file.
 	visible_pages: u64,
 }
 
@@ -119,28 +128,43 @@ impl SnapshotFile {
 
 /// Database-global statistics auxiliary bindings and caches.
 struct PhysicalBaseStatistics {
+	/// Layout associated with this physical base statistics.
 	layout: BaseStatisticsLayout,
+	/// Classes associated with this physical base statistics.
 	classes: SnapshotFile,
+	/// Properties associated with this physical base statistics.
 	properties: SnapshotFile,
+	/// Class cache associated with this physical base statistics.
 	class_cache: CachedPart<ClassCounts>,
+	/// Property cache associated with this physical base statistics.
 	property_cache: CachedPart<PropertyHistograms>,
 }
 
 /// Graph-local statistics auxiliary bindings and caches.
 struct PhysicalGraphStatistics {
+	/// Layout associated with this physical graph statistics.
 	layout: StatisticsLayout,
+	/// Graph associated with this physical graph statistics.
 	graph: SnapshotFile,
+	/// Labels associated with this physical graph statistics.
 	labels: SnapshotFile,
+	/// Properties associated with this physical graph statistics.
 	properties: SnapshotFile,
+	/// Class cache associated with this physical graph statistics.
 	class_cache: CachedPart<ClassCounts>,
+	/// Label cache associated with this physical graph statistics.
 	label_cache: CachedPart<LabelCounts>,
+	/// Degree cache associated with this physical graph statistics.
 	degree_cache: CachedPart<DegreeHistograms>,
+	/// Property cache associated with this physical graph statistics.
 	property_cache: CachedPart<PropertyHistograms>,
 }
 
 /// Lazy statistics bindings retained with one durable catalog generation.
 pub(super) struct PhysicalStatisticsFiles {
+	/// Base associated with this physical statistics files.
 	base: PhysicalBaseStatistics,
+	/// Graphs associated with this physical statistics files.
 	graphs: BTreeMap<GraphId, PhysicalGraphStatistics>,
 }
 
@@ -191,13 +215,14 @@ pub(super) fn load_statistics_roots(
 
 	let mut graph_files = BTreeMap::new();
 	let mut deferred = base_class_pages > 1 || base_property_pages != 0;
-	for space in files
+	// Preserve deterministic graph order and deduplicate companion files.
+	let spaces = files
 		.files
 		.iter()
 		.map(|entry| entry.space_id)
 		.filter(|space| matches!(space, DataSpaceId::Graph(_)))
-		.collect::<std::collections::BTreeSet<_>>()
-	{
+		.collect::<std::collections::BTreeSet<_>>();
+	for &space in &spaces {
 		let graph_file_id = singleton(files, space, DataFileKind::Statistics)?;
 		let label_file_id = singleton(files, space, DataFileKind::LabelStatistics)?;
 		let property_file_id = singleton(files, space, DataFileKind::PropertyStatistics)?;
@@ -367,6 +392,7 @@ impl PhysicalStatisticsFiles {
 		Ok(())
 	}
 
+	/// Returns the base classes result.
 	fn base_classes(
 		&self,
 		store: &LocalStore,
@@ -388,6 +414,7 @@ impl PhysicalStatisticsFiles {
 		})
 	}
 
+	/// Returns the base properties result.
 	fn base_properties(
 		&self,
 		store: &LocalStore,
@@ -409,6 +436,7 @@ impl PhysicalStatisticsFiles {
 		})
 	}
 
+	/// Returns the graph classes result.
 	fn graph_classes(
 		&self,
 		store: &LocalStore,
@@ -426,6 +454,7 @@ impl PhysicalStatisticsFiles {
 		})
 	}
 
+	/// Returns the graph labels result.
 	fn graph_labels(
 		&self,
 		store: &LocalStore,
@@ -445,6 +474,7 @@ impl PhysicalStatisticsFiles {
 		})
 	}
 
+	/// Returns the graph degrees result.
 	fn graph_degrees(
 		&self,
 		store: &LocalStore,
@@ -464,6 +494,7 @@ impl PhysicalStatisticsFiles {
 		})
 	}
 
+	/// Returns the graph properties result.
 	fn graph_properties(
 		&self,
 		store: &LocalStore,
@@ -487,6 +518,7 @@ impl PhysicalStatisticsFiles {
 		})
 	}
 
+	/// Returns the graph result.
 	fn graph(&self, graph: GraphId) -> FerrosGrynnResult<&PhysicalGraphStatistics> {
 		self.graphs
 			.get(&graph)
@@ -494,6 +526,7 @@ impl PhysicalStatisticsFiles {
 	}
 }
 
+/// Returns the label dictionary result.
 fn label_dictionary(database: &DatabaseRoot, graph: GraphId) -> FerrosGrynnResult<LabelDictionary> {
 	let graph = database
 		.graph(graph)
@@ -508,6 +541,7 @@ fn label_dictionary(database: &DatabaseRoot, graph: GraphId) -> FerrosGrynnResul
 	}))
 }
 
+/// Returns the snapshot file result.
 fn snapshot_file(
 	registry: &FileRegistry,
 	space: DataSpaceId,
@@ -521,6 +555,7 @@ fn snapshot_file(
 	})
 }
 
+/// Returns the singleton result.
 fn singleton(
 	files: &FileCatalog,
 	space: DataSpaceId,

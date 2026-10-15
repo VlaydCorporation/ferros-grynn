@@ -6,6 +6,7 @@
 use super::*;
 use crate::{datastore::GraphSchema, graph::GraphStorageMode, values::PropertyMap};
 
+/// Evaluates graph properties.
 pub(super) fn evaluate_graph_properties(
 	transaction: &mut Transaction,
 	expression: Option<&TypedExpr>,
@@ -25,6 +26,7 @@ pub(super) fn evaluate_graph_properties(
 	object_to_property_map(transaction, &object)
 }
 
+/// Executes graph property update.
 pub(super) fn execute_graph_property_update(
 	transaction: &mut Transaction,
 	snapshot: &QuerySnapshot,
@@ -87,6 +89,7 @@ pub(super) fn execute_graph_property_update(
 	}
 }
 
+/// Returns the property map to object result.
 pub(super) fn property_map_to_object(
 	properties: &PropertyMap,
 	dictionary: &crate::values::PropertyDictionary,
@@ -103,6 +106,7 @@ pub(super) fn property_map_to_object(
 		.collect()
 }
 
+/// Returns the object to property map result.
 fn object_to_property_map(
 	transaction: &mut Transaction,
 	object: &Object,
@@ -121,6 +125,7 @@ fn object_to_property_map(
 		.collect()
 }
 
+/// Returns the intern object keys result.
 fn intern_object_keys(transaction: &mut Transaction, object: &Object) -> FerrosGrynnResult<()> {
 	for (name, value) in object {
 		transaction.intern_property(name.as_str())?;
@@ -129,6 +134,7 @@ fn intern_object_keys(transaction: &mut Transaction, object: &Object) -> FerrosG
 	Ok(())
 }
 
+/// Sets object path.
 fn set_object_path(object: &mut Object, path: &[Box<str>], value: Value) -> FerrosGrynnResult<()> {
 	let Some((head, tail)) = path.split_first() else {
 		return Err(FerrosGrynnError::invalid_argument("Graph property path is empty."));
@@ -149,6 +155,7 @@ fn set_object_path(object: &mut Object, path: &[Box<str>], value: Value) -> Ferr
 	set_object_path(nested, tail, value)
 }
 
+/// Returns the unset object path result.
 fn unset_object_path(object: &mut Object, path: &[Box<str>]) -> FerrosGrynnResult<()> {
 	let Some((head, tail)) = path.split_first() else {
 		return Err(FerrosGrynnError::invalid_argument("Graph property path is empty."));
@@ -169,6 +176,7 @@ fn unset_object_path(object: &mut Object, path: &[Box<str>]) -> FerrosGrynnResul
 	unset_object_path(nested, tail)
 }
 
+/// Returns the graph row result.
 fn graph_row<Graph: GraphRead>(
 	schema: &GraphSchema,
 	graph: &Graph,
@@ -186,6 +194,7 @@ fn graph_row<Graph: GraphRead>(
 	]))
 }
 
+/// Returns the storage mode name result.
 pub(super) const fn storage_mode_name(mode: GraphStorageMode) -> &'static str {
 	match mode {
 		GraphStorageMode::InMemory => "in_memory",

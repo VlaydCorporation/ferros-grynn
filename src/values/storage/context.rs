@@ -15,13 +15,17 @@ use crate::{
 	values::runtime::{GraphRef, PropertyDictionary, PropertyKeyId, Text},
 };
 
+/// Bidirectional dictionary assigning compact identifiers to text values.
 #[derive(Debug, Default)]
 pub(super) struct StringDictionary {
+	/// Mapping from names to the identifiers assigned by the dictionary.
 	ids: BTreeMap<Text, u32>,
+	/// Reverse mapping from assigned dictionary identifiers to names.
 	names: Vec<Text>,
 }
 
 impl StringDictionary {
+	/// Returns intern for `StringDictionary`.
 	pub(super) fn intern(
 		&mut self,
 		name: Text,
@@ -50,22 +54,28 @@ impl StringDictionary {
 		Ok(id)
 	}
 
+	/// Returns resolve for `StringDictionary`.
 	pub(super) fn resolve(&self, id: u32, first_id: u32) -> Option<&Text> {
 		id.checked_sub(first_id).and_then(|index| self.names.get(index as usize))
 	}
 
+	/// Returns names for `StringDictionary`.
 	fn names(&self) -> impl ExactSizeIterator<Item = &Text> {
 		self.names.iter()
 	}
 }
 
+/// Bidirectional mapping between class names and on-disk class identifiers.
 #[derive(Debug, Default)]
 pub(super) struct ClassDictionary {
+	/// Mapping from names to the identifiers assigned by the dictionary.
 	ids: BTreeMap<Text, u32>,
+	/// Reverse mapping from assigned dictionary identifiers to names.
 	names: BTreeMap<u32, Text>,
 }
 
 impl ClassDictionary {
+	/// Returns register for `ClassDictionary`.
 	fn register(&mut self, id: u32, name: Text) -> FerrosGrynnResult<()> {
 		if id == 0 || id == u32::MAX {
 			return Err(FerrosGrynnError::invalid_argument(
@@ -82,14 +92,17 @@ impl ClassDictionary {
 		Ok(())
 	}
 
+	/// Returns id for `ClassDictionary`.
 	pub(super) fn id(&self, name: &Text) -> Option<u32> {
 		self.ids.get(name).copied()
 	}
 
+	/// Returns resolve for `ClassDictionary`.
 	pub(super) fn resolve(&self, id: u32) -> Option<&Text> {
 		self.names.get(&id)
 	}
 
+	/// Returns entries for `ClassDictionary`.
 	fn entries(&self) -> impl ExactSizeIterator<Item = (u32, &Text)> {
 		self.names.iter().map(|(id, name)| (*id, name))
 	}
@@ -99,14 +112,20 @@ impl ClassDictionary {
 /// values.
 #[derive(Debug, Default)]
 pub struct EncodeContext {
+	/// Dictionary resolving interned property keys during value conversion.
 	pub(super) properties: PropertyDictionary,
+	/// Class-name dictionary used to resolve stored record identities.
 	pub(super) classes: ClassDictionary,
+	/// Dictionary resolving time-zone names used by stored timestamps.
 	time_zones: StringDictionary,
+	/// Mapping from owned graph references to compact on-disk references.
 	graphs_to_disk: BTreeMap<GraphRef, DiskGraphRef>,
+	/// Mapping from compact on-disk graph references to owned references.
 	graphs_from_disk: BTreeMap<DiskGraphRef, GraphRef>,
 }
 
 impl EncodeContext {
+	/// Constructs `EncodeContext` from the supplied initial state.
 	pub fn new(properties: PropertyDictionary) -> Self {
 		Self {
 			properties,
@@ -114,6 +133,7 @@ impl EncodeContext {
 		}
 	}
 
+	/// Borrows the stored properties of this `EncodeContext`.
 	pub const fn property_dictionary(&self) -> &PropertyDictionary {
 		&self.properties
 	}
@@ -171,6 +191,7 @@ impl EncodeContext {
 		self.graphs_from_disk.get(&disk)
 	}
 
+	/// Registers graph for `EncodeContext`.
 	pub fn register_graph(
 		&mut self,
 		runtime: GraphRef,
@@ -199,6 +220,7 @@ impl EncodeContext {
 		Ok(())
 	}
 
+	/// Returns decoder for `EncodeContext`.
 	pub const fn decoder(&self) -> DecodeContext<'_> {
 		DecodeContext {
 			properties: &self.properties,
@@ -208,6 +230,7 @@ impl EncodeContext {
 		}
 	}
 
+	/// Returns graph to disk for `EncodeContext`.
 	pub(super) fn graph_to_disk(&self, value: &GraphRef) -> FerrosGrynnResult<DiskGraphRef> {
 		self.graphs_to_disk
 			.get(value)
@@ -215,6 +238,7 @@ impl EncodeContext {
 			.ok_or_else(|| unresolved("graph", value.name().to_string()))
 	}
 
+	/// Returns intern time zone for `EncodeContext`.
 	pub(super) fn intern_time_zone(&mut self, value: &jiff::Zoned) -> FerrosGrynnResult<u32> {
 		if let Some(name) = value.time_zone().iana_name() {
 			if name == "UTC" {
@@ -240,17 +264,23 @@ impl EncodeContext {
 /// values.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeContext<'a> {
+	/// Dictionary resolving interned property keys during value conversion.
 	pub(super) properties: &'a PropertyDictionary,
+	/// Class-name dictionary used to resolve stored record identities.
 	pub(super) classes: &'a ClassDictionary,
+	/// Dictionary resolving time-zone names used by stored timestamps.
 	time_zones: &'a StringDictionary,
+	/// Graph references or physical graph snapshots indexed for resolution.
 	graphs: &'a BTreeMap<DiskGraphRef, GraphRef>,
 }
 
 impl DecodeContext<'_> {
+	/// Returns graph from disk for `DecodeContext<'_>`.
 	pub(super) fn graph_from_disk(&self, value: DiskGraphRef) -> FerrosGrynnResult<&GraphRef> {
 		self.graphs.get(&value).ok_or_else(|| unresolved("graph", value.to_string()))
 	}
 
+	/// Returns time zone for `DecodeContext<'_>`.
 	pub(super) fn time_zone(&self, id: u32) -> FerrosGrynnResult<TimeZone> {
 		match id {
 			0 => Ok(TimeZone::UTC),

@@ -1,14 +1,32 @@
 //! Reusable page builders for hot files and overflow chains.
 
-use super::super::*;
+use super::super::{
+	AlignedPage,
+	CROSS_LEVEL_REFS_PER_PAGE,
+	EndpointSide,
+	FerrosGrynnResult,
+	OVERFLOW_REFS_PER_PAGE,
+	PageLsn,
+	PageNo,
+	QualifiedDiskAtomRef,
+	SUBGRAPHS_PER_PAGE,
+	SubgraphEntry,
+	encode_adjacency_overflow,
+	encode_cross_level_overflow,
+	encode_subgraph_directory,
+	invalid_page,
+};
 use crate::values::storage::DiskAtomRef;
 
 #[derive(Default)]
+/// Overflow builder state.
 pub(super) struct OverflowBuilder {
+	/// Pages associated with this overflow builder.
 	pages: Vec<AlignedPage>,
 }
 
 impl OverflowBuilder {
+	/// Appends overflow builder.
 	pub(super) fn append(
 		&mut self,
 		entries: &[DiskAtomRef],
@@ -27,17 +45,21 @@ impl OverflowBuilder {
 		Ok(Some(first))
 	}
 
+	/// Finishes overflow builder.
 	pub(super) fn finish(self) -> Vec<AlignedPage> {
 		self.pages
 	}
 }
 
 #[derive(Default)]
+/// Qualified overflow builder state.
 pub(super) struct QualifiedOverflowBuilder {
+	/// Pages associated with this qualified overflow builder.
 	pages: Vec<AlignedPage>,
 }
 
 impl QualifiedOverflowBuilder {
+	/// Appends qualified overflow builder.
 	pub(super) fn append(
 		&mut self,
 		entries: &[super::topology::EncodedEndpoint],
@@ -65,11 +87,13 @@ impl QualifiedOverflowBuilder {
 		Ok(Some(first))
 	}
 
+	/// Finishes qualified overflow builder.
 	pub(super) fn finish(self) -> Vec<AlignedPage> {
 		self.pages
 	}
 }
 
+/// Returns the inline refs result.
 pub(super) fn inline_refs<const N: usize>(entries: &[DiskAtomRef]) -> [Option<DiskAtomRef>; N] {
 	let mut result = [None; N];
 	for (destination, source) in result.iter_mut().zip(entries) {
@@ -78,6 +102,7 @@ pub(super) fn inline_refs<const N: usize>(entries: &[DiskAtomRef]) -> [Option<Di
 	result
 }
 
+/// Returns the subgraph pages result.
 pub(super) fn subgraph_pages(
 	entries: &[SubgraphEntry],
 	page_lsn: PageLsn,
@@ -95,6 +120,7 @@ pub(super) fn subgraph_pages(
 	Ok(pages)
 }
 
+/// Returns the page index result.
 pub(super) fn page_index(page: PageNo, count: usize) -> FerrosGrynnResult<usize> {
 	let index = usize::try_from(page.get())
 		.map_err(|_error| invalid_page(page.get(), "page number exceeds usize"))?;
@@ -104,6 +130,7 @@ pub(super) fn page_index(page: PageNo, count: usize) -> FerrosGrynnResult<usize>
 	Ok(index)
 }
 
+/// Returns the page no result.
 pub(super) fn page_no(index: usize, family: &str) -> FerrosGrynnResult<PageNo> {
 	u64::try_from(index)
 		.map(PageNo::new)

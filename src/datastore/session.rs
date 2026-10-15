@@ -43,14 +43,20 @@ use crate::{
 
 /// Persistent bindings and optional explicit transaction for GrynnQL calls.
 pub struct GqlSession {
+	/// Store associated with this gql session.
 	store: Datastore,
+	/// Bindings associated with this gql session.
 	bindings: Object,
 	/// Owned lexical contracts, independent of the current value
 	/// representation.
 	binding_types: crate::gql::bindings::BindingTypes,
+	/// Transaction associated with this gql session.
 	transaction: Option<Transaction>,
+	/// Execution mode associated with this gql session.
 	execution_mode: ExecutionMode,
+	/// Cursors associated with this gql session.
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
+	/// Closures associated with this gql session.
 	closures: Arc<LanguageClosureState>,
 	/// Owned admitted consumers detach when the session or extracted handle
 	/// drops.
@@ -58,6 +64,7 @@ pub struct GqlSession {
 }
 
 impl GqlSession {
+	/// Creates a new `GqlSession` value.
 	pub(crate) fn new(store: Datastore) -> Self {
 		let max_snapshot_age = match store.options() {
 			super::DatastoreOptions::InMemory(options) => options.max_snapshot_age,
@@ -75,6 +82,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Returns the new transient result.
 	pub(crate) fn new_transient(store: Datastore) -> Self {
 		Self {
 			store,
@@ -339,6 +347,7 @@ impl GqlSession {
 		self.execute_internal(source, variables, &options, false)
 	}
 
+	/// Executes internal.
 	pub(crate) fn execute_internal(
 		&mut self,
 		source: &str,
@@ -622,6 +631,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Executes admin statement.
 	fn execute_admin_statement(
 		&mut self,
 		statement: &Statement,
@@ -711,6 +721,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Executes maintenance.
 	fn execute_maintenance(
 		&self,
 		statement: &crate::syn::MaintenanceStatement,
@@ -775,6 +786,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Returns the maintenance options result.
 	fn maintenance_options(
 		&self,
 		statement: &crate::syn::MaintenanceStatement,
@@ -819,6 +831,7 @@ impl GqlSession {
 		})
 	}
 
+	/// Resolves maintenance target.
 	fn resolve_maintenance_target(
 		&self,
 		target: &MaintenanceTargetName,
@@ -866,6 +879,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Resolves index owner.
 	fn resolve_index_owner(
 		&self,
 		owner: &MaintenanceIndexOwner,
@@ -941,6 +955,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Resolves index target.
 	fn resolve_index_target(
 		&self,
 		class_name: &str,
@@ -969,6 +984,7 @@ impl GqlSession {
 		})
 	}
 
+	/// Returns the enqueue concurrent index result.
 	fn enqueue_concurrent_index(
 		&self,
 		class_name: &str,
@@ -993,6 +1009,7 @@ impl GqlSession {
 			.map(Some)
 	}
 
+	/// Executes transaction command.
 	fn execute_transaction_command(
 		&mut self,
 		command: TransactionCommand,
@@ -1044,6 +1061,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Executes in explicit transaction.
 	fn execute_in_explicit_transaction(
 		&mut self,
 		statement: &Statement,
@@ -1071,6 +1089,7 @@ impl GqlSession {
 		}
 	}
 
+	/// Executes autocommit.
 	fn execute_autocommit(
 		&mut self,
 		statement: &Statement,
@@ -1160,6 +1179,7 @@ impl GqlSession {
 		result
 	}
 
+	/// Validates structure.
 	fn validate_structure(&self, program: &Program, require_closed: bool) -> FerrosGrynnResult<()> {
 		let needs_structural_walk = program.statements.iter().any(|statement| {
 			matches!(
@@ -1236,6 +1256,7 @@ impl GqlSession {
 		Ok(())
 	}
 
+	/// Ensures parameter names available.
 	fn ensure_parameter_names_available(&self, variables: &Object) -> FerrosGrynnResult<()> {
 		for name in variables.keys() {
 			if self.bindings.contains_key(name)
@@ -1252,6 +1273,7 @@ impl GqlSession {
 		Ok(())
 	}
 
+	/// Returns the merged bindings result.
 	fn merged_bindings(&mut self, variables: &Object) -> FerrosGrynnResult<Object> {
 		let mut bindings = if let Some(transaction) = &mut self.transaction {
 			transaction.parameter_bindings()?
@@ -1287,6 +1309,7 @@ impl GqlSession {
 		Ok(bindings)
 	}
 
+	/// Returns whether the binding declared in current scope condition holds.
 	fn binding_declared_in_current_scope(&self, name: &str, variables: &Object) -> bool {
 		variables.contains_key(name)
 			|| self.transaction.as_ref().map_or_else(
@@ -1295,6 +1318,7 @@ impl GqlSession {
 			)
 	}
 
+	/// Returns the mutable binding names result.
 	fn mutable_binding_names(&self) -> std::collections::BTreeSet<Box<str>> {
 		self.transaction.as_ref().map_or_else(
 			|| self.bindings.keys().map(|name| Box::<str>::from(name.as_str())).collect(),
@@ -1308,12 +1332,14 @@ impl GqlSession {
 		)
 	}
 
+	/// Performs the rollback explicit transaction operation.
 	fn rollback_explicit_transaction(&mut self) {
 		self.transaction.take();
 		self.execution_mode = ExecutionMode::BestEffort;
 	}
 }
 
+/// Performs the finalize explain publication operation.
 fn finalize_explain_publication(result: &mut QueryResult, elapsed: std::time::Duration) {
 	let Ok(outcome) = &result.result else {
 		return;
@@ -1342,6 +1368,7 @@ fn finalize_explain_publication(result: &mut QueryResult, elapsed: std::time::Du
 	result.result = Ok(Outcome::new(value, statuses));
 }
 
+/// Resolves job id.
 fn resolve_job_id(bindings: &Object, job: &crate::syn::Identifier) -> FerrosGrynnResult<JobId> {
 	match bindings.get(job.value.as_ref()) {
 		Some(Value::Uuid(id)) => Ok(JobId::from_uuid(*id)),
@@ -1356,9 +1383,13 @@ fn resolve_job_id(bindings: &Object, job: &crate::syn::Identifier) -> FerrosGryn
 	}
 }
 
+/// Resolves analyze mode.
 fn resolve_analyze_mode(mode: AnalyzeModeName) -> FerrosGrynnResult<MaintenanceAnalyzeMode> {
+	/// Samples used when approximate ANALYZE omits an explicit sample count.
 	const DEFAULT_SAMPLE_COUNT: u32 = 30_000;
+	/// Minimum sample count accepted by approximate ANALYZE.
 	const MIN_SAMPLE_COUNT: u64 = 1_024;
+	/// Maximum sample count accepted by approximate ANALYZE.
 	const MAX_SAMPLE_COUNT: u64 = 1_000_000;
 
 	match mode {
@@ -1382,7 +1413,8 @@ fn resolve_analyze_mode(mode: AnalyzeModeName) -> FerrosGrynnResult<MaintenanceA
 	}
 }
 
-pub(crate) fn validate_control_structure(
+/// Validates control structure.
+pub fn validate_control_structure(
 	statement: &Statement,
 	loop_depth: u32,
 	nested: bool,
@@ -1429,6 +1461,7 @@ pub(crate) fn validate_control_structure(
 	}
 }
 
+/// Validates block structure.
 fn validate_block_structure(block: &crate::syn::Block, loop_depth: u32) -> FerrosGrynnResult<()> {
 	for statement in &block.statements {
 		validate_control_structure(statement, loop_depth, true)?;
@@ -1436,6 +1469,7 @@ fn validate_block_structure(block: &crate::syn::Block, loop_depth: u32) -> Ferro
 	Ok(())
 }
 
+/// Returns the error result result.
 fn error_result(statement: &Statement, started: Instant, error: FerrosGrynnError) -> QueryResult {
 	QueryResult {
 		kind: crate::gql::statement_kind(&statement.kind),

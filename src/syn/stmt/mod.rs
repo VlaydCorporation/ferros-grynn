@@ -1,22 +1,33 @@
 mod bridge;
 mod changefeed;
 pub use bridge::BridgeClause;
+/// Executable blocks, loops and control-flow syntax.
 mod control;
+/// Atom creation, update and deletion syntax.
 mod dml;
 /// Class/graph event definitions and ordered lifecycle actions.
 mod event;
 mod explain;
+/// Graph membership and incidence mutation syntax.
 mod graph_dml;
+/// Graph property statement syntax.
 mod graph_properties;
 mod graph_result;
+/// Bounded import statement syntax.
 mod import;
+/// Lexical binding declarations.
 mod r#let;
 mod live;
 mod maintenance;
+/// Graph patterns, path bounds and MATCH syntax.
 mod r#match;
+/// RETURN statement syntax.
 mod r#return;
+/// Schema definition, alteration and removal syntax.
 mod schema;
+/// SELECT sources, clauses and projections.
 mod select;
+/// BEGIN, COMMIT and CANCEL syntax.
 mod transaction;
 mod traverse;
 
@@ -66,6 +77,7 @@ pub use r#match::{
 	MatchConstraints,
 	MatchContains,
 	MatchDirection,
+	MatchDistinctness,
 	MatchEdge,
 	MatchEndpoint,
 	MatchEndpointKind,
@@ -153,11 +165,15 @@ use super::{
 };
 use crate::gql_status::{FerrosGrynnResult, TextSpan};
 
+/// Statement syntax with its source span and optional timeout.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Statement {
+	/// Selected operation or representation discriminator.
 	pub kind: StatementKind,
+	/// Source byte range used to report diagnostics for this syntax element.
 	pub span: TextSpan,
+	/// Optional time limit attached to this operation.
 	pub timeout: Option<TimeoutValue>,
 }
 
@@ -165,70 +181,256 @@ pub struct Statement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TimeoutValue {
+	/// Timeout supplied as a literal duration.
 	Literal {
+		/// Payload retained for the operation or its expected result.
 		value: Box<str>,
+		/// Source byte range used to report diagnostics for this syntax
+		/// element.
 		span: TextSpan,
 	},
-	Parameter(Identifier),
+	/// Timeout supplied through a query parameter.
+	Parameter(
+		/// Timeout supplied through a query parameter.
+		Identifier,
+	),
 }
 
+/// Executable and declarative statement forms recognized by the parser.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StatementKind {
-	Explain(ExplainStatement),
-	Begin(BeginStatement),
-	Commit(CommitStatement),
+	/// A EXPLAIN statement or control operation.
+	Explain(
+		/// A EXPLAIN statement or control operation.
+		ExplainStatement,
+	),
+	/// A BEGIN statement or control operation.
+	Begin(
+		/// A BEGIN statement or control operation.
+		BeginStatement,
+	),
+	/// A COMMIT statement or control operation.
+	Commit(
+		/// A COMMIT statement or control operation.
+		CommitStatement,
+	),
+	/// A CANCEL statement or control operation.
 	Cancel,
-	Expression(Expr),
-	If(IfStatement),
-	For(ForStatement),
-	While(WhileStatement),
+	/// A EXPRESSION statement or control operation.
+	Expression(
+		/// A EXPRESSION statement or control operation.
+		Expr,
+	),
+	/// A IF statement or control operation.
+	If(
+		/// A IF statement or control operation.
+		IfStatement,
+	),
+	/// A FOR statement or control operation.
+	For(
+		/// A FOR statement or control operation.
+		ForStatement,
+	),
+	/// A WHILE statement or control operation.
+	While(
+		/// A WHILE statement or control operation.
+		WhileStatement,
+	),
+	/// A BREAK statement or control operation.
 	Break,
+	/// A CONTINUE statement or control operation.
 	Continue,
-	Try(TryStatement),
-	Throw(Expr),
-	Sleep(TimeoutValue),
-	AssertInvariants(AssertInvariantsStatement),
-	BuildGraph(BuildGraphStatement),
-	Attach(AttachStatement),
-	Create(CreateStatement),
-	Update(MutateStatement),
-	UpdateGraph(UpdateGraphStatement),
-	Upsert(MutateStatement),
-	Delete(DeleteStatement),
-	Detach(DetachStatement),
-	DefineGraph(DefineGraphStatement),
-	DefineClass(DefineClassStatement),
-	DefineField(DefineFieldStatement),
-	DefineAnalyzer(DefineAnalyzerStatement),
-	DefineFunction(DefineFunctionStatement),
+	/// A TRY statement or control operation.
+	Try(
+		/// A TRY statement or control operation.
+		TryStatement,
+	),
+	/// A THROW statement or control operation.
+	Throw(
+		/// A THROW statement or control operation.
+		Expr,
+	),
+	/// A SLEEP statement or control operation.
+	Sleep(
+		/// A SLEEP statement or control operation.
+		TimeoutValue,
+	),
+	/// A ASSERT INVARIANTS statement or control operation.
+	AssertInvariants(
+		/// A ASSERT INVARIANTS statement or control operation.
+		AssertInvariantsStatement,
+	),
+	/// A BUILD GRAPH statement or control operation.
+	BuildGraph(
+		/// A BUILD GRAPH statement or control operation.
+		BuildGraphStatement,
+	),
+	/// A ATTACH statement or control operation.
+	Attach(
+		/// A ATTACH statement or control operation.
+		AttachStatement,
+	),
+	/// A CREATE statement or control operation.
+	Create(
+		/// A CREATE statement or control operation.
+		CreateStatement,
+	),
+	/// A UPDATE statement or control operation.
+	Update(
+		/// A UPDATE statement or control operation.
+		MutateStatement,
+	),
+	/// A UPDATE GRAPH statement or control operation.
+	UpdateGraph(
+		/// A UPDATE GRAPH statement or control operation.
+		UpdateGraphStatement,
+	),
+	/// A UPSERT statement or control operation.
+	Upsert(
+		/// A UPSERT statement or control operation.
+		MutateStatement,
+	),
+	/// A DELETE statement or control operation.
+	Delete(
+		/// A DELETE statement or control operation.
+		DeleteStatement,
+	),
+	/// A DETACH statement or control operation.
+	Detach(
+		/// A DETACH statement or control operation.
+		DetachStatement,
+	),
+	/// A DEFINE GRAPH statement or control operation.
+	DefineGraph(
+		/// A DEFINE GRAPH statement or control operation.
+		DefineGraphStatement,
+	),
+	/// A DEFINE CLASS statement or control operation.
+	DefineClass(
+		/// A DEFINE CLASS statement or control operation.
+		DefineClassStatement,
+	),
+	/// A DEFINE FIELD statement or control operation.
+	DefineField(
+		/// A DEFINE FIELD statement or control operation.
+		DefineFieldStatement,
+	),
+	/// A DEFINE ANALYZER statement or control operation.
+	DefineAnalyzer(
+		/// A DEFINE ANALYZER statement or control operation.
+		DefineAnalyzerStatement,
+	),
+	/// A DEFINE FUNCTION statement or control operation.
+	DefineFunction(
+		/// A DEFINE FUNCTION statement or control operation.
+		DefineFunctionStatement,
+	),
 	/// Versioned source-owned event definition.
-	DefineEvent(DefineEventStatement),
-	DefineIndex(DefineIndexStatement),
+	DefineEvent(
+		/// Versioned source-owned event definition.
+		DefineEventStatement,
+	),
+	/// A DEFINE INDEX statement or control operation.
+	DefineIndex(
+		/// A DEFINE INDEX statement or control operation.
+		DefineIndexStatement,
+	),
 	/// Graph-owned snapshot index definition.
-	DefineGraphIndex(DefineGraphIndexStatement),
-	DefineParameter(DefineParameterStatement),
-	Remove(RemoveStatement),
-	Alter(AlterStatement),
-	Info(InfoStatement),
+	DefineGraphIndex(
+		/// Graph-owned snapshot index definition.
+		DefineGraphIndexStatement,
+	),
+	/// A DEFINE PARAMETER statement or control operation.
+	DefineParameter(
+		/// A DEFINE PARAMETER statement or control operation.
+		DefineParameterStatement,
+	),
+	/// A REMOVE statement or control operation.
+	Remove(
+		/// A REMOVE statement or control operation.
+		RemoveStatement,
+	),
+	/// A ALTER statement or control operation.
+	Alter(
+		/// A ALTER statement or control operation.
+		AlterStatement,
+	),
+	/// A INFO statement or control operation.
+	Info(
+		/// A INFO statement or control operation.
+		InfoStatement,
+	),
 	/// Durable whole-commit history read.
-	ShowChanges(ShowChangesStatement),
-	Maintenance(MaintenanceStatement),
-	Kill(KillStatement),
-	Import(ImportStatement),
-	Let(LetStatement),
+	ShowChanges(
+		/// Durable whole-commit history read.
+		ShowChangesStatement,
+	),
+	/// A MAINTENANCE statement or control operation.
+	Maintenance(
+		/// A MAINTENANCE statement or control operation.
+		MaintenanceStatement,
+	),
+	/// A KILL statement or control operation.
+	Kill(
+		/// A KILL statement or control operation.
+		KillStatement,
+	),
+	/// A IMPORT statement or control operation.
+	Import(
+		/// A IMPORT statement or control operation.
+		ImportStatement,
+	),
+	/// A LET statement or control operation.
+	Let(
+		/// A LET statement or control operation.
+		LetStatement,
+	),
 	/// Registers one transactional LIVE query incarnation.
-	LiveSelect(LiveSelectStatement),
+	LiveSelect(
+		/// Registers one transactional LIVE query incarnation.
+		LiveSelectStatement,
+	),
 	/// Defines one transactional reactive binding identity.
-	LiveLet(LiveLetStatement),
+	LiveLet(
+		/// Defines one transactional reactive binding identity.
+		LiveLetStatement,
+	),
 	/// Confirms one issued whole-commit delivery.
-	AckLive(LiveAckStatement),
-	Match(MatchStatement),
-	Relate(RelateStatement),
-	Return(ReturnStatement),
-	ReturnGraph(ReturnGraph),
-	Select(SelectStatement),
-	Traverse(TraverseStatement),
+	AckLive(
+		/// Confirms one issued whole-commit delivery.
+		LiveAckStatement,
+	),
+	/// A MATCH statement or control operation.
+	Match(
+		/// A MATCH statement or control operation.
+		MatchStatement,
+	),
+	/// A RELATE statement or control operation.
+	Relate(
+		/// A RELATE statement or control operation.
+		RelateStatement,
+	),
+	/// A RETURN statement or control operation.
+	Return(
+		/// A RETURN statement or control operation.
+		ReturnStatement,
+	),
+	/// A RETURN GRAPH statement or control operation.
+	ReturnGraph(
+		/// A RETURN GRAPH statement or control operation.
+		ReturnGraph,
+	),
+	/// A SELECT statement or control operation.
+	Select(
+		/// A SELECT statement or control operation.
+		SelectStatement,
+	),
+	/// A TRAVERSE statement or control operation.
+	Traverse(
+		/// A TRAVERSE statement or control operation.
+		TraverseStatement,
+	),
 }
 pub use dml::{
 	Assignment,

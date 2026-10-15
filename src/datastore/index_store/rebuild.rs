@@ -9,7 +9,7 @@ use crate::{
 /// Rebuilds every engine-owned and explicit index from normalized source
 /// data. Durable index pages are validated separately; this reconstruction is
 /// also the recovery fallback for derived index state.
-pub(crate) fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<IndexStoreRoot> {
+pub fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<IndexStoreRoot> {
 	let mut indexes = IndexStoreRoot::default();
 	for graph in database.schema.all_graphs() {
 		crate::storage::check_external_sort_cancelled()?;
@@ -65,9 +65,7 @@ pub(crate) fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<
 
 /// Rebuilds only engine-owned class and label lookups while retaining
 /// schema-defined indexes as lazy immutable side-file bindings.
-pub(crate) fn rebuild_lookup_index_store(
-	database: &DatabaseRoot,
-) -> FerrosGrynnResult<IndexStoreRoot> {
+pub fn rebuild_lookup_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<IndexStoreRoot> {
 	let mut indexes = IndexStoreRoot::default();
 	for graph in database.schema.all_graphs() {
 		indexes.register_graph(graph.id())?;
@@ -107,6 +105,7 @@ pub(crate) fn rebuild_lookup_index_store(
 	Ok(indexes)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

@@ -22,6 +22,8 @@ use ferros_grynn::{
 
 use crate::support::{create_person, people, record, value};
 
+/// Verifies mutable sdk materialization writes only on explicit flush and
+/// commit.
 #[test]
 fn mutable_sdk_materialization_writes_only_on_explicit_flush_and_commit() {
 	let db = database();
@@ -73,6 +75,8 @@ fn mutable_sdk_materialization_writes_only_on_explicit_flush_and_commit() {
 	});
 }
 
+/// Verifies atom snapshots own their payload after transaction and datastore
+/// drop.
 #[test]
 fn atom_snapshots_own_their_payload_after_transaction_and_datastore_drop() {
 	let db = database();
@@ -89,6 +93,8 @@ fn atom_snapshots_own_their_payload_after_transaction_and_datastore_drop() {
 	assert_eq!(before.record_id(), after.record_id());
 }
 
+/// Verifies sdk runtime values round trip through atoms queries and local
+/// recovery.
 #[test]
 fn sdk_runtime_values_round_trip_through_atoms_queries_and_local_recovery() {
 	let db = database();
@@ -125,6 +131,7 @@ fn sdk_runtime_values_round_trip_through_atoms_queries_and_local_recovery() {
 	});
 }
 
+/// Verifies sdk none and null remain distinct query parameters.
 #[test]
 fn sdk_none_and_null_remain_distinct_query_parameters() {
 	let db = database();
@@ -133,6 +140,8 @@ fn sdk_none_and_null_remain_distinct_query_parameters() {
 	assert_eq!(value(&db, "RETURN $null;", &parameters), Value::Null);
 }
 
+/// Verifies sdk traversals and owned materialization use stable graph
+/// references.
 #[test]
 fn sdk_traversals_and_owned_materialization_use_stable_graph_references() {
 	let db = database();

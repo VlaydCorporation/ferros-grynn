@@ -22,9 +22,16 @@ use crate::values::{Value, runtime::same_value};
 #[non_exhaustive]
 pub enum LiveGraphTarget {
 	/// Family, validators, ROOT or properties of one scope.
-	Graph(LiveGraphScopeId),
+	Graph(
+		/// Family, validators, ROOT or properties of one scope.
+		LiveGraphScopeId,
+	),
 	/// An effective atom, its incidence, child binding or write-back source.
-	Atom(LiveGraphAtomId),
+	Atom(
+		/// An effective atom, its incidence, child binding or write-back
+		/// source.
+		LiveGraphAtomId,
+	),
 }
 
 /// A complete graph revision; retained images also anchor replay intervals.

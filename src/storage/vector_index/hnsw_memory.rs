@@ -12,43 +12,64 @@ use crate::{
 	values::Vector,
 };
 
+/// Configured default hnsw cache bytes value.
 const DEFAULT_HNSW_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// Configured default hnsw build bytes value.
 const DEFAULT_HNSW_BUILD_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Shared hnsw build bytes value.
 static HNSW_BUILD_BYTES: LazyLock<Result<usize, String>> =
 	LazyLock::new(|| configured_bytes("FG_HNSW_BUILD_MEM", DEFAULT_HNSW_BUILD_BYTES, false));
+/// Shared hnsw vector cache value.
 static HNSW_VECTOR_CACHE: LazyLock<Result<HnswVectorCache, String>> = LazyLock::new(|| {
 	configured_bytes("FG_HNSW_CACHE_SIZE", DEFAULT_HNSW_CACHE_BYTES, true).map(HnswVectorCache::new)
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Cache key state.
 struct CacheKey {
+	/// Namespace associated with this cache key.
 	namespace: u64,
+	/// Ordinal associated with this cache key.
 	ordinal: u32,
 }
 
+/// Cache entry state.
 struct CacheEntry {
+	/// Vector associated with this cache entry.
 	vector: Arc<Vector>,
+	/// Bytes associated with this cache entry.
 	bytes: usize,
+	/// Stamp associated with this cache entry.
 	stamp: u64,
 }
 
 #[derive(Default)]
+/// Cached HNSW vectors, retained byte count and recency index used for
+/// eviction.
 struct CacheState {
+	/// Bytes associated with this cache state.
 	bytes: usize,
+	/// Clock associated with this cache state.
 	clock: u64,
+	/// Entries associated with this cache state.
 	entries: BTreeMap<CacheKey, CacheEntry>,
+	/// Oldest associated with this cache state.
 	oldest: BTreeSet<(u64, CacheKey)>,
 }
 
+/// Hnsw vector cache state.
 struct HnswVectorCache {
+	/// Number of elements the backing allocation can hold.
 	capacity: usize,
-	// ponytail: one global lock matches the single process-wide budget; shard only if contention
+	// shortcut: one global lock matches the single process-wide budget; shard only if contention
 	// is measured.
+	/// State associated with this hnsw vector cache.
 	state: Mutex<CacheState>,
 }
 
 impl HnswVectorCache {
+	/// Creates a new `HnswVectorCache` value.
 	const fn new(capacity: usize) -> Self {
 		Self {
 			capacity,
@@ -61,6 +82,7 @@ impl HnswVectorCache {
 		}
 	}
 
+	/// Returns hnsw vector cache.
 	fn get(&self, key: CacheKey) -> Option<Arc<Vector>> {
 		let mut state = self.state.lock();
 		let previous = state.entries.get(&key)?.stamp;
@@ -73,6 +95,7 @@ impl HnswVectorCache {
 		Some(vector)
 	}
 
+	/// Inserts hnsw vector cache.
 	fn insert(&self, key: CacheKey, vector: Arc<Vector>) -> Arc<Vector> {
 		let bytes = vector_payload_bytes(&vector);
 		if self.capacity == 0 || bytes > self.capacity {
@@ -103,6 +126,7 @@ impl HnswVectorCache {
 		vector
 	}
 
+	/// Performs the purge operation.
 	fn purge(&self, namespace: u64) {
 		let mut state = self.state.lock();
 		let keys = state
@@ -127,6 +151,7 @@ impl HnswVectorCache {
 	}
 }
 
+/// Returns the next stamp.
 fn next_stamp(state: &mut CacheState) -> u64 {
 	let Some(next) = state.clock.checked_add(1) else {
 		state.entries.clear();
@@ -139,11 +164,13 @@ fn next_stamp(state: &mut CacheState) -> u64 {
 	next
 }
 
-pub(crate) fn hnsw_build_memory_bytes() -> FerrosGrynnResult<usize> {
+/// Returns the hnsw build memory bytes result.
+pub fn hnsw_build_memory_bytes() -> FerrosGrynnResult<usize> {
 	configured(&HNSW_BUILD_BYTES)
 }
 
-pub(crate) fn hnsw_vector_cache_get(
+/// Returns the hnsw vector cache get result.
+pub fn hnsw_vector_cache_get(
 	namespace: u64,
 	ordinal: u32,
 ) -> FerrosGrynnResult<Option<Arc<Vector>>> {
@@ -153,7 +180,8 @@ pub(crate) fn hnsw_vector_cache_get(
 	}))
 }
 
-pub(crate) fn hnsw_vector_cache_insert(
+/// Returns the hnsw vector cache insert result.
+pub fn hnsw_vector_cache_insert(
 	namespace: u64,
 	ordinal: u32,
 	vector: Arc<Vector>,
@@ -167,20 +195,24 @@ pub(crate) fn hnsw_vector_cache_insert(
 	))
 }
 
-pub(crate) fn purge_hnsw_vector_cache(namespace: u64) {
+/// Performs the purge hnsw vector cache operation.
+pub fn purge_hnsw_vector_cache(namespace: u64) {
 	if let Ok(cache) = HNSW_VECTOR_CACHE.as_ref() {
 		cache.purge(namespace);
 	}
 }
 
+/// Returns the configured cache result.
 fn configured_cache() -> FerrosGrynnResult<&'static HnswVectorCache> {
 	HNSW_VECTOR_CACHE.as_ref().map_err(|reason| FerrosGrynnError::invalid_argument(reason.clone()))
 }
 
+/// Returns the configured result.
 fn configured(value: &'static LazyLock<Result<usize, String>>) -> FerrosGrynnResult<usize> {
 	value.as_ref().copied().map_err(FerrosGrynnError::invalid_argument)
 }
 
+/// Returns the configured bytes result.
 fn configured_bytes(name: &str, default: usize, allow_zero: bool) -> Result<usize, String> {
 	let Some(raw) = std::env::var_os(name) else {
 		return Ok(default);
@@ -195,6 +227,7 @@ fn configured_bytes(name: &str, default: usize, allow_zero: bool) -> Result<usiz
 	Ok(parsed)
 }
 
+/// Returns the vector payload bytes result.
 fn vector_payload_bytes(vector: &Vector) -> usize {
 	let width = match vector {
 		Vector::F64(_) | Vector::I64(_) => 8,
@@ -206,12 +239,14 @@ fn vector_payload_bytes(vector: &Vector) -> usize {
 }
 
 #[cfg(test)]
+/// Regression tests for hnsw memory behavior.
 mod tests {
 	use std::sync::Arc;
 
 	use super::{CacheKey, HnswVectorCache};
 	use crate::values::Vector;
 
+	/// Verifies hnsw vector cache enforces one budget across namespaces.
 	#[test]
 	fn hnsw_vector_cache_enforces_one_budget_across_namespaces() {
 		let cache = HnswVectorCache::new(8);
@@ -232,6 +267,7 @@ mod tests {
 		assert_eq!(cache.state.lock().bytes, 8);
 	}
 
+	/// Verifies hnsw vector cache does not retain oversized vectors.
 	#[test]
 	fn hnsw_vector_cache_does_not_retain_oversized_vectors() {
 		let cache = HnswVectorCache::new(4);

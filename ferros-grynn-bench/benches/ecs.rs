@@ -4,12 +4,15 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use ferros_grynn::{ecs::SparseSet, graph::AtomId};
 use rapidhash::{HashMapExt, RapidHashMap};
 
+/// Atom populations compared by the sparse-set and hash-map benchmarks.
 const SIZES: [usize; 3] = [128, 4_096, 65_536];
 
+/// Returns atoms for this module.
 fn atoms(size: usize) -> Vec<AtomId> {
 	(0..size).map(|slot| AtomId::from_raw(slot as u64)).collect()
 }
 
+/// Measures build with the benchmark harness.
 fn benchmark_build(criterion: &mut Criterion) {
 	let mut group = criterion.benchmark_group("ecs/build");
 	for size in SIZES {
@@ -37,6 +40,7 @@ fn benchmark_build(criterion: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures lookup with the benchmark harness.
 fn benchmark_lookup(criterion: &mut Criterion) {
 	let mut group = criterion.benchmark_group("ecs/lookup_all_hits");
 	for size in SIZES {
@@ -71,6 +75,7 @@ fn benchmark_lookup(criterion: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures dense iteration with the benchmark harness.
 fn benchmark_dense_iteration(criterion: &mut Criterion) {
 	let mut group = criterion.benchmark_group("ecs/dense_iteration");
 	for size in SIZES {

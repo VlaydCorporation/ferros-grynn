@@ -120,7 +120,7 @@ impl<'a> Parts<'a> {
 			endpoints += usize::from(line.0.last() == Some(&point));
 		}
 		if covered {
-			return if endpoints % 2 == 0 {
+			return if endpoints.is_multiple_of(2) {
 				CoordPos::Inside
 			} else {
 				CoordPos::OnBoundary
@@ -152,11 +152,12 @@ impl<'a> Parts<'a> {
 					}) = line_intersection(edge, boundary)
 						&& intersection.start != intersection.end
 					{
-						let same_direction = if edge.start.x != edge.end.x {
-							(edge.end.x > edge.start.x) == (boundary.end.x > boundary.start.x)
-						} else {
-							(edge.end.y > edge.start.y) == (boundary.end.y > boundary.start.y)
-						};
+						let same_direction =
+							if edge.start.x.partial_cmp(&edge.end.x) != Some(Ordering::Equal) {
+								(edge.end.x > edge.start.x) == (boundary.end.x > boundary.start.x)
+							} else {
+								(edge.end.y > edge.start.y) == (boundary.end.y > boundary.start.y)
+							};
 						let left = (ring.winding_order() == Some(WindingOrder::CounterClockwise))
 							^ (ring_id != 0)
 							^ !same_direction;
@@ -202,7 +203,7 @@ pub(super) fn within(left: &Geometry, right: &Geometry) -> FerrosGrynnResult<boo
 	a.add(left);
 	let mut b = Parts::default();
 	b.add(right);
-	// ponytail: bounded pairwise arrangement; use a sweep if collection-heavy
+	// shortcut: bounded pairwise arrangement; use a sweep if collection-heavy
 	// workloads exceed this cap.
 	let work = a
 		.complexity()
@@ -326,7 +327,7 @@ fn split<'a>(
 	}
 	cuts.extend(points.iter().copied().filter(|point| contains(edge, *point)));
 	cuts.sort_unstable_by(|a, b| {
-		if edge.start.x != edge.end.x {
+		if edge.start.x.partial_cmp(&edge.end.x) != Some(Ordering::Equal) {
 			a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y))
 		} else {
 			a.y.total_cmp(&b.y)
@@ -355,7 +356,10 @@ fn covered(edge: Line, right: &Parts<'_>) -> (bool, bool) {
 
 /// Orders rays robustly around an original boundary point.
 fn compare_rays(origin: Coord, a: Coord, b: Coord) -> Ordering {
-	let half = |point: Coord| point.y > origin.y || (point.y == origin.y && point.x >= origin.x);
+	let half = |point: Coord| {
+		point.y > origin.y
+			|| (point.y.partial_cmp(&origin.y) == Some(Ordering::Equal) && point.x >= origin.x)
+	};
 	match half(b).cmp(&half(a)) {
 		Ordering::Equal => match RobustKernel::orient2d(origin, a, b) {
 			Orientation::CounterClockwise => Ordering::Less,

@@ -46,12 +46,18 @@ use crate::{
 	values::{Number, PropertyMap, RecordId, RecordIdPart, Value},
 };
 
+/// Process-local suffix counter that separates temporary graph-store test
+/// directories.
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 /// Self-cleaning directory for one Direct-I/O integration test.
-pub(super) struct TestDirectory(PathBuf);
+pub(super) struct TestDirectory(
+	/// Path retained for the lifetime of the temporary directory owner.
+	PathBuf,
+);
 
 impl TestDirectory {
+	/// Constructs `TestDirectory` from the supplied initial state.
 	pub(super) fn new() -> io::Result<Self> {
 		let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
 		Ok(Self(
@@ -60,12 +66,14 @@ impl TestDirectory {
 		))
 	}
 
+	/// Borrows the wrapped path representation.
 	pub(super) fn as_path(&self) -> &Path {
 		&self.0
 	}
 }
 
 impl Drop for TestDirectory {
+	/// Runs cleanup for this `TestDirectory` before its fields are released.
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.0));
 	}
@@ -73,14 +81,20 @@ impl Drop for TestDirectory {
 
 /// Runtime state and identities used by durable round-trip checks.
 pub(super) struct Fixture {
+	/// Database identity or retained database state used by the operation.
 	pub(super) database: DatabaseRoot,
+	/// Datastore graph identity used to resolve catalog metadata.
 	pub(super) graph_id: GraphId,
+	/// Owned graph reference identifying the operation scope.
 	pub(super) reference: GraphRef,
+	/// Materialization-local atom handle used by this operation.
 	pub(super) left: crate::datastore::GlobalAtomId,
+	/// Materialization-local atom handle used by this operation.
 	pub(super) left_local: crate::graph::AtomId,
 }
 
 impl Fixture {
+	/// Returns build for `Fixture`.
 	pub(super) fn build() -> FerrosGrynnResult<Self> {
 		let mut database = DatabaseRoot::default();
 		let person = install_class(&mut database, 1, "person", AtomKind::Node)?;
@@ -144,6 +158,7 @@ impl Fixture {
 		})
 	}
 
+	/// Returns empty database for `Fixture`.
 	pub(super) fn empty_database(&self) -> FerrosGrynnResult<DatabaseRoot> {
 		let mut empty = DatabaseRoot::default();
 		empty.schema = self.database.schema.clone();
@@ -152,6 +167,7 @@ impl Fixture {
 		Ok(empty)
 	}
 
+	/// Returns images for `Fixture`.
 	pub(super) fn images(
 		&self,
 	) -> FerrosGrynnResult<(DurableAtomStoreImage, BuiltGraphImage, BuiltPrimaryIndex)> {
@@ -170,13 +186,20 @@ impl Fixture {
 
 /// Physical bindings and catalog for one combined AtomStore/graph generation.
 pub(super) struct CombinedLayout {
+	/// File catalog or elapsed catalog-restoration duration retained by this
+	/// startup phase.
 	pub(super) catalog: FileCatalog,
+	/// Physical atom files retained by the layout or read snapshot.
 	pub(super) atoms: AtomStoreFileSet,
+	/// Graph materialization or physical graph files retained by the operation.
 	pub(super) graph: GraphFileSet,
+	/// Reverse-membership file used to resolve graph occurrences of global
+	/// atoms.
 	pub(super) reverse: ReverseMembershipFile,
 }
 
 impl CombinedLayout {
+	/// Returns create for `CombinedLayout`.
 	pub(super) fn create(
 		root: &Path,
 		graph_id: GraphId,
@@ -416,6 +439,7 @@ impl CombinedLayout {
 	}
 }
 
+/// Returns install class for this module.
 fn install_class(
 	database: &mut DatabaseRoot,
 	id: u32,
@@ -428,6 +452,7 @@ fn install_class(
 	database.schema.class(name).ok_or_else(|| invalid("installed test class is absent"))
 }
 
+/// Returns allocate for this module.
 fn allocate(next: &mut u64, kind: DataFileKind) -> FerrosGrynnResult<DataFileId> {
 	let value = DataFileId::new(*next, kind)
 		.ok_or_else(|| invalid("test data-file identity is invalid"))?;
@@ -435,6 +460,7 @@ fn allocate(next: &mut u64, kind: DataFileKind) -> FerrosGrynnResult<DataFileId>
 	Ok(value)
 }
 
+/// Returns entry for this module.
 fn entry(
 	space_id: DataSpaceId,
 	file_id: DataFileId,
@@ -451,6 +477,7 @@ fn entry(
 	})
 }
 
+/// Writes freelist for this module.
 fn write_freelist(path: &Path) -> FerrosGrynnResult<()> {
 	let mut page =
 		AlignedPage::new(PageType::Freelist, PageFlags::empty(), PageLsn::ZERO, PageNo::new(0));
@@ -458,6 +485,7 @@ fn write_freelist(path: &Path) -> FerrosGrynnResult<()> {
 	write_pages(path, &[page])
 }
 
+/// Writes pages for this module.
 fn write_pages(path: &Path, pages: &[AlignedPage]) -> FerrosGrynnResult<()> {
 	let parent = path.parent().ok_or_else(|| invalid("test data file has no parent"))?;
 	fs::create_dir_all(parent).map_err(|source| {
@@ -471,6 +499,7 @@ fn write_pages(path: &Path, pages: &[AlignedPage]) -> FerrosGrynnResult<()> {
 	file.sync_data()
 }
 
+/// Returns invalid for this module.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

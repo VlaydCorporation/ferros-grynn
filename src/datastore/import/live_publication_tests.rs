@@ -12,35 +12,40 @@ use crate::{
 /// A completed preparation must remain retryable without losing its accepted
 /// spool or retaining envelopes from an unpublished attempt.
 #[test]
-fn live_import_preparation_retry_keeps_spool_and_latest_controls() -> FerrosGrynnResult<()> {
+fn live_import_preparation_retry_keeps_spool_and_latest_controls() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let class =
-		setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
-			"value",
-			Type::Int,
-		)])?)?;
-	let key = setup.intern_property("value")?;
-	let record: RecordId = "item:a".parse()?;
-	setup.create_atom(record.clone(), PropertyMap::from_iter([(key, 1.into())]))?;
-	let second: RecordId = "item:b".parse()?;
-	setup.create_atom(second.clone(), PropertyMap::from_iter([(key, 2.into())]))?;
-	let graph = setup.define_graph("scope", GraphKind::Metagraph)?;
-	setup.attach_node(graph.id(), &record, None, None)?;
-	setup.commit()?;
+	let class = setup
+		.define_class(
+			ClassSchema::new("item", AtomKind::Node, [ClassField::new("value", Type::Int)])
+				.assert_ok(),
+		)
+		.assert_ok();
+	let key = setup.intern_property("value").assert_ok();
+	let record: RecordId = "item:a".parse().assert_ok();
+	setup.create_atom(record.clone(), PropertyMap::from_iter([(key, 1.into())])).assert_ok();
+	let second: RecordId = "item:b".parse().assert_ok();
+	setup.create_atom(second.clone(), PropertyMap::from_iter([(key, 2.into())])).assert_ok();
+	let graph = setup.define_graph("scope", GraphKind::Metagraph).assert_ok();
+	setup.attach_node(graph.id(), &record, None, None).assert_ok();
+	setup.commit().assert_ok();
 	let mut setup = store.begin();
-	let feed = setup.configure_changefeed(
-		ChangefeedSource::Class(class),
-		ChangefeedConfig::from_nanoseconds(86_400_000_000_000)?.with_full(true),
-	)?;
+	let feed = setup
+		.configure_changefeed(
+			ChangefeedSource::Class(class),
+			ChangefeedConfig::from_nanoseconds(86_400_000_000_000).assert_ok().with_full(true),
+		)
+		.assert_ok();
 	let query = LiveQuery::new(LiveSource::Record(record.clone()))
-		.with_projection(LiveProjection::Value(LiveExpr::field("value")?));
-	let live = setup.register_live(query.clone(), LiveOptions::default())?;
-	let stopped = setup.register_live(query, LiveOptions::default())?;
-	setup.commit()?;
+		.with_projection(LiveProjection::Value(LiveExpr::field("value").assert_ok()));
+	let live = setup.register_live(query.clone(), LiveOptions::default()).assert_ok();
+	let stopped = setup.register_live(query, LiveOptions::default()).assert_ok();
+	setup.commit().assert_ok();
 	let base = store.inner.current_root();
 	let owner = store.inner.next_transaction.fetch_add(1, Ordering::Relaxed);
-	let lease = ImportLease::acquire(store.inner.clone(), owner)?;
+	let lease = ImportLease::acquire(store.inner.clone(), owner).assert_ok();
 	let options = ImportOptions {
 		changefeed: ImportChangefeedMode::On,
 		segment_size: 1,
@@ -52,32 +57,30 @@ fn live_import_preparation_retry_keeps_spool_and_latest_controls() -> FerrosGryn
 		owner,
 		TransactionOptions::new(IsolationLevel::Serializable, TransactionAccess::ReadWrite),
 		Arc::clone(&base),
-		options.indexes,
-		options.constraints,
-		options.on_violation,
+		options,
 		None,
-		options.changefeed,
-		options.events,
 		provisional,
 	);
 	let mut session =
 		ImportSession::new(tx, options, provisional, store.inner.import_scratch_root());
-	session.apply_item(|tx| tx.set_base_property(&record, key, 3.into()))?;
-	session.apply_item(|tx| {
-		tx.set_base_property(&record, key, 5.into())?;
-		tx.attach_node(graph.id(), &second, None, None)
-	})?;
-	let (tx, _report, changed, quarantine) = session.finish()?;
+	session.apply_item(|tx| tx.set_base_property(&record, key, 3.into())).assert_ok();
+	session
+		.apply_item(|tx| {
+			tx.set_base_property(&record, key, 5.into())?;
+			tx.attach_node(graph.id(), &second, None, None)
+		})
+		.assert_ok();
+	let (tx, _report, changed, quarantine) = session.finish().assert_ok();
 	assert!(changed);
 	assert!(quarantine.is_none());
-	let (mut tx, _indexes) = tx.finish_import(provisional, options.indexes, false)?;
-	tx.prepare_import_publication(&base, 256 * 1024 * 1024)?;
+	let (mut tx, _indexes) = tx.finish_import(provisional, options.indexes, false).assert_ok();
+	tx.prepare_import_publication(&base, 256 * 1024 * 1024).assert_ok();
 	let mut close = store.begin();
-	close.close_live(stopped)?;
-	let close_stamp = close.commit()?.commit_ts();
+	close.close_live(stopped).assert_ok();
+	let close_stamp = close.commit().assert_ok().commit_ts();
 	assert_eq!(close_stamp, provisional);
 	let observed = store.inner.current_root();
-	tx.prepare_import_publication(&observed, 256 * 1024 * 1024)?;
+	tx.prepare_import_publication(&observed, 256 * 1024 * 1024).assert_ok();
 	let mut root = tx.into_import_root();
 	assert_eq!(root.commit_ts, close_stamp + 1);
 	assert_eq!(root.version(ConflictKey::LiveDefinition(stopped)), close_stamp);
@@ -87,32 +90,40 @@ fn live_import_preparation_retry_keeps_spool_and_latest_controls() -> FerrosGryn
 	let source = root
 		.change_history()
 		.get(&(feed, root.commit_ts))
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("retry lost accepted source history"))?;
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("retry lost accepted source history"))
+		.assert_ok();
 	assert_eq!(source.full.as_ref().map(|batch| batch.entries().len()), Some(2));
 	let bytes = root
 		.live_history()
 		.get(&(live, root.commit_ts))
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("retry lost computed history"))?;
-	let LivePayload::Batch(batch) = crate::storage::live_history::decode(bytes, 8 * 1024 * 1024)?
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("retry lost computed history"))
+		.assert_ok();
+	let LivePayload::Batch(batch) =
+		crate::storage::live_history::decode(bytes, 8 * 1024 * 1024).assert_ok()
 	else {
-		return Err(FerrosGrynnError::invalid_argument("retry did not produce a batch"));
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(FerrosGrynnError::invalid_argument("retry did not produce a batch"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(batch.events()[0].before(), Some(&Value::from(1)));
 	assert_eq!(batch.events()[0].after(), Some(&Value::from(5)));
 	assert_eq!(root.live_catalog().queries[&stopped].state, LiveState::Closed);
 	let _commit = store.inner.commit.lock();
 	assert!(Arc::ptr_eq(&observed, &store.inner.current_root()));
-	store.inner.persist_import_root(&mut root, None)?;
+	store.inner.persist_import_root(&mut root, None).assert_ok();
 	*store.inner.current.write() = Arc::new(root);
 	drop(_commit);
 	drop(lease);
-	assert_eq!(store.begin().live_info(stopped)?.state(), LiveState::Closed);
-	Ok(())
+	assert_eq!(store.begin().live_info(stopped).assert_ok().state(), LiveState::Closed);
 }
 
 /// Models a repeated UTC time at the preparation boundary without relying on
 /// operating-system clock resolution or sleeping during a test.
 fn repeated_time_publication(store: &Datastore, import: bool) -> FerrosGrynnResult<()> {
+	use crate::test_assertions::AssertComparison as _;
+
 	let mut setup = store.begin();
 	let class =
 		setup.define_class(ClassSchema::new("item", AtomKind::Node, [ClassField::new(
@@ -140,7 +151,8 @@ fn repeated_time_publication(store: &Datastore, import: bool) -> FerrosGrynnResu
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("missing clock fixture atom"))?;
 	root.set_base_property(atom, key, 2.into())?;
 	let frozen = root.committed_at_ns;
-	assert_eq!(frozen, previous.committed_at_ns, "preparation accepts a repeated time");
+	(&(frozen), &(previous.committed_at_ns))
+		.assert_equal_with(|| "preparation accepts a repeated time".to_string());
 	crate::datastore::transaction::prepare_live_publication(
 		&previous,
 		&mut root,
@@ -159,12 +171,10 @@ fn repeated_time_publication(store: &Datastore, import: bool) -> FerrosGrynnResu
 	} else {
 		store.inner.persist_root(&mut root, Some(&previous), None, false, false)?;
 	}
-	assert_eq!(
-		root.committed_at_ns, frozen,
-		"persistence must not refresh the prepared commit clock"
-	);
+	(&(root.committed_at_ns), &(frozen))
+		.assert_equal_with(|| "persistence must not refresh the prepared commit clock".to_string());
 	let info = crate::storage::live_history::inspect(&bytes, bytes.len() as u64)?;
-	assert_eq!(info.time, root.committed_at_ns);
+	(&(info.time), &(root.committed_at_ns)).assert_equal();
 	Ok(())
 }
 
@@ -190,8 +200,11 @@ fn repeated_time_local(mode: crate::datastore::IoMode) -> FerrosGrynnResult<()> 
 			"fgdb-{:016x}",
 			Uuid::now_v7().as_inner().as_u128() & u128::from(u64::MAX)
 		));
-		let mut options = crate::datastore::LocalOptions::default();
-		options.io_mode = mode;
+		let options_defaults = crate::datastore::LocalOptions::default();
+		let options = crate::datastore::LocalOptions {
+			io_mode: mode,
+			..options_defaults
+		};
 		let store = Datastore::create_local(&path, options)?;
 		let result = repeated_time_publication(&store, import);
 		drop(store);
@@ -221,25 +234,28 @@ fn live_import_repeated_time_keeps_local_native_clock() -> FerrosGrynnResult<()>
 /// Resident unchanged revisions need no scratch copy, but a real control
 /// rebase still fails before COW when the admitted budget cannot hold it.
 #[test]
-fn live_import_revision_admission_only_charges_required_rebase() -> FerrosGrynnResult<()> {
+fn live_import_revision_admission_only_charges_required_rebase() {
+	use crate::test_assertions::AssertResult as _;
+
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-	let live =
-		setup.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-	setup.commit()?;
+	let class =
+		setup.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok()).assert_ok();
+	let live = setup
+		.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+		.assert_ok();
+	setup.commit().assert_ok();
 	let base = store.inner.current_root();
 	let mut candidate = (*base).clone();
 	candidate.commit_ts = base.commit_ts + 1;
 	let revisions = Arc::clone(&candidate.versions);
-	candidate.rebase_import_controls(&base, &base, 1, 1)?;
+	candidate.rebase_import_controls(&base, &base, 1, 1).assert_ok();
 	assert!(Arc::ptr_eq(&candidate.versions, &revisions), "unchanged revisions stay shared");
 	let mut close = store.begin();
-	close.close_live(live)?;
-	close.commit()?;
+	close.close_live(live).assert_ok();
+	close.commit().assert_ok();
 	let current = store.inner.current_root();
 	assert!(candidate.rebase_import_controls(&base, &current, 1, 1).is_err());
 	assert!(Arc::ptr_eq(&candidate.versions, &revisions), "rejected admission precedes COW");
 	assert_eq!(current.live_catalog().queries[&live].state, LiveState::Closed);
-	Ok(())
 }

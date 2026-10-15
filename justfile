@@ -11,7 +11,7 @@ build *args:
 # Check compilation
 [group('dev')]
 check *args:
-    cargo +{{toolchain}} check --locked -p ferros-grynn --all-targets {{args}}
+    cargo +{{toolchain}} check --locked --workspace --all-targets {{args}}
 
 # Format the workspace explicitly
 [group('dev')]
@@ -26,21 +26,25 @@ fmt-check:
 # Run the repository's Clippy rules
 [group('dev')]
 clippy *args:
-    cargo +{{toolchain}} clippy --locked -p ferros-grynn --all-targets {{args}}
+    cargo +{{toolchain}} clippy --locked --workspace --all-targets {{args}} -- -D warnings
+
+# Check core targets without workspace feature unification
+[group('dev')]
+clippy-core:
+    cargo +{{toolchain}} clippy --locked -p ferros-grynn --no-default-features --all-targets -- -D warnings
 
 # Check compilation, formatting and Clippy without rewriting source
 [group('dev')]
-all-check: check fmt-check clippy
+all-check: check fmt-check clippy clippy-core
 
 # Run tests
 [group('dev')]
 test *args:
-    cargo +{{toolchain}} test --locked -p ferros-grynn {{args}} -- --test-threads=1
+    cargo +{{toolchain}} test --locked --workspace {{args}} -- --test-threads=1
 
 # Run the complete pre-commit gate
 [group('dev')]
-pre-commit:
-#pre-commit: all-check test
+pre-commit: all-check test
 
 # Install the tracked pre-commit hook without replacing other hooks
 [group('dev')]
@@ -56,6 +60,11 @@ quick-start:
 [group('ci')]
 coverage:
     pwsh -NoLogo -NoProfile -File scripts/coverage.ps1 -Toolchain {{toolchain}}
+
+# Measure workspace coverage with default features
+[group('ci')]
+coverage-workspace:
+    pwsh -NoLogo -NoProfile -File scripts/coverage.ps1 -Toolchain {{toolchain}} -Scope Workspace
 
 # Validate CI scripts, badge generation and documentation links
 [group('ci')]

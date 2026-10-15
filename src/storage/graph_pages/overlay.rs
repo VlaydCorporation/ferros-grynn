@@ -1,4 +1,4 @@
-use super::*;
+use super::{AlignedPage, FerrosGrynnResult, PageLsn, PageNo, invalid_page};
 use crate::{
 	datastore::{OverlayValue, PropertyOverlay},
 	storage::{
@@ -118,8 +118,11 @@ pub(in crate::storage) fn decode_overlay(
 /// Append-only builder for graph-local overlay records.
 #[derive(Default)]
 pub(in crate::storage) struct GraphOverlayStore {
+	/// Next page associated with this graph overlay store.
 	next_page: u64,
+	/// Current associated with this graph overlay store.
 	current: Option<(PageNo, PropertyPageBuilder)>,
+	/// Pages associated with this graph overlay store.
 	pages: Vec<AlignedPage>,
 }
 
@@ -179,6 +182,7 @@ impl GraphOverlayStore {
 		PropertyRef::inline(*page_no, slot, length)
 	}
 
+	/// Finishes graph overlay store.
 	pub(in crate::storage) fn finish(mut self) -> FerrosGrynnResult<Vec<AlignedPage>> {
 		self.finish_current()?;
 		if u64::try_from(self.pages.len()).ok() != Some(self.next_page) {
@@ -187,6 +191,7 @@ impl GraphOverlayStore {
 		Ok(self.pages)
 	}
 
+	/// Returns the start page result.
 	fn start_page(&mut self, page_lsn: PageLsn) -> FerrosGrynnResult<()> {
 		let page_no = PageNo::new(self.next_page);
 		let index = usize::try_from(page_no.get())
@@ -207,6 +212,7 @@ impl GraphOverlayStore {
 		Ok(())
 	}
 
+	/// Finishes current.
 	fn finish_current(&mut self) -> FerrosGrynnResult<()> {
 		if let Some((page_no, builder)) = self.current.take() {
 			let index = usize::try_from(page_no.get())
@@ -257,12 +263,14 @@ pub(in crate::storage) fn read_overlay_record(
 	}
 }
 
+/// Returns the page at result.
 fn page_at(pages: &[AlignedPage], page_no: PageNo) -> FerrosGrynnResult<&AlignedPage> {
 	let index = usize::try_from(page_no.get())
 		.map_err(|_error| invalid_page(page_no.get(), "overlay page exceeds usize"))?;
 	pages.get(index).ok_or_else(|| invalid_page(page_no.get(), "overlay page exceeds its file"))
 }
 
+/// Writes uleb.
 fn write_uleb(output: &mut Vec<u8>, mut value: u64) {
 	loop {
 		let mut byte = (value & 0x7f) as u8;
@@ -277,6 +285,7 @@ fn write_uleb(output: &mut Vec<u8>, mut value: u64) {
 	}
 }
 
+/// Reads uleb.
 fn read_uleb(bytes: &[u8]) -> FerrosGrynnResult<(u64, usize)> {
 	let mut value = 0_u64;
 	for (index, byte) in bytes.iter().copied().take(10).enumerate() {
@@ -297,25 +306,29 @@ fn read_uleb(bytes: &[u8]) -> FerrosGrynnResult<(u64, usize)> {
 }
 
 #[cfg(test)]
+/// Regression tests for overlay behavior.
 mod tests {
 	use super::*;
 	use crate::values::{PropertyDictionary, Value};
 
+	/// Verifies sparse overlay round trips hidden and null.
 	#[test]
-	fn sparse_overlay_round_trips_hidden_and_null() -> FerrosGrynnResult<()> {
+	fn sparse_overlay_round_trips_hidden_and_null() {
+		use crate::test_assertions::AssertResult as _;
+
 		let overlay = PropertyOverlay::from_entries([
 			(PropertyKeyId::new(2), OverlayValue::Hidden),
 			(PropertyKeyId::new(7), OverlayValue::Value(Value::Null)),
-		])?;
+		])
+		.assert_ok();
 		let mut encode = EncodeContext::new(PropertyDictionary::new());
-		let record = encode_overlay(&overlay, &mut encode)?;
+		let record = encode_overlay(&overlay, &mut encode).assert_ok();
 		let decode = encode.decoder();
-		assert_eq!(decode_overlay(&record, &decode, DecodeLimits::default())?, overlay);
+		assert_eq!(decode_overlay(&record, &decode, DecodeLimits::default()).assert_ok(), overlay);
 
 		let mut store = GraphOverlayStore::default();
-		let reference = store.insert(&record, PageLsn::new(3))?;
-		let pages = store.finish()?;
-		assert_eq!(read_overlay_record(&pages, reference, 1 << 20)?, Some(record));
-		Ok(())
+		let reference = store.insert(&record, PageLsn::new(3)).assert_ok();
+		let pages = store.finish().assert_ok();
+		assert_eq!(read_overlay_record(&pages, reference, 1 << 20).assert_ok(), Some(record));
 	}
 }

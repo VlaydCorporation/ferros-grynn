@@ -206,6 +206,8 @@ impl HistogramBuilder {
 			.ok_or_else(|| invalid("property bucket ordinal overflows usize"))?;
 		self.bucket_seen = 0;
 		self.bucket_distinct = 0;
+		// A value split across buckets counts in each bucket, but only once in
+		// the global total.
 		self.bucket_previous = None;
 		Ok(())
 	}
@@ -251,25 +253,33 @@ fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for bounded histogram behavior.
 mod tests {
 	use std::sync::atomic::{AtomicU64, Ordering};
 
 	use super::*;
 	use crate::storage::ExternalIndexSorter;
 
+	/// Process-local suffix counter that separates temporary histogram-test
+	/// directories.
 	static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+	/// Verifies spilled values keep exact distinct counts and bounded buckets.
 	#[test]
-	fn spilled_values_keep_exact_distinct_counts_and_bounded_buckets() -> FerrosGrynnResult<()> {
+	fn spilled_values_keep_exact_distinct_counts_and_bounded_buckets() {
+		use crate::test_assertions::AssertResult as _;
+
 		let root = std::env::temp_dir().join(format!(
 			"fg-stats-sort-{}-{}",
 			std::process::id(),
 			NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
 		));
-		std::fs::create_dir(&root).map_err(|source| {
-			FerrosGrynnError::storage_io_failure("create statistics sorter test directory")
-				.with_technical_source(source)
-		})?;
+		std::fs::create_dir(&root)
+			.map_err(|source| {
+				FerrosGrynnError::storage_io_failure("create statistics sorter test directory")
+					.with_technical_source(source)
+			})
+			.assert_ok();
 		let result = (|| {
 			let mut sorter = ExternalIndexSorter::with_budget(&root, 64);
 			for sequence in (0..250_u64).rev() {
@@ -290,6 +300,7 @@ mod tests {
 			Ok(())
 		})();
 		drop(std::fs::remove_dir_all(root));
-		result
+		let test_result: FerrosGrynnResult<()> = result;
+		test_result.assert_ok();
 	}
 }

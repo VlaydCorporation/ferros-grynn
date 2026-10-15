@@ -19,7 +19,9 @@ use crate::{
 	values::{QueryCursor, Value},
 };
 
+/// Configured max cursor spools value.
 const MAX_CURSOR_SPOOLS: usize = 64;
+/// Shared next session id value.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Exact graph selectors and root stay with the existing bounded cursor spool.
@@ -35,10 +37,11 @@ pub(in crate::gql) struct GraphCursorContext {
 	/// Stores recipe and ordering fingerprints of the original cursor.
 	pub(in crate::gql) template: (u64, u64),
 	/// Retains admission for the complete cursor frame until its spool closes.
-	pub(in crate::gql) account: BarrierAccount,
+	pub(in crate::gql) _account: BarrierAccount,
 }
 
 impl std::fmt::Debug for GraphCursorContext {
+	/// Formats `GraphCursorContext` using the requested formatter.
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("GraphCursorContext")
 			.field("snapshot", &self.root.commit_ts)
@@ -48,20 +51,29 @@ impl std::fmt::Debug for GraphCursorContext {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CursorAnchor {
+/// Cursor anchor state.
+pub struct CursorAnchor {
+	/// Order keys associated with this cursor anchor.
 	pub(crate) order_keys: Vec<Value>,
+	/// Stable key associated with this cursor anchor.
 	pub(crate) stable_key: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CursorRecord {
+/// Cursor record state.
+pub struct CursorRecord {
+	/// Value associated with this cursor record.
 	pub(crate) value: Value,
+	/// Anchor associated with this cursor record.
 	pub(crate) anchor: CursorAnchor,
 }
 
 #[derive(Debug)]
-pub(crate) struct CursorPage {
+/// Cursor page state.
+pub struct CursorPage {
+	/// Values associated with this cursor page.
 	pub(crate) values: Vec<Value>,
+	/// Continuation associated with this cursor page.
 	pub(crate) continuation: Option<QueryCursor>,
 }
 
@@ -69,6 +81,7 @@ pub(crate) struct CursorPage {
 pub(in crate::gql) struct IndexSeekPlan {
 	/// Retains the bound logical graph selectors for exact cursor resume.
 	pub(in crate::gql) plan: LogicalSelect,
+	/// Physical associated with this index seek plan.
 	pub(in crate::gql) physical: PhysicalSelectPlan,
 	/// Owns the evaluated frame used by the original graph cursor.
 	pub(in crate::gql) slots: Vec<Value>,
@@ -76,15 +89,19 @@ pub(in crate::gql) struct IndexSeekPlan {
 	pub(in crate::gql) source: String,
 }
 
+/// Session-owned exact transaction snapshot and resumable index seek plan.
+/// Its registry lifetime is separate from SELECT materialization barriers.
 struct IndexSeekState {
+	/// Transaction associated with this index seek state.
 	transaction: Option<Transaction>,
+	/// Plan associated with this index seek state.
 	plan: IndexSeekPlan,
 }
 
 impl std::fmt::Debug for IndexSeekState {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter
-			.debug_struct("IndexSeekState")
+	/// Formats `IndexSeekState` using the requested formatter.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("IndexSeekState")
 			.field("transaction_attached", &self.transaction.is_some())
 			.finish_non_exhaustive()
 	}
@@ -92,66 +109,112 @@ impl std::fmt::Debug for IndexSeekState {
 
 /// Temporarily checked-out exact snapshot while one keyset page is produced.
 pub(in crate::gql) struct IndexSeekCheckout {
+	/// Transaction associated with this index seek checkout.
 	pub(in crate::gql) transaction: Transaction,
 	/// Retains the bound logical graph selectors for exact cursor resume.
 	pub(in crate::gql) plan: LogicalSelect,
+	/// Physical associated with this index seek checkout.
 	pub(in crate::gql) physical: PhysicalSelectPlan,
 	/// Owns the evaluated frame used by the original graph cursor.
 	pub(in crate::gql) slots: Vec<Value>,
 	/// Retains original source text for checked cursor diagnostics.
 	pub(in crate::gql) source: String,
+	/// Anchor associated with this index seek checkout.
 	pub(in crate::gql) anchor: CursorAnchor,
+	/// Spool associated with this index seek checkout.
 	spool: u64,
+	/// Cursor associated with this index seek checkout.
 	cursor: QueryCursor,
+	/// Prior next associated with this index seek checkout.
 	prior_next: Option<QueryCursor>,
 }
 
 #[derive(Debug)]
+/// Cursor spool state.
 struct CursorSpool {
 	/// Pins the graph cursor frame for the lifetime of its existing spool.
 	graph: Option<Arc<GraphCursorContext>>,
+	/// Rows associated with this cursor spool.
 	rows: CursorRows,
+	/// Created associated with this cursor spool.
 	created: Instant,
+	/// Snapshot associated with this cursor spool.
 	_snapshot: u64,
+	/// Fingerprint associated with this cursor spool.
 	fingerprint: u64,
+	/// Order fingerprint associated with this cursor spool.
 	order_fingerprint: u64,
 }
 
 #[derive(Debug)]
+/// Cursor rows alternatives.
 enum CursorRows {
+	/// Memory case of cursor rows.
 	Memory {
+		/// Rows associated with this cursor rows.
 		rows: Vec<CursorRecord>,
+		/// Memory admission account retained for the lifetime of this value.
 		_account: BarrierAccount,
 	},
-	Disk(QuerySpool),
-	IndexSeek(IndexSeekState),
+	/// Disk case of cursor rows.
+	Disk(
+		/// Disk case of cursor rows.
+		QuerySpool,
+	),
+	/// Index seek case of cursor rows.
+	IndexSeek(
+		/// Index seek case of cursor rows.
+		Box<IndexSeekState>,
+	),
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Cursor offset alternatives.
 enum CursorOffset {
-	Memory(usize),
-	Disk(u64),
+	/// Memory case of cursor offset.
+	Memory(
+		/// Memory case of cursor offset.
+		usize,
+	),
+	/// Disk case of cursor offset.
+	Disk(
+		/// Disk case of cursor offset.
+		u64,
+	),
+	/// Index seek case of cursor offset.
 	IndexSeek,
 }
 
 #[derive(Debug)]
+/// Cursor entry state.
 struct CursorEntry {
+	/// Spool associated with this cursor entry.
 	spool: u64,
+	/// Position relative to the beginning of the associated buffer.
 	offset: CursorOffset,
+	/// Anchor associated with this cursor entry.
 	anchor: CursorAnchor,
+	/// Next associated with this cursor entry.
 	next: Option<QueryCursor>,
 }
 
 #[derive(Debug)]
-pub(crate) struct CursorRuntime {
+/// Cursor runtime state.
+pub struct CursorRuntime {
+	/// Session associated with this cursor runtime.
 	session: u64,
+	/// Next id associated with this cursor runtime.
 	next_id: u64,
+	/// Max snapshot age associated with this cursor runtime.
 	max_snapshot_age: Duration,
+	/// Spools associated with this cursor runtime.
 	spools: BTreeMap<u64, CursorSpool>,
+	/// Entries associated with this cursor runtime.
 	entries: BTreeMap<u64, CursorEntry>,
 }
 
 impl CursorRuntime {
+	/// Creates a new `CursorRuntime` value.
 	pub(crate) fn new(max_snapshot_age: Duration) -> Self {
 		Self {
 			session: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
@@ -162,6 +225,7 @@ impl CursorRuntime {
 		}
 	}
 
+	/// Registers cursor runtime.
 	pub(crate) fn register(
 		&mut self,
 		rows: Vec<CursorRecord>,
@@ -197,6 +261,7 @@ impl CursorRuntime {
 		Ok(cursor)
 	}
 
+	/// Registers disk.
 	pub(crate) fn register_disk(
 		&mut self,
 		rows: QuerySpool,
@@ -228,6 +293,7 @@ impl CursorRuntime {
 		Ok(cursor)
 	}
 
+	/// Registers index seek.
 	pub(in crate::gql) fn register_index_seek(
 		&mut self,
 		plan: IndexSeekPlan,
@@ -241,12 +307,15 @@ impl CursorRuntime {
 		}
 		let spool_id = self.allocate_id()?;
 		let cursor = QueryCursor::new(self.session, self.allocate_id()?);
+		// Boxing relocates the existing session registry payload. Its count,
+		// snapshot age and lifecycle remain owned by this runtime.
+		let state = Box::new(IndexSeekState {
+			transaction: None,
+			plan,
+		});
 		self.spools.insert(spool_id, CursorSpool {
 			graph: None,
-			rows: CursorRows::IndexSeek(IndexSeekState {
-				transaction: None,
-				plan,
-			}),
+			rows: CursorRows::IndexSeek(state),
 			created: Instant::now(),
 			_snapshot: snapshot,
 			fingerprint,
@@ -261,6 +330,7 @@ impl CursorRuntime {
 		Ok(cursor)
 	}
 
+	/// Attaches index seek.
 	pub(in crate::gql) fn attach_index_seek(
 		&mut self,
 		cursor: QueryCursor,
@@ -352,6 +422,7 @@ impl CursorRuntime {
 		Ok((state.fingerprint, state.order_fingerprint))
 	}
 
+	/// Returns the checkout index seek result.
 	pub(in crate::gql) fn checkout_index_seek(
 		&mut self,
 		cursor: QueryCursor,
@@ -403,6 +474,7 @@ impl CursorRuntime {
 		}))
 	}
 
+	/// Finishes index seek.
 	pub(in crate::gql) fn finish_index_seek(
 		&mut self,
 		checkout: IndexSeekCheckout,
@@ -446,10 +518,12 @@ impl CursorRuntime {
 		Ok(Some(next))
 	}
 
+	/// Performs the abort index seek operation.
 	pub(in crate::gql) fn abort_index_seek(&mut self, checkout: &IndexSeekCheckout) {
 		self.remove_spool(checkout.spool);
 	}
 
+	/// Returns the page result.
 	pub(crate) fn page(
 		&mut self,
 		cursor: QueryCursor,
@@ -475,12 +549,12 @@ impl CursorRuntime {
 			let spool = self.spools.get(&spool_id).ok_or_else(|| {
 				FerrosGrynnError::invalid_query_cursor("result spool is unavailable")
 			})?;
-			self.validate_spool(spool, fingerprint, order_fingerprint)?;
+			Self::validate_spool(spool, fingerprint, order_fingerprint)?;
 			match (&spool.rows, offset) {
 				(
 					CursorRows::Memory {
 						rows,
-						_account: _,
+						..
 					},
 					CursorOffset::Memory(offset),
 				) => {
@@ -566,10 +640,11 @@ impl CursorRuntime {
 			.spools
 			.get(&spool_id)
 			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("result spool is unavailable"))?;
-		self.validate_spool(spool, fingerprint, order_fingerprint)?;
+		Self::validate_spool(spool, fingerprint, order_fingerprint)?;
 		Ok(entry.anchor.clone())
 	}
 
+	/// Closes cursor runtime.
 	pub(crate) fn close(&mut self, cursor: QueryCursor) -> FerrosGrynnResult<()> {
 		self.validate_token(cursor)?;
 		let spool = self
@@ -581,6 +656,7 @@ impl CursorRuntime {
 		Ok(())
 	}
 
+	/// Returns the allocate id result.
 	fn allocate_id(&mut self) -> FerrosGrynnResult<u64> {
 		let id = self.next_id;
 		self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
@@ -589,6 +665,7 @@ impl CursorRuntime {
 		Ok(id)
 	}
 
+	/// Validates token.
 	fn validate_token(&self, cursor: QueryCursor) -> FerrosGrynnResult<()> {
 		if cursor.session() != self.session {
 			return Err(FerrosGrynnError::invalid_query_cursor(
@@ -598,8 +675,8 @@ impl CursorRuntime {
 		Ok(())
 	}
 
+	/// Validates spool.
 	fn validate_spool(
-		&self,
 		spool: &CursorSpool,
 		fingerprint: u64,
 		order_fingerprint: u64,
@@ -615,6 +692,7 @@ impl CursorRuntime {
 		Ok(())
 	}
 
+	/// Removes spool.
 	fn remove_spool(&mut self, spool: u64) {
 		self.entries.retain(|_id, entry| entry.spool != spool);
 		self.spools.remove(&spool);

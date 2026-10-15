@@ -61,12 +61,12 @@ impl ReachabilityArtifact {
 	/// # Errors
 	/// Returns a definition, relation, cancellation or resource error before
 	/// publishing any labels or pages.
-	pub fn build(
+	pub fn build<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		database: &DatabaseRoot,
 		index: &GraphIndex,
 		revision: u64,
 		scratch_bytes: usize,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<Option<Self>> {
 		let GraphIndexDefinition::Reachability {
 			algorithm,
@@ -219,13 +219,13 @@ impl ReachabilityArtifact {
 	/// # Errors
 	/// Rejects incompatible metadata, references, CSR, label bounds or
 	/// descriptor bytes before constructing a query-visible artifact.
-	pub fn restore(
+	pub fn restore<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		graph: &GraphRoot,
 		index: &GraphIndex,
 		layout: ReachabilityLayout,
 		data: [Vec<u8>; 8],
 		scratch_bytes: usize,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<Self> {
 		layout.admit_decode(scratch_bytes)?;
 		let header = layout.header;

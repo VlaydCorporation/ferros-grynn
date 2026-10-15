@@ -42,9 +42,9 @@ impl LiveGraphResult {
 
 	/// Adds orthogonal validators in canonical order, deduplicating repeated
 	/// inputs.
-	pub fn with_validators(
+	pub fn with_validators<ValidatorsArg: IntoIterator<Item = GraphTopologyConstraint>>(
 		mut self,
-		validators: impl IntoIterator<Item = GraphTopologyConstraint>,
+		validators: ValidatorsArg,
 	) -> Self {
 		for validator in validators {
 			self.validators.insert(validator);

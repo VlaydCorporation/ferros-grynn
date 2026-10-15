@@ -57,6 +57,8 @@ impl HyperLogLog {
 	pub(crate) fn insert(&mut self, value: &[u8]) {
 		let hash = rapidhash::v3::rapidhash_v3(value);
 		let index = (hash >> (64 - self.precision)) as usize;
+		// Shifting removes the bucket bits; cap the zero-suffix case to its
+		// remaining-bit rank.
 		let rank = (hash << self.precision)
 			.leading_zeros()
 			.saturating_add(1)
@@ -92,6 +94,8 @@ impl HyperLogLog {
 		};
 		let raw = alpha * count * count / reciprocal_sum;
 		let empty = self.registers.iter().filter(|rank| **rank == 0).count();
+		// Empty-register counting corrects the raw estimator bias at small
+		// cardinalities.
 		let corrected = if raw <= 2.5 * count && empty != 0 {
 			count * (count / empty as f64).ln()
 		} else {
@@ -110,15 +114,19 @@ fn register_count(precision: u8) -> FerrosGrynnResult<usize> {
 }
 
 #[cfg(test)]
+/// Regression tests for hyper log log behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies merge matches distinct union and checked register roundtrip.
 	#[test]
 	fn merge_matches_distinct_union_and_checked_register_roundtrip() {
 		for precision in [4, 5, 6, 12, 18] {
-			let mut left = HyperLogLog::new(precision).unwrap();
-			let mut right = HyperLogLog::new(precision).unwrap();
-			let mut union = HyperLogLog::new(precision).unwrap();
+			let mut left = HyperLogLog::new(precision).assert_ok();
+			let mut right = HyperLogLog::new(precision).assert_ok();
+			let mut union = HyperLogLog::new(precision).assert_ok();
 			assert_eq!(left.estimate(), 0);
 			assert_eq!(left.registers().len(), 1 << precision);
 			for member in 0..10_000_u64 {
@@ -130,17 +138,17 @@ mod tests {
 					right.insert(&member.to_le_bytes());
 				}
 			}
-			left.merge(&right).unwrap();
+			left.merge(&right).assert_ok();
 			assert_eq!(left, union);
 			assert_eq!(
 				left,
-				HyperLogLog::from_registers(precision, left.registers().to_vec()).unwrap()
+				HyperLogLog::from_registers(precision, left.registers().to_vec()).assert_ok()
 			);
 		}
-		let mut left = HyperLogLog::new(12).unwrap();
+		let mut left = HyperLogLog::new(12).assert_ok();
 		assert_eq!(left.registers().len(), 4096);
 		let before = left.registers().to_vec();
-		assert!(left.merge(&HyperLogLog::new(4).unwrap()).is_err());
+		assert!(left.merge(&HyperLogLog::new(4).assert_ok()).is_err());
 		assert_eq!(left.registers(), before);
 		for precision in [0, 3, 19, 255] {
 			assert!(HyperLogLog::new(precision).is_err());

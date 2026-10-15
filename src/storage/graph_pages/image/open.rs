@@ -10,7 +10,7 @@ use super::{
 	topology::{NodeAdjacency, record_node_adjacency},
 };
 use crate::{
-	datastore::{DatabaseRoot, GlobalAtomId, GraphRoot, OccurrenceState},
+	datastore::{DatabaseRoot, GlobalAtomId, GraphRoot, OccurrenceStateRef},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, GraphId},
 	storage::{
@@ -140,18 +140,21 @@ pub(in crate::storage) fn open_graph_image(
 	Ok(graph)
 }
 
+/// Decodes nodes.
 fn decode_nodes(image: &BuiltGraphImage, capacity: u64) -> FerrosGrynnResult<Vec<NodeHotSlot>> {
 	decode_hot(capacity, &image.nodes, |page, page_no, slot| {
 		read_node_hot_slot(page, page_no, slot)
 	})
 }
 
+/// Decodes edges.
 fn decode_edges(image: &BuiltGraphImage, capacity: u64) -> FerrosGrynnResult<Vec<EdgeHotSlot>> {
 	decode_hot(capacity, &image.edges, |page, page_no, slot| {
 		read_edge_hot_slot(page, page_no, slot)
 	})
 }
 
+/// Decodes hot.
 fn decode_hot<Slot>(
 	capacity: u64,
 	pages: &[AlignedPage],
@@ -179,6 +182,7 @@ fn decode_hot<Slot>(
 	Ok(result)
 }
 
+/// Returns the local addresses result.
 fn local_addresses(
 	nodes: &[NodeHotSlot],
 	edges: &[EdgeHotSlot],
@@ -214,6 +218,7 @@ fn local_addresses(
 	Ok(result)
 }
 
+/// Decodes memberships.
 fn decode_memberships(
 	image: &BuiltGraphImage,
 ) -> FerrosGrynnResult<BTreeMap<DiskAtomRef, GlobalAtomId>> {
@@ -235,6 +240,7 @@ fn decode_memberships(
 	Ok(result)
 }
 
+/// Validates membership.
 fn validate_membership(
 	database: &DatabaseRoot,
 	remaining: &mut BTreeMap<DiskAtomRef, GlobalAtomId>,
@@ -255,6 +261,7 @@ fn validate_membership(
 	Ok(indexed)
 }
 
+/// Returns the install overlay result.
 fn install_overlay(
 	graph: &mut GraphRoot,
 	local: AtomId,
@@ -276,6 +283,7 @@ fn install_overlay(
 	Ok(())
 }
 
+/// Reads local side.
 fn read_local_side<const N: usize>(
 	count: u32,
 	inline: &[Option<DiskAtomRef>; N],
@@ -298,6 +306,7 @@ fn read_local_side<const N: usize>(
 	Ok(result)
 }
 
+/// Validates node adjacency.
 fn validate_node_adjacency(
 	graph: &GraphRoot,
 	expected: BTreeMap<AtomId, NodeAdjacency>,
@@ -308,10 +317,10 @@ fn validate_node_adjacency(
 		.map(|occurrence| (occurrence.local_id(), NodeAdjacency::default()))
 		.collect::<BTreeMap<_, _>>();
 	for occurrence in graph.occurrences() {
-		if let OccurrenceState::Edge {
+		if let OccurrenceStateRef::Edge {
 			topology,
 			..
-		} = occurrence.state()
+		} = occurrence.state().view()
 		{
 			record_node_adjacency(
 				topology,
@@ -326,6 +335,7 @@ fn validate_node_adjacency(
 	Ok(())
 }
 
+/// Validates subgraphs.
 fn validate_subgraphs(
 	image: &BuiltGraphImage,
 	database: &DatabaseRoot,
@@ -378,11 +388,11 @@ fn validate_subgraphs(
 		let container = graph
 			.occurrence(scope[0])
 			.ok_or_else(|| invalid("subgraph container is absent from parent graph"))?;
-		let bound = match container.state() {
-			OccurrenceState::Node {
+		let bound = match container.state().view() {
+			OccurrenceStateRef::Node {
 				nested_graph,
 			} => *nested_graph,
-			OccurrenceState::Edge {
+			OccurrenceStateRef::Edge {
 				transition_graph,
 				..
 			} => *transition_graph,
@@ -403,6 +413,7 @@ fn validate_subgraphs(
 	Ok(())
 }
 
+/// Validates ceilings.
 fn validate_ceilings(image: &BuiltGraphImage) -> FerrosGrynnResult<()> {
 	for (actual, expected, family) in [
 		(image.nodes.len(), image.superblock.node_hot_pages, "node-hot"),
@@ -424,6 +435,7 @@ fn validate_ceilings(image: &BuiltGraphImage) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Validates arena root.
 fn validate_arena_root(arena: &GraphArenaBindings, graph: GraphId) -> FerrosGrynnResult<()> {
 	if arena.graph_by_slot.get(&0) != Some(&graph)
 		|| arena.scope_by_slot.get(&0).is_none_or(|scope| !scope.is_empty())
@@ -434,6 +446,7 @@ fn validate_arena_root(arena: &GraphArenaBindings, graph: GraphId) -> FerrosGryn
 	Ok(())
 }
 
+/// Returns the child graph result.
 fn child_graph(
 	slot: Option<u32>,
 	arena: &GraphArenaBindings,
@@ -451,6 +464,7 @@ fn child_graph(
 	.transpose()
 }
 
+/// Returns the label result.
 fn label(
 	dictionary: &LabelDictionary,
 	kind: LabelKind,
@@ -465,6 +479,7 @@ fn label(
 	.transpose()
 }
 
+/// Returns the local id result.
 fn local_id(kind: AtomKind, slot: usize, generation: u32) -> FerrosGrynnResult<AtomId> {
 	AtomId::from_parts(
 		kind,
@@ -473,14 +488,17 @@ fn local_id(kind: AtomKind, slot: usize, generation: u32) -> FerrosGrynnResult<A
 	)
 }
 
+/// Returns the usize u64 result.
 fn usize_u64(value: usize) -> FerrosGrynnResult<u64> {
 	u64::try_from(value).map_err(|_error| invalid("value exceeds u64"))
 }
 
+/// Returns the usize u32 result.
 fn usize_u32(value: usize) -> FerrosGrynnResult<u32> {
 	u32::try_from(value).map_err(|_error| invalid("value exceeds u32"))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

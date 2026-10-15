@@ -2,6 +2,7 @@
 use super::*;
 
 /// One unpublished frame owned by a batched miss operation.
+#[cfg(test)]
 pub(super) struct BatchLoadReservation {
 	/// Position in the deduplicated request vector.
 	pub(super) unique_index: usize,
@@ -16,6 +17,7 @@ pub(super) struct BatchLoadReservation {
 }
 
 /// One source-local extent and its assigned range in a shared batch buffer.
+#[cfg(test)]
 pub(in crate::storage) struct PageLoadExtent {
 	/// First physical page identity in this extent.
 	pub(super) first_key: PageKey,
@@ -25,24 +27,8 @@ pub(in crate::storage) struct PageLoadExtent {
 	pub(super) page_count: usize,
 }
 
-impl PageLoadExtent {
-	/// Returns the first physical page identity.
-	pub(in crate::storage) const fn first_key(&self) -> PageKey {
-		self.first_key
-	}
-
-	/// Returns the first assigned page in the batch buffer.
-	pub(in crate::storage) const fn buffer_start(&self) -> usize {
-		self.buffer_start
-	}
-
-	/// Returns the number of consecutive pages.
-	pub(in crate::storage) const fn page_count(&self) -> usize {
-		self.page_count
-	}
-}
-
 /// Loads sorted reservations as adjacent, source-local extents.
+#[cfg(test)]
 pub(super) fn load_reserved_extents<Loader>(
 	reservations: &mut [BatchLoadReservation],
 	scratch: &mut [AlignedPage],
@@ -110,6 +96,7 @@ where
 }
 
 /// Validates one loaded image and copies it into its permanent frame.
+#[cfg(test)]
 fn install_loaded_page(
 	reservation: &mut BatchLoadReservation,
 	loaded_page: &AlignedPage,

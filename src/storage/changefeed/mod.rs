@@ -15,19 +15,11 @@ pub(in crate::storage) use group::{
 	inspect as inspect_group,
 };
 
+#[cfg(test)]
+pub(in crate::storage) use super::history_codec::pages::{SegmentHeader, encode_pages};
 pub(in crate::storage) use super::history_codec::{
 	CodecBudget,
-	pages::{
-		CommitLocator,
-		SegmentHeader,
-		decode_header,
-		decode_locator,
-		decode_pages,
-		encode_header,
-		encode_pages,
-		first_payload,
-		payload_pages,
-	},
+	pages::{CommitLocator, decode_header, decode_locator, decode_pages, first_payload},
 };
 use super::history_codec::{Decoder, append, append_blob, checked_payload, invalid, values};
 
@@ -36,7 +28,7 @@ use super::history_codec::{Decoder, append, append_blob, checked_payload, invali
 	clippy::redundant_pub_crate,
 	reason = "Re-exported internally for MVCC snapshot ownership."
 )]
-pub(crate) type ChangefeedSegments = std::sync::Arc<
+pub type ChangefeedSegments = std::sync::Arc<
 	std::collections::BTreeMap<
 		crate::changefeed::ChangefeedId,
 		std::sync::Arc<Vec<crate::storage::HistorySegment>>,
@@ -46,7 +38,7 @@ pub(crate) type ChangefeedSegments = std::sync::Arc<
 /// Checked commit metadata for bounded seeking and FULL coverage preflight.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::redundant_pub_crate, reason = "Internal storage/datastore reader boundary.")]
-pub(crate) struct ChangefeedGroupInfo {
+pub struct ChangefeedGroupInfo {
 	/// Exact source incarnation.
 	pub(crate) source: crate::changefeed::ChangefeedId,
 	/// Whole-commit position.

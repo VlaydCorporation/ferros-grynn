@@ -54,11 +54,11 @@ impl Transaction {
 	///
 	/// # Errors
 	/// Propagates snapshot/read/check errors and resource exhaustion.
-	pub fn endpoint_tensor_with_check(
+	pub fn endpoint_tensor_with_check<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 		&mut self,
 		graph: &GraphRef,
 		options: TensorOptions,
-		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		check: &mut CheckArg,
 	) -> FerrosGrynnResult<EndpointTensor> {
 		let snapshot = self.query_snapshot()?;
 		self.endpoint_tensor_at(&snapshot, graph, options, check)
@@ -323,7 +323,7 @@ impl Transaction {
 			};
 			control.admit(artifact.tensor.admitted_bytes())?;
 			control.work(artifact.tensor.admitted_bytes())?;
-			// ponytail: the owned SDK result clones the sparse capture; share
+			// shortcut: the owned SDK result clones the sparse capture; share
 			// its payload only if measured warm-read allocations
 			// require it.
 			let mut tensor = artifact.tensor.clone();
@@ -374,374 +374,19 @@ impl Transaction {
 		Ok(None)
 	}
 }
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::{
-		datastore::{
-			ClassSchema,
-			ConflictKey,
-			Datastore,
-			GraphIndex,
-			GraphIndexDefinition,
-			TensorArtifact,
-			TensorCacheFormat,
-		},
-		graph::{AtomKind, EdgeTopology, GraphKind},
-		values::{PropertyMap, RecordId},
-	};
-
-	#[test]
-	fn tensor_auto_chooses_a_work_admitted_format_and_external_sort_matches_capture() {
-		use crate::graph::tensor::GraphAlgorithmLimits;
-		let store = Datastore::in_memory();
-		let mut seed = store.begin();
-		seed.define_class(ClassSchema::new("n", AtomKind::Node, []).unwrap()).unwrap();
-		seed.define_class(ClassSchema::new("e", AtomKind::Edge, []).unwrap()).unwrap();
-		let graph = seed.define_graph("sort", GraphKind::Hypergraph).unwrap();
-		let mut nodes = Vec::new();
-		for ordinal in 0..100 {
-			let record: RecordId = format!("n:{ordinal}").parse().unwrap();
-			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
-			nodes.push(seed.attach_node(graph.id(), &record, None, None).unwrap());
-		}
-		for ordinal in 0..100 {
-			let record: RecordId = format!("e:{ordinal}").parse().unwrap();
-			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
-			seed.attach_edge(
-				graph.id(),
-				&record,
-				None,
-				EdgeTopology::directed(nodes[..10].iter().copied(), nodes[10..20].iter().copied()),
-				None,
-				None,
-			)
-			.unwrap();
-		}
-		let id = seed
-			.define_graph_index(
-				"sort",
-				GraphIndex::new_tensor(
-					"auto",
-					TensorScope::Local,
-					TensorCacheFormat::Auto,
-					1 << 20,
-				)
-				.unwrap(),
-			)
-			.unwrap();
-		for ordinal in 0..3 {
-			seed.define_graph_index(
-				"sort",
-				GraphIndex::new_tensor(
-					format!("extra{ordinal}"),
-					TensorScope::Local,
-					TensorCacheFormat::Auto,
-					1 << 20,
-				)
-				.unwrap(),
-			)
-			.unwrap();
-		}
-		seed.commit().unwrap();
-		let mut read = store.begin();
-		let snapshot = read.query_snapshot().unwrap();
-		let mut index = read.graph_index("sort", "auto").unwrap().unwrap();
-		index.build_revision = snapshot.root.commit_ts + 1;
-		let limits = GraphAlgorithmLimits {
-			memory_bytes: 32 << 20,
-			max_work: 1_000_000,
-			..Default::default()
-		};
-		let memory = TensorArtifact::build(
-			&snapshot.root,
-			&index,
-			index.build_revision(),
-			limits,
-			None,
-			&mut || Ok(()),
-		)
-		.unwrap();
-		assert_eq!(memory.layout.header.format, crate::storage::TensorCacheTag::Csr);
-		let mut data: [Vec<u8>; 8] = std::array::from_fn(|section| {
-			vec![
-				0;
-				memory.layout.sections[section].count as usize
-					* usize::from(memory.layout.sections[section].width)
-			]
-		});
-		for (section, bytes) in memory.layout.sections.iter().zip(&mut data) {
-			for (ordinal, output) in bytes.chunks_exact_mut(usize::from(section.width)).enumerate()
-			{
-				memory.encode_element(section.kind, ordinal as u64, output).unwrap();
-			}
-		}
-		let restored = TensorArtifact::restore(
-			&snapshot.root,
-			&index,
-			memory.layout.clone(),
-			data,
-			GraphAlgorithmLimits::default(),
-			&mut || Ok(()),
-		)
-		.unwrap();
-		assert_eq!(restored.layout, memory.layout);
-		assert_eq!(restored.tensor.source, memory.tensor.source);
-		index.definition = GraphIndexDefinition::Tensor {
-			scope: TensorScope::Local,
-			format: TensorCacheFormat::Dense,
-		};
-		assert!(
-			TensorArtifact::build(
-				&snapshot.root,
-				&index,
-				index.build_revision(),
-				limits,
-				None,
-				&mut || Ok(())
-			)
-			.is_err()
-		);
-		index.definition = GraphIndexDefinition::Tensor {
-			scope: TensorScope::Local,
-			format: TensorCacheFormat::Auto,
-		};
-		let root = store.inner.query_scratch_root().join("tensor-sort");
-		let sorted = crate::storage::with_external_sort_control(
-			std::num::NonZeroUsize::new(512).unwrap(),
-			std::num::NonZeroUsize::MIN,
-			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-			|| {
-				TensorArtifact::build(
-					&snapshot.root,
-					&index,
-					index.build_revision(),
-					limits,
-					Some(&root),
-					&mut || Ok(()),
-				)
-			},
-		)
-		.unwrap();
-		assert!(crate::storage::external_sort_metrics().runs > 0);
-		assert_eq!(sorted.tensor.source, memory.tensor.source);
-		assert_eq!(sorted.tensor.target, memory.tensor.target);
-		assert!(root.join("tmp/index-sort").read_dir().unwrap().next().is_none());
-		let options = TensorOptions {
-			limits: GraphAlgorithmLimits {
-				max_work: 1,
-				..limits
-			},
-			..Default::default()
-		};
-		let error = read
-			.endpoint_tensor_using_index(&graph, options, IndexId::new(id.get() + 100).unwrap())
-			.unwrap_err();
-		assert!(error.to_string().contains("work"), "{error}");
-	}
-
-	#[test]
-	fn tensor_artifact_restores_both_formats_and_checks_full_metadata_revisions_and_caps() {
-		let store = Datastore::in_memory();
-		let mut seed = store.begin();
-		seed.define_class(ClassSchema::new("n", AtomKind::Node, []).unwrap()).unwrap();
-		seed.define_class(ClassSchema::new("e", AtomKind::Edge, []).unwrap()).unwrap();
-		let graph = seed.define_graph("cache", GraphKind::Graph).unwrap();
-		let records = ["n:a", "n:b", "e:ab"].map(|id| id.parse::<RecordId>().unwrap());
-		for record in &records {
-			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
-		}
-		let a = seed.attach_node(graph.id(), &records[0], None, None).unwrap();
-		let b = seed.attach_node(graph.id(), &records[1], None, None).unwrap();
-		let edge = seed
-			.attach_edge(
-				graph.id(),
-				&records[2],
-				None,
-				EdgeTopology::bidirectional([a], [b]),
-				Some(Number::Int(-3)),
-				None,
-			)
-			.unwrap();
-		let id = seed
-			.define_graph_index(
-				"cache",
-				GraphIndex::new_tensor(
-					"tensor",
-					TensorScope::Local,
-					TensorCacheFormat::Auto,
-					1 << 20,
-				)
-				.unwrap(),
-			)
-			.unwrap();
-		seed.commit().unwrap();
-		let mut read = store.begin();
-		let snapshot = read.query_snapshot().unwrap();
-		let mut index = snapshot
-			.root
-			.schema
-			.graph(graph.id())
-			.unwrap()
-			.indexes()
-			.find(|index| index.id() == Some(id))
-			.unwrap()
-			.clone();
-		index.build_revision = snapshot.root.commit_ts + 1;
-		let limits = crate::graph::tensor::GraphAlgorithmLimits {
-			memory_bytes: 16 << 20,
-			..Default::default()
-		};
-		for format in [TensorCacheFormat::Csr, TensorCacheFormat::Dense, TensorCacheFormat::Auto] {
-			index.definition = GraphIndexDefinition::Tensor {
-				scope: TensorScope::Local,
-				format,
-			};
-			let artifact = TensorArtifact::build(
-				&snapshot.root,
-				&index,
-				index.build_revision(),
-				limits,
-				None,
-				&mut || Ok(()),
-			)
-			.unwrap();
-			let mut data: [Vec<u8>; 8] = std::array::from_fn(|section| {
-				vec![
-					0;
-					artifact.layout.sections[section].count as usize
-						* usize::from(artifact.layout.sections[section].width)
-				]
-			});
-			for (section, bytes) in artifact.layout.sections.iter().zip(&mut data) {
-				for (ordinal, output) in
-					bytes.chunks_exact_mut(usize::from(section.width)).enumerate()
-				{
-					artifact.encode_element(section.kind, ordinal as u64, output).unwrap();
-				}
-			}
-			let restored = TensorArtifact::restore(
-				&snapshot.root,
-				&index,
-				artifact.layout.clone(),
-				data.clone(),
-				limits,
-				&mut || Ok(()),
-			)
-			.unwrap();
-			assert_eq!(restored.tensor.atoms(), artifact.tensor.atoms());
-			assert_eq!(restored.tensor.connectors(), artifact.tensor.connectors());
-			assert_eq!(restored.tensor.source, artifact.tensor.source);
-			assert_eq!(restored.tensor.target, artifact.tensor.target);
-			assert!(restored.admitted_work > artifact.admitted_work);
-			let mut cancelled = 0;
-			assert!(
-				TensorArtifact::restore(
-					&snapshot.root,
-					&index,
-					artifact.layout.clone(),
-					data.clone(),
-					limits,
-					&mut || {
-						cancelled += 1;
-						Err(invalid("cancelled restore"))
-					}
-				)
-				.is_err()
-			);
-			assert_eq!(cancelled, 1);
-			assert!(
-				TensorArtifact::restore(
-					&snapshot.root,
-					&index,
-					artifact.layout.clone(),
-					data.clone(),
-					crate::graph::tensor::GraphAlgorithmLimits {
-						max_work: artifact.admitted_work,
-						..limits
-					},
-					&mut || Ok(())
-				)
-				.is_err()
-			);
-			let mut retained = data.clone();
-			retained[0].reserve(limits.memory_bytes);
-			assert!(
-				TensorArtifact::restore(
-					&snapshot.root,
-					&index,
-					artifact.layout.clone(),
-					retained,
-					limits,
-					&mut || Ok(())
-				)
-				.is_err()
-			);
-			let mut corrupted = data.clone();
-			corrupted[0][0] ^= 1;
-			assert!(
-				TensorArtifact::restore(
-					&snapshot.root,
-					&index,
-					artifact.layout.clone(),
-					corrupted,
-					limits,
-					&mut || Ok(())
-				)
-				.is_err()
-			);
-			let mut changed = snapshot.root.as_ref().clone();
-			changed
-				.mark_version(ConflictKey::GraphIncidence(graph.id(), edge), changed.commit_ts + 1);
-			assert!(
-				TensorArtifact::restore(
-					&changed,
-					&index,
-					artifact.layout.clone(),
-					data,
-					limits,
-					&mut || Ok(())
-				)
-				.is_err()
-			);
-			assert!(
-				TensorArtifact::build(
-					&snapshot.root,
-					&index,
-					index.build_revision(),
-					crate::graph::tensor::GraphAlgorithmLimits {
-						memory_bytes: 100,
-						..limits
-					},
-					None,
-					&mut || Ok(())
-				)
-				.is_err()
-			);
-		}
-		index.max_bytes = Some(16_383);
-		assert!(
-			TensorArtifact::build(
-				&snapshot.root,
-				&index,
-				index.build_revision(),
-				limits,
-				None,
-				&mut || Ok(())
-			)
-			.is_err()
-		);
-	}
-}
 
 /// Captures qualified incidence through the common transactional/root reader.
-pub fn capture_tensor<'view>(
+pub fn capture_tensor<
+	'view,
+	ViewArg: FnMut(&GraphRef) -> FerrosGrynnResult<TransactionGraphView<'view>>,
+	CheckArg: FnMut() -> FerrosGrynnResult<()>,
+>(
 	graph: &GraphRef,
 	options: TensorOptions,
-	view: &mut impl FnMut(&GraphRef) -> FerrosGrynnResult<TransactionGraphView<'view>>,
+	view: &mut ViewArg,
 	read: &dyn Fn(ConflictKey),
 	plane: Option<&mut PlaneBuilder<'_>>,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<EndpointTensor> {
 	let mut builder = TensorBuilder::new(options, check)?;
 	let mut pending = VecDeque::new();
@@ -849,4 +494,377 @@ fn tensor_endpoint<'view>(
 		atom: builder.atom(&graph_view, terminal, false)?,
 		owners,
 	})
+}
+
+#[cfg(test)]
+/// Regression tests for tensor behavior.
+mod tests {
+	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
+	use crate::{
+		datastore::{
+			ClassSchema,
+			ConflictKey,
+			Datastore,
+			GraphIndex,
+			GraphIndexDefinition,
+			TensorArtifact,
+			TensorCacheFormat,
+		},
+		graph::{AtomKind, EdgeTopology, GraphKind},
+		values::{PropertyMap, RecordId},
+	};
+
+	/// Verifies tensor auto chooses a work admitted format and external sort
+	/// matches capture.
+	#[test]
+	fn tensor_auto_chooses_a_work_admitted_format_and_external_sort_matches_capture() {
+		use crate::graph::tensor::GraphAlgorithmLimits;
+		let store = Datastore::in_memory();
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("n", AtomKind::Node, []).assert_ok()).assert_ok();
+		seed.define_class(ClassSchema::new("e", AtomKind::Edge, []).assert_ok()).assert_ok();
+		let graph = seed.define_graph("sort", GraphKind::Hypergraph).assert_ok();
+		let mut nodes = Vec::new();
+		for ordinal in 0..100 {
+			let record: RecordId = format!("n:{ordinal}").parse().assert_ok();
+			seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+			nodes.push(seed.attach_node(graph.id(), &record, None, None).assert_ok());
+		}
+		for ordinal in 0..100 {
+			let record: RecordId = format!("e:{ordinal}").parse().assert_ok();
+			seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+			seed.attach_edge(
+				graph.id(),
+				&record,
+				None,
+				EdgeTopology::directed(nodes[..10].iter().copied(), nodes[10..20].iter().copied()),
+				None,
+				None,
+			)
+			.assert_ok();
+		}
+		let id = seed
+			.define_graph_index(
+				"sort",
+				GraphIndex::new_tensor(
+					"auto",
+					TensorScope::Local,
+					TensorCacheFormat::Auto,
+					1 << 20,
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
+		for ordinal in 0..3 {
+			seed.define_graph_index(
+				"sort",
+				GraphIndex::new_tensor(
+					format!("extra{ordinal}"),
+					TensorScope::Local,
+					TensorCacheFormat::Auto,
+					1 << 20,
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
+		}
+		seed.commit().assert_ok();
+		let mut read = store.begin();
+		let snapshot = read.query_snapshot().assert_ok();
+		let mut index = read.graph_index("sort", "auto").assert_ok().assert_some();
+		index.build_revision = snapshot.root.commit_ts + 1;
+		let limits = GraphAlgorithmLimits {
+			memory_bytes: 32 << 20,
+			max_work: 1_000_000,
+			..Default::default()
+		};
+		let memory = TensorArtifact::build(
+			&snapshot.root,
+			&index,
+			index.build_revision(),
+			limits,
+			None,
+			&mut || Ok(()),
+		)
+		.assert_ok();
+		assert_eq!(memory.layout.header.format, crate::storage::TensorCacheTag::Csr);
+		let mut data: [Vec<u8>; 8] = std::array::from_fn(|section| {
+			vec![
+				0;
+				memory.layout.sections[section].count as usize
+					* usize::from(memory.layout.sections[section].width)
+			]
+		});
+		for (section, bytes) in memory.layout.sections.iter().zip(&mut data) {
+			for (ordinal, output) in bytes.chunks_exact_mut(usize::from(section.width)).enumerate()
+			{
+				memory.encode_element(section.kind, ordinal as u64, output).assert_ok();
+			}
+		}
+		let restored = TensorArtifact::restore(
+			&snapshot.root,
+			&index,
+			memory.layout.clone(),
+			data,
+			GraphAlgorithmLimits::default(),
+			&mut || Ok(()),
+		)
+		.assert_ok();
+		assert_eq!(restored.layout, memory.layout);
+		assert_eq!(restored.tensor.source, memory.tensor.source);
+		index.definition = GraphIndexDefinition::Tensor {
+			scope: TensorScope::Local,
+			format: TensorCacheFormat::Dense,
+		};
+		assert!(
+			TensorArtifact::build(
+				&snapshot.root,
+				&index,
+				index.build_revision(),
+				limits,
+				None,
+				&mut || Ok(())
+			)
+			.is_err()
+		);
+		index.definition = GraphIndexDefinition::Tensor {
+			scope: TensorScope::Local,
+			format: TensorCacheFormat::Auto,
+		};
+		let root = store.inner.query_scratch_root().join("tensor-sort");
+		let sorted = crate::storage::with_external_sort_control(
+			std::num::NonZeroUsize::new(512).assert_some(),
+			std::num::NonZeroUsize::MIN,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+			|| {
+				TensorArtifact::build(
+					&snapshot.root,
+					&index,
+					index.build_revision(),
+					limits,
+					Some(&root),
+					&mut || Ok(()),
+				)
+			},
+		)
+		.assert_ok();
+		assert!(crate::storage::external_sort_metrics().runs > 0);
+		assert_eq!(sorted.tensor.source, memory.tensor.source);
+		assert_eq!(sorted.tensor.target, memory.tensor.target);
+		assert!(root.join("tmp/index-sort").read_dir().assert_ok().next().is_none());
+		let options = TensorOptions {
+			limits: GraphAlgorithmLimits {
+				max_work: 1,
+				..limits
+			},
+			..Default::default()
+		};
+		let error = read
+			.endpoint_tensor_using_index(
+				&graph,
+				options,
+				IndexId::new(id.get() + 100).assert_some(),
+			)
+			.assert_err();
+		assert!(error.to_string().contains("work"), "{error}");
+	}
+
+	/// Verifies tensor artifact restores both formats and checks full metadata
+	/// revisions and caps.
+	#[test]
+	fn tensor_artifact_restores_both_formats_and_checks_full_metadata_revisions_and_caps() {
+		let store = Datastore::in_memory();
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("n", AtomKind::Node, []).assert_ok()).assert_ok();
+		seed.define_class(ClassSchema::new("e", AtomKind::Edge, []).assert_ok()).assert_ok();
+		let graph = seed.define_graph("cache", GraphKind::Graph).assert_ok();
+		let records = ["n:a", "n:b", "e:ab"].map(|id| id.parse::<RecordId>().assert_ok());
+		for record in &records {
+			seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		}
+		let a = seed.attach_node(graph.id(), &records[0], None, None).assert_ok();
+		let b = seed.attach_node(graph.id(), &records[1], None, None).assert_ok();
+		let edge = seed
+			.attach_edge(
+				graph.id(),
+				&records[2],
+				None,
+				EdgeTopology::bidirectional([a], [b]),
+				Some(Number::Int(-3)),
+				None,
+			)
+			.assert_ok();
+		let id = seed
+			.define_graph_index(
+				"cache",
+				GraphIndex::new_tensor(
+					"tensor",
+					TensorScope::Local,
+					TensorCacheFormat::Auto,
+					1 << 20,
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
+		seed.commit().assert_ok();
+		let mut read = store.begin();
+		let snapshot = read.query_snapshot().assert_ok();
+		let mut index = snapshot
+			.root
+			.schema
+			.graph(graph.id())
+			.assert_some()
+			.indexes()
+			.find(|index| index.id() == Some(id))
+			.assert_some()
+			.clone();
+		index.build_revision = snapshot.root.commit_ts + 1;
+		let limits = crate::graph::tensor::GraphAlgorithmLimits {
+			memory_bytes: 16 << 20,
+			..Default::default()
+		};
+		for format in [TensorCacheFormat::Csr, TensorCacheFormat::Dense, TensorCacheFormat::Auto] {
+			index.definition = GraphIndexDefinition::Tensor {
+				scope: TensorScope::Local,
+				format,
+			};
+			let artifact = TensorArtifact::build(
+				&snapshot.root,
+				&index,
+				index.build_revision(),
+				limits,
+				None,
+				&mut || Ok(()),
+			)
+			.assert_ok();
+			let mut data: [Vec<u8>; 8] = std::array::from_fn(|section| {
+				vec![
+					0;
+					artifact.layout.sections[section].count as usize
+						* usize::from(artifact.layout.sections[section].width)
+				]
+			});
+			for (section, bytes) in artifact.layout.sections.iter().zip(&mut data) {
+				for (ordinal, output) in
+					bytes.chunks_exact_mut(usize::from(section.width)).enumerate()
+				{
+					artifact.encode_element(section.kind, ordinal as u64, output).assert_ok();
+				}
+			}
+			let restored = TensorArtifact::restore(
+				&snapshot.root,
+				&index,
+				artifact.layout.clone(),
+				data.clone(),
+				limits,
+				&mut || Ok(()),
+			)
+			.assert_ok();
+			assert_eq!(restored.tensor.atoms(), artifact.tensor.atoms());
+			assert_eq!(restored.tensor.connectors(), artifact.tensor.connectors());
+			assert_eq!(restored.tensor.source, artifact.tensor.source);
+			assert_eq!(restored.tensor.target, artifact.tensor.target);
+			assert!(restored.admitted_work > artifact.admitted_work);
+			let mut cancelled = 0;
+			assert!(
+				TensorArtifact::restore(
+					&snapshot.root,
+					&index,
+					artifact.layout.clone(),
+					data.clone(),
+					limits,
+					&mut || {
+						cancelled += 1;
+						Err(invalid("cancelled restore"))
+					}
+				)
+				.is_err()
+			);
+			assert_eq!(cancelled, 1);
+			assert!(
+				TensorArtifact::restore(
+					&snapshot.root,
+					&index,
+					artifact.layout.clone(),
+					data.clone(),
+					crate::graph::tensor::GraphAlgorithmLimits {
+						max_work: artifact.admitted_work,
+						..limits
+					},
+					&mut || Ok(())
+				)
+				.is_err()
+			);
+			let mut retained = data.clone();
+			retained[0].reserve(limits.memory_bytes);
+			assert!(
+				TensorArtifact::restore(
+					&snapshot.root,
+					&index,
+					artifact.layout.clone(),
+					retained,
+					limits,
+					&mut || Ok(())
+				)
+				.is_err()
+			);
+			let mut corrupted = data.clone();
+			corrupted[0][0] ^= 1;
+			assert!(
+				TensorArtifact::restore(
+					&snapshot.root,
+					&index,
+					artifact.layout.clone(),
+					corrupted,
+					limits,
+					&mut || Ok(())
+				)
+				.is_err()
+			);
+			let mut changed = snapshot.root.as_ref().clone();
+			changed
+				.mark_version(ConflictKey::GraphIncidence(graph.id(), edge), changed.commit_ts + 1);
+			assert!(
+				TensorArtifact::restore(
+					&changed,
+					&index,
+					artifact.layout.clone(),
+					data,
+					limits,
+					&mut || Ok(())
+				)
+				.is_err()
+			);
+			assert!(
+				TensorArtifact::build(
+					&snapshot.root,
+					&index,
+					index.build_revision(),
+					crate::graph::tensor::GraphAlgorithmLimits {
+						memory_bytes: 100,
+						..limits
+					},
+					None,
+					&mut || Ok(())
+				)
+				.is_err()
+			);
+		}
+		index.max_bytes = Some(16_383);
+		assert!(
+			TensorArtifact::build(
+				&snapshot.root,
+				&index,
+				index.build_revision(),
+				limits,
+				None,
+				&mut || Ok(())
+			)
+			.is_err()
+		);
+	}
 }

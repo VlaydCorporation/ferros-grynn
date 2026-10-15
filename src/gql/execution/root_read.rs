@@ -367,6 +367,7 @@ impl QueryRead for RootRead<'_> {
 		Self: 'a;
 	type Savepoint = ();
 
+	/// Returns live binding value for `RootRead<'_>`.
 	fn live_binding_value(
 		&self,
 		snapshot: Snapshot,
@@ -377,15 +378,18 @@ impl QueryRead for RootRead<'_> {
 		self.root.live_catalog().binding_value(id)
 	}
 
+	/// Returns snapshot for `RootRead<'_>`.
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
 		self.control.check()?;
 		Ok(Snapshot(self.root.commit_ts))
 	}
 
+	/// Returns the stored scalar graph of this `RootRead<'_>`.
 	fn scalar_graph(&self) -> Option<&GraphRef> {
 		self.scalar_graph
 	}
 
+	/// Returns snapshot root for `RootRead<'_>`.
 	fn snapshot_root(&self, snapshot: Snapshot) -> FerrosGrynnResult<Arc<DatabaseRoot>> {
 		if snapshot.0 != self.root.commit_ts {
 			return Err(FerrosGrynnError::invalid_argument("graph cursor snapshot mismatch"));
@@ -393,22 +397,27 @@ impl QueryRead for RootRead<'_> {
 		Ok(Arc::clone(self.root))
 	}
 
+	/// Refreshes snapshot for `RootRead<'_>`.
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot> {
 		self.snapshot()
 	}
 
+	/// Returns mutation count for `RootRead<'_>`.
 	fn mutation_count(&self) -> usize {
 		0
 	}
 
+	/// Returns catalog for `RootRead<'_>`.
 	fn catalog(&self, _snapshot: Snapshot) -> &dyn QueryCatalog {
 		self
 	}
 
+	/// Returns bounded fields for `RootRead<'_>`.
 	fn bounded_fields(&self) -> Option<&dyn AtomFieldRead> {
 		Some(&self.fields)
 	}
 
+	/// Returns planner snapshot for `RootRead<'_>`.
 	fn planner_snapshot(
 		&self,
 		snapshot: Snapshot,
@@ -469,8 +478,8 @@ impl QueryRead for RootRead<'_> {
 			}
 			result.classes.insert(class.name().clone(), PlannerClass {
 				id,
-				version: class.version(),
-				name: class.name().clone(),
+				_version: class.version(),
+				_name: class.name().clone(),
 				fields,
 				// Candidate roots have no published physical generation. The
 				// ordinary optimizer therefore chooses exact scan/refinement.
@@ -484,7 +493,7 @@ impl QueryRead for RootRead<'_> {
 			let statistics = self.root.statistics.graph(graph.id());
 			result.graphs.insert(graph.id(), PlannerGraph {
 				reference: graph.reference().clone(),
-				version: graph.version(),
+				_version: graph.version(),
 				statistics: PlannerStatisticsMeta::default(),
 				node_rows: statistics.map_or(0, |statistics| statistics.node_count),
 				edge_rows: statistics.map_or(0, |statistics| statistics.edge_count),
@@ -518,6 +527,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(result)
 	}
 
+	/// Returns scan for `RootRead<'_>`.
 	fn scan<'a>(
 		&'a self,
 		snapshot: Snapshot,
@@ -526,8 +536,7 @@ impl QueryRead for RootRead<'_> {
 		_predicate: Option<&TypedExpr>,
 		index: Option<(IndexId, bool)>,
 		window: Option<IndexScanWindow<'_>>,
-		_slots: &[Value],
-		_source: &str,
+		_bindings: (&[Value], &str),
 		full_row: bool,
 	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
 		self.check_snapshot(snapshot)?;
@@ -562,6 +571,7 @@ impl QueryRead for RootRead<'_> {
 		}))
 	}
 
+	/// Looks up the requested entry without modifying the collection.
 	fn get(
 		&self,
 		snapshot: Snapshot,
@@ -574,6 +584,7 @@ impl QueryRead for RootRead<'_> {
 			.transpose()
 	}
 
+	/// Returns base atom for `RootRead<'_>`.
 	fn base_atom(
 		&self,
 		snapshot: Snapshot,
@@ -583,6 +594,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(self.point(record, None)?.map(|row| (row.kind, row.properties)))
 	}
 
+	/// Records field for `RootRead<'_>`.
 	fn record_field(
 		&self,
 		snapshot: Snapshot,
@@ -610,6 +622,7 @@ impl QueryRead for RootRead<'_> {
 		)
 	}
 
+	/// Returns graph for `RootRead<'_>`.
 	fn graph(
 		&self,
 		snapshot: Snapshot,
@@ -628,6 +641,7 @@ impl QueryRead for RootRead<'_> {
 		)
 	}
 
+	/// Returns graph reference for `RootRead<'_>`.
 	fn graph_reference(&self, snapshot: Snapshot, graph: GraphId) -> FerrosGrynnResult<GraphRef> {
 		self.check_snapshot(snapshot)?;
 		(self.observe)(ConflictKey::GraphDefinition(graph));
@@ -640,6 +654,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(graph.reference().clone())
 	}
 
+	/// Returns graph references for `RootRead<'_>`.
 	fn graph_references(&self, snapshot: Snapshot) -> FerrosGrynnResult<Vec<GraphRef>> {
 		self.check_snapshot(snapshot)?;
 		(self.observe)(ConflictKey::GraphCatalogRange);
@@ -652,6 +667,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(references)
 	}
 
+	/// Returns named graph contract for `RootRead<'_>`.
 	fn named_graph_contract(
 		&self,
 		snapshot: Snapshot,
@@ -669,6 +685,7 @@ impl QueryRead for RootRead<'_> {
 			.transpose()
 	}
 
+	/// Returns level path for `RootRead<'_>`.
 	fn level_path(
 		&self,
 		snapshot: Snapshot,
@@ -679,14 +696,16 @@ impl QueryRead for RootRead<'_> {
 		self.fields.level_path(occurrence)
 	}
 
+	/// Returns property dictionary for `RootRead<'_>`.
 	fn property_dictionary(&self, _snapshot: Snapshot) -> Arc<PropertyDictionary> {
 		self.root.dictionary.clone()
 	}
 
+	/// Returns spill context for `RootRead<'_>`.
 	fn spill_context(
 		&self,
 		snapshot: Snapshot,
-	) -> FerrosGrynnResult<crate::values::storage::EncodeContext> {
+	) -> FerrosGrynnResult<Box<crate::values::storage::EncodeContext>> {
 		self.check_snapshot(snapshot)?;
 		(self.observe)(ConflictKey::PropertyDictionary);
 		(self.observe)(ConflictKey::GraphCatalogRange);
@@ -704,13 +723,20 @@ impl QueryRead for RootRead<'_> {
 		}
 		// The existing context encoder is shared with physical builders and
 		// preserves exact public identities in temporary SELECT runs.
-		crate::datastore::index_context(&self.root.schema, &self.root.dictionary)
+		let context = crate::datastore::index_context(&self.root.schema, &self.root.dictionary)?;
+		// Existing dictionary/graph checks keep their error order. Admit the
+		// newly owned shell immediately before its heap allocation, outside
+		// the sorter account whose tiny limit deliberately requests spilling.
+		self.fields.admit_retained(size_of::<crate::values::storage::EncodeContext>())?;
+		Ok(Box::new(context))
 	}
 
+	/// Returns query scratch root for `RootRead<'_>`.
 	fn query_scratch_root(&self) -> PathBuf {
 		self.scratch_root.clone()
 	}
 
+	/// Counts index for `RootRead<'_>`.
 	fn count_index(
 		&self,
 		_snapshot: Snapshot,
@@ -720,6 +746,7 @@ impl QueryRead for RootRead<'_> {
 		unavailable_index()
 	}
 
+	/// Returns probe index for `RootRead<'_>`.
 	fn probe_index<'a>(
 		&'a self,
 		_snapshot: Snapshot,
@@ -732,6 +759,7 @@ impl QueryRead for RootRead<'_> {
 		unavailable_index()
 	}
 
+	/// Returns fulltext index for `RootRead<'_>`.
 	fn fulltext_index(
 		&self,
 		_snapshot: Snapshot,
@@ -743,6 +771,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns geometry index for `RootRead<'_>`.
 	fn geometry_index(
 		&self,
 		_snapshot: Snapshot,
@@ -755,6 +784,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns vector index for `RootRead<'_>`.
 	fn vector_index(
 		&self,
 		_snapshot: Snapshot,
@@ -768,6 +798,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns path lower bound for `RootRead<'_>`.
 	fn path_lower_bound(
 		&self,
 		_snapshot: Snapshot,
@@ -778,6 +809,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns physical traversal candidates for `RootRead<'_>`.
 	fn physical_traversal_candidates(
 		&self,
 		_snapshot: Snapshot,
@@ -788,6 +820,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns physical inner graph for `RootRead<'_>`.
 	fn physical_inner_graph(
 		&self,
 		_snapshot: Snapshot,
@@ -797,6 +830,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns physical occurrence fields for `RootRead<'_>`.
 	fn physical_occurrence_fields(
 		&self,
 		_snapshot: Snapshot,
@@ -806,6 +840,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns graph rows for `RootRead<'_>`.
 	fn graph_rows(
 		&self,
 		snapshot: Snapshot,
@@ -868,6 +903,7 @@ impl QueryRead for RootRead<'_> {
 		Ok(rows)
 	}
 
+	/// Matches candidates for `RootRead<'_>`.
 	fn match_candidates(
 		&self,
 		_snapshot: Snapshot,
@@ -877,6 +913,7 @@ impl QueryRead for RootRead<'_> {
 		Err(FerrosGrynnError::query_feature_not_supported("MATCH source in LIVE logical recipe"))
 	}
 
+	/// Returns k hop estimate for `RootRead<'_>`.
 	fn k_hop_estimate(
 		&self,
 		_snapshot: Snapshot,
@@ -894,12 +931,15 @@ impl QueryRead for RootRead<'_> {
 		))
 	}
 
+	/// Returns savepoint for `RootRead<'_>`.
 	fn savepoint(&self) -> Self::Savepoint {}
 
+	/// Restores savepoint for `RootRead<'_>`.
 	fn restore_savepoint(&mut self, _savepoint: Self::Savepoint) -> FerrosGrynnResult<()> {
 		read_only()
 	}
 
+	/// Returns assert invariants for `RootRead<'_>`.
 	fn assert_invariants(
 		&mut self,
 		_graph: Option<&GraphRef>,
@@ -908,6 +948,7 @@ impl QueryRead for RootRead<'_> {
 		read_only()
 	}
 
+	/// Executes schema for `RootRead<'_>`.
 	fn execute_schema(
 		&mut self,
 		_statement: &LogicalSchemaStatement,
@@ -918,6 +959,7 @@ impl QueryRead for RootRead<'_> {
 		read_only()
 	}
 
+	/// Executes dml for `RootRead<'_>`.
 	fn execute_dml(
 		&mut self,
 		_statement: &LogicalDmlStatement,
@@ -928,6 +970,7 @@ impl QueryRead for RootRead<'_> {
 		read_only()
 	}
 
+	/// Executes graph dml for `RootRead<'_>`.
 	fn execute_graph_dml(
 		&mut self,
 		_statement: &LogicalGraphDmlStatement,
@@ -938,6 +981,7 @@ impl QueryRead for RootRead<'_> {
 		read_only()
 	}
 
+	/// Returns install built graph for `RootRead<'_>`.
 	fn install_built_graph(
 		&mut self,
 		_name: &str,
@@ -951,15 +995,18 @@ impl QueryRead for RootRead<'_> {
 }
 
 impl QueryCatalog for RootRead<'_> {
+	/// Admits analysis for `RootRead<'_>`.
 	fn admit_analysis(&self, bytes: usize, work: u64) -> FerrosGrynnResult<()> {
 		self.work(work)?;
 		self.fields.admit(bytes)
 	}
 
+	/// Returns the stored root.commit ts of this `RootRead<'_>`.
 	fn schema_epoch(&self) -> u64 {
 		self.root.commit_ts
 	}
 
+	/// Returns class definition for `RootRead<'_>`.
 	fn class_definition(
 		&self,
 		class: &str,
@@ -976,6 +1023,7 @@ impl QueryCatalog for RootRead<'_> {
 		Ok(class)
 	}
 
+	/// Returns schema for `RootRead<'_>`.
 	fn schema(&self, class: &str) -> FerrosGrynnResult<super::Schema> {
 		let class = self.class_definition(class)?;
 		self.fields.admit(
@@ -1001,19 +1049,23 @@ impl QueryCatalog for RootRead<'_> {
 		Ok(super::adapter::query_schema(&class))
 	}
 
+	/// Returns schema mode for `RootRead<'_>`.
 	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<crate::datastore::ClassSchemaMode> {
 		self.class_definition(class).map(|class| class.schema_mode())
 	}
 
+	/// Returns class kind for `RootRead<'_>`.
 	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind> {
 		self.class_definition(class).map(|class| class.kind())
 	}
 
+	/// Returns graph for `RootRead<'_>`.
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef> {
 		self.graph_if_exists(name)?
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name.to_owned()))
 	}
 
+	/// Returns graph if exists for `RootRead<'_>`.
 	fn graph_if_exists(&self, name: &str) -> FerrosGrynnResult<Option<GraphRef>> {
 		self.work(1)?;
 		(self.observe)(ConflictKey::GraphCatalogRange);
@@ -1026,6 +1078,7 @@ impl QueryCatalog for RootRead<'_> {
 			.transpose()
 	}
 
+	/// Returns functions for `RootRead<'_>`.
 	fn functions(
 		&self,
 		namespace: &str,
@@ -1046,6 +1099,7 @@ impl QueryCatalog for RootRead<'_> {
 		Ok(functions)
 	}
 
+	/// Returns function for `RootRead<'_>`.
 	fn function(
 		&self,
 		id: crate::datastore::FunctionId,
@@ -1060,6 +1114,7 @@ impl QueryCatalog for RootRead<'_> {
 		Ok(None)
 	}
 
+	/// Returns analyzer for `RootRead<'_>`.
 	fn analyzer(
 		&self,
 		name: &str,
@@ -1073,6 +1128,7 @@ impl QueryCatalog for RootRead<'_> {
 		Ok(result)
 	}
 
+	/// Returns analyzer by id for `RootRead<'_>`.
 	fn analyzer_by_id(
 		&self,
 		id: crate::datastore::AnalyzerId,
@@ -1101,6 +1157,7 @@ struct RootCursor<'read, 'root> {
 }
 
 impl RowCursor for RootCursor<'_, '_> {
+	/// Advances this `RootCursor<'_, '_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		control.check()?;
 		let row = self

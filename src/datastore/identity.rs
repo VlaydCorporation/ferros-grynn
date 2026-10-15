@@ -2,11 +2,14 @@ use crate::graph::GraphId;
 
 /// Physical data-space identity used by database and graph-local persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum DataSpaceId {
+pub enum DataSpaceId {
 	/// Database-global AtomStore and catalogs.
 	Database,
 	/// One graph's occurrences, overlays, and incidence.
-	Graph(GraphId),
+	Graph(
+		/// One graph's occurrences, overlays, and incidence.
+		GraphId,
+	),
 }
 
 impl DataSpaceId {
@@ -32,13 +35,17 @@ impl DataSpaceId {
 }
 
 #[cfg(test)]
+/// Regression tests for identity behavior.
 mod tests {
 	use super::DataSpaceId;
 	use crate::graph::GraphId;
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
 
+	/// Verifies database space is not a fake graph.
 	#[test]
 	fn database_space_is_not_a_fake_graph() {
-		let graph = GraphId::new(1).unwrap();
+		let graph = GraphId::new(1).assert_some();
 
 		assert_eq!(DataSpaceId::Database.raw(), 0);
 		assert_eq!(DataSpaceId::Graph(graph).raw(), 1);

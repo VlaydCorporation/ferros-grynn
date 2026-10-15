@@ -67,10 +67,14 @@ pub struct BridgeCatalogBinding {
 
 /// Checked heap page/slot pointer, never interpreted as a physical atom ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MappingLocator(u64);
+pub(super) struct MappingLocator(
+	/// Packed 48-bit heap page number and 16-bit record slot.
+	u64,
+);
 
 impl MappingLocator {
-	/// Constructs the owned state used by this bounded operation.
+	/// Packs a heap page and record slot after checking the 48-bit page-number
+	/// limit.
 	fn new(page: PageNo, slot: u16) -> FerrosGrynnResult<Self> {
 		if page.get() >= 1_u64 << 48 {
 			return Err(invalid("mapping heap address exceeds 48 bits"));
@@ -78,7 +82,7 @@ impl MappingLocator {
 		Ok(Self((page.get() << 16) | u64::from(slot)))
 	}
 
-	/// One active aligned slotted page.
+	/// Returns the heap page number encoded in this mapping locator.
 	fn page(self) -> PageNo {
 		PageNo::new(self.0 >> 16)
 	}
@@ -90,6 +94,7 @@ impl MappingLocator {
 }
 
 impl PrimaryAddress for MappingLocator {
+	/// Constructs from raw for `MappingLocator`.
 	fn from_raw(raw: u64) -> FerrosGrynnResult<Self> {
 		if raw == u64::MAX {
 			return Err(invalid("reserved mapping locator"));
@@ -97,14 +102,17 @@ impl PrimaryAddress for MappingLocator {
 		Ok(Self(raw))
 	}
 
+	/// Returns the wrapped raw representation.
 	fn raw(self) -> u64 {
 		self.0
 	}
 
+	/// Returns kind for `MappingLocator`.
 	fn kind(self) -> Option<crate::graph::AtomKind> {
 		None
 	}
 
+	/// Returns the wrapped order key representation.
 	fn order_key(self) -> u64 {
 		self.0
 	}
@@ -801,7 +809,10 @@ fn reverse_key(row: &BridgeMapping) -> FerrosGrynnResult<Vec<u8>> {
 }
 
 /// Exact-consumption reader for one decoded authoritative value array.
-struct Fields(std::vec::IntoIter<Value>);
+struct Fields(
+	/// Iterator retaining progress through the selected source.
+	std::vec::IntoIter<Value>,
+);
 impl Fields {
 	/// Constructs the owned state used by this bounded operation.
 	fn new(value: Value) -> FerrosGrynnResult<Self> {
@@ -1011,10 +1022,12 @@ fn invalid(reason: &str) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for bridge mapping behavior.
 mod tests {
 	use super::*;
 	use crate::storage::types::{DataFileId, DataFileKind};
 
+	/// Builds the fixture fixture used by nearby scenarios.
 	fn fixture() -> FerrosGrynnResult<(uuid::Uuid, BridgeRegistry, BridgeMappingRef)> {
 		let owner = uuid::Uuid::now_v7();
 		let database = BridgeDatabaseRef {
@@ -1050,6 +1063,7 @@ mod tests {
 		}))?;
 		Ok((owner, registry, reference))
 	}
+	/// Returns binding for this module.
 	fn binding(
 		registry: &BridgeRegistry,
 		built: &BuiltMappings,
@@ -1071,6 +1085,7 @@ mod tests {
 			reverse: file(4, built.reverse.root)?,
 		})
 	}
+	/// Performs the read operation for this module.
 	fn read(
 		built: &BuiltMappings,
 		root: PhysicalIndexBinding,
@@ -1093,22 +1108,28 @@ mod tests {
 		output.as_bytes_mut().copy_from_slice(page.as_bytes());
 		Ok(())
 	}
+	/// Verifies bridge codec registry roundtrip and unsigned graph identity.
 	#[test]
-	fn bridge_codec_registry_roundtrip_and_unsigned_graph_identity() -> FerrosGrynnResult<()> {
-		let (owner, registry, reference) = fixture()?;
-		let built = build(&registry, owner)?;
-		let binding = binding(&registry, &built)?;
+	fn bridge_codec_registry_roundtrip_and_unsigned_graph_identity() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (owner, registry, reference) = fixture().assert_ok();
+		let built = build(&registry, owner).assert_ok();
+		let binding = binding(&registry, &built).assert_ok();
 		let recovered =
-			recover(owner, binding, |root, number, output| read(&built, root, number, output))?;
+			recover(owner, binding, |root, number, output| read(&built, root, number, output))
+				.assert_ok();
 		assert_eq!(recovered.get(reference.id), registry.get(reference.id));
 		assert_eq!(recovered.databases, registry.databases);
-		Ok(())
 	}
+	/// Verifies bridge codec declared count stops before extra heap allocation.
 	#[test]
-	fn bridge_codec_declared_count_stops_before_extra_heap_allocation() -> FerrosGrynnResult<()> {
-		let (owner, registry, _) = fixture()?;
-		let built = build(&registry, owner)?;
-		let mut binding = binding(&registry, &built)?;
+	fn bridge_codec_declared_count_stops_before_extra_heap_allocation() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (owner, registry, _) = fixture().assert_ok();
+		let built = build(&registry, owner).assert_ok();
+		let mut binding = binding(&registry, &built).assert_ok();
 		binding.count = 1;
 		let reads = std::cell::Cell::new(0_usize);
 		assert!(
@@ -1119,66 +1140,91 @@ mod tests {
 			.is_err()
 		);
 		assert!(reads.get() <= 5);
-		Ok(())
 	}
+	/// Verifies bridge codec rejects versions lengths and fractional tags.
 	#[test]
-	fn bridge_codec_rejects_versions_lengths_and_fractional_tags() -> FerrosGrynnResult<()> {
-		let (_, registry, _) = fixture()?;
-		let database =
-			registry.databases.values().next().ok_or_else(|| invalid("test descriptor"))?;
-		let mut bytes = encode_value(&database_value(database)?)?;
+	fn bridge_codec_rejects_versions_lengths_and_fractional_tags() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (_, registry, _) = fixture().assert_ok();
+		let database = registry
+			.databases
+			.values()
+			.next()
+			.ok_or_else(|| invalid("test descriptor"))
+			.assert_ok();
+		let mut bytes = encode_value(&database_value(database).assert_ok()).assert_ok();
 		bytes[4] = 2;
 		assert!(decode_value(&bytes, 1024 * 1024).is_err());
-		let mut bytes = encode_value(&database_value(database)?)?;
+		let mut bytes = encode_value(&database_value(database).assert_ok()).assert_ok();
 		bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
 		assert!(decode_value(&bytes, 1024 * 1024).is_err());
-		assert!(Fields::new(Value::Array(vec![Value::from(1.5_f64)].into()))?.number().is_err());
-		Ok(())
+		assert!(
+			Fields::new(Value::Array(vec![Value::from(1.5_f64)].into()))
+				.assert_ok()
+				.number()
+				.is_err()
+		);
 	}
 
+	/// Verifies bridge codec preflights borrowed payloads.
 	#[test]
-	fn bridge_codec_preflights_borrowed_payloads() -> FerrosGrynnResult<()> {
-		let (_, registry, reference) = fixture()?;
-		let mut row =
-			registry.get(reference.id).ok_or_else(|| invalid("test mapping"))?.as_ref().clone();
+	fn bridge_codec_preflights_borrowed_payloads() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (_, registry, reference) = fixture().assert_ok();
+		let mut row = registry
+			.get(reference.id)
+			.ok_or_else(|| invalid("test mapping"))
+			.assert_ok()
+			.as_ref()
+			.clone();
 		row.mirror = Some(Arc::new(BridgeMirrorRequest {
-			relation: "relation:r".parse()?,
-			source: "profile:a".parse()?,
-			target: "profile:b".parse()?,
+			relation: "relation:r".parse().assert_ok(),
+			source: "profile:a".parse().assert_ok(),
+			target: "profile:b".parse().assert_ok(),
 			properties: crate::values::Object::from_iter([(
 				"payload",
 				Value::Bytes(vec![0; MAX_RECORD_BYTES + 1].into()),
 			)]),
 		}));
 		assert!(mapping_value(&row).is_err());
-		Ok(())
 	}
 
+	/// Verifies bridge codec registration matches index and descriptor caps.
 	#[test]
-	fn bridge_codec_registration_matches_index_and_descriptor_caps() -> FerrosGrynnResult<()> {
+	fn bridge_codec_registration_matches_index_and_descriptor_caps() {
+		use crate::test_assertions::AssertResult as _;
+
 		assert!(super::super::graph_index::validate_unique_index_key(&vec![1; 16_330]).is_ok());
 		assert!(super::super::graph_index::validate_unique_index_key(&vec![1; 16_331]).is_err());
-		let (_, registry, reference) = fixture()?;
-		let mut row =
-			registry.get(reference.id).ok_or_else(|| invalid("test row absent"))?.as_ref().clone();
+		let (_, registry, reference) = fixture().assert_ok();
+		let mut row = registry
+			.get(reference.id)
+			.ok_or_else(|| invalid("test row absent"))
+			.assert_ok()
+			.as_ref()
+			.clone();
 		row.external.record = RecordId::from_value(
 			"profile",
 			Value::Array(vec![Value::from("x".repeat(16_384))].into()),
-		)?;
+		)
+		.assert_ok();
 		assert!(validate_mapping_record(&row).is_err());
 		let mut database = registry
 			.databases
 			.values()
 			.next()
-			.ok_or_else(|| invalid("test descriptor absent"))?
+			.ok_or_else(|| invalid("test descriptor absent"))
+			.assert_ok()
 			.as_ref()
 			.clone();
 		database.graphs.clear();
 		for ordinal in 1..=1030 {
-			let graph = GraphId::new(ordinal).ok_or_else(|| invalid("test graph identity"))?;
+			let graph =
+				GraphId::new(ordinal).ok_or_else(|| invalid("test graph identity")).assert_ok();
 			database.graphs.insert(graph, format!("{ordinal:04}{}", "x".repeat(4092)).into());
 		}
 		assert!(validate_database_record(&database).is_err());
-		Ok(())
 	}
 }

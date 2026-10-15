@@ -31,14 +31,16 @@ use crate::{
 	},
 };
 
+/// Verifies fgdc v15 round trips recursive types bindings and graph properties.
 #[test]
-fn fgdc_v15_round_trips_recursive_types_bindings_and_graph_properties() -> FerrosGrynnResult<()> {
-	let catalog = fixture()?;
-	let bytes = catalog.encode()?;
+fn fgdc_v15_round_trips_recursive_types_bindings_and_graph_properties() {
+	use crate::test_assertions::AssertResult as _;
+
+	let catalog = fixture().assert_ok();
+	let bytes = catalog.encode().assert_ok();
 	assert_eq!(&bytes[..4], b"FGDC");
 	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 15);
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
-	Ok(())
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 }
 
 /// Creates a valid small entry so corruption tests change only one invariant.
@@ -88,15 +90,18 @@ fn live_binding_fixture(
 
 /// Large exact values and fault heads survive checked binding sections.
 #[test]
-fn fgdc_live_bindings_check_headers_lengths_limits_and_fault_bounds() -> FerrosGrynnResult<()> {
+fn fgdc_live_bindings_check_headers_lengths_limits_and_fault_bounds() {
 	use crate::{
 		live::{LiveExpr, LiveState},
+		test_assertions::AssertResult as _,
 		values::Value,
 	};
-	let mut catalog = fixture()?;
-	catalog.live_bindings.push(live_binding_fixture(42, LiveExpr::Literal(Value::from(1_i64)))?);
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let mut catalog = fixture().assert_ok();
+	catalog
+		.live_bindings
+		.push(live_binding_fixture(42, LiveExpr::Literal(Value::from(1_i64))).assert_ok());
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	assert_eq!(&bytes[128..132], &1_u32.to_le_bytes());
 	let entry = &catalog.live_bindings[0];
 	let start = bytes.len() - 104 - entry.descriptor.len() - entry.value_descriptor.len();
@@ -134,26 +139,28 @@ fn fgdc_live_bindings_check_headers_lengths_limits_and_fault_bounds() -> FerrosG
 	}
 	catalog.live_bindings[0].state = LiveState::Paused;
 	catalog.live_bindings[0].diagnostic = Some(("FG-G1F09".into(), "evaluation failed".into()));
-	assert_eq!(DatabaseCatalog::decode(&catalog.encode()?)?, catalog);
+	assert_eq!(DatabaseCatalog::decode(&catalog.encode().assert_ok()).assert_ok(), catalog);
 	catalog.live_bindings[0].value_at = 3;
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
 /// Runtime-invalid dependencies must not become Active merely through reopen.
 #[test]
-fn fgdc_live_record_owner_tails_round_trip_and_reject_malformed_fields() -> FerrosGrynnResult<()> {
-	use crate::live::{LiveExpr, LiveQuery, LiveSource};
-	let mut catalog = fixture()?;
+fn fgdc_live_record_owner_tails_round_trip_and_reject_malformed_fields() {
+	use crate::{
+		live::{LiveExpr, LiveQuery, LiveSource},
+		test_assertions::AssertResult as _,
+	};
+	let mut catalog = fixture().assert_ok();
 	let source = catalog.classes[0].clone();
 	let expression = LiveExpr::Select(Box::new(LiveQuery::new(LiveSource::Record(
-		format!("{}:a", source.name).parse()?,
+		format!("{}:a", source.name).parse().assert_ok(),
 	))));
-	let mut entry = live_binding_fixture(42, expression)?;
+	let mut entry = live_binding_fixture(42, expression).assert_ok();
 	entry.record_sources.push((source.name.clone(), source.id));
 	catalog.live_bindings.push(entry);
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let entry = &catalog.live_bindings[0];
 	let start = bytes.len()
 		- 104
@@ -172,13 +179,11 @@ fn fgdc_live_record_owner_tails_round_trip_and_reject_malformed_fields() -> Ferr
 	}
 	catalog.live_bindings[0].record_sources.clear();
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
 /// Runtime-invalid dependencies must not become Active merely through reopen.
 #[test]
-fn fgdc_live_bindings_reject_cycles_sources_and_invalid_function_references()
--> FerrosGrynnResult<()> {
+fn fgdc_live_bindings_reject_cycles_sources_and_invalid_function_references() {
 	use std::sync::Arc;
 
 	use crate::{
@@ -194,17 +199,19 @@ fn fgdc_live_bindings_reject_cycles_sources_and_invalid_function_references()
 			LiveVersion,
 		},
 		storage::live_descriptor::{self, LiveDescriptor},
+		test_assertions::AssertResult as _,
 		values::Value,
 	};
-	let mut catalog = fixture()?;
-	let first = LiveBindingId::from_uuid(uuid::Uuid::from_u128(1).into())?;
-	let second = LiveBindingId::from_uuid(uuid::Uuid::from_u128(2).into())?;
+	let mut catalog = fixture().assert_ok();
+	let first = LiveBindingId::from_uuid(uuid::Uuid::from_u128(1).into()).assert_ok();
+	let second = LiveBindingId::from_uuid(uuid::Uuid::from_u128(2).into()).assert_ok();
 	catalog.live_bindings = vec![
-		live_binding_fixture(1, LiveExpr::Binding(second))?,
-		live_binding_fixture(2, LiveExpr::Binding(first))?,
+		live_binding_fixture(1, LiveExpr::Binding(second)).assert_ok(),
+		live_binding_fixture(2, LiveExpr::Binding(first)).assert_ok(),
 	];
 	assert!(catalog.encode().is_err());
-	catalog.live_bindings = vec![live_binding_fixture(1, LiveExpr::Literal(Value::Null))?];
+	catalog.live_bindings =
+		vec![live_binding_fixture(1, LiveExpr::Literal(Value::Null)).assert_ok()];
 	catalog.live_bindings[0]
 		.functions
 		.push((FunctionId::from_schema_id(catalog.classes[0].id.into()), SchemaVersion::INITIAL));
@@ -212,10 +219,11 @@ fn fgdc_live_bindings_reject_cycles_sources_and_invalid_function_references()
 	catalog.live_bindings[0].functions.clear();
 	let query = LiveQuery::new(LiveSource::Class(catalog.classes[0].id))
 		.with_projection(LiveProjection::Value(LiveExpr::Binding(second)));
-	let descriptor = live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1024 * 1024)?;
+	let descriptor =
+		live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1024 * 1024).assert_ok();
 	catalog.live_queries.push(LiveCatalogEntry {
 		graph_checkpoint: None,
-		id: LiveId::from_uuid(uuid::Uuid::from_u128(3).into())?,
+		id: LiveId::from_uuid(uuid::Uuid::from_u128(3).into()).assert_ok(),
 		version: LiveVersion::default(),
 		state: LiveState::Active,
 		defined_at: 1,
@@ -234,13 +242,12 @@ fn fgdc_live_bindings_reject_cycles_sources_and_invalid_function_references()
 		diagnostic: None,
 	});
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
 /// Private coverage epochs are authoritative and cannot impersonate another
 /// source, configuration, query version or lifecycle.
 #[test]
-fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult<()> {
+fn fgdc_live_history_epochs_bounds_and_malformed_sections() {
 	use crate::{
 		changefeed::{
 			ChangefeedCaptureEpoch,
@@ -252,11 +259,12 @@ fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult
 		datastore::{LiveCaptureEpoch, LiveCapturePolicy, LiveHistoryMetadata},
 		live::{LiveId, LiveOptions, LiveQuery, LiveSource, LiveState, LiveVersion},
 		storage::live_descriptor::{self, LiveDescriptor},
+		test_assertions::AssertResult as _,
 	};
-	let mut catalog = fixture()?;
-	let config = ChangefeedConfig::from_nanoseconds(1234)?;
-	let feed = ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into())?;
-	let id = LiveId::from_uuid(uuid::Uuid::from_u128(43).into())?;
+	let mut catalog = fixture().assert_ok();
+	let config = ChangefeedConfig::from_nanoseconds(1234).assert_ok();
+	let feed = ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into()).assert_ok();
+	let id = LiveId::from_uuid(uuid::Uuid::from_u128(43).into()).assert_ok();
 	let query = LiveQuery::new(LiveSource::Class(catalog.classes[0].id));
 	catalog.live_queries.push(LiveCatalogEntry {
 		graph_checkpoint: None,
@@ -268,7 +276,8 @@ fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult
 		published_at: 1,
 		acknowledged: 1,
 		options: LiveOptions::default(),
-		descriptor: live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1024 * 1024)?
+		descriptor: live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1024 * 1024)
+			.assert_ok()
 			.into(),
 		query: std::sync::Arc::new(query),
 		source_class: Some(catalog.classes[0].id),
@@ -313,14 +322,17 @@ fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult
 			retained_groups: 0,
 			epochs: vec![LiveCaptureEpoch {
 				started_at: 2,
-				policy: Some(LiveCapturePolicy::from_source(feed, SchemaVersion::INITIAL, config)?),
+				policy: Some(
+					LiveCapturePolicy::from_source(feed, SchemaVersion::INITIAL, config)
+						.assert_ok(),
+				),
 			}],
 		},
 		segments: Vec::new(),
 	});
-	let bytes = catalog.encode()?;
+	let bytes = catalog.encode().assert_ok();
 	assert_eq!(&bytes[132..136], &1_u32.to_le_bytes());
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let offset = bytes.len() - super::live_history::MIN_BYTES;
 	for end in offset..bytes.len() {
 		assert!(DatabaseCatalog::decode(&bytes[..end]).is_err());
@@ -344,14 +356,16 @@ fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult
 	wrong_source.live_history[0].metadata.epochs[0]
 		.policy
 		.as_mut()
-		.ok_or_else(|| codec::invalid("fixture capture absent"))?
-		.source = ChangefeedId::from_uuid(uuid::Uuid::from_u128(99).into())?;
+		.ok_or_else(|| codec::invalid("fixture capture absent"))
+		.assert_ok()
+		.source = ChangefeedId::from_uuid(uuid::Uuid::from_u128(99).into()).assert_ok();
 	assert!(wrong_source.encode().is_err());
 	let mut wrong_retention = catalog.clone();
 	wrong_retention.live_history[0].metadata.epochs[0]
 		.policy
 		.as_mut()
-		.ok_or_else(|| codec::invalid("fixture capture absent"))?
+		.ok_or_else(|| codec::invalid("fixture capture absent"))
+		.assert_ok()
 		.retention_ns = 5678;
 	assert!(wrong_retention.encode().is_err());
 	let mut future = catalog.clone();
@@ -365,19 +379,23 @@ fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult
 		started_at: 11,
 		policy: None,
 	});
-	assert_eq!(DatabaseCatalog::decode(&closed.encode()?)?, closed);
-	Ok(())
+	assert_eq!(DatabaseCatalog::decode(&closed.encode().assert_ok()).assert_ok(), closed);
 }
 
+/// Verifies fgdc changefeed origin bounds and reserved bytes are checked.
 #[test]
-fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() -> FerrosGrynnResult<()> {
-	use crate::changefeed::{ChangefeedConfig, ChangefeedId, ChangefeedSource, ChangefeedState};
-	let mut catalog = fixture()?;
+fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() {
+	use crate::{
+		changefeed::{ChangefeedConfig, ChangefeedId, ChangefeedSource, ChangefeedState},
+		test_assertions::AssertResult as _,
+	};
+	let mut catalog = fixture().assert_ok();
 	catalog.changefeeds.push(ChangefeedCatalogEntry {
-		id: ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into())?,
+		id: ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into()).assert_ok(),
 		source: ChangefeedSource::Class(catalog.classes[0].id),
 		name: "person".into(),
-		config: ChangefeedConfig::from_nanoseconds(1_234)?
+		config: ChangefeedConfig::from_nanoseconds(1_234)
+			.assert_ok()
 			.with_full(true)
 			.with_include_original(true),
 		state: ChangefeedState::Active,
@@ -396,18 +414,19 @@ fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() -> FerrosGrynn
 			revision: SchemaVersion::INITIAL,
 			started_at: 2.into(),
 			configuration: Some(
-				ChangefeedConfig::from_nanoseconds(1_234)?
+				ChangefeedConfig::from_nanoseconds(1_234)
+					.assert_ok()
 					.with_full(true)
 					.with_include_original(true),
 			),
 		}],
 	});
-	let bytes = catalog.encode()?;
+	let bytes = catalog.encode().assert_ok();
 	assert_eq!(&bytes[88..104], catalog.database_uuid.as_bytes());
 	assert_eq!(&bytes[104..120], &catalog.committed_at_ns.to_le_bytes());
 	assert_eq!(&bytes[120..124], &1_u32.to_le_bytes());
 	assert_eq!(&bytes[124..128], &[0; 4]);
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let descriptor = bytes.len() - 152 - 32 - "person".len();
 	assert_eq!(&bytes[descriptor..descriptor + 16], uuid::Uuid::from_u128(42).as_bytes());
 	assert_eq!(&bytes[descriptor + 16..descriptor + 20], &[0, 0, 3, 0]);
@@ -424,7 +443,7 @@ fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() -> FerrosGrynn
 	let mut huge_count = bytes.clone();
 	huge_count[120..124].copy_from_slice(&u32::MAX.to_le_bytes());
 	assert!(DatabaseCatalog::decode(&huge_count).is_err());
-	let mut nil_origin = bytes.clone();
+	let mut nil_origin = bytes;
 	nil_origin[88..104].fill(0);
 	assert!(DatabaseCatalog::decode(&nil_origin).is_err());
 	catalog.changefeeds[0].state = ChangefeedState::Retired;
@@ -432,12 +451,13 @@ fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() -> FerrosGrynn
 	catalog.changefeeds[0].closed_time_ns = Some(catalog.committed_at_ns);
 	catalog.changefeeds[0].epochs[0].configuration = None;
 	catalog.classes.clear();
-	assert_eq!(DatabaseCatalog::decode(&catalog.encode()?)?, catalog);
+	assert_eq!(DatabaseCatalog::decode(&catalog.encode().assert_ok()).assert_ok(), catalog);
 	for source in [
-		ChangefeedSource::Class(ClassId::from_storage(catalog.next_schema_id as u32)?),
+		ChangefeedSource::Class(ClassId::from_storage(catalog.next_schema_id as u32).assert_ok()),
 		ChangefeedSource::Graph(
 			GraphId::new(catalog.next_graph_id)
-				.ok_or_else(|| codec::invalid("fixture graph clock is zero"))?,
+				.ok_or_else(|| codec::invalid("fixture graph clock is zero"))
+				.assert_ok(),
 		),
 	] {
 		let mut future = catalog.clone();
@@ -446,13 +466,12 @@ fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() -> FerrosGrynn
 	}
 	catalog.changefeeds[0].name = "invalid\0name".into();
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
 /// Logical descriptors and exact whole-commit positions survive catalog round
 /// trips.
 #[test]
-fn fgdc_live_recipe_options_and_watermarks_are_checked() -> FerrosGrynnResult<()> {
+fn fgdc_live_recipe_options_and_watermarks_are_checked() {
 	use std::sync::Arc;
 
 	use crate::{
@@ -468,27 +487,32 @@ fn fgdc_live_recipe_options_and_watermarks_are_checked() -> FerrosGrynnResult<()
 			LiveVersion,
 		},
 		storage::live_descriptor::{self, LiveDescriptor},
+		test_assertions::AssertResult as _,
 	};
-	let mut catalog = fixture()?;
+	let mut catalog = fixture().assert_ok();
 	let query = Arc::new(LiveQuery::new(LiveSource::Class(catalog.classes[0].id)).with_omit(vec![
-		LivePath::field("id")?,
-		LivePath::new(vec!["private".into(), "token".into()])?,
+		LivePath::field("id").assert_ok(),
+		LivePath::new(vec!["private".into(), "token".into()]).assert_ok(),
 	]));
 	let descriptor: Arc<[u8]> =
-		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 1024 * 1024)?
+		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 1024 * 1024)
+			.assert_ok()
 			.into();
 	let stamp = (1_u64 << 53) + 1;
-	let id = LiveId::from_uuid(uuid::Uuid::from_u128(42).into())?;
+	let id = LiveId::from_uuid(uuid::Uuid::from_u128(42).into()).assert_ok();
 	for since in [
 		LiveSince::Now,
 		LiveSince::Versionstamp(stamp.into()),
-		LiveSince::Timestamp("2026-10-04T00:00:00Z[UTC]".parse()?),
-		LiveSince::Cursor(crate::live::LiveCursor::new(
-			catalog.database_uuid.into(),
-			id,
-			LiveVersion::default(),
-			stamp.into(),
-		)?),
+		LiveSince::Timestamp("2026-10-04T00:00:00Z[UTC]".parse().assert_ok()),
+		LiveSince::Cursor(
+			crate::live::LiveCursor::new(
+				catalog.database_uuid.into(),
+				id,
+				LiveVersion::default(),
+				stamp.into(),
+			)
+			.assert_ok(),
+		),
 	] {
 		catalog.live_queries = vec![LiveCatalogEntry {
 			graph_checkpoint: None,
@@ -512,9 +536,9 @@ fn fgdc_live_recipe_options_and_watermarks_are_checked() -> FerrosGrynnResult<()
 			record_sources: Vec::new(),
 			diagnostic: None,
 		}];
-		let bytes = catalog.encode()?;
+		let bytes = catalog.encode().assert_ok();
 		assert_eq!(&bytes[124..128], &1_u32.to_le_bytes());
-		assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+		assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 		let mut bad_paths = bytes.clone();
 		let descriptor_start = bytes.len() - descriptor.len();
 		bad_paths[descriptor_start + 48..descriptor_start + 52]
@@ -582,8 +606,12 @@ fn fgdc_live_recipe_options_and_watermarks_are_checked() -> FerrosGrynnResult<()
 	entry.options = entry.options.clone().with_since(LiveSince::Versionstamp((stamp - 1).into()));
 	entry.starting_after = stamp - 1;
 	entry.acknowledged = stamp - 1;
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog, "historical ACK precedes registration");
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(
+		DatabaseCatalog::decode(&bytes).assert_ok(),
+		catalog,
+		"historical ACK precedes registration"
+	);
 	let mut malformed = catalog.clone();
 	malformed.live_queries[0].acknowledged = stamp - 2;
 	assert!(malformed.encode().is_err());
@@ -595,24 +623,25 @@ fn fgdc_live_recipe_options_and_watermarks_are_checked() -> FerrosGrynnResult<()
 	assert!(malformed.encode().is_err(), "NOW cannot impersonate historical capture");
 	catalog.live_queries.push(catalog.live_queries[0].clone());
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
 /// Qualified capture owners have canonical bytes independent of class policy.
 #[test]
-fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
+fn fgdc_live_capture_graph_owners_are_checked() {
 	use crate::{
 		changefeed::ChangefeedSource,
 		live::{LiveId, LiveOptions, LiveQuery, LiveSource, LiveState, LiveVersion},
 		storage::live_descriptor::{self, LiveDescriptor},
+		test_assertions::AssertResult as _,
 		values::Value,
 	};
-	let mut catalog = fixture()?;
+	let mut catalog = fixture().assert_ok();
 	let class = catalog.classes[0].id;
 	let name = catalog.classes[0].name.clone();
 	let graph = &catalog.graphs[0];
 	let reference =
-		crate::graph::GraphRef::new(graph.id, graph.name.clone(), graph.kind, graph.storage_mode)?;
+		crate::graph::GraphRef::new(graph.id, graph.name.clone(), graph.kind, graph.storage_mode)
+			.assert_ok();
 	for source in [
 		LiveSource::Graph(reference.clone()),
 		LiveSource::GraphClass {
@@ -621,7 +650,7 @@ fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
 		},
 		LiveSource::GraphRecord {
 			graph: reference.clone(),
-			record: format!("{name}:a").parse()?,
+			record: format!("{name}:a").parse().assert_ok(),
 		},
 		LiveSource::GraphClassExpr {
 			graph: Box::new(crate::live::LiveExpr::Literal(Value::from(reference.name().as_str()))),
@@ -629,7 +658,7 @@ fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
 		},
 		LiveSource::GraphRecordExpr {
 			graph: Box::new(crate::live::LiveExpr::Literal(Value::from(reference.name().as_str()))),
-			record: format!("{name}:a").parse()?,
+			record: format!("{name}:a").parse().assert_ok(),
 		},
 	] {
 		let is_graph = matches!(source, LiveSource::Graph(_));
@@ -637,10 +666,11 @@ fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
 			matches!(source, LiveSource::GraphRecord { .. } | LiveSource::GraphRecordExpr { .. });
 		let scope_name = source.graph_expression().map(|_| reference.name().clone());
 		let query = LiveQuery::new(source);
-		let descriptor = live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1 << 20)?;
+		let descriptor =
+			live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1 << 20).assert_ok();
 		catalog.live_queries = vec![LiveCatalogEntry {
 			graph_checkpoint: None,
-			id: LiveId::from_uuid(uuid::Uuid::from_u128(42).into())?,
+			id: LiveId::from_uuid(uuid::Uuid::from_u128(42).into()).assert_ok(),
 			version: LiveVersion::default(),
 			state: LiveState::Active,
 			defined_at: 1,
@@ -666,8 +696,8 @@ fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
 			},
 			diagnostic: None,
 		}];
-		let bytes = catalog.encode()?;
-		assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+		let bytes = catalog.encode().assert_ok();
+		assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 		let entry = &catalog.live_queries[0];
 		let captures = if is_record {
 			8 + name.len()
@@ -705,12 +735,11 @@ fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
 		wrong_source.live_queries[0].capture_source = ChangefeedSource::Class(class);
 		assert!(wrong_source.encode().is_err(), "graph query cannot inherit class capture");
 	}
-	Ok(())
 }
 
 /// Captured owners, function versions and fault images survive exact reopen.
 #[test]
-fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnResult<()> {
+fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() {
 	use std::sync::Arc;
 
 	use crate::{
@@ -725,25 +754,26 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 			LiveVersion,
 		},
 		storage::live_descriptor::{self, LiveDescriptor},
+		test_assertions::AssertResult as _,
 		values::Value,
 	};
-	let mut catalog = fixture()?;
+	let mut catalog = fixture().assert_ok();
 	let source = catalog.classes[0].clone();
 	let function = &catalog.functions[0];
 	let query = Arc::new(
-		LiveQuery::new(LiveSource::Record(format!("{}:a", source.name).parse()?)).with_projection(
-			LiveProjection::Value(LiveExpr::Call {
+		LiveQuery::new(LiveSource::Record(format!("{}:a", source.name).parse().assert_ok()))
+			.with_projection(LiveProjection::Value(LiveExpr::Call {
 				name: "fn::increment".into(),
 				arguments: vec![LiveExpr::Literal(Value::from(1_i64))],
-			}),
-		),
+			})),
 	);
 	let descriptor: Arc<[u8]> =
-		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 1024 * 1024)?
+		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 1024 * 1024)
+			.assert_ok()
 			.into();
 	catalog.live_queries.push(LiveCatalogEntry {
 		graph_checkpoint: None,
-		id: LiveId::from_uuid(uuid::Uuid::from_u128(42).into())?,
+		id: LiveId::from_uuid(uuid::Uuid::from_u128(42).into()).assert_ok(),
 		version: LiveVersion::default(),
 		state: LiveState::Active,
 		defined_at: 1,
@@ -761,8 +791,8 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 		record_sources: vec![(source.name.clone(), source.id)],
 		diagnostic: None,
 	});
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let start = bytes.len() - 160 - 8 - 8 - source.name.len() - descriptor.len();
 	for offset in [
 		start + 128,
@@ -784,15 +814,15 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 	}
 	let mut incompatible = catalog.clone();
 	incompatible.live_queries[0].functions[0].1 =
-		SchemaVersion::new(2).ok_or_else(|| codec::invalid("fixture version"))?;
+		SchemaVersion::new(2).ok_or_else(|| codec::invalid("fixture version")).assert_ok();
 	assert!(incompatible.encode().is_err());
 	let mut incompatible = catalog.clone();
 	incompatible.live_queries[0].record_sources[0].0 = "other".into();
 	assert!(incompatible.encode().is_err());
 	catalog.live_queries[0].state = LiveState::Paused;
 	catalog.live_queries[0].diagnostic = Some(("FG-G1F09".into(), "evaluation failed".into()));
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let tail = bytes.len() - "FG-G1F09".len() - "evaluation failed".len();
 	for offset in [tail, tail + 8] {
 		let mut malformed = bytes.clone();
@@ -813,9 +843,10 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 			"r",
 			crate::live::LiveJoinKind::Cross,
 			None,
-		)?]));
+		).assert_ok()]));
 	entry.descriptor =
-		live_descriptor::encode(&LiveDescriptor::Query(entry.query.as_ref().clone()), 1024 * 1024)?
+		live_descriptor::encode(&LiveDescriptor::Query(entry.query.as_ref().clone()), 1024 * 1024)
+			.assert_ok()
 			.into();
 	entry.rhs_scope_anchors = vec![crate::datastore::LiveRhsScopeAnchor {
 		source: 1,
@@ -830,8 +861,8 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 		+ 29
 		+ "FG-G1F09".len()
 		+ "evaluation failed".len();
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let start = bytes.len() - entry_length;
 	assert_eq!(bytes[start + 59], 1);
 	for flags in [0, 2, 255] {
@@ -839,12 +870,11 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 		malformed[start + 59] = flags;
 		assert!(DatabaseCatalog::decode(&malformed).is_err());
 	}
-	Ok(())
 }
 
 /// Writer admission uses the aggregate recovery cap for many compact recipes.
 #[test]
-fn fgdc_live_writer_rejects_catalog_exceeding_recovery_scratch() -> FerrosGrynnResult<()> {
+fn fgdc_live_writer_rejects_catalog_exceeding_recovery_scratch() {
 	use std::sync::Arc;
 
 	use crate::{
@@ -860,22 +890,24 @@ fn fgdc_live_writer_rejects_catalog_exceeding_recovery_scratch() -> FerrosGrynnR
 			LiveVersion,
 		},
 		storage::live_descriptor::{self, LiveDescriptor},
+		test_assertions::AssertResult as _,
 		values::Value,
 	};
-	let mut catalog = fixture()?;
+	let mut catalog = fixture().assert_ok();
 	let class = catalog.classes[0].id;
 	let query =
 		Arc::new(LiveQuery::new(LiveSource::Class(class)).with_projection(LiveProjection::Fields(
 			(0..30_000).map(|_| LiveField::new(LiveExpr::Literal(Value::Null))).collect(),
 		)));
 	let descriptor: Arc<[u8]> =
-		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 256 * 1024 * 1024)?
+		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 256 * 1024 * 1024)
+			.assert_ok()
 			.into();
 	assert!(descriptor.len() < 1024 * 1024);
 	for ordinal in 1..=20 {
 		catalog.live_queries.push(LiveCatalogEntry {
 			graph_checkpoint: None,
-			id: LiveId::from_uuid(uuid::Uuid::from_u128(ordinal).into())?,
+			id: LiveId::from_uuid(uuid::Uuid::from_u128(ordinal).into()).assert_ok(),
 			version: LiveVersion::default(),
 			state: LiveState::Active,
 			defined_at: 1,
@@ -894,28 +926,28 @@ fn fgdc_live_writer_rejects_catalog_exceeding_recovery_scratch() -> FerrosGrynnR
 			diagnostic: None,
 		});
 		if ordinal == 4 {
-			let bytes = catalog.encode()?;
-			assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+			let bytes = catalog.encode().assert_ok();
+			assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 		}
 	}
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
 /// Trusted segment bounds remain decodable independently of file contents.
 #[test]
-fn fgdc_changefeed_segment_descriptors_check_ids_bounds_lengths_and_reserved()
--> FerrosGrynnResult<()> {
+fn fgdc_changefeed_segment_descriptors_check_ids_bounds_lengths_and_reserved() {
 	use crate::{
 		changefeed::{ChangefeedConfig, ChangefeedId, ChangefeedSource, ChangefeedState},
 		storage::{HistoryOwner, HistorySegment, changefeed::SegmentHeader},
+		test_assertions::AssertResult as _,
 	};
-	let mut catalog = fixture()?;
-	let id = ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into())?;
-	let config = ChangefeedConfig::from_nanoseconds(1_234)?;
+	let mut catalog = fixture().assert_ok();
+	let id = ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into()).assert_ok();
+	let config = ChangefeedConfig::from_nanoseconds(1_234).assert_ok();
 	let segment = HistorySegment {
 		file: DataFileId::new(99, DataFileKind::Changefeed)
-			.ok_or_else(|| codec::invalid("fixture file identity invalid"))?,
+			.ok_or_else(|| codec::invalid("fixture file identity invalid"))
+			.assert_ok(),
 		header: SegmentHeader {
 			database: catalog.database_uuid,
 			owner: HistoryOwner::Changefeed(id),
@@ -951,8 +983,8 @@ fn fgdc_changefeed_segment_descriptors_check_ids_bounds_lengths_and_reserved()
 		}],
 		segments: vec![segment],
 	});
-	let bytes = catalog.encode()?;
-	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let bytes = catalog.encode().assert_ok();
+	assert_eq!(DatabaseCatalog::decode(&bytes).assert_ok(), catalog);
 	let start = bytes.len() - 128;
 	assert_eq!(&bytes[start..start + 8], &segment.file.get().to_le_bytes());
 	assert_eq!(&bytes[start + 56..start + 64], &2_u64.to_le_bytes());
@@ -974,43 +1006,48 @@ fn fgdc_changefeed_segment_descriptors_check_ids_bounds_lengths_and_reserved()
 		assert!(DatabaseCatalog::decode(&bytes[..end]).is_err());
 	}
 	let mut bad = catalog.clone();
-	bad.changefeeds[0].segments[0].header.owner =
-		HistoryOwner::Changefeed(ChangefeedId::from_uuid(uuid::Uuid::from_u128(43).into())?);
+	bad.changefeeds[0].segments[0].header.owner = HistoryOwner::Changefeed(
+		ChangefeedId::from_uuid(uuid::Uuid::from_u128(43).into()).assert_ok(),
+	);
 	assert!(bad.encode().is_err());
 	let mut bad = catalog.clone();
 	bad.changefeeds[0].segments[0].header.last_stamp = 11;
 	assert!(bad.encode().is_err());
 	let mut bad = catalog.clone();
 	bad.changefeeds[0].segments[0].header.owner =
-		HistoryOwner::Live(crate::live::LiveId::from_uuid(id.as_uuid().clone())?);
+		HistoryOwner::Live(crate::live::LiveId::from_uuid(id.as_uuid()).assert_ok());
 	assert!(bad.encode().is_err(), "LIVE history cannot enter the user-visible source catalog");
 	let mut bad = catalog.clone();
 	bad.changefeeds[0].segments.push(segment);
 	assert!(bad.encode().is_err());
-	Ok(())
 }
 
+/// Verifies fgdc v12 round trips fulltext hnsw and disk ann payloads.
 #[test]
-fn fgdc_v12_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResult<()> {
-	let mut catalog = fixture()?;
+fn fgdc_v12_round_trips_fulltext_hnsw_and_disk_ann_payloads() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut catalog = fixture().assert_ok();
 	let class = &mut catalog.classes[0];
 	class.fields.extend([
 		ClassFieldCatalogEntry {
-			id: SchemaId::new(9).ok_or_else(|| codec::invalid("invalid title field"))?,
+			id: SchemaId::new(9).ok_or_else(|| codec::invalid("invalid title field")).assert_ok(),
 			version: SchemaVersion::INITIAL,
 			name: "title".into(),
 			value_type: Type::String,
 			property_key: PropertyKeyId::new(1),
 		},
 		ClassFieldCatalogEntry {
-			id: SchemaId::new(10).ok_or_else(|| codec::invalid("invalid vector field"))?,
+			id: SchemaId::new(10).ok_or_else(|| codec::invalid("invalid vector field")).assert_ok(),
 			version: SchemaVersion::INITIAL,
 			name: "embedding".into(),
 			value_type: Type::Vector(VectorKind::F32),
 			property_key: PropertyKeyId::new(2),
 		},
 		ClassFieldCatalogEntry {
-			id: SchemaId::new(11).ok_or_else(|| codec::invalid("invalid compact field"))?,
+			id: SchemaId::new(11)
+				.ok_or_else(|| codec::invalid("invalid compact field"))
+				.assert_ok(),
 			version: SchemaVersion::INITIAL,
 			name: "compact".into(),
 			value_type: Type::Vector(VectorKind::F16),
@@ -1026,7 +1063,9 @@ fn fgdc_v12_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResu
 	};
 	class.indexes.extend([
 		ClassIndexCatalogEntry {
-			id: IndexId::new(12).ok_or_else(|| codec::invalid("invalid Fulltext index"))?,
+			id: IndexId::new(12)
+				.ok_or_else(|| codec::invalid("invalid Fulltext index"))
+				.assert_ok(),
 			version: SchemaVersion::INITIAL,
 			name: "title_search".into(),
 			kind: ClassIndexKind::Fulltext,
@@ -1035,18 +1074,23 @@ fn fgdc_v12_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResu
 			build_revision: 3,
 			scope: IndexScope::Base,
 			fields: vec![PropertyKeyId::new(1)],
-			options: ClassIndexOptions::Fulltext(FulltextIndexOptions::new(
-				AnalyzerId::new(8).ok_or_else(|| codec::invalid("invalid analyzer"))?,
-				SchemaVersion::INITIAL,
-				1.4,
-				0.6,
-				true,
-			)?),
-			physical: Some(binding(6)?),
-			delta: Some(binding(7)?),
+			options: ClassIndexOptions::Fulltext(
+				FulltextIndexOptions::new(
+					AnalyzerId::new(8)
+						.ok_or_else(|| codec::invalid("invalid analyzer"))
+						.assert_ok(),
+					SchemaVersion::INITIAL,
+					1.4,
+					0.6,
+					true,
+				)
+				.assert_ok(),
+			),
+			physical: Some(binding(6).assert_ok()),
+			delta: Some(binding(7).assert_ok()),
 		},
 		ClassIndexCatalogEntry {
-			id: IndexId::new(13).ok_or_else(|| codec::invalid("invalid HNSW index"))?,
+			id: IndexId::new(13).ok_or_else(|| codec::invalid("invalid HNSW index")).assert_ok(),
 			version: SchemaVersion::INITIAL,
 			name: "embedding_hnsw".into(),
 			kind: ClassIndexKind::Hnsw,
@@ -1055,18 +1099,23 @@ fn fgdc_v12_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResu
 			build_revision: 3,
 			scope: IndexScope::Base,
 			fields: vec![PropertyKeyId::new(2)],
-			options: ClassIndexOptions::Hnsw(HnswIndexOptions::new(
-				VectorKind::F32,
-				NonZeroU16::new(128).ok_or_else(|| codec::invalid("invalid dimension"))?,
-				VectorDistance::Cosine,
-				NonZeroU16::new(16).ok_or_else(|| codec::invalid("invalid M"))?,
-				NonZeroU16::new(180).ok_or_else(|| codec::invalid("invalid EFC"))?,
-			)?),
-			physical: Some(binding(8)?),
-			delta: Some(binding(9)?),
+			options: ClassIndexOptions::Hnsw(
+				HnswIndexOptions::new(
+					VectorKind::F32,
+					NonZeroU16::new(128)
+						.ok_or_else(|| codec::invalid("invalid dimension"))
+						.assert_ok(),
+					VectorDistance::Cosine,
+					NonZeroU16::new(16).ok_or_else(|| codec::invalid("invalid M")).assert_ok(),
+					NonZeroU16::new(180).ok_or_else(|| codec::invalid("invalid EFC")).assert_ok(),
+				)
+				.assert_ok(),
+			),
+			physical: Some(binding(8).assert_ok()),
+			delta: Some(binding(9).assert_ok()),
 		},
 		ClassIndexCatalogEntry {
-			id: IndexId::new(14).ok_or_else(|| codec::invalid("invalid DiskANN index"))?,
+			id: IndexId::new(14).ok_or_else(|| codec::invalid("invalid DiskANN index")).assert_ok(),
 			version: SchemaVersion::INITIAL,
 			name: "compact_disk".into(),
 			kind: ClassIndexKind::DiskAnn,
@@ -1075,122 +1124,141 @@ fn fgdc_v12_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResu
 			build_revision: 3,
 			scope: IndexScope::Base,
 			fields: vec![PropertyKeyId::new(3)],
-			options: ClassIndexOptions::DiskAnn(DiskAnnIndexOptions::new(
-				VectorKind::F16,
-				NonZeroU16::new(768).ok_or_else(|| codec::invalid("invalid dimension"))?,
-				VectorDistance::CosineNormalized,
-				NonZeroU16::new(48).ok_or_else(|| codec::invalid("invalid degree"))?,
-				NonZeroU16::new(120).ok_or_else(|| codec::invalid("invalid build list"))?,
-				1.3,
-				true,
-			)?),
-			physical: Some(binding(10)?),
-			delta: Some(binding(11)?),
+			options: ClassIndexOptions::DiskAnn(
+				DiskAnnIndexOptions::new(
+					VectorKind::F16,
+					NonZeroU16::new(768)
+						.ok_or_else(|| codec::invalid("invalid dimension"))
+						.assert_ok(),
+					VectorDistance::CosineNormalized,
+					NonZeroU16::new(48).ok_or_else(|| codec::invalid("invalid degree")).assert_ok(),
+					NonZeroU16::new(120)
+						.ok_or_else(|| codec::invalid("invalid build list"))
+						.assert_ok(),
+					1.3,
+					true,
+				)
+				.assert_ok(),
+			),
+			physical: Some(binding(10).assert_ok()),
+			delta: Some(binding(11).assert_ok()),
 		},
 	]);
 	catalog.next_schema_id = 15;
-	let decoded = DatabaseCatalog::decode(&catalog.encode()?)?;
+	let decoded = DatabaseCatalog::decode(&catalog.encode().assert_ok()).assert_ok();
 	assert_eq!(decoded, catalog);
-	Ok(())
 }
 
+/// Verifies fgdc rejects old version truncation and duplicate schema identity.
 #[test]
-fn fgdc_rejects_old_version_truncation_and_duplicate_schema_identity() -> FerrosGrynnResult<()> {
-	let catalog = fixture()?;
-	let mut old = catalog.encode()?;
+fn fgdc_rejects_old_version_truncation_and_duplicate_schema_identity() {
+	use crate::test_assertions::AssertResult as _;
+
+	let catalog = fixture().assert_ok();
+	let mut old = catalog.encode().assert_ok();
 	old[4..6].copy_from_slice(&9_u16.to_le_bytes());
 	assert!(DatabaseCatalog::decode(&old).is_err());
 
-	let mut truncated = catalog.encode()?;
+	let mut truncated = catalog.encode().assert_ok();
 	truncated.pop();
 	assert!(DatabaseCatalog::decode(&truncated).is_err());
 
 	let mut duplicate = catalog;
 	duplicate.parameters[0].id = duplicate.classes[0].fields[0].id;
 	assert!(duplicate.encode().is_err());
-	Ok(())
 }
 
+/// Verifies fgdc rejects duplicate or unsorted graph properties.
 #[test]
-fn fgdc_rejects_duplicate_or_unsorted_graph_properties() -> FerrosGrynnResult<()> {
-	let mut catalog = fixture()?;
+fn fgdc_rejects_duplicate_or_unsorted_graph_properties() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut catalog = fixture().assert_ok();
 	catalog.graphs[0].properties.push(GraphPropertyCatalogEntry {
 		key: PropertyKeyId::new(0),
 		value: vec![1],
 	});
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
+/// Verifies fgdc v12 allows one internal child through multiple owner scopes.
 #[test]
-fn fgdc_v12_allows_one_internal_child_through_multiple_owner_scopes() -> FerrosGrynnResult<()> {
-	let catalog = fixture_with_shared_child()?;
-	let decoded = DatabaseCatalog::decode(&catalog.encode()?)?;
+fn fgdc_v12_allows_one_internal_child_through_multiple_owner_scopes() {
+	use crate::test_assertions::AssertResult as _;
+
+	let catalog = fixture_with_shared_child().assert_ok();
+	let decoded = DatabaseCatalog::decode(&catalog.encode().assert_ok()).assert_ok();
 	let root = &decoded.graphs[0];
 	assert_eq!(root.arena.graph_by_slot[&1], root.arena.graph_by_slot[&2]);
 	assert_ne!(root.arena.scope_by_slot[&1], root.arena.scope_by_slot[&2]);
 	assert_eq!(decoded.graphs[1].owner_root, Some(root.id));
-	Ok(())
 }
 
+/// Verifies fgdc v12 rejects duplicate scope and noncanonical internal name.
 #[test]
-fn fgdc_v12_rejects_duplicate_scope_and_noncanonical_internal_name() -> FerrosGrynnResult<()> {
-	let mut duplicate_scope = fixture_with_shared_child()?;
+fn fgdc_v12_rejects_duplicate_scope_and_noncanonical_internal_name() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut duplicate_scope = fixture_with_shared_child().assert_ok();
 	let first_scope = duplicate_scope.graphs[0].arena.scope_by_slot[&1].clone();
 	duplicate_scope.graphs[0].arena.scope_by_slot.insert(2, first_scope);
 	assert!(duplicate_scope.encode().is_err());
 
-	let mut invalid_name = fixture_with_shared_child()?;
+	let mut invalid_name = fixture_with_shared_child().assert_ok();
 	invalid_name.graphs[1].name = "$fg$build_wrong".into();
 	assert!(invalid_name.encode().is_err());
-	Ok(())
 }
 
+/// Verifies fgdc v12 rejects unknown constraint bits and invalid roots.
 #[test]
-fn fgdc_v12_rejects_unknown_constraint_bits_and_invalid_roots() -> FerrosGrynnResult<()> {
-	let catalog = fixture()?;
-	let mut unknown_bits = catalog.encode()?;
-	let graph_header = first_graph_header(&unknown_bits, &catalog.graphs[0])?;
+fn fgdc_v12_rejects_unknown_constraint_bits_and_invalid_roots() {
+	use crate::test_assertions::AssertResult as _;
+
+	let catalog = fixture().assert_ok();
+	let mut unknown_bits = catalog.encode().assert_ok();
+	let graph_header = first_graph_header(&unknown_bits, &catalog.graphs[0]).assert_ok();
 	unknown_bits[graph_header + 30..graph_header + 32].copy_from_slice(&u16::MAX.to_le_bytes());
 	assert!(DatabaseCatalog::decode(&unknown_bits).is_err());
 
-	let mut wrong_family = fixture()?;
+	let mut wrong_family = fixture().assert_ok();
 	wrong_family.graphs[0].root = Some(vec![1]);
 	assert!(wrong_family.encode().is_err());
 
-	let mut missing_root = fixture()?;
+	let mut missing_root = fixture().assert_ok();
 	missing_root.graphs[0].kind = GraphKind::RootedTree;
 	assert!(missing_root.encode().is_ok());
-	Ok(())
 }
 
+/// Verifies fgdc v12 rejects invalid internal ownership and scope ancestry.
 #[test]
-fn fgdc_v12_rejects_invalid_internal_ownership_and_scope_ancestry() -> FerrosGrynnResult<()> {
-	let mut missing_owner = fixture_with_shared_child()?;
+fn fgdc_v12_rejects_invalid_internal_ownership_and_scope_ancestry() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut missing_owner = fixture_with_shared_child().assert_ok();
 	missing_owner.graphs[1].owner_root = GraphId::new(99);
 	assert!(missing_owner.encode().is_err());
 
-	let mut orphan = fixture_with_shared_child()?;
+	let mut orphan = fixture_with_shared_child().assert_ok();
 	orphan.graphs[0].arena.graph_by_slot.remove(&1);
 	orphan.graphs[0].arena.scope_by_slot.remove(&1);
 	orphan.graphs[0].arena.graph_by_slot.remove(&2);
 	orphan.graphs[0].arena.scope_by_slot.remove(&2);
 	assert!(orphan.encode().is_err());
 
-	let mut missing_parent = fixture_with_shared_child()?;
+	let mut missing_parent = fixture_with_shared_child().assert_ok();
 	let owner = missing_parent.graphs[0].arena.scope_by_slot[&1][0];
-	let nested = AtomId::from_parts(AtomKind::Node, 2, 0)?;
+	let nested = AtomId::from_parts(AtomKind::Node, 2, 0).assert_ok();
 	missing_parent.graphs[0].arena.scope_by_slot.insert(2, vec![owner, nested].into_boxed_slice());
 	assert!(missing_parent.encode().is_err());
 
-	let mut cycle = fixture_with_shared_child()?;
+	let mut cycle = fixture_with_shared_child().assert_ok();
 	let first = cycle.graphs[0].arena.scope_by_slot[&1][0];
 	let second = cycle.graphs[0].arena.scope_by_slot[&2][0];
 	cycle.graphs[0].arena.scope_by_slot.insert(2, vec![first, second].into_boxed_slice());
 	assert!(cycle.encode().is_err());
-	Ok(())
 }
 
+/// Returns first graph header for this module.
 fn first_graph_header(bytes: &[u8], graph: &GraphCatalogEntry) -> FerrosGrynnResult<usize> {
 	let mut prefix = Vec::new();
 	prefix.extend_from_slice(&graph.id.get().to_le_bytes());
@@ -1203,6 +1271,7 @@ fn first_graph_header(bytes: &[u8], graph: &GraphCatalogEntry) -> FerrosGrynnRes
 		.ok_or_else(|| codec::invalid("fixture graph header is absent"))
 }
 
+/// Builds the fixture fixture used by nearby scenarios.
 fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 	let graph = GraphId::new(7).ok_or_else(|| codec::invalid("invalid fixture graph"))?;
 	let index = |instance| -> FerrosGrynnResult<PhysicalIndexBinding> {
@@ -1340,18 +1409,21 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 	})
 }
 
+/// Verifies fgdc tensor bindings require the dedicated family without weakening
+/// indexes.
 #[test]
-fn fgdc_tensor_bindings_require_the_dedicated_family_without_weakening_indexes()
--> FerrosGrynnResult<()> {
+fn fgdc_tensor_bindings_require_the_dedicated_family_without_weakening_indexes() {
 	use crate::{
 		datastore::{GraphIndex, TensorCacheFormat},
 		graph::tensor::TensorScope,
+		test_assertions::AssertResult as _,
 	};
-	let mut catalog = fixture()?;
+	let mut catalog = fixture().assert_ok();
 	let graph = &mut catalog.graphs[0];
 	let mut definition =
-		GraphIndex::new_tensor("tensor", TensorScope::Local, TensorCacheFormat::Csr, 1 << 20)?;
-	let id = IndexId::new(9).ok_or_else(|| codec::invalid("invalid fixture index"))?;
+		GraphIndex::new_tensor("tensor", TensorScope::Local, TensorCacheFormat::Csr, 1 << 20)
+			.assert_ok();
+	let id = IndexId::new(9).ok_or_else(|| codec::invalid("invalid fixture index")).assert_ok();
 	definition.id = Some(id);
 	definition.graph = Some(graph.id);
 	definition.state = ClassIndexState::Ready;
@@ -1359,27 +1431,30 @@ fn fgdc_tensor_bindings_require_the_dedicated_family_without_weakening_indexes()
 	graph.indexes.push(definition);
 	let binding = PhysicalIndexBinding {
 		file_id: DataFileId::new(20, DataFileKind::TensorCache)
-			.ok_or_else(|| codec::invalid("invalid tensor file"))?,
+			.ok_or_else(|| codec::invalid("invalid tensor file"))
+			.assert_ok(),
 		root: crate::storage::page::PageNo::new(0),
 	};
 	graph.index_bindings.insert(id, binding);
 	catalog.next_schema_id = 10;
-	let bytes = catalog.encode()?;
-	let decoded = DatabaseCatalog::decode(&bytes)?;
+	let bytes = catalog.encode().assert_ok();
+	let decoded = DatabaseCatalog::decode(&bytes).assert_ok();
 	assert_eq!(decoded.graphs[0].index_bindings[&id], binding);
 	catalog.graphs[0]
 		.index_bindings
 		.get_mut(&id)
-		.ok_or_else(|| codec::invalid("missing tensor binding"))?
+		.ok_or_else(|| codec::invalid("missing tensor binding"))
+		.assert_ok()
 		.file_id = DataFileId::new(20, DataFileKind::Index)
-		.ok_or_else(|| codec::invalid("invalid ordinary file"))?;
+		.ok_or_else(|| codec::invalid("invalid ordinary file"))
+		.assert_ok();
 	assert!(catalog.encode().is_err());
 	catalog.graphs[0].index_bindings.insert(id, binding);
 	catalog.atom_store.primary = binding;
 	assert!(catalog.encode().is_err());
-	Ok(())
 }
 
+/// Returns fixture with shared child for this module.
 fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 	let mut catalog = fixture()?;
 	let root = catalog.graphs[0].id;

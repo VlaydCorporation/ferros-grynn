@@ -5,14 +5,18 @@
 
 use super::*;
 
+/// Returned expression and optional name assigned to its result.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ReturnStatement {
+	/// Payload retained for the operation or its expected result.
 	pub value: Expr,
+	/// Optional name assigned to the produced value or source.
 	pub alias: Option<Identifier>,
 }
 
 impl Parser<'_> {
+	/// Parses the return statement syntax.
 	pub(in crate::syn) async fn return_statement(
 		&mut self,
 		context: &mut Stk,

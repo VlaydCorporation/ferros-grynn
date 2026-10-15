@@ -22,6 +22,10 @@ use crate::{
 	graph::GraphId,
 };
 
+/// Replacement class definitions and index identities affected by a schema
+/// change.
+type ClassIndexChanges = (Vec<(ClassId, ClassSchema)>, Vec<IndexId>);
+
 impl DatabaseRoot {
 	/// Installs one newly published durable text analyzer.
 	pub(crate) fn install_analyzer(
@@ -292,7 +296,7 @@ impl DatabaseRoot {
 		analyzer_versions: &BTreeMap<AnalyzerId, SchemaVersion>,
 		function: Option<(FunctionId, SchemaVersion)>,
 		published_at: u64,
-	) -> FerrosGrynnResult<(Vec<(ClassId, ClassSchema)>, Vec<IndexId>)> {
+	) -> FerrosGrynnResult<ClassIndexChanges> {
 		let mut classes = Vec::new();
 		let mut stale_indexes = Vec::new();
 		for (class_id, current) in &self.schema.classes {
@@ -670,18 +674,22 @@ impl DatabaseRoot {
 	}
 }
 
+/// Returns the parameter missing result.
 fn parameter_missing(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("parameter '${name}' does not exist"))
 }
 
+/// Returns the analyzer exists result.
 fn analyzer_exists(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("analyzer '{name}' already exists"))
 }
 
+/// Returns the analyzer missing result.
 fn analyzer_missing(id: AnalyzerId) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("analyzer {id} does not exist"))
 }
 
+/// Returns the function exists result.
 fn function_exists(function: &SchemaFunction) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!(
 		"function '{}::{}' with the same parameter types already exists",
@@ -690,6 +698,7 @@ fn function_exists(function: &SchemaFunction) -> FerrosGrynnError {
 	))
 }
 
+/// Returns the function missing result.
 fn function_missing(id: FunctionId) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("function {id} does not exist"))
 }

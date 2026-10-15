@@ -23,7 +23,10 @@ use windows::{
 };
 
 /// Event retained until each overlapped scatter read fully completes.
-struct ScatterEvent(HANDLE);
+struct ScatterEvent(
+	/// Event retained until each overlapped scatter read fully completes.
+	HANDLE,
+);
 
 impl ScatterEvent {
 	/// Creates one reusable manual-reset event.
@@ -177,10 +180,10 @@ impl ScatterReader {
 				ptr::from_mut(self.overlapped.as_mut()),
 			)
 		};
-		if let Err(source) = submitted {
-			if source.code() != HRESULT::from_win32(ERROR_IO_PENDING.0) {
-				return Err(windows_failure("submit ReadFileScatter", source));
-			}
+		if let Err(source) = submitted
+			&& source.code() != HRESULT::from_win32(ERROR_IO_PENDING.0)
+		{
+			return Err(windows_failure("submit ReadFileScatter", source));
 		}
 		let mut transferred = 0_u32;
 		// SAFETY: waiting to completion ends every native access to the
@@ -276,6 +279,7 @@ fn windows_failure(operation: &'static str, source: windows::core::Error) -> Fer
 	reason = "fallible platform test setup returns Result while assertions report contract \
 	          failures"
 )]
+/// Regression tests for windows transport behavior.
 mod tests {
 	use std::{error::Error, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
@@ -297,7 +301,10 @@ mod tests {
 	};
 
 	/// Unique path removed after each native transport test.
-	struct TestPath(PathBuf);
+	struct TestPath(
+		/// Unique path removed after each native transport test.
+		PathBuf,
+	);
 
 	impl TestPath {
 		/// Creates a collision-resistant workspace-local path.
@@ -310,6 +317,7 @@ mod tests {
 	}
 
 	impl Drop for TestPath {
+		/// Runs cleanup for this `TestPath` before its fields are released.
 		fn drop(&mut self) {
 			drop(std::fs::remove_file(&self.0));
 		}
@@ -347,6 +355,7 @@ mod tests {
 		Ok(file)
 	}
 
+	/// Verifies scatter reads and validates disjoint frames.
 	#[test]
 	fn scatter_reads_and_validates_disjoint_frames() -> Result<(), Box<dyn Error>> {
 		let path = TestPath::new()?;
@@ -379,6 +388,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies scatter raw read and validation are independently reusable.
 	#[test]
 	fn scatter_raw_read_and_validation_are_independently_reusable() -> Result<(), Box<dyn Error>> {
 		let path = TestPath::new()?;
@@ -414,6 +424,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies scatter eof rolls back atomic batch and releases capacity.
 	#[test]
 	fn scatter_eof_rolls_back_atomic_batch_and_releases_capacity() -> Result<(), Box<dyn Error>> {
 		let path = TestPath::new()?;
@@ -439,6 +450,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies frame ioring eof rolls back vm batch and decommits budget.
 	#[test]
 	fn frame_ioring_eof_rolls_back_vm_batch_and_decommits_budget() -> Result<(), Box<dyn Error>> {
 		let path = TestPath::new()?;

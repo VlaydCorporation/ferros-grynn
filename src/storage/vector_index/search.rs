@@ -17,25 +17,36 @@ use crate::{
 	values::{Vector, storage::DiskAtomRef},
 };
 
+/// Configured paged node batch value.
 const PAGED_NODE_BATCH: usize = 32;
 
 /// One stable exact-reranked result from an immutable ANN generation.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct VectorSearchHit {
+pub struct VectorSearchHit {
+	/// Atom associated with this vector search hit.
 	pub(crate) atom: DiskAtomRef,
+	/// Distance associated with this vector search hit.
 	pub(crate) distance: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Candidate state.
 struct Candidate {
+	/// Distance associated with this candidate.
 	distance: f64,
+	/// Ordinal associated with this candidate.
 	ordinal: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RankedHit(VectorSearchHit);
+/// Ranked hit state.
+struct RankedHit(
+	/// Ranked hit state.
+	VectorSearchHit,
+);
 
 impl PartialEq for RankedHit {
+	/// Compares this `RankedHit` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -44,23 +55,30 @@ impl PartialEq for RankedHit {
 impl Eq for RankedHit {}
 
 impl PartialOrd for RankedHit {
+	/// Compares this `RankedHit` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for RankedHit {
+	/// Compares this `RankedHit` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.0.distance.total_cmp(&other.0.distance).then_with(|| self.0.atom.cmp(&other.0.atom))
 	}
 }
 
+/// Top hits state.
 struct TopHits {
+	/// Limit associated with this top hits.
 	limit: usize,
+	/// Hits associated with this top hits.
 	hits: BinaryHeap<RankedHit>,
 }
 
 impl TopHits {
+	/// Creates a new `TopHits` value.
 	fn new(limit: usize) -> Self {
 		Self {
 			limit,
@@ -68,6 +86,7 @@ impl TopHits {
 		}
 	}
 
+	/// Pushes top hits.
 	fn push(&mut self, hit: VectorSearchHit) {
 		if self.limit == 0 {
 			return;
@@ -78,6 +97,7 @@ impl TopHits {
 		}
 	}
 
+	/// Converts this value into sorted.
 	fn into_sorted(self) -> Vec<VectorSearchHit> {
 		let mut hits = self.hits.into_iter().map(|hit| hit.0).collect::<Vec<_>>();
 		hits.sort_unstable_by(|left, right| {
@@ -88,6 +108,7 @@ impl TopHits {
 }
 
 impl PartialEq for Candidate {
+	/// Compares this `Candidate` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -96,12 +117,15 @@ impl PartialEq for Candidate {
 impl Eq for Candidate {}
 
 impl PartialOrd for Candidate {
+	/// Compares this `Candidate` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for Candidate {
+	/// Compares this `Candidate` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.distance.total_cmp(&other.distance).then_with(|| self.ordinal.cmp(&other.ordinal))
 	}
@@ -109,7 +133,7 @@ impl Ord for Candidate {
 
 /// Searches a fully decoded graph for builder recall tests.
 #[cfg(test)]
-pub(crate) fn search_vector_index_with_distance(
+pub fn search_vector_index_with_distance(
 	index: &DecodedVectorIndex,
 	query: &Vector,
 	k: usize,
@@ -148,13 +172,15 @@ pub(crate) fn search_vector_index_with_distance(
 
 /// Searches DiskANN through an ordinal loader without materializing the base
 /// generation. The loader owns page-windowing and snapshot validation.
-pub(crate) fn search_paged_diskann(
+pub fn search_paged_diskann<
+	LoadArg: FnMut(&[u32], usize) -> FerrosGrynnResult<Vec<PagedVectorNode>>,
+>(
 	header: &PagedVectorHeader,
 	delta: Option<&DecodedVectorDelta>,
 	query: &Vector,
 	k: usize,
 	breadth: usize,
-	mut load: impl FnMut(&[u32], usize) -> FerrosGrynnResult<Vec<PagedVectorNode>>,
+	mut load: LoadArg,
 ) -> FerrosGrynnResult<Vec<VectorSearchHit>> {
 	if header.spec.algorithm()? != VectorAlgorithm::DiskAnn {
 		return Err(invalid("paged DiskANN search received another vector algorithm"));
@@ -165,10 +191,10 @@ pub(crate) fn search_paged_diskann(
 		));
 	}
 	validate_vector(header.spec, query)?;
-	if let Some(delta) = delta {
-		if delta.spec.base != header.spec {
-			return Err(invalid("vector delta definition disagrees with its base"));
-		}
+	if let Some(delta) = delta
+		&& delta.spec.base != header.spec
+	{
+		return Err(invalid("vector delta definition disagrees with its base"));
 	}
 	let shadowed = delta
 		.into_iter()
@@ -213,6 +239,7 @@ pub(crate) fn search_paged_diskann(
 	Ok(hits)
 }
 
+/// Returns the paged level zero result.
 fn paged_level_zero(
 	header: &PagedVectorHeader,
 	query: &Vector,
@@ -272,6 +299,7 @@ fn paged_level_zero(
 	Ok(nearest.into_iter().map(|candidate| candidate.ordinal).collect())
 }
 
+/// Appends paged hits.
 fn append_paged_hits(
 	header: &PagedVectorHeader,
 	query: &Vector,
@@ -295,6 +323,7 @@ fn append_paged_hits(
 	Ok(())
 }
 
+/// Appends paged batch.
 fn append_paged_batch(
 	header: &PagedVectorHeader,
 	query: &Vector,
@@ -323,6 +352,7 @@ fn append_paged_batch(
 	Ok(())
 }
 
+/// Loads paged node.
 fn load_paged_node(
 	load: &mut impl FnMut(&[u32], usize) -> FerrosGrynnResult<Vec<PagedVectorNode>>,
 	ordinal: u32,
@@ -335,6 +365,7 @@ fn load_paged_node(
 	Ok(nodes.remove(0))
 }
 
+/// Appends delta hits.
 fn append_delta_hits(
 	header: &PagedVectorHeader,
 	delta: Option<&DecodedVectorDelta>,
@@ -356,6 +387,7 @@ fn append_delta_hits(
 	Ok(())
 }
 
+/// Validates paged node.
 fn validate_paged_node(
 	header: &PagedVectorHeader,
 	ordinal: u32,
@@ -387,6 +419,7 @@ fn validate_paged_node(
 	Ok(())
 }
 
+/// Returns greedy upper levels for this module.
 #[cfg(test)]
 fn greedy_upper_levels(
 	index: &DecodedVectorIndex,
@@ -441,6 +474,7 @@ fn greedy_upper_levels(
 	Ok(current)
 }
 
+/// Returns bounded level zero for this module.
 #[cfg(test)]
 fn bounded_level_zero(
 	index: &DecodedVectorIndex,
@@ -503,6 +537,7 @@ fn bounded_level_zero(
 		.collect()
 }
 
+/// Returns rerank for this module.
 #[cfg(test)]
 fn rerank(
 	index: &DecodedVectorIndex,
@@ -532,6 +567,7 @@ fn rerank(
 	Ok(hits)
 }
 
+/// Returns search distance for this module.
 #[cfg(test)]
 fn search_distance(
 	index: &DecodedVectorIndex,
@@ -553,15 +589,19 @@ fn search_distance(
 	}
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for search behavior.
 mod tests {
 	use std::{cell::Cell, num::NonZeroU16};
 
 	use super::search_paged_diskann;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{
 			ClassId,
@@ -583,20 +623,21 @@ mod tests {
 		values::{PropertyKeyId, Vector, VectorKind, storage::DiskAtomRef},
 	};
 
+	/// Verifies hashed diskann requests only the top k posting prefix.
 	#[test]
 	fn hashed_diskann_requests_only_the_top_k_posting_prefix() {
 		let options = DiskAnnIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(1).unwrap(),
+			NonZeroU16::new(1).assert_some(),
 			VectorDistance::Euclidean,
 			true,
 		)
-		.unwrap();
+		.assert_ok();
 		let spec = VectorBuildSpec {
-			index: IndexId::new(7).unwrap(),
+			index: IndexId::new(7).assert_some(),
 			index_version: SchemaVersion::INITIAL,
 			scope: IndexScope::Base,
-			class: ClassId::new(3).unwrap(),
+			class: ClassId::new(3).assert_some(),
 			field: PropertyKeyId::new(2),
 			options: ClassIndexOptions::DiskAnn(options),
 			build_revision: 11,
@@ -637,9 +678,9 @@ mod tests {
 								.map(|slot| {
 									DiskAtomRef::from_parts(
 										AtomKind::Node,
-										u64::try_from(slot).unwrap(),
+										u64::try_from(slot).assert_ok(),
 									)
-									.unwrap()
+									.assert_ok()
 								})
 								.collect(),
 							vector: Vector::from(vec![0.0_f32]),
@@ -651,7 +692,7 @@ mod tests {
 					.collect())
 			},
 		)
-		.unwrap();
+		.assert_ok();
 
 		assert_eq!(maximum_requested.get(), 3);
 		assert_eq!(results.len(), 3);
@@ -659,21 +700,23 @@ mod tests {
 		assert_eq!(results[2].atom.slot(), 3);
 	}
 
+	/// Verifies paged diskann keeps nearest candidate discovered at breadth
+	/// boundary.
 	#[test]
 	fn paged_diskann_keeps_nearest_candidate_discovered_at_breadth_boundary() {
 		let options = DiskAnnIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(1).unwrap(),
+			NonZeroU16::new(1).assert_some(),
 			VectorDistance::Euclidean,
 			false,
 		)
-		.unwrap();
+		.assert_ok();
 		let header = PagedVectorHeader {
 			spec: VectorBuildSpec {
-				index: IndexId::new(7).unwrap(),
+				index: IndexId::new(7).assert_some(),
 				index_version: SchemaVersion::INITIAL,
 				scope: IndexScope::Base,
-				class: ClassId::new(3).unwrap(),
+				class: ClassId::new(3).assert_some(),
 				field: PropertyKeyId::new(2),
 				options: ClassIndexOptions::DiskAnn(options),
 				build_revision: 11,
@@ -707,11 +750,12 @@ mod tests {
 				Ok(ordinals
 					.iter()
 					.map(|ordinal| {
-						let (slot, value, neighbors) = &nodes[usize::try_from(*ordinal).unwrap()];
+						let (slot, value, neighbors) =
+							&nodes[usize::try_from(*ordinal).assert_ok()];
 						PagedVectorNode {
 							node: VectorNode {
 								postings: vec![
-									DiskAtomRef::from_parts(AtomKind::Node, *slot).unwrap(),
+									DiskAtomRef::from_parts(AtomKind::Node, *slot).assert_ok(),
 								],
 								vector: Vector::from(vec![*value]),
 								vector_hash: 0,
@@ -723,7 +767,7 @@ mod tests {
 					.collect())
 			},
 		)
-		.unwrap();
+		.assert_ok();
 
 		assert!(maximum_batch.get() > 1);
 		assert_eq!(results.iter().map(|hit| hit.atom.slot()).collect::<Vec<_>>(), [3, 2]);

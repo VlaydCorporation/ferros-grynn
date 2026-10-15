@@ -9,17 +9,32 @@ use super::*;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum LetValue {
-	Expression(Expr),
-	BuildGraph(BuildGraphStatement),
+	/// Variable initialized from an expression.
+	Expression(
+		/// Variable initialized from an expression.
+		Expr,
+	),
+	/// Cold graph construction owned by this lexical binding.
+	BuildGraph(
+		/// Cold graph construction owned by this lexical binding.
+		Box<BuildGraphStatement>,
+	),
 	/// A LIVE registration returns its owned UUID to the lexical binding.
-	LiveSelect(Box<LiveSelectStatement>),
+	LiveSelect(
+		/// A LIVE registration returns its owned UUID to the lexical binding.
+		Box<LiveSelectStatement>,
+	),
 }
 
+/// Variable binding with an optional declared type and its initializer.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct LetStatement {
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Optional type annotation applied to the variable initializer.
 	pub declared_type: Option<TypeName>,
+	/// Payload retained for the operation or its expected result.
 	pub value: LetValue,
 }
 
@@ -50,6 +65,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the let statement syntax.
 	pub(in crate::syn) async fn let_statement(
 		&mut self,
 		context: &mut Stk,
@@ -67,7 +83,9 @@ impl Parser<'_> {
 			))
 		} else if self.consume_keyword(keywords::BUILD).is_some() {
 			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `BUILD`.")?;
-			LetValue::BuildGraph(context.run(|context| self.build_graph_statement(context)).await?)
+			LetValue::BuildGraph(Box::new(
+				context.run(|context| self.build_graph_statement(context)).await?,
+			))
 		} else {
 			LetValue::Expression(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		};

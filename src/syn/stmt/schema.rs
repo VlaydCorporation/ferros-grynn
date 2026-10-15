@@ -9,8 +9,11 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DefinitionMode {
+	/// Use ordinary definition behavior when a name already exists.
 	Normal,
+	/// Keep an existing definition with the same name.
 	IfNotExists,
+	/// Replace the existing named definition.
 	Overwrite,
 }
 
@@ -18,7 +21,9 @@ pub enum DefinitionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClassKindName {
+	/// Declare a class containing node atoms.
 	Node,
+	/// Declare a class containing edge atoms.
 	Edge,
 }
 
@@ -26,7 +31,9 @@ pub enum ClassKindName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClassSchemaModeName {
+	/// Permit properties outside the explicitly declared field set.
 	Schemaless,
+	/// Apply the declared class schema to accepted properties.
 	Schemafull,
 }
 
@@ -34,10 +41,15 @@ pub enum ClassSchemaModeName {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DefineGraphStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Requested graph family and structural validators.
 	pub contract: GraphContract,
+	/// Optional expression selecting the root of the produced graph.
 	pub root: Option<Expr>,
+	/// Optional expression supplying initial graph content.
 	pub content: Option<Expr>,
 	/// Optional durable capture policy.
 	pub changefeed: Option<ChangefeedClause>,
@@ -47,9 +59,13 @@ pub struct DefineGraphStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DefineClassStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Selected operation or representation discriminator.
 	pub kind: ClassKindName,
+	/// Class property-validation policy selected by the schema declaration.
 	pub schema_mode: ClassSchemaModeName,
 	/// Optional durable capture policy.
 	pub changefeed: Option<ChangefeedClause>,
@@ -59,9 +75,13 @@ pub struct DefineClassStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DefineFieldStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Class selected by the schema declaration, query target or fixture.
 	pub class: Identifier,
+	/// Declared value type retained for semantic validation.
 	pub value_type: Option<TypeName>,
 }
 
@@ -69,13 +89,21 @@ pub struct DefineFieldStatement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VectorElementName {
+	/// 64-bit floating-point vector elements.
 	F64,
+	/// 32-bit floating-point vector elements.
 	F32,
+	/// 16-bit floating-point vector elements.
 	F16,
+	/// 64-bit signed integer vector elements.
 	I64,
+	/// 32-bit signed integer vector elements.
 	I32,
+	/// 16-bit signed integer vector elements.
 	I16,
+	/// 8-bit signed integer vector elements.
 	I8,
+	/// 8-bit unsigned integer vector elements.
 	U8,
 }
 
@@ -83,51 +111,96 @@ pub enum VectorElementName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VectorDistanceName {
+	/// Euclidean distance between numeric vectors.
 	Euclidean,
+	/// Cosine distance between numeric vectors.
 	Cosine,
+	/// L1 distance between numeric vectors.
 	Manhattan,
+	/// Minkowski distance with an explicit exponent.
 	Minkowski {
+		/// Floating-point bit representation of the Minkowski exponent.
 		exponent_bits: u64,
 	},
+	/// Inner-product distance for vector search.
 	InnerProduct,
+	/// Cosine-distance form for normalized vectors.
 	CosineNormalized,
-	Function(FunctionSignatureName),
+	/// User-defined function supplying vector distance.
+	Function(
+		/// User-defined function supplying vector distance.
+		FunctionSignatureName,
+	),
 }
 
 /// Class-index kind and kind-specific syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BasicIndexDefinition {
-	Standard(Vec<Identifier>),
-	Unique(Vec<Identifier>),
+	/// Ordinary scalar index definition.
+	Standard(
+		/// Ordinary scalar index definition.
+		Vec<Identifier>,
+	),
+	/// Scalar index enforcing key uniqueness.
+	Unique(
+		/// Scalar index enforcing key uniqueness.
+		Vec<Identifier>,
+	),
+	/// Index maintaining aggregate counts.
 	Count,
+	/// Spatial index definition for geometry values.
 	Geometry {
+		/// Property name addressed by this expression or schema declaration.
 		field: Identifier,
+		/// Optional geometry-kind restriction of the spatial index.
 		geometry_type: Option<Identifier>,
 	},
+	/// Analyzed full-text index definition.
 	Fulltext {
+		/// Property name addressed by this expression or schema declaration.
 		field: Identifier,
+		/// Named analyzer used to tokenize indexed full-text values.
 		analyzer: Identifier,
+		/// Floating-point bit representation of the full-text k1 parameter.
 		k1_bits: u64,
+		/// Floating-point bit representation of the full-text b parameter.
 		b_bits: u64,
+		/// Whether the index retains data required for highlighted matches.
 		highlights: bool,
 	},
+	/// HNSW approximate nearest-neighbor index definition.
 	Hnsw {
+		/// Property name addressed by this expression or schema declaration.
 		field: Identifier,
+		/// Number of scalar coordinates in each indexed vector.
 		dimension: u16,
+		/// Scalar element type selected for indexed vectors.
 		element: VectorElementName,
+		/// Distance contract selected for vector comparisons.
 		distance: VectorDistanceName,
+		/// Candidate-list bound used while constructing the HNSW index.
 		ef_construction: u16,
+		/// Configured connectivity parameter of the HNSW index.
 		m: u16,
 	},
+	/// DiskANN approximate nearest-neighbor index definition.
 	DiskAnn {
+		/// Property name addressed by this expression or schema declaration.
 		field: Identifier,
+		/// Number of scalar coordinates in each indexed vector.
 		dimension: u16,
+		/// Scalar element type selected for indexed vectors.
 		element: VectorElementName,
+		/// Distance contract selected for vector comparisons.
 		distance: VectorDistanceName,
+		/// Maximum graph degree configured for the DiskANN index.
 		degree: u16,
+		/// Candidate-list size configured for the DiskANN build.
 		build_list_size: u16,
+		/// Floating-point bit representation of the DiskANN pruning parameter.
 		alpha_bits: u32,
+		/// Whether the vector-index definition requests hashed vectors.
 		hashed_vector: bool,
 	},
 }
@@ -136,8 +209,12 @@ pub enum BasicIndexDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IndexScopeName {
+	/// Index values from base class properties.
 	Base,
+	/// Index effective values after applying the graph scope.
 	Effective {
+		/// Graph materialization or physical graph files retained by the
+		/// operation.
 		graph: Identifier,
 	},
 }
@@ -146,30 +223,42 @@ pub enum IndexScopeName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DefineIndexStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Class selected by the schema declaration, query target or fixture.
 	pub class: Identifier,
+	/// Selected scalar, search or vector index specification.
 	pub definition: BasicIndexDefinition,
+	/// Base or graph-effective scope of the index.
 	pub scope: IndexScopeName,
+	/// Whether the operation requests background concurrent execution.
 	pub concurrently: bool,
+	/// Whether initial index population is deferred.
 	pub deferred: bool,
 }
 
 /// Parsed graph-owned index family and optional radius.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GraphIndexFamilyName {
 	/// Shortest-path or bounded pattern acceleration.
 	Path,
 	/// Unbounded reachability of the selected projection.
 	Reachability,
 	/// Maximum neighbourhood radius.
-	Neighbourhood(u32),
+	Neighbourhood(
+		/// Maximum neighbourhood radius.
+		u32,
+	),
 	/// Complete ATOM incidence cache with NODE exposed as a view.
 	Tensor,
 }
 
 /// Graph-owned `DEFINE INDEX` syntax before catalog resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DefineGraphIndexStatement {
 	/// Conflict behavior.
 	pub mode: DefinitionMode,
@@ -211,9 +300,13 @@ pub struct DefineGraphIndexStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DefineParameterStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Payload retained for the operation or its expected result.
 	pub value: Expr,
+	/// User-supplied description retained in the schema declaration.
 	pub comment: Option<Box<str>>,
 }
 
@@ -221,9 +314,13 @@ pub struct DefineParameterStatement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AnalyzerTokenizerName {
+	/// Split text on whitespace.
 	Blank,
+	/// Split text at camel-case boundaries.
 	Camel,
+	/// Tokenize according to character-class boundaries.
 	Class,
+	/// Split text using punctuation boundaries.
 	Punct,
 }
 
@@ -231,32 +328,58 @@ pub enum AnalyzerTokenizerName {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AnalyzerFilterName {
+	/// Apply canonical Unicode composition.
 	Nfc,
+	/// Apply compatibility Unicode composition.
 	Nfkc,
+	/// Apply the analyzer ASCII-normalization filter.
 	Ascii,
+	/// Convert tokens to lowercase.
 	Lowercase,
+	/// Convert tokens to uppercase.
 	Uppercase,
+	/// Produce edge n-grams within the configured size range.
 	EdgeNgram {
+		/// Inclusive lower bound accepted by the pattern or filter.
 		min: u16,
+		/// Upper bound accepted by the pattern or filter, when specified.
 		max: u16,
 	},
+	/// Produce n-grams within the configured size range.
 	Ngram {
+		/// Inclusive lower bound accepted by the pattern or filter.
 		min: u16,
+		/// Upper bound accepted by the pattern or filter, when specified.
 		max: u16,
 	},
-	Snowball(Identifier),
-	Mapper(Expr),
+	/// Apply the selected Snowball language stemmer.
+	Snowball(
+		/// Apply the selected Snowball language stemmer.
+		Identifier,
+	),
+	/// Apply a configured token-mapping resource.
+	Mapper(
+		/// Apply a configured token-mapping resource.
+		Expr,
+	),
 }
 
 /// Durable text-analyzer definition.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DefineAnalyzerStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Optional named function selected by the analyzer declaration or
+	/// alteration.
 	pub function: Option<FunctionSignatureName>,
+	/// Tokenizer sequence selected by the analyzer declaration.
 	pub tokenizers: Vec<AnalyzerTokenizerName>,
+	/// Filters retained in the order required by the selected declaration.
 	pub filters: Vec<AnalyzerFilterName>,
+	/// User-supplied description retained in the schema declaration.
 	pub comment: Option<Box<str>>,
 }
 
@@ -264,8 +387,12 @@ pub struct DefineAnalyzerStatement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FunctionEffectName {
+	/// Function declaration promises pure evaluation.
 	Pure,
+	/// Function declaration promises stability within its supported evaluation
+	/// scope.
 	Stable,
+	/// Function declaration permits observable side effects.
 	Impure,
 }
 
@@ -273,7 +400,9 @@ pub enum FunctionEffectName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FunctionParameterDefinition {
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Declared value type retained for semantic validation.
 	pub value_type: TypeName,
 }
 
@@ -281,8 +410,11 @@ pub struct FunctionParameterDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FunctionSignatureName {
+	/// Namespace qualifying the function name.
 	pub namespace: Identifier,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Declared parameters or bound values supplied to this operation.
 	pub parameters: Option<Vec<TypeName>>,
 }
 
@@ -290,15 +422,25 @@ pub struct FunctionSignatureName {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DefineFunctionStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: DefinitionMode,
+	/// Declared purity or observable-effect category of the function.
 	pub effect: FunctionEffectName,
+	/// Whether the function is declared usable as a path-cost function.
 	pub cost: bool,
+	/// Namespace qualifying the function name.
 	pub namespace: Identifier,
+	/// Declared name used when resolving or displaying this element.
 	pub name: Identifier,
+	/// Declared parameters or bound values supplied to this operation.
 	pub parameters: Vec<FunctionParameterDefinition>,
+	/// Optional declared result type of the function.
 	pub result_type: Option<TypeName>,
+	/// Maximum nested depth accepted by the operation or declaration.
 	pub max_depth: Option<u8>,
+	/// Statement block executed when the declared function is called.
 	pub body: Block,
+	/// User-supplied description retained in the schema declaration.
 	pub comment: Option<Box<str>>,
 }
 
@@ -306,8 +448,14 @@ pub struct DefineFunctionStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParameterCommentChange {
+	/// Leave the existing parameter comment unchanged.
 	Keep,
-	Set(Box<str>),
+	/// Replace the parameter comment with supplied text.
+	Set(
+		/// Replace the parameter comment with supplied text.
+		Box<str>,
+	),
+	/// Remove the existing parameter comment.
 	Drop,
 }
 
@@ -325,41 +473,79 @@ pub enum RemoveTarget {
 		owner: EventOwnerName,
 	},
 	/// Removes a reactive binding after checking its dependents.
-	LiveLet(Identifier),
+	LiveLet(
+		/// Removes a reactive binding after checking its dependents.
+		Identifier,
+	),
 	/// Removes a graph-owned user definition.
 	GraphIndex {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Graph materialization or physical graph files retained by the
+		/// operation.
 		graph: Identifier,
 	},
+	/// Analyzer definition selected to be removed.
 	Analyzer {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
 	},
+	/// Function definition and signature selected to be removed.
 	Function {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Qualified function name and optional parameter-type signature.
 		signature: FunctionSignatureName,
 	},
+	/// Stored parameter definition selected to be removed.
 	Parameter {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
 	},
+	/// Named graph selected to be removed.
 	Graph {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
 	},
+	/// Class definition selected to be removed.
 	Class {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
 	},
+	/// Class field declaration selected to be removed.
 	Field {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
 	},
+	/// Named index definition selected to be removed.
 	Index {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
 	},
 }
@@ -368,6 +554,7 @@ pub enum RemoveTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RemoveStatement {
+	/// Target endpoint or schema object selected by the operation.
 	pub target: RemoveTarget,
 }
 
@@ -411,42 +598,81 @@ pub enum AlterTarget {
 		/// None represents DROP CHANGEFEED.
 		configuration: Option<ChangefeedClause>,
 	},
+	/// Analyzer definition selected to be altered.
 	Analyzer {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Optional named function selected by the analyzer declaration or
+		/// alteration.
 		function: Option<Option<FunctionSignatureName>>,
+		/// Tokenizer sequence selected by the analyzer declaration.
 		tokenizers: Option<Vec<AnalyzerTokenizerName>>,
+		/// Filters retained in the order required by the selected declaration.
 		filters: Option<Vec<AnalyzerFilterName>>,
+		/// User-supplied description retained in the schema declaration.
 		comment: ParameterCommentChange,
 	},
+	/// Function definition and signature selected to be altered.
 	Function {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Qualified function name and optional parameter-type signature.
 		signature: FunctionSignatureName,
+		/// Declared purity or observable-effect category of the function.
 		effect: Option<FunctionEffectName>,
+		/// Whether the function is declared usable as a path-cost function.
 		cost: Option<bool>,
+		/// Maximum nested depth accepted by the operation or declaration.
 		max_depth: Option<Option<u8>>,
+		/// Optional replacement function body supplied by an ALTER FUNCTION
+		/// statement.
 		body: Option<Block>,
+		/// User-supplied description retained in the schema declaration.
 		comment: ParameterCommentChange,
 	},
+	/// Stored parameter definition selected to be altered.
 	Parameter {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Payload retained for the operation or its expected result.
 		value: Option<Expr>,
+		/// User-supplied description retained in the schema declaration.
 		comment: ParameterCommentChange,
 	},
+	/// Class definition selected to be altered.
 	Class {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Class property-validation policy selected by the schema declaration.
 		schema_mode: ClassSchemaModeName,
 	},
+	/// Class field declaration selected to be altered.
 	Field {
+		/// Whether an absent target is accepted instead of reported as an
+		/// error.
 		if_exists: bool,
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
+		/// Declared value type retained for semantic validation.
 		value_type: Option<TypeName>,
 	},
+	/// Index prepared for removal selected to be altered.
 	IndexPrepareRemove {
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
 	},
 }
@@ -455,6 +681,7 @@ pub enum AlterTarget {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AlterStatement {
+	/// Target endpoint or schema object selected by the operation.
 	pub target: AlterTarget,
 }
 
@@ -463,27 +690,67 @@ pub struct AlterStatement {
 #[non_exhaustive]
 pub enum InfoTarget {
 	/// Reads a reactive identity and its definition/value revisions.
-	LiveLet(Identifier),
+	LiveLet(
+		/// Reads a reactive identity and its definition/value revisions.
+		Identifier,
+	),
 	/// Runtime UUID parameter containing a retained LIVE query incarnation.
-	Live(Identifier),
+	Live(
+		/// Runtime UUID parameter containing a retained LIVE query incarnation.
+		Identifier,
+	),
 	/// Runtime parameter containing the retained feed UUID.
-	Changefeed(Identifier),
+	Changefeed(
+		/// Runtime parameter containing the retained feed UUID.
+		Identifier,
+	),
 	/// Reads a graph-owned user or engine index definition.
 	GraphIndex {
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Graph materialization or physical graph files retained by the
+		/// operation.
 		graph: Identifier,
 	},
+	/// Database metadata selected to be inspected.
 	Database,
-	Analyzer(Identifier),
-	Function(FunctionSignatureName),
-	Parameter(Identifier),
-	Job(Identifier),
+	/// Analyzer definition selected to be inspected.
+	Analyzer(
+		/// Analyzer definition selected to be inspected.
+		Identifier,
+	),
+	/// Function definition and signature selected to be inspected.
+	Function(
+		/// Function definition and signature selected to be inspected.
+		FunctionSignatureName,
+	),
+	/// Stored parameter definition selected to be inspected.
+	Parameter(
+		/// Stored parameter definition selected to be inspected.
+		Identifier,
+	),
+	/// One maintenance job selected to be inspected.
+	Job(
+		/// One maintenance job selected to be inspected.
+		Identifier,
+	),
+	/// Maintenance job collection selected to be inspected.
 	Jobs,
-	Class(Identifier),
+	/// Class definition selected to be inspected.
+	Class(
+		/// Class definition selected to be inspected.
+		Identifier,
+	),
 	/// Reads graph schema metadata, including source-owned events.
-	Graph(Identifier),
+	Graph(
+		/// Reads graph schema metadata, including source-owned events.
+		Identifier,
+	),
+	/// Named index definition selected to be inspected.
 	Index {
+		/// Declared name used when resolving or displaying this element.
 		name: Identifier,
+		/// Class selected by the schema declaration, query target or fixture.
 		class: Identifier,
 	},
 }
@@ -492,6 +759,7 @@ pub enum InfoTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct InfoStatement {
+	/// Target endpoint or schema object selected by the operation.
 	pub target: InfoTarget,
 }
 
@@ -534,6 +802,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define function statement syntax.
 	pub(in crate::syn) async fn define_function_statement(
 		&mut self,
 		context: &mut Stk,
@@ -593,6 +862,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define parameter statement syntax.
 	pub(in crate::syn) async fn define_parameter_statement(
 		&mut self,
 		context: &mut Stk,
@@ -615,6 +885,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define analyzer statement syntax.
 	pub(in crate::syn) async fn define_analyzer_statement(
 		&mut self,
 		context: &mut Stk,
@@ -677,6 +948,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the analyzer function name syntax.
 	fn analyzer_function_name(&mut self) -> FerrosGrynnResult<FunctionSignatureName> {
 		let (namespace, name) = self.qualified_function_name()?;
 		Ok(FunctionSignatureName {
@@ -686,6 +958,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the analyzer tokenizers syntax.
 	fn analyzer_tokenizers(&mut self) -> FerrosGrynnResult<Vec<AnalyzerTokenizerName>> {
 		let mut tokenizers = Vec::new();
 		loop {
@@ -708,6 +981,7 @@ impl Parser<'_> {
 		Ok(tokenizers)
 	}
 
+	/// Parses the analyzer filters syntax.
 	async fn analyzer_filters(
 		&mut self,
 		context: &mut Stk,
@@ -767,6 +1041,7 @@ impl Parser<'_> {
 		Ok(filters)
 	}
 
+	/// Parses the analyzer u16 syntax.
 	fn analyzer_u16(&mut self, field: &str) -> FerrosGrynnResult<u16> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {
@@ -780,6 +1055,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define graph statement syntax.
 	pub(in crate::syn) async fn define_graph_statement(
 		&mut self,
 		context: &mut Stk,
@@ -850,6 +1126,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define class statement syntax.
 	pub(in crate::syn) fn define_class_statement(
 		&mut self,
 	) -> FerrosGrynnResult<DefineClassStatement> {
@@ -899,6 +1176,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define field statement syntax.
 	pub(in crate::syn) fn define_field_statement(
 		&mut self,
 	) -> FerrosGrynnResult<DefineFieldStatement> {
@@ -924,6 +1202,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the define index statement syntax.
 	pub(in crate::syn) fn define_index_statement(&mut self) -> FerrosGrynnResult<StatementKind> {
 		let mode = self.definition_mode()?;
 		let name = self.identifier()?;
@@ -1273,6 +1552,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the single specialized index field syntax.
 	fn single_specialized_index_field(
 		&self,
 		mut fields: Vec<Identifier>,
@@ -1288,6 +1568,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the index positive u16 syntax.
 	fn index_positive_u16(&mut self, label: &str) -> FerrosGrynnResult<u16> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {
@@ -1302,6 +1583,7 @@ impl Parser<'_> {
 		Ok(value)
 	}
 
+	/// Parses the index f64 syntax.
 	fn index_f64(&mut self, label: &str) -> FerrosGrynnResult<f64> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {
@@ -1313,6 +1595,7 @@ impl Parser<'_> {
 			.map_err(|_error| self.syntax(&format!("Expected finite numeric {label}."), token.span))
 	}
 
+	/// Parses the index f32 syntax.
 	fn index_f32(&mut self, label: &str) -> FerrosGrynnResult<f32> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {
@@ -1324,6 +1607,7 @@ impl Parser<'_> {
 			.map_err(|_error| self.syntax(&format!("Expected finite numeric {label}."), token.span))
 	}
 
+	/// Parses the vector element name syntax.
 	fn vector_element_name(&mut self) -> FerrosGrynnResult<VectorElementName> {
 		let token = self.tokens.next();
 		let TokenKind::Word {
@@ -1354,6 +1638,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the vector distance name syntax.
 	fn vector_distance_name(&mut self) -> FerrosGrynnResult<VectorDistanceName> {
 		if self.consume_keyword(keywords::EUCLIDEAN).is_some() {
 			Ok(VectorDistanceName::Euclidean)
@@ -1384,6 +1669,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Removes statement.
 	pub(in crate::syn) fn remove_statement(&mut self) -> FerrosGrynnResult<RemoveStatement> {
 		let target = if self.consume_keyword("EVENT").is_some() {
 			let if_exists = self.if_exists()?;
@@ -1460,6 +1746,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the alter statement syntax.
 	pub(in crate::syn) async fn alter_statement(
 		&mut self,
 		context: &mut Stk,
@@ -1508,116 +1795,7 @@ impl Parser<'_> {
 				actions,
 			}
 		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
-			let if_exists = self.if_exists()?;
-			let name = self.identifier()?;
-			let mut function = None;
-			let mut tokenizers = None;
-			let mut filters = None;
-			let mut comment = ParameterCommentChange::Keep;
-			while !self.at_statement_end() {
-				if self.consume_keyword(keywords::FUNCTION).is_some() {
-					if function.is_some() {
-						return Err(self.syntax(
-							"ALTER ANALYZER FUNCTION may appear only once.",
-							self.previous_span(),
-						));
-					}
-					function = Some(Some(self.analyzer_function_name()?));
-				} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
-					if tokenizers.is_some() {
-						return Err(self.syntax(
-							"ALTER ANALYZER TOKENIZERS may appear only once.",
-							self.previous_span(),
-						));
-					}
-					tokenizers = Some(self.analyzer_tokenizers()?);
-				} else if self.consume_keyword(keywords::FILTERS).is_some() {
-					if filters.is_some() {
-						return Err(self.syntax(
-							"ALTER ANALYZER FILTERS may appear only once.",
-							self.previous_span(),
-						));
-					}
-					filters = Some(context.run(|context| self.analyzer_filters(context)).await?);
-				} else if self.consume_keyword(keywords::COMMENT).is_some() {
-					if comment != ParameterCommentChange::Keep {
-						return Err(self.syntax(
-							"ALTER ANALYZER COMMENT may appear only once.",
-							self.previous_span(),
-						));
-					}
-					comment = ParameterCommentChange::Set(
-						self.string_value("Expected a string after `COMMENT`.")?,
-					);
-				} else if self.consume_keyword(keywords::DROP).is_some() {
-					if self.consume_keyword(keywords::FUNCTION).is_some() {
-						if function.is_some() {
-							return Err(self.syntax(
-								"ALTER ANALYZER FUNCTION may appear only once.",
-								self.previous_span(),
-							));
-						}
-						function = Some(None);
-					} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
-						if tokenizers.is_some() {
-							return Err(self.syntax(
-								"ALTER ANALYZER TOKENIZERS may appear only once.",
-								self.previous_span(),
-							));
-						}
-						tokenizers = Some(Vec::new());
-					} else if self.consume_keyword(keywords::FILTERS).is_some() {
-						if filters.is_some() {
-							return Err(self.syntax(
-								"ALTER ANALYZER FILTERS may appear only once.",
-								self.previous_span(),
-							));
-						}
-						filters = Some(Vec::new());
-					} else if self.consume_keyword(keywords::COMMENT).is_some() {
-						if comment != ParameterCommentChange::Keep {
-							return Err(self.syntax(
-								"ALTER ANALYZER COMMENT may appear only once.",
-								self.previous_span(),
-							));
-						}
-						comment = ParameterCommentChange::Drop;
-					} else {
-						return Err(self.syntax(
-							"Expected FUNCTION, TOKENIZERS, FILTERS, or COMMENT after DROP.",
-							self.current().span,
-						));
-					}
-				} else {
-					return Err(
-						self.syntax("Unexpected ALTER ANALYZER clause.", self.current().span)
-					);
-				}
-			}
-			if function.is_none()
-				&& tokenizers.is_none()
-				&& filters.is_none()
-				&& comment == ParameterCommentChange::Keep
-			{
-				return Err(self
-					.syntax("ALTER ANALYZER requires at least one change.", self.current().span));
-			}
-			if function.as_ref().is_some_and(Option::is_some)
-				&& tokenizers.as_ref().is_some_and(|values| !values.is_empty())
-			{
-				return Err(self.syntax(
-					"ANALYZER FUNCTION and TOKENIZERS are mutually exclusive.",
-					name.span,
-				));
-			}
-			AlterTarget::Analyzer {
-				if_exists,
-				name,
-				function,
-				tokenizers,
-				filters,
-				comment,
-			}
+			self.alter_analyzer_target(context).await?
 		} else if self.consume_keyword(keywords::FUNCTION).is_some() {
 			let if_exists = self.if_exists()?;
 			let signature = self.function_signature_name()?;
@@ -1790,6 +1968,123 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses one ALTER ANALYZER target after ANALYZER was consumed.
+	///
+	/// # Errors
+	/// Returns the existing clause, duplicate-change or incompatible-option
+	/// error.
+	async fn alter_analyzer_target(&mut self, context: &mut Stk) -> FerrosGrynnResult<AlterTarget> {
+		let if_exists = self.if_exists()?;
+		let name = self.identifier()?;
+		let mut function = None;
+		let mut tokenizers = None;
+		let mut filters = None;
+		let mut comment = ParameterCommentChange::Keep;
+		while !self.at_statement_end() {
+			if self.consume_keyword(keywords::FUNCTION).is_some() {
+				if function.is_some() {
+					return Err(self.syntax(
+						"ALTER ANALYZER FUNCTION may appear only once.",
+						self.previous_span(),
+					));
+				}
+				function = Some(Some(self.analyzer_function_name()?));
+			} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
+				if tokenizers.is_some() {
+					return Err(self.syntax(
+						"ALTER ANALYZER TOKENIZERS may appear only once.",
+						self.previous_span(),
+					));
+				}
+				tokenizers = Some(self.analyzer_tokenizers()?);
+			} else if self.consume_keyword(keywords::FILTERS).is_some() {
+				if filters.is_some() {
+					return Err(self.syntax(
+						"ALTER ANALYZER FILTERS may appear only once.",
+						self.previous_span(),
+					));
+				}
+				filters = Some(context.run(|context| self.analyzer_filters(context)).await?);
+			} else if self.consume_keyword(keywords::COMMENT).is_some() {
+				if comment != ParameterCommentChange::Keep {
+					return Err(self.syntax(
+						"ALTER ANALYZER COMMENT may appear only once.",
+						self.previous_span(),
+					));
+				}
+				comment = ParameterCommentChange::Set(
+					self.string_value("Expected a string after `COMMENT`.")?,
+				);
+			} else if self.consume_keyword(keywords::DROP).is_some() {
+				if self.consume_keyword(keywords::FUNCTION).is_some() {
+					if function.is_some() {
+						return Err(self.syntax(
+							"ALTER ANALYZER FUNCTION may appear only once.",
+							self.previous_span(),
+						));
+					}
+					function = Some(None);
+				} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
+					if tokenizers.is_some() {
+						return Err(self.syntax(
+							"ALTER ANALYZER TOKENIZERS may appear only once.",
+							self.previous_span(),
+						));
+					}
+					tokenizers = Some(Vec::new());
+				} else if self.consume_keyword(keywords::FILTERS).is_some() {
+					if filters.is_some() {
+						return Err(self.syntax(
+							"ALTER ANALYZER FILTERS may appear only once.",
+							self.previous_span(),
+						));
+					}
+					filters = Some(Vec::new());
+				} else if self.consume_keyword(keywords::COMMENT).is_some() {
+					if comment != ParameterCommentChange::Keep {
+						return Err(self.syntax(
+							"ALTER ANALYZER COMMENT may appear only once.",
+							self.previous_span(),
+						));
+					}
+					comment = ParameterCommentChange::Drop;
+				} else {
+					return Err(self.syntax(
+						"Expected FUNCTION, TOKENIZERS, FILTERS, or COMMENT after DROP.",
+						self.current().span,
+					));
+				}
+			} else {
+				return Err(self.syntax("Unexpected ALTER ANALYZER clause.", self.current().span));
+			}
+		}
+		if function.is_none()
+			&& tokenizers.is_none()
+			&& filters.is_none()
+			&& comment == ParameterCommentChange::Keep
+		{
+			return Err(
+				self.syntax("ALTER ANALYZER requires at least one change.", self.current().span)
+			);
+		}
+		if function.as_ref().is_some_and(Option::is_some)
+			&& tokenizers.as_ref().is_some_and(|values| !values.is_empty())
+		{
+			return Err(
+				self.syntax("ANALYZER FUNCTION and TOKENIZERS are mutually exclusive.", name.span)
+			);
+		}
+		Ok(AlterTarget::Analyzer {
+			if_exists,
+			name,
+			function,
+			tokenizers,
+			filters,
+			comment,
+		})
+	}
+
+	/// Parses the info statement syntax.
 	pub(in crate::syn) fn info_statement(&mut self) -> FerrosGrynnResult<InfoStatement> {
 		self.expect_keyword(keywords::FOR, "Expected `FOR` after `INFO`.")?;
 		let target = if self.consume_keyword(keywords::DB).is_some() {
@@ -1838,6 +2133,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the definition mode syntax.
 	pub(in crate::syn) fn definition_mode(&mut self) -> FerrosGrynnResult<DefinitionMode> {
 		if self.consume_keyword(keywords::OVERWRITE).is_some() {
 			return Ok(DefinitionMode::Overwrite);
@@ -1850,6 +2146,7 @@ impl Parser<'_> {
 		Ok(DefinitionMode::Normal)
 	}
 
+	/// Parses the if exists syntax.
 	pub(in crate::syn) fn if_exists(&mut self) -> FerrosGrynnResult<bool> {
 		if self.consume_keyword(keywords::IF).is_none() {
 			return Ok(false);
@@ -1858,16 +2155,19 @@ impl Parser<'_> {
 		Ok(true)
 	}
 
+	/// Parses the on class syntax.
 	pub(in crate::syn) fn on_class(&mut self) -> FerrosGrynnResult<Identifier> {
 		self.expect_keyword(keywords::ON, "Expected `ON CLASS` before class name.")?;
 		self.expect_keyword(keywords::CLASS, "Expected `CLASS` after `ON`.")?;
 		self.identifier()
 	}
 
+	/// Returns whether the at statement end condition holds.
 	pub(in crate::syn) fn at_statement_end(&self) -> bool {
 		self.at_eof() || self.at_symbol(Symbol::Semicolon)
 	}
 
+	/// Parses the expect statement end syntax.
 	pub(in crate::syn) fn expect_statement_end(&self, statement: &str) -> FerrosGrynnResult<()> {
 		if self.at_statement_end() {
 			Ok(())
@@ -1876,6 +2176,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the current word syntax.
 	pub(in crate::syn) fn current_word(&self) -> Option<&str> {
 		match &self.current().kind {
 			TokenKind::Word {
@@ -1896,12 +2197,14 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Returns whether the at function definition condition holds.
 	pub(in crate::syn) fn at_function_definition(&self) -> bool {
 		[keywords::PURE, keywords::STABLE, keywords::IMPURE, keywords::COST, keywords::FUNCTION]
 			.iter()
 			.any(|keyword| self.at_keyword(keyword))
 	}
 
+	/// Parses the function effect syntax.
 	fn function_effect(&mut self) -> Option<FunctionEffectName> {
 		if self.consume_keyword(keywords::PURE).is_some() {
 			Some(FunctionEffectName::Pure)
@@ -1914,6 +2217,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the qualified function name syntax.
 	fn qualified_function_name(&mut self) -> FerrosGrynnResult<(Identifier, Identifier)> {
 		let namespace = self.identifier()?;
 		self.expect_symbol(Symbol::DoubleColon, "Expected `::` in a function name.")?;
@@ -1921,6 +2225,7 @@ impl Parser<'_> {
 		Ok((namespace, name))
 	}
 
+	/// Parses the function signature name syntax.
 	pub(in crate::syn) fn function_signature_name(
 		&mut self,
 	) -> FerrosGrynnResult<FunctionSignatureName> {
@@ -1947,6 +2252,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the function max depth syntax.
 	fn function_max_depth(&mut self) -> FerrosGrynnResult<u8> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {

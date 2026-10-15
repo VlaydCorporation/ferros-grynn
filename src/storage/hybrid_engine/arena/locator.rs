@@ -1,16 +1,18 @@
 //! Source-bound page-number locators and reusable resident handles.
 
-use std::{
-	num::NonZeroUsize,
-	sync::{
-		Arc,
-		atomic::{AtomicU64, AtomicUsize, Ordering},
-	},
+#[cfg(feature = "storage-engine-prototype-api")]
+use std::num::NonZeroUsize;
+use std::sync::{
+	Arc,
+	atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use parking_lot::{Mutex, RwLock};
-use rapidhash::{HashMapExt, RapidHashMap};
+#[cfg(feature = "storage-engine-prototype-api")]
+use rapidhash::HashMapExt;
+use rapidhash::RapidHashMap;
 
+#[cfg(feature = "storage-engine-prototype-api")]
 use super::{
 	AtomicArenaBufferPool,
 	AtomicEpochPage,
@@ -24,10 +26,11 @@ use super::{
 	PinResult,
 	pin_exhausted,
 };
+use crate::storage::hybrid_engine::{SourceEpoch, SourceIdentity};
+#[cfg(feature = "storage-engine-prototype-api")]
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
-		hybrid_engine::{SourceEpoch, SourceIdentity},
 		page::{AlignedPage, PageHeader},
 		page_cache::{PageCacheKey, PageCacheVersion},
 	},
@@ -44,6 +47,7 @@ pub(super) struct FrameLocator {
 
 /// Cached resolution of one exact immutable page version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct ResolvedFrameHandle {
 	/// Identity of the arena that produced this locator.
 	pub(super) arena_id: u64,
@@ -53,6 +57,7 @@ pub struct ResolvedFrameHandle {
 	pub(super) locator: FrameLocator,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl ResolvedFrameHandle {
 	/// Creates a resolved handle from a resident directory entry.
 	pub(super) const fn new(arena_id: u64, key: PageCacheKey, locator: FrameLocator) -> Self {
@@ -86,47 +91,49 @@ impl ResolvedFrameHandle {
 /// page bytes are exposed.
 pub struct SourceBoundLocator {
 	/// Arena that produced every stored frame locator.
-	arena_id: u64,
+	_arena_id: u64,
 	/// Stable physical source identity.
-	source: SourceIdentity,
+	_source: SourceIdentity,
 	/// Exact immutable source version.
-	epoch: SourceEpoch,
+	_epoch: SourceEpoch,
 	/// Number of addressable pages in this source.
-	page_count: usize,
+	_page_count: usize,
 	/// Lazily allocated page-number chunks.
-	chunks: RwLock<RapidHashMap<usize, Arc<LocatorChunk>>>,
+	_chunks: RwLock<RapidHashMap<usize, Arc<LocatorChunk>>>,
 	/// Live slots owned by this source epoch.
 	entries: AtomicUsize,
 	/// Arena-wide live locator slots across all source epochs.
 	global_entries: Arc<AtomicUsize>,
 	/// Maximum arena-wide live locator slots.
-	entry_budget: usize,
+	_entry_budget: usize,
 }
 
 /// One removable page-number chunk.
 struct LocatorChunk {
 	/// Compact frame locators for consecutive source pages.
-	slots: Box<[AtomicU64]>,
+	_slots: Box<[AtomicU64]>,
 	/// Nonempty slots in this chunk.
-	live: AtomicUsize,
+	_live: AtomicUsize,
 	/// Serializes slot-count changes outside the page hot loop.
-	updates: Mutex<()>,
+	_updates: Mutex<()>,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl LocatorChunk {
 	/// Allocates one zeroed chunk.
 	fn new() -> Self {
 		Self {
-			slots: (0..DENSE_LOCATOR_LEAF_SLOTS)
+			_slots: (0..DENSE_LOCATOR_LEAF_SLOTS)
 				.map(|_| AtomicU64::new(0))
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
-			live: AtomicUsize::new(0),
-			updates: Mutex::new(()),
+			_live: AtomicUsize::new(0),
+			_updates: Mutex::new(()),
 		}
 	}
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl SourceBoundLocator {
 	/// Creates an empty locator for one exact source epoch.
 	///
@@ -150,14 +157,14 @@ impl SourceBoundLocator {
 		}
 		let page_count = page_count.get();
 		Ok(Self {
-			arena_id: pool.arena_id,
-			source: SourceIdentity::from_key(first_key),
-			epoch: SourceEpoch::from_key(first_key),
-			page_count,
-			chunks: RwLock::new(RapidHashMap::new()),
+			_arena_id: pool._arena_id,
+			_source: SourceIdentity::from_key(first_key),
+			_epoch: SourceEpoch::from_key(first_key),
+			_page_count: page_count,
+			_chunks: RwLock::new(RapidHashMap::new()),
 			entries: AtomicUsize::new(0),
 			global_entries: Arc::clone(&pool.locator_entries),
-			entry_budget: pool.capacity(),
+			_entry_budget: pool.capacity(),
 		})
 	}
 
@@ -188,7 +195,7 @@ impl SourceBoundLocator {
 		let index = self.exact_index(pool, key)?;
 		if let Some(locator) = self.load_locator(index) {
 			if pool.is_locator_resident(locator) {
-				return Some(ResolvedFrameHandle::new(pool.arena_id, key, locator));
+				return Some(ResolvedFrameHandle::new(pool._arena_id, key, locator));
 			}
 			self.clear_slot(index);
 		}
@@ -281,12 +288,12 @@ impl SourceBoundLocator {
 
 	/// Returns the number of allocated nonempty chunks.
 	pub fn chunk_count(&self) -> usize {
-		self.chunks.read().len()
+		self._chunks.read().len()
 	}
 
 	/// Returns the source page range accepted by this locator.
 	pub const fn page_count(&self) -> usize {
-		self.page_count
+		self._page_count
 	}
 
 	/// Returns whether a key belongs to this arena, source epoch, and page
@@ -297,23 +304,23 @@ impl SourceBoundLocator {
 
 	/// Returns the exact page-number slot only for this arena and source epoch.
 	fn exact_index(&self, pool: &AtomicArenaBufferPool, key: PageCacheKey) -> Option<usize> {
-		if pool.arena_id != self.arena_id
-			|| SourceIdentity::from_key(key) != self.source
-			|| SourceEpoch::from_key(key) != self.epoch
+		if pool._arena_id != self._arena_id
+			|| SourceIdentity::from_key(key) != self._source
+			|| SourceEpoch::from_key(key) != self._epoch
 		{
 			return None;
 		}
 		let index = usize::try_from(key.page_no().get()).ok()?;
-		(index < self.page_count).then_some(index)
+		(index < self._page_count).then_some(index)
 	}
 
 	/// Loads and decodes one compact locator slot.
 	fn load_locator(&self, index: usize) -> Option<FrameLocator> {
 		let chunk_index = index / DENSE_LOCATOR_LEAF_SLOTS;
 		let slot_index = index % DENSE_LOCATOR_LEAF_SLOTS;
-		let chunks = self.chunks.read();
+		let chunks = self._chunks.read();
 		let chunk = chunks.get(&chunk_index)?;
-		unpack_dense_locator(chunk.slots[slot_index].load(Ordering::Acquire))
+		unpack_dense_locator(chunk._slots[slot_index].load(Ordering::Acquire))
 	}
 
 	/// Stores one resident locator while enforcing the shared locator budget.
@@ -331,10 +338,10 @@ impl SourceBoundLocator {
 		// lock prevents removal while its update lock serializes the slot
 		// count.
 		{
-			let chunks = self.chunks.read();
+			let chunks = self._chunks.read();
 			if let Some(chunk) = chunks.get(&chunk_index) {
-				let _updates = chunk.updates.lock();
-				let slot = &chunk.slots[slot_index];
+				let _updates = chunk._updates.lock();
+				let slot = &chunk._slots[slot_index];
 				if slot.load(Ordering::Acquire) != 0 {
 					slot.store(packed, Ordering::Release);
 					return true;
@@ -346,12 +353,12 @@ impl SourceBoundLocator {
 			return false;
 		}
 		{
-			let chunks = self.chunks.read();
+			let chunks = self._chunks.read();
 			if let Some(chunk) = chunks.get(&chunk_index) {
-				let _updates = chunk.updates.lock();
-				let previous = chunk.slots[slot_index].swap(packed, Ordering::AcqRel);
+				let _updates = chunk._updates.lock();
+				let previous = chunk._slots[slot_index].swap(packed, Ordering::AcqRel);
 				if previous == 0 {
-					chunk.live.fetch_add(1, Ordering::Release);
+					chunk._live.fetch_add(1, Ordering::Release);
 					self.entries.fetch_add(1, Ordering::Release);
 				} else {
 					self.global_entries.fetch_sub(1, Ordering::AcqRel);
@@ -360,13 +367,13 @@ impl SourceBoundLocator {
 			}
 		}
 
-		let mut chunks = self.chunks.write();
+		let mut chunks = self._chunks.write();
 		let chunk =
 			Arc::clone(chunks.entry(chunk_index).or_insert_with(|| Arc::new(LocatorChunk::new())));
-		let _updates = chunk.updates.lock();
-		let previous = chunk.slots[slot_index].swap(packed, Ordering::AcqRel);
+		let _updates = chunk._updates.lock();
+		let previous = chunk._slots[slot_index].swap(packed, Ordering::AcqRel);
 		if previous == 0 {
-			chunk.live.fetch_add(1, Ordering::Release);
+			chunk._live.fetch_add(1, Ordering::Release);
 			self.entries.fetch_add(1, Ordering::Release);
 		} else {
 			self.global_entries.fetch_sub(1, Ordering::AcqRel);
@@ -379,7 +386,7 @@ impl SourceBoundLocator {
 		if self
 			.global_entries
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
-				(entries < self.entry_budget).then_some(entries + 1)
+				(entries < self._entry_budget).then_some(entries + 1)
 			})
 			.is_ok()
 		{
@@ -388,7 +395,7 @@ impl SourceBoundLocator {
 		self.prune_stale(pool);
 		self.global_entries
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
-				(entries < self.entry_budget).then_some(entries + 1)
+				(entries < self._entry_budget).then_some(entries + 1)
 			})
 			.is_ok()
 	}
@@ -397,16 +404,16 @@ impl SourceBoundLocator {
 	fn clear_slot(&self, index: usize) {
 		let chunk_index = index / DENSE_LOCATOR_LEAF_SLOTS;
 		let slot_index = index % DENSE_LOCATOR_LEAF_SLOTS;
-		let chunks = self.chunks.read();
+		let chunks = self._chunks.read();
 		let Some(chunk) = chunks.get(&chunk_index) else {
 			return;
 		};
 		let chunk = Arc::clone(chunk);
-		let _updates = chunk.updates.lock();
-		if chunk.slots[slot_index].swap(0, Ordering::AcqRel) == 0 {
+		let _updates = chunk._updates.lock();
+		if chunk._slots[slot_index].swap(0, Ordering::AcqRel) == 0 {
 			return;
 		}
-		chunk.live.fetch_sub(1, Ordering::AcqRel);
+		chunk._live.fetch_sub(1, Ordering::AcqRel);
 		self.entries.fetch_sub(1, Ordering::AcqRel);
 		self.global_entries.fetch_sub(1, Ordering::AcqRel);
 		drop(_updates);
@@ -417,14 +424,14 @@ impl SourceBoundLocator {
 	/// Clears stale generations without touching live resident frames.
 	fn prune_stale(&self, pool: &AtomicArenaBufferPool) {
 		let chunks = self
-			.chunks
+			._chunks
 			.read()
 			.iter()
 			.map(|(index, chunk)| (*index, Arc::clone(chunk)))
 			.collect::<Vec<_>>();
 		for (chunk_index, chunk) in chunks {
-			let updates = chunk.updates.lock();
-			for slot in &chunk.slots {
+			let updates = chunk._updates.lock();
+			for slot in &chunk._slots {
 				let raw = slot.load(Ordering::Acquire);
 				let Some(locator) = unpack_dense_locator(raw) else {
 					continue;
@@ -434,7 +441,7 @@ impl SourceBoundLocator {
 				{
 					continue;
 				}
-				chunk.live.fetch_sub(1, Ordering::AcqRel);
+				chunk._live.fetch_sub(1, Ordering::AcqRel);
 				self.entries.fetch_sub(1, Ordering::AcqRel);
 				self.global_entries.fetch_sub(1, Ordering::AcqRel);
 			}
@@ -445,12 +452,12 @@ impl SourceBoundLocator {
 
 	/// Removes an exact empty chunk without racing a concurrent insertion.
 	fn remove_empty_chunk(&self, chunk_index: usize, chunk: &Arc<LocatorChunk>) {
-		if chunk.live.load(Ordering::Acquire) != 0 {
+		if chunk._live.load(Ordering::Acquire) != 0 {
 			return;
 		}
-		let mut chunks = self.chunks.write();
+		let mut chunks = self._chunks.write();
 		let remove = chunks.get(&chunk_index).is_some_and(|current| Arc::ptr_eq(current, chunk))
-			&& chunk.live.load(Ordering::Acquire) == 0;
+			&& chunk._live.load(Ordering::Acquire) == 0;
 		if remove {
 			chunks.remove(&chunk_index);
 		}
@@ -460,11 +467,14 @@ impl SourceBoundLocator {
 impl Drop for SourceBoundLocator {
 	/// Returns this source's remaining slots to the arena-wide metadata budget.
 	fn drop(&mut self) {
+		// This destructor owns the outstanding charge even when locator lookup
+		// APIs are feature-gated.
 		self.global_entries.fetch_sub(self.entries.load(Ordering::Acquire), Ordering::AcqRel);
 	}
 }
 
 /// Packs one arena locator while preserving every frame-generation bit.
+#[cfg(feature = "storage-engine-prototype-api")]
 fn pack_dense_locator(locator: FrameLocator) -> u64 {
 	debug_assert!(locator.index as u64 <= DENSE_LOCATOR_INDEX_MASK);
 	debug_assert!(locator.generation <= MAX_GENERATION);
@@ -472,6 +482,7 @@ fn pack_dense_locator(locator: FrameLocator) -> u64 {
 }
 
 /// Decodes one nonempty compact arena locator.
+#[cfg(feature = "storage-engine-prototype-api")]
 fn unpack_dense_locator(raw: u64) -> Option<FrameLocator> {
 	(raw & DENSE_LOCATOR_VALID != 0).then_some(FrameLocator {
 		index: (raw & DENSE_LOCATOR_INDEX_MASK) as usize,

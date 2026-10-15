@@ -8,6 +8,7 @@ mod property;
 mod root;
 
 #[cfg(test)]
+/// Regression tests for statistics behavior.
 mod tests;
 
 pub(in crate::storage) use class::{
@@ -22,11 +23,7 @@ pub(in crate::storage) use property::{
 	decode_property_statistics_range,
 	encode_property_statistics,
 };
-pub(in crate::storage) use root::{
-	StatisticsLayout,
-	decode_statistics_root,
-	validate_statistics_file_lengths,
-};
+pub(in crate::storage) use root::{StatisticsLayout, decode_statistics_root};
 
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -93,6 +90,7 @@ pub(in crate::storage) fn encode_statistics(
 	})
 }
 
+/// Returns the checked page no result.
 fn checked_page_no(index: usize, base: u64, family: &str) -> FerrosGrynnResult<PageNo> {
 	let index = u64::try_from(index)
 		.map_err(|_error| invalid(format!("{family} page index exceeds u64")))?;
@@ -101,6 +99,7 @@ fn checked_page_no(index: usize, base: u64, family: &str) -> FerrosGrynnResult<P
 		.ok_or_else(|| invalid(format!("{family} page number overflows")))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

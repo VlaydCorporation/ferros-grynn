@@ -225,26 +225,32 @@ fn text(decoder: &mut Decoder<'_>, limit: usize) -> FerrosGrynnResult<Text> {
 }
 
 #[cfg(test)]
+/// Regression tests for graph index behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies tensor definition round trip requires full projection and
+	/// explicit budget.
 	#[test]
 	fn tensor_definition_round_trip_requires_full_projection_and_explicit_budget() {
 		for scope in [TensorScope::Local, TensorScope::Rooted] {
 			for format in
 				[TensorCacheFormat::Auto, TensorCacheFormat::Csr, TensorCacheFormat::Dense]
 			{
-				let mut index = GraphIndex::new_tensor("tensor", scope, format, 1 << 20).unwrap();
+				let mut index =
+					GraphIndex::new_tensor("tensor", scope, format, 1 << 20).assert_ok();
 				index.id = IndexId::new(9);
 				index.graph = GraphId::new(7);
 				let mut bytes = Vec::new();
-				encode(&mut bytes, &index).unwrap();
-				assert_eq!(entry(&bytes).unwrap(), index);
+				encode(&mut bytes, &index).assert_ok();
+				assert_eq!(entry(&bytes).assert_ok(), index);
 				assert!(index.clone().with_mode(TraversalSemantics::Node).validate().is_err());
 				assert!(
 					index.clone().with_direction(TraversalDirection::Forward).validate().is_err()
 				);
-				assert!(index.with_edge_labels(["edge"]).unwrap().validate().is_err());
+				assert!(index.with_edge_labels(["edge"]).assert_ok().validate().is_err());
 			}
 		}
 		assert!(
@@ -272,6 +278,7 @@ mod tests {
 		Ok(index)
 	}
 
+	/// Verifies graph index descriptor round trips and checks canonical bytes.
 	#[test]
 	fn graph_index_descriptor_round_trips_and_checks_canonical_bytes() {
 		let mut index = GraphIndex::new(
@@ -281,18 +288,18 @@ mod tests {
 			},
 			Some(1_000_000),
 		)
-		.unwrap()
+		.assert_ok()
 		.with_mode(TraversalSemantics::Atom)
 		.with_direction(TraversalDirection::Both)
 		.with_edge_labels(["b", "a"])
-		.unwrap();
+		.assert_ok();
 		index.id = IndexId::new(9);
 		index.graph = GraphId::new(7);
 		index.build_revision = 44;
 		index.comment = Some("snapshot".into());
 		let mut bytes = Vec::new();
-		encode(&mut bytes, &index).unwrap();
-		assert_eq!(entry(&bytes).unwrap(), index);
+		encode(&mut bytes, &index).assert_ok();
+		assert_eq!(entry(&bytes).assert_ok(), index);
 		assert_eq!(&bytes[..8], &[1, 0, 0, 0, 0, 0, 0, 0]);
 		assert_eq!(&bytes[20..44], &[
 			9, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 2, 0, 0, 0
@@ -300,7 +307,7 @@ mod tests {
 		for length in 0..bytes.len() {
 			assert!(entry(&bytes[..length]).is_err(), "prefix {length}");
 		}
-		let length = index.descriptor().unwrap().len();
+		let length = index.descriptor().assert_ok().len();
 		for (offset, value) in [
 			(0, 9),
 			(1, 1),

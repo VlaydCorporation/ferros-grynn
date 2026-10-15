@@ -39,25 +39,7 @@ impl Transaction {
 	///
 	/// Returns invalid-source, nonrestorable-capture, import-DDL, read-only or
 	/// resource errors. Rollback and savepoints discard the staged definition.
-	///
-	/// ```
-	/// use ferros_grynn::{
-	/// 	datastore::{ClassSchema, Datastore},
-	/// 	graph::AtomKind,
-	/// 	live::{LiveOptions, LiveQuery, LiveSource, LiveState},
-	/// };
-	/// # fn example() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
-	/// let store = Datastore::in_memory();
-	/// let mut tx = store.begin();
-	/// let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-	/// let id = tx.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-	/// tx.commit()?;
-	/// let info = store.begin().live_info(id)?;
-	/// assert_eq!(info.state(), LiveState::Active);
-	/// # Ok(()) }
-	/// # example()?;
-	/// # Ok::<(), ferros_grynn::gql_status::FerrosGrynnError>(())
-	/// ```
+	#[doc = include_str!("../../../docs/rustdoc/datastore-transaction-live-example-01.md")]
 	pub fn register_live(
 		&mut self,
 		query: LiveQuery,
@@ -461,6 +443,7 @@ pub(super) fn source_class(
 }
 
 #[cfg(test)]
+/// Regression tests for live behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -470,73 +453,85 @@ mod tests {
 
 	/// Publication and old snapshots preserve independent incarnation states.
 	#[test]
-	fn live_info_history_reads_prevent_stale_serializable_writes() -> FerrosGrynnResult<()> {
+	fn live_info_history_reads_prevent_stale_serializable_writes() {
 		use crate::{
 			changefeed::{ChangefeedConfig, ChangefeedSource},
 			datastore::{IsolationLevel, TransactionAccess, TransactionOptions},
+			test_assertions::AssertResult as _,
 			values::PropertyMap,
 		};
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
-		setup.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::new("P1D".parse()?)?,
-		)?;
+		let class = setup
+			.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		setup
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::new("P1D".parse().assert_ok()).assert_ok(),
+			)
+			.assert_ok();
 		let id = setup
-			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-		setup.commit()?;
+			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut reader = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Serializable,
 			TransactionAccess::ReadWrite,
 		));
 		assert_eq!(
-			reader.live_info(id)?.history().map(|history| history.last_stamp().get()),
+			reader.live_info(id).assert_ok().history().map(|history| history.last_stamp().get()),
 			Some(0)
 		);
 		let mut writer = store.begin();
-		writer.create_atom("item:new".parse()?, PropertyMap::new())?;
-		let changed = writer.commit()?.versionstamp();
+		writer.create_atom("item:new".parse().assert_ok(), PropertyMap::new()).assert_ok();
+		let changed = writer.commit().assert_ok().versionstamp();
 		assert_eq!(
-			store.begin().live_info(id)?.history().map(|history| history.last_stamp()),
+			store.begin().live_info(id).assert_ok().history().map(|history| history.last_stamp()),
 			Some(changed)
 		);
-		reader.create_atom("item:stale".parse()?, PropertyMap::new())?;
+		reader.create_atom("item:stale".parse().assert_ok(), PropertyMap::new()).assert_ok();
 		assert!(reader.commit().is_err(), "owned metadata must participate in SSI");
-		Ok(())
 	}
 
 	/// Owned metadata caps cover frozen vectors and names before cloning them.
 	#[test]
-	fn live_info_vector_admission_and_fixed_statement_snapshot() -> FerrosGrynnResult<()> {
-		use crate::datastore::{
-			FunctionId,
-			IsolationLevel,
-			SchemaVersion,
-			TransactionAccess,
-			TransactionOptions,
+	fn live_info_vector_admission_and_fixed_statement_snapshot() {
+		use crate::{
+			datastore::{
+				FunctionId,
+				IsolationLevel,
+				SchemaVersion,
+				TransactionAccess,
+				TransactionOptions,
+			},
+			test_assertions::AssertResult as _,
 		};
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+		let class = setup
+			.define_class(ClassSchema::new("item", AtomKind::Node, []).assert_ok())
+			.assert_ok();
 		let id = setup
-			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-		setup.commit()?;
+			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut reader = store.begin_with(TransactionOptions::new(
 			IsolationLevel::ReadCommitted,
 			TransactionAccess::ReadOnly,
 		));
-		let snapshot = reader.query_snapshot()?;
+		let snapshot = reader.query_snapshot().assert_ok();
 		let mut close = store.begin();
-		close.close_live(id)?;
-		close.commit()?;
-		assert_eq!(reader.live_info(id)?.state(), LiveState::Closed);
-		let fixed = reader.query_live_info(&snapshot, id, 1 << 20)?;
+		close.close_live(id).assert_ok();
+		close.commit().assert_ok();
+		assert_eq!(reader.live_info(id).assert_ok().state(), LiveState::Closed);
+		let fixed = reader.query_live_info(&snapshot, id, 1 << 20).assert_ok();
 		assert_eq!(fixed.state(), LiveState::Active);
 		assert_eq!(fixed.snapshot().get(), snapshot.commit_ts());
 		let mut definition = snapshot.logical_root().live_catalog().queries[&id].as_ref().clone();
 		let function = FunctionId::new(1)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture function id"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture function id"))
+			.assert_ok();
 		definition.functions = vec![(function, SchemaVersion::INITIAL); 8192];
 		assert!(definition.info_bounded(snapshot.logical_root(), 64 * 1024).is_err());
 		definition.functions.clear();
@@ -545,7 +540,8 @@ mod tests {
 		definition.record_sources.clear();
 		let mut root = snapshot.logical_root().as_ref().clone();
 		root.commit_ts = definition.starting_after + 8192;
-		let source = crate::changefeed::ChangefeedId::from_uuid(crate::values::Uuid::now_v7())?;
+		let source =
+			crate::changefeed::ChangefeedId::from_uuid(crate::values::Uuid::now_v7()).assert_ok();
 		let policy = crate::datastore::LiveCapturePolicy {
 			source,
 			revision: SchemaVersion::INITIAL,
@@ -554,11 +550,7 @@ mod tests {
 		let epochs = (0..4097_u64)
 			.map(|at| crate::datastore::LiveCaptureEpoch {
 				started_at: definition.starting_after + at + 1,
-				policy: if at % 2 == 0 {
-					Some(policy)
-				} else {
-					None
-				},
+				policy: (at % 2 == 0).then_some(policy),
 			})
 			.collect::<Vec<_>>();
 		Arc::make_mut(root.live_catalog_mut()).histories.insert(
@@ -575,62 +567,67 @@ mod tests {
 		);
 		let slots = 4097 * std::mem::size_of::<crate::live::LiveCaptureEpoch>();
 		let bytes = std::mem::size_of::<LiveInfo>() + slots + 4096;
-		let info = definition.info_bounded(&root, bytes)?;
+		let info = definition.info_bounded(&root, bytes).assert_ok();
 		let history = info
 			.history()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture public epochs"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture public epochs"))
+			.assert_ok();
 		assert_eq!(
 			history.epochs.capacity(),
 			4097,
 			"fallible collection must not grow beyond admitted slots"
 		);
 		assert!(definition.info_bounded(&root, slots - 1).is_err());
-		Ok(())
 	}
 
 	/// Publication and old snapshots preserve independent incarnation states.
 	#[test]
-	fn live_registration_replacement_and_close_are_transactional() -> FerrosGrynnResult<()> {
+	fn live_registration_replacement_and_close_are_transactional() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
 		let query = LiveQuery::new(LiveSource::Class(class));
-		let id = tx.register_live(query.clone(), LiveOptions::default())?;
-		assert_eq!(tx.live_info(id)?.state(), LiveState::Pending);
+		let id = tx.register_live(query.clone(), LiveOptions::default()).assert_ok();
+		assert_eq!(tx.live_info(id).assert_ok().state(), LiveState::Pending);
 		assert!(store.begin().live_info(id).is_err());
-		let stamp = tx.commit()?.versionstamp();
+		let stamp = tx.commit().assert_ok().versionstamp();
 		let mut old = store.begin();
-		let info = old.live_info(id)?;
+		let info = old.live_info(id).assert_ok();
 		assert_eq!(info.state(), LiveState::Active);
 		assert_eq!(info.defined_at(), stamp);
 		assert_eq!(info.cursor().versionstamp(), stamp);
 		let mut first = store.begin();
 		let mut second = store.begin();
-		let replacement = first.reregister_live(id, query, LiveOptions::default())?;
-		second.close_live(id)?;
+		let replacement = first.reregister_live(id, query, LiveOptions::default()).assert_ok();
+		second.close_live(id).assert_ok();
 		assert_ne!(replacement, id);
-		first.commit()?;
+		first.commit().assert_ok();
 		assert!(second.commit().is_err());
-		assert_eq!(store.begin().live_info(id)?.state(), LiveState::Closed);
-		assert_eq!(store.begin().live_info(replacement)?.state(), LiveState::Active);
-		assert_eq!(old.live_info(id)?.state(), LiveState::Active);
-		Ok(())
+		assert_eq!(store.begin().live_info(id).assert_ok().state(), LiveState::Closed);
+		assert_eq!(store.begin().live_info(replacement).assert_ok().state(), LiveState::Active);
+		assert_eq!(old.live_info(id).assert_ok().state(), LiveState::Active);
 	}
 
 	/// Savepoints discard recipes, and failed atomic replacement keeps the old
 	/// one.
 	#[test]
-	fn live_savepoint_and_replacement_failure_preserve_registry() -> FerrosGrynnResult<()> {
+	fn live_savepoint_and_replacement_failure_preserve_registry() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
 		let query = LiveQuery::new(LiveSource::Class(class));
 		let saved = tx.gql_savepoint();
-		let discarded = tx.register_live(query.clone(), LiveOptions::default())?;
+		let discarded = tx.register_live(query.clone(), LiveOptions::default()).assert_ok();
 		tx.restore_gql_savepoint(saved);
 		assert!(tx.live_info(discarded).is_err());
-		let kept = tx.register_live(query, LiveOptions::default())?;
-		tx.commit()?;
+		let kept = tx.register_live(query, LiveOptions::default()).assert_ok();
+		tx.commit().assert_ok();
 		let mut replace = store.begin();
 		// Replacement is atomic even when ordinary mutation rollback is
 		// disabled.
@@ -639,40 +636,49 @@ mod tests {
 			replace
 				.reregister_live(
 					kept,
-					LiveQuery::new(LiveSource::Record("missing:a".parse()?)),
+					LiveQuery::new(LiveSource::Record("missing:a".parse().assert_ok())),
 					LiveOptions::default(),
 				)
 				.is_err()
 		);
-		assert_eq!(replace.live_info(kept)?.state(), LiveState::Active);
+		assert_eq!(replace.live_info(kept).assert_ok().state(), LiveState::Active);
 		let before = replace.mutations.len();
-		replace.close_live(kept)?;
-		replace.close_live(kept)?;
+		replace.close_live(kept).assert_ok();
+		replace.close_live(kept).assert_ok();
 		assert_eq!(replace.mutations.len(), before + 1);
-		replace.commit()?;
-		Ok(())
+		replace.commit().assert_ok();
 	}
 
 	/// Resource rejection does not retain a definition or commit an empty
 	/// write.
 	#[test]
-	fn live_registration_budget_and_aborted_transaction_do_not_publish() -> FerrosGrynnResult<()> {
+	fn live_registration_budget_and_aborted_transaction_do_not_publish() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let class = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let stamp = setup.commit()?.versionstamp();
+		let class = setup
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let stamp = setup.commit().assert_ok().versionstamp();
 		let mut discarded = store.begin();
 		let id = discarded
-			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
 		drop(discarded);
 		assert!(store.begin().live_info(id).is_err());
-		assert_eq!(store.begin().commit()?.versionstamp(), stamp);
-		let mut limits = InMemoryOptions::default();
-		limits.max_write_set_bytes = SCHEMA_WRITE_BYTES;
+		assert_eq!(store.begin().commit().assert_ok().versionstamp(), stamp);
+		let limits_defaults = InMemoryOptions::default();
+		let limits = InMemoryOptions {
+			max_write_set_bytes: SCHEMA_WRITE_BYTES,
+			..limits_defaults
+		};
 		let limited = Datastore::in_memory_with(limits);
 		let mut setup = limited.begin();
-		let class = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		setup.commit()?;
+		let class = setup
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut rejected = limited.begin();
 		assert!(
 			rejected
@@ -681,20 +687,20 @@ mod tests {
 		);
 		assert!(rejected.working.live_catalog().queries.is_empty());
 		assert!(rejected.mutations.is_empty());
-		Ok(())
 	}
 
 	/// Empty sources retain effect/capture checks, and lowering checks budgets.
 	#[test]
-	fn live_empty_graph_inputs_and_lowering_admission_are_checked() -> FerrosGrynnResult<()> {
+	fn live_empty_graph_inputs_and_lowering_admission_are_checked() {
 		use crate::{
 			graph::GraphKind,
 			live::{LiveExpr, LivePath, LiveProjection},
+			test_assertions::AssertResult as _,
 			values::Value,
 		};
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let graph = tx.define_graph("scope", GraphKind::Graph)?;
+		let graph = tx.define_graph("scope", GraphKind::Graph).assert_ok();
 		for expression in [
 			LiveExpr::Call {
 				name: "time::now".into(),
@@ -709,111 +715,138 @@ mod tests {
 		assert!(tx.working.live_catalog().queries.is_empty());
 		let query = LiveQuery::new(LiveSource::Graph(graph.clone()))
 			.with_projection(LiveProjection::Value(LiveExpr::Literal(Value::Null)));
-		tx.register_live(query, LiveOptions::default())?;
+		tx.register_live(query, LiveOptions::default()).assert_ok();
 		for index in 0..10 {
-			tx.define_class(ClassSchema::new(format!("c{index}"), AtomKind::Node, [])?)?;
+			tx.define_class(ClassSchema::new(format!("c{index}"), AtomKind::Node, []).assert_ok())
+				.assert_ok();
 		}
 		for fetch in [false, true] {
-			let path = LivePath::field("x".repeat(16 * 1024))?;
+			let path = LivePath::field("x".repeat(16 * 1024)).assert_ok();
 			let query = if fetch {
 				LiveQuery::new(LiveSource::Graph(graph.clone())).with_fetch(vec![path])
 			} else {
 				LiveQuery::new(LiveSource::Graph(graph.clone()))
 					.with_projection(LiveProjection::Value(LiveExpr::Field(path)))
 			};
-			let options = LiveOptions::default().with_budgets(256 * 1024, 1_000_000)?;
-			let error = tx.register_live(query, options).err().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("oversized repeated names were admitted")
-			})?;
+			let options = LiveOptions::default().with_budgets(256 * 1024, 1_000_000).assert_ok();
+			let error = tx
+				.register_live(query, options)
+				.err()
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("oversized repeated names were admitted")
+				})
+				.assert_ok();
 			assert!(error.to_string().contains("LIVE registration scratch"), "{error}");
 		}
 		let query = LiveQuery::new(LiveSource::Graph(graph))
 			.with_projection(LiveProjection::Value(LiveExpr::Literal(Value::Null)));
-		assert!(tx.register_live(query, LiveOptions::default().with_budgets(1 << 20, 1)?).is_err());
+		assert!(
+			tx.register_live(query, LiveOptions::default().with_budgets(1 << 20, 1).assert_ok())
+				.is_err()
+		);
 		assert_eq!(tx.working.live_catalog().queries.len(), 1);
-		Ok(())
 	}
 
 	/// Wide schemas and named bodies cannot bypass registration admission.
 	#[test]
-	fn live_registration_admits_schema_and_pure_compilation_before_analysis()
-	-> FerrosGrynnResult<()> {
+	fn live_registration_admits_schema_and_pure_compilation_before_analysis() {
 		use crate::{
 			datastore::{ClassField, FunctionEffect, SchemaFunction},
 			live::{LiveExpr, LiveProjection},
+			test_assertions::AssertResult as _,
 			values::Type,
 		};
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let wide = tx.define_class(ClassSchema::new(
-			"wide",
-			AtomKind::Node,
-			(0..1000).map(|index| {
-				ClassField::new(format!("f{index}"), Type::Array(Box::new(Type::Int)))
-			}),
-		)?)?;
+		let wide = tx
+			.define_class(
+				ClassSchema::new(
+					"wide",
+					AtomKind::Node,
+					(0..1000).map(|index| {
+						ClassField::new(format!("f{index}"), Type::Array(Box::new(Type::Int)))
+					}),
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
 		for (scratch, work) in [(64 * 1024, 1_000_000), (1 << 20, 1)] {
 			assert!(
 				tx.register_live(
 					LiveQuery::new(LiveSource::Class(wide)),
-					LiveOptions::default().with_budgets(scratch, work)?
+					LiveOptions::default().with_budgets(scratch, work).assert_ok()
 				)
 				.is_err()
 			);
 		}
-		let rich =
-			tx.define_class(ClassSchema::new("rich", AtomKind::Node, [ClassField::new(
-				"payload",
-				Type::Union(vec![Type::Int; 4096]),
-			)])?)?;
+		let rich = tx
+			.define_class(
+				ClassSchema::new("rich", AtomKind::Node, [ClassField::new(
+					"payload",
+					Type::Union(vec![Type::Int; 4096]),
+				)])
+				.assert_ok(),
+			)
+			.assert_ok();
 		for segments in [
 			vec!["payload".into()],
 			vec!["PAYLOAD".into()],
 			vec!["rich".into(), "payload".into()],
 			vec!["RICH".into(), "PAYLOAD".into()],
 		] {
-			let path = crate::live::LivePath::new(segments)?;
+			let path = crate::live::LivePath::new(segments).assert_ok();
 			let fields = (0..100)
 				.map(|index| {
 					Ok(crate::live::LiveField::new(LiveExpr::Field(path.clone()))
 						.with_alias(crate::live::LivePath::field(format!("p{index}"))?))
 				})
-				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				.collect::<FerrosGrynnResult<Vec<_>>>()
+				.assert_ok();
 			let query = LiveQuery::new(LiveSource::Class(rich))
 				.with_projection(LiveProjection::Fields(fields));
 			let error = tx
 				.register_live(
 					query.clone(),
-					LiveOptions::default().with_budgets(4 << 20, 1_000_000)?,
+					LiveOptions::default().with_budgets(4 << 20, 1_000_000).assert_ok(),
 				)
 				.err()
 				.ok_or_else(|| {
 					FerrosGrynnError::invalid_argument("rich type multiplicity was admitted")
-				})?;
+				})
+				.assert_ok();
 			assert!(error.to_string().contains("LIVE registration scratch"), "{error}");
 			let saved = tx.gql_savepoint();
 			// The optimizer copy is now admitted too; a narrower projection
 			// demonstrates the same rich type contract within the default cap.
 			let LiveProjection::Fields(fields) = query.projection() else {
-				return Err(FerrosGrynnError::invalid_argument("fixture projection"));
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("fixture projection"));
+					test_result.assert_ok();
+				};
 			};
 			let query = query
 				.clone()
 				.with_projection(LiveProjection::Fields(fields.iter().take(10).cloned().collect()));
-			tx.register_live(query, LiveOptions::default())?;
+			tx.register_live(query, LiveOptions::default()).assert_ok();
 			tx.restore_gql_savepoint(saved);
 		}
-		let narrow = tx.define_class(ClassSchema::new("narrow", AtomKind::Node, [])?)?;
-		tx.define_function(SchemaFunction::new(
-			"fn",
-			"large",
-			Vec::new(),
-			Type::String,
-			FunctionEffect::Pure,
-			false,
-			None,
-			format!("{{ RETURN \"{}\"; }}", "x".repeat(8192)),
-		)?)?;
+		let narrow =
+			tx.define_class(ClassSchema::new("narrow", AtomKind::Node, []).assert_ok()).assert_ok();
+		tx.define_function(
+			SchemaFunction::new(
+				"fn",
+				"large",
+				Vec::new(),
+				Type::String,
+				FunctionEffect::Pure,
+				false,
+				None,
+				format!("{{ RETURN \"{}\"; }}", "x".repeat(8192)),
+			)
+			.assert_ok(),
+		)
+		.assert_ok();
 		let query = LiveQuery::new(LiveSource::Class(narrow)).with_projection(
 			LiveProjection::Value(LiveExpr::Call {
 				name: "fn::large".into(),
@@ -823,104 +856,125 @@ mod tests {
 		let error = tx
 			.register_live(
 				query.clone(),
-				LiveOptions::default().with_budgets(64 * 1024, 1_000_000)?,
+				LiveOptions::default().with_budgets(64 * 1024, 1_000_000).assert_ok(),
 			)
 			.err()
 			.ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("oversized PURE compiler input was admitted")
-			})?;
+			})
+			.assert_ok();
 		assert!(error.to_string().contains("PURE compiler scratch"), "{error}");
 		let error = tx
-			.register_live(query, LiveOptions::default().with_budgets(64 * 1024 * 1024, 10)?)
+			.register_live(
+				query,
+				LiveOptions::default().with_budgets(64 * 1024 * 1024, 10).assert_ok(),
+			)
 			.err()
 			.ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("oversized PURE compiler work was admitted")
-			})?;
+			})
+			.assert_ok();
 		assert!(error.to_string().contains("PURE compiler work"), "{error}");
 		assert!(tx.working.live_catalog().queries.is_empty());
-		Ok(())
 	}
 
 	/// Record names never rebind within a captured ReadCommitted statement.
 	#[test]
-	fn live_record_registration_keeps_statement_owner_until_validation() -> FerrosGrynnResult<()> {
-		use crate::datastore::{IsolationLevel, TransactionAccess, TransactionOptions};
+	fn live_record_registration_keeps_statement_owner_until_validation() {
+		use crate::{
+			datastore::{IsolationLevel, TransactionAccess, TransactionOptions},
+			test_assertions::AssertResult as _,
+		};
 		for scoped in [false, true] {
 			let store = Datastore::in_memory();
 			let mut setup = store.begin();
-			let owner = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-			let graph = setup.define_graph("single", crate::graph::GraphKind::Graph)?;
-			setup.commit()?;
+			let owner = setup
+				.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+				.assert_ok();
+			let graph = setup.define_graph("single", crate::graph::GraphKind::Graph).assert_ok();
+			setup.commit().assert_ok();
 			let mut reader = store.begin_with(TransactionOptions::new(
 				IsolationLevel::ReadCommitted,
 				TransactionAccess::ReadWrite,
 			));
-			let id = reader.run_gql_statement(|reader| {
-				let mut writer = store.begin();
-				writer.remove_class("person")?;
-				let replacement =
-					writer.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-				assert_ne!(owner, replacement);
-				writer.commit()?;
-				reader.register_live(
-					LiveQuery::new(if scoped {
-						LiveSource::GraphRecord {
-							graph: graph.clone(),
-							record: "person:a".parse()?,
-						}
-					} else {
-						LiveSource::Record("person:a".parse()?)
-					}),
-					LiveOptions::default(),
-				)
-			})?;
+			let id = reader
+				.run_gql_statement(|reader| {
+					let mut writer = store.begin();
+					writer.remove_class("person")?;
+					let replacement =
+						writer.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+					assert_ne!(owner, replacement);
+					writer.commit()?;
+					reader.register_live(
+						LiveQuery::new(if scoped {
+							LiveSource::GraphRecord {
+								graph: graph.clone(),
+								record: "person:a".parse()?,
+							}
+						} else {
+							LiveSource::Record("person:a".parse()?)
+						}),
+						LiveOptions::default(),
+					)
+				})
+				.assert_ok();
 			assert_eq!(reader.working.live_catalog().queries[&id].source_class, Some(owner));
 			assert!(reader.commit().is_err());
 			assert!(store.begin().live_info(id).is_err());
 		}
-		Ok(())
 	}
 
 	/// Nested sources retain their class incarnation even before any matching
 	/// occurrence exists; a reused name pauses the binding instead of
 	/// rebinding.
 	#[test]
-	fn live_graph_record_nested_binding_keeps_owner() -> FerrosGrynnResult<()> {
-		use crate::live::{LiveBindingOptions, LiveExpr, LiveProjection};
+	fn live_graph_record_nested_binding_keeps_owner() {
+		use crate::{
+			live::{LiveBindingOptions, LiveExpr, LiveProjection},
+			test_assertions::AssertResult as _,
+		};
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
-		let owner = setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let graph = setup.define_graph("single", crate::graph::GraphKind::Graph)?;
-		let id = setup.define_live_binding(
-			LiveExpr::Select(Box::new(
-				LiveQuery::new(LiveSource::GraphRecord {
-					graph,
-					record: "person:a".parse()?,
-				})
-				.with_projection(LiveProjection::Value(LiveExpr::Call {
-					name: "count".into(),
-					arguments: Vec::new(),
-				})),
-			)),
-			crate::values::Object::new(),
-			LiveBindingOptions::default(),
-		)?;
-		setup.commit()?;
-		assert_eq!(store.begin().live_binding_value(id)?, crate::values::Value::from(0));
+		let owner = setup
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let graph = setup.define_graph("single", crate::graph::GraphKind::Graph).assert_ok();
+		let id = setup
+			.define_live_binding(
+				LiveExpr::Select(Box::new(
+					LiveQuery::new(LiveSource::GraphRecord {
+						graph,
+						record: "person:a".parse().assert_ok(),
+					})
+					.with_projection(LiveProjection::Value(LiveExpr::Call {
+						name: "count".into(),
+						arguments: Vec::new(),
+					})),
+				)),
+				crate::values::Object::new(),
+				LiveBindingOptions::default(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
+		assert_eq!(store.begin().live_binding_value(id).assert_ok(), crate::values::Value::from(0));
 		let mut update = store.begin();
-		update.remove_class("person")?;
-		let replacement = update.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+		update.remove_class("person").assert_ok();
+		let replacement = update
+			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
+			.assert_ok();
 		assert_ne!(owner, replacement);
-		update.commit()?;
-		assert_eq!(store.begin().live_binding_info(id)?.state(), crate::live::LiveState::Paused);
+		update.commit().assert_ok();
+		assert_eq!(
+			store.begin().live_binding_info(id).assert_ok().state(),
+			crate::live::LiveState::Paused
+		);
 		assert!(store.begin().live_binding_value(id).is_err());
-		Ok(())
 	}
 
 	/// Root-bound values preserve existing SELECT semantics and exact
 	/// identities.
 	#[test]
-	fn live_root_expression_select_fetch_and_frozen_inputs() -> FerrosGrynnResult<()> {
+	fn live_root_expression_select_fetch_and_frozen_inputs() {
 		use std::{cell::RefCell, collections::BTreeSet};
 
 		use crate::{
@@ -933,28 +987,36 @@ mod tests {
 				LivePath,
 				LiveProjection,
 			},
+			test_assertions::AssertResult as _,
 			values::{Object, PropertyMap, Type, Value},
 		};
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [
-			ClassField::new("age", Type::Int),
-			ClassField::new("manager", Type::Option(Box::new(Type::Record))),
-		])?)?;
-		let age = tx.intern_property("age")?;
-		let manager = tx.intern_property("manager")?;
-		let alice = "person:alice".parse()?;
-		let bob: crate::values::RecordId = "person:bob".parse()?;
+		let class = tx
+			.define_class(
+				ClassSchema::new("person", AtomKind::Node, [
+					ClassField::new("age", Type::Int),
+					ClassField::new("manager", Type::Option(Box::new(Type::Record))),
+				])
+				.assert_ok(),
+			)
+			.assert_ok();
+		let age = tx.intern_property("age").assert_ok();
+		let manager = tx.intern_property("manager").assert_ok();
+		let alice = "person:alice".parse().assert_ok();
+		let bob: crate::values::RecordId = "person:bob".parse().assert_ok();
 		tx.create_atom(
 			alice,
 			PropertyMap::from_iter([
 				(age, Value::from(9_007_199_254_740_993_i64)),
 				(manager, Value::Record(Box::new(bob.clone()))),
 			]),
-		)?;
-		tx.create_atom(bob.clone(), PropertyMap::from_iter([(age, Value::from(42_i64))]))?;
-		let graph = tx.define_graph("scope", crate::graph::GraphKind::Graph)?;
-		tx.attach_node(graph.id(), &"person:alice".parse()?, None, None)?;
+		)
+		.assert_ok();
+		tx.create_atom(bob.clone(), PropertyMap::from_iter([(age, Value::from(42_i64))]))
+			.assert_ok();
+		let graph = tx.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
+		tx.attach_node(graph.id(), &"person:alice".parse().assert_ok(), None, None).assert_ok();
 		let root = Arc::new(tx.working.clone());
 		let dependencies = RefCell::new(BTreeSet::new());
 		let observe = |key| {
@@ -962,7 +1024,7 @@ mod tests {
 		};
 		let mut parameters = Object::new();
 		parameters.insert("fixed", Value::from(3_i64));
-		let binding = LiveBindingId::from_uuid(crate::values::Uuid::now_v7())?;
+		let binding = LiveBindingId::from_uuid(crate::values::Uuid::now_v7()).assert_ok();
 		let binding_value = Value::from(5_i64);
 		let values = |id| {
 			if id == binding {
@@ -987,7 +1049,8 @@ mod tests {
 			evaluate(
 				&LiveExpr::Parameter("fixed".into())
 					.binary(LiveBinaryOperator::Add, LiveExpr::Binding(binding))
-			)?,
+			)
+			.assert_ok(),
 			Value::from(8_i64)
 		);
 		let count = |source| {
@@ -998,36 +1061,47 @@ mod tests {
 				}),
 			)))
 		};
-		assert_eq!(evaluate(&count(LiveSource::Class(class)))?, Value::from(2_i64));
+		assert_eq!(evaluate(&count(LiveSource::Class(class))).assert_ok(), Value::from(2_i64));
 		assert_eq!(
 			evaluate(&count(LiveSource::GraphClass {
 				graph: graph.clone(),
 				class
-			}))?,
+			}))
+			.assert_ok(),
 			Value::from(1_i64)
 		);
 		let query = LiveExpr::Select(Box::new(
-			LiveQuery::new(LiveSource::Record("person:alice".parse()?))
-				.with_fetch(vec![LivePath::field("manager")?]),
+			LiveQuery::new(LiveSource::Record("person:alice".parse().assert_ok()))
+				.with_fetch(vec![LivePath::field("manager").assert_ok()]),
 		));
-		let Value::Object(record) = evaluate(&query)? else {
-			return Err(FerrosGrynnError::invalid_argument("root SELECT returned no record"));
+		let Value::Object(record) = evaluate(&query).assert_ok() else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("root SELECT returned no record"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(record.get("age"), Some(&Value::from(9_007_199_254_740_993_i64)));
 		let Value::Object(fetched) = record
 			.get("manager")
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("missing manager"))?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("missing manager"))
+			.assert_ok()
 		else {
-			return Err(FerrosGrynnError::invalid_argument("FETCH did not resolve its record"));
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("FETCH did not resolve its record"));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(fetched.get("age"), Some(&Value::from(42_i64)));
 		assert!(dependencies.borrow().contains(&ConflictKey::BaseClassRange(class)));
 		assert!(dependencies.borrow().contains(&ConflictKey::GraphClassRange(graph.id(), class)));
 		let bob_id = root
 			.resolve_atom(&bob)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("missing Bob"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("missing Bob"))
+			.assert_ok();
 		assert!(dependencies.borrow().contains(&ConflictKey::BaseAtom(bob_id)));
-		let limited = LiveBindingOptions::default().with_budgets(1024, 1_000_000)?;
+		let limited = LiveBindingOptions::default().with_budgets(1024, 1_000_000).assert_ok();
 		assert!(
 			crate::gql::live_lowering::evaluate_binding(
 				&root,
@@ -1040,31 +1114,36 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 
 	/// Shared SELECT special materialization keeps named calls and lazy
 	/// branches.
 	#[test]
-	fn live_root_expression_named_select_and_short_circuit() -> FerrosGrynnResult<()> {
+	fn live_root_expression_named_select_and_short_circuit() {
 		use crate::{
 			datastore::{FunctionEffect, SchemaFunction, SchemaFunctionParameter},
 			live::{LiveBinaryOperator, LiveBindingOptions, LiveExpr, LiveProjection},
+			test_assertions::AssertResult as _,
 			values::{Object, Type, Value},
 		};
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		tx.define_function(SchemaFunction::new(
-			"fn",
-			"identity",
-			vec![SchemaFunctionParameter::new("value", Type::Any)?],
-			Type::Any,
-			FunctionEffect::Pure,
-			false,
-			None,
-			"{ RETURN $value; }",
-		)?)?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		tx.define_function(
+			SchemaFunction::new(
+				"fn",
+				"identity",
+				vec![SchemaFunctionParameter::new("value", Type::Any).assert_ok()],
+				Type::Any,
+				FunctionEffect::Pure,
+				false,
+				None,
+				"{ RETURN $value; }",
+			)
+			.assert_ok(),
+		)
+		.assert_ok();
 		let root = Arc::new(tx.working.clone());
 		let captures = Object::new();
 		let missing = |_id| Err(FerrosGrynnError::invalid_argument("unexpected binding"));
@@ -1092,8 +1171,9 @@ mod tests {
 			name: "fn::identity".into(),
 			arguments: vec![count],
 		};
-		assert_eq!(evaluate(&call)?, Value::from(0_i64));
-		tx.create_atom("person:a".parse()?, crate::values::PropertyMap::new())?;
+		assert_eq!(evaluate(&call).assert_ok(), Value::from(0_i64));
+		tx.create_atom("person:a".parse().assert_ok(), crate::values::PropertyMap::new())
+			.assert_ok();
 		let root = Arc::new(tx.working.clone());
 		let failing = LiveExpr::Select(Box::new(
 			LiveQuery::new(LiveSource::Class(class)).with_projection(LiveProjection::Value(
@@ -1114,7 +1194,8 @@ mod tests {
 				&LiveBindingOptions::default(),
 				tx.query_scratch_root(),
 				&observe
-			)?
+			)
+			.assert_ok()
 			.value,
 			Value::Bool(false)
 		);
@@ -1134,27 +1215,33 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 
 	/// Recovered stamps are bounded by the root clock, independent of
 	/// filenames.
 	#[test]
-	fn live_catalog_recovery_requires_authoritative_commit_bounds() -> FerrosGrynnResult<()> {
+	fn live_catalog_recovery_requires_authoritative_commit_bounds() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let mut tx = store.begin();
-		let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let id =
-			tx.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
-		let stamp = tx.commit()?.versionstamp().get();
-		let root = store.begin().working.clone();
-		root.live_catalog().validate_recovered(stamp)?;
+		let class =
+			tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let id = tx
+			.register_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())
+			.assert_ok();
+		let stamp = tx.commit().assert_ok().versionstamp().get();
+		let root = store.begin().working;
+		root.live_catalog().validate_recovered(stamp).assert_ok();
 		for ack in [false, true] {
 			let mut catalog = root.live_catalog().as_ref().clone();
-			let entry =
-				Arc::make_mut(catalog.queries.get_mut(&id).ok_or_else(|| {
-					FerrosGrynnError::invalid_argument("missing test definition")
-				})?);
+			let entry = Arc::make_mut(
+				catalog
+					.queries
+					.get_mut(&id)
+					.ok_or_else(|| FerrosGrynnError::invalid_argument("missing test definition"))
+					.assert_ok(),
+			);
 			if ack {
 				entry.acknowledged = stamp + 1;
 			} else {
@@ -1162,6 +1249,5 @@ mod tests {
 			}
 			assert!(catalog.validate_recovered(stamp).is_err());
 		}
-		Ok(())
 	}
 }

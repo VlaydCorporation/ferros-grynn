@@ -28,8 +28,12 @@ use crate::{
 	values::{Object, Text, Value},
 };
 
+/// A durable bridge descriptor paired with its query-scoped runtime adapter.
+type BoundBridgeAdapter = (Arc<BridgeDatabase>, Arc<dyn Bridge>);
+
 /// One independent external effect; local query success is retained separately.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BridgeEffectOutcome {
 	/// Stable operation identity for explicit retry/resume.
 	pub mapping: BridgeMappingRef,
@@ -40,6 +44,7 @@ pub struct BridgeEffectOutcome {
 /// Owned local results and external outcomes after the ordinary commit
 /// barriers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BridgeQueryResult {
 	/// Ordinary local query results, including committed local success.
 	pub results: Vec<QueryResult>,
@@ -71,6 +76,7 @@ pub trait FerrosQueryBridgeExt: Sized {
 	fn use_bridge<B: Bridge + 'static>(self, adapter: B, data: BridgeData<'_>) -> Self;
 }
 impl FerrosQueryBridgeExt for BridgeQuery {
+	/// Returns use bridge for `BridgeQuery`.
 	fn use_bridge<B: Bridge + 'static>(self, adapter: B, data: BridgeData<'_>) -> Self {
 		BridgeQuery::use_bridge(self, adapter, data)
 	}
@@ -186,8 +192,13 @@ impl SourceBinding {
 
 /// Cancelling an orchestration future also interrupts its blocking query
 /// worker.
-pub struct CancelOnDrop(pub(crate) QueryCancellation);
+pub struct CancelOnDrop(
+	/// Cancelling an orchestration future also interrupts its blocking query
+	/// worker.
+	pub(crate) QueryCancellation,
+);
 impl Drop for CancelOnDrop {
+	/// Runs cleanup for this `CancelOnDrop` before its fields are released.
 	fn drop(&mut self) {
 		self.0.cancel();
 	}
@@ -207,7 +218,7 @@ impl BridgeQuery {
 	}
 
 	/// Supplies receiving parameters; bridge parameters are applied afterwards.
-	#[must_use]
+	#[must_use = "the updated query builder must be executed"]
 	pub fn bind(mut self, variables: Object) -> Self {
 		for (name, value) in variables {
 			self.variables.insert(name, value);
@@ -216,7 +227,7 @@ impl BridgeQuery {
 	}
 
 	/// Supplies parser, cancellation, deadline and bounded-resource controls.
-	#[must_use]
+	#[must_use = "the updated query builder must be executed"]
 	pub fn options(mut self, options: QueryExecutionOptions) -> Self {
 		self.options = options;
 		self
@@ -224,7 +235,7 @@ impl BridgeQuery {
 
 	/// Adds one query-scoped external source without importing atoms or
 	/// classes.
-	#[must_use]
+	#[must_use = "the updated query builder must be executed"]
 	pub fn use_bridge<B: Bridge + 'static>(mut self, adapter: B, data: BridgeData<'_>) -> Self {
 		match SourceBinding::new(Arc::new(adapter), data) {
 			Ok(binding) if !binding.internal => self.sources.push(binding),
@@ -276,7 +287,7 @@ impl BridgeQuery {
 		};
 		let mut context = context;
 		context.options.cancellation = Some(cancellation);
-		context.options.bridge_memory = Some(memory);
+		context.options.context.bridge_memory = Some(memory);
 		let (scope, receiver) = BridgeQueryScope::new(&self.store, context.clone())?;
 		for source in self.sources.drain(..) {
 			scope.attach_source(&self.store, &source.adapter)?;
@@ -294,7 +305,7 @@ impl BridgeQuery {
 			.ok_or_else(|| FerrosGrynnError::operation_overflow("bridge parameter bytes"))?;
 		context.admit_bytes(binding_bytes)?;
 		self.options = context.options.clone();
-		self.options.bridge_scope = Some(scope.clone());
+		self.options.context.bridge_scope = Some(scope.clone());
 		let store = self.store.clone();
 		let source = self.source;
 		let variables = self.variables;
@@ -376,8 +387,8 @@ pub async fn internal_query(
 	mut context: BridgeContext,
 ) -> FerrosGrynnResult<Value> {
 	context.check()?;
-	context.options.bridge_scope = None;
-	context.options.bridge_read_only = true;
+	context.options.context.bridge_scope = None;
+	context.options.context.bridge_read_only = true;
 	let program = crate::gql::parse(&source, context.options.parser_settings)?;
 	if program.statements.len() != 1 {
 		return Err(FerrosGrynnError::bridge_operation_error(
@@ -386,7 +397,7 @@ pub async fn internal_query(
 	}
 	let (scope, receiver) = BridgeQueryScope::new(&store, context.clone())?;
 	let mut options = context.options();
-	options.bridge_scope = Some(scope.clone());
+	options.context.bridge_scope = Some(scope.clone());
 	let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
 		FerrosGrynnError::bridge_operation_error(
 			"InternalQuery requires a Tokio runtime with time enabled",
@@ -434,7 +445,7 @@ pub struct BridgeQueryScope {
 	/// Shared interruption authority and boundary memory account.
 	pub(crate) context: BridgeContext,
 	/// Query-scoped runtime clients paired with their durable descriptors.
-	adapters: Mutex<BTreeMap<BridgeDatabaseId, (Arc<BridgeDatabase>, Arc<dyn Bridge>)>>,
+	adapters: Mutex<BTreeMap<BridgeDatabaseId, BoundBridgeAdapter>>,
 	/// Bounded async request queue; no page guard crosses this port.
 	requests: tokio::sync::mpsc::Sender<Request>,
 	/// Reserved mapping identities awaiting the local commit barrier.
@@ -443,6 +454,7 @@ pub struct BridgeQueryScope {
 	cache: Mutex<BTreeMap<(BridgeDatabaseId, crate::values::RecordId), Arc<Value>>>,
 }
 impl std::fmt::Debug for BridgeQueryScope {
+	/// Formats `BridgeQueryScope` using the requested formatter.
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("BridgeQueryScope")
 			.field("adapters", &self.adapters.lock().len())
@@ -598,6 +610,8 @@ impl BridgeQueryScope {
 			.map_err(|_error| FerrosGrynnError::query_cancelled())?;
 		loop {
 			check()?;
+			// Periodic wakeups let the synchronous caller observe statement
+			// cancellation and deadlines.
 			match receiver.recv_timeout(Duration::from_millis(25)) {
 				Ok(result) => return result,
 				Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -616,7 +630,8 @@ impl BridgeQueryScope {
 		control: &crate::gql::ExecutionControl,
 	) -> FerrosGrynnResult<Arc<Value>> {
 		let key = (database, record.clone());
-		if let Some(value) = self.cache.lock().get(&key).cloned() {
+		let cached = self.cache.lock().get(&key).cloned();
+		if let Some(value) = cached {
 			return Ok(value);
 		}
 		self.prefetch(database, vec![record.clone()], control)?;
@@ -688,9 +703,9 @@ pub async fn execute_adapter(
 		BridgeOperation::Query {
 			..
 		}
-		| BridgeOperation::RecordOrClass(_) => capabilities.queries,
-		BridgeOperation::Records(_) => capabilities.records,
-		BridgeOperation::Mirror(_) => capabilities.mirror,
+		| BridgeOperation::RecordOrClass(_) => capabilities.queries(),
+		BridgeOperation::Records(_) => capabilities.records(),
+		BridgeOperation::Mirror(_) => capabilities.mirror(),
 	};
 	if !supported {
 		return Err(FerrosGrynnError::bridge_operation_error(
@@ -700,9 +715,8 @@ pub async fn execute_adapter(
 	let mut future = adapter.execute(operation, context.clone());
 	loop {
 		context.check()?;
-		match tokio::time::timeout(Duration::from_millis(25), &mut future).await {
-			Ok(result) => return result,
-			Err(_) => {}
+		if let Ok(result) = tokio::time::timeout(Duration::from_millis(25), &mut future).await {
+			return result;
 		}
 	}
 }
@@ -710,7 +724,7 @@ pub async fn execute_adapter(
 impl Datastore {
 	/// Creates explicit asynchronous bridge orchestration over the sync
 	/// executor.
-	#[must_use]
+	#[must_use = "the query builder must be executed"]
 	pub fn query(&self, source: &str) -> BridgeQuery {
 		BridgeQuery::new(self.clone(), source)
 	}
@@ -788,7 +802,7 @@ impl Datastore {
 				.and_then(|timeout| Instant::now().checked_add(timeout)),
 		};
 		context.options.cancellation = Some(cancellation);
-		context.options.bridge_memory = Some(Arc::new(Mutex::new(
+		context.options.context.bridge_memory = Some(Arc::new(Mutex::new(
 			crate::gql::BarrierAccount::new(options.barrier_memory_bytes.get()),
 		)));
 		let (scope, _receiver) = BridgeQueryScope::new(self, context.clone())?;
@@ -819,6 +833,8 @@ impl Datastore {
 		let mut worker = runtime
 			.spawn_blocking(move || store.confirm_bridge_mirror(tx, reference, &worker_context));
 		loop {
+			// Borrow the handle across timeouts: blocking confirmation must
+			// finish before its result is returned.
 			match tokio::time::timeout(Duration::from_millis(25), &mut worker).await {
 				Ok(result) => {
 					result.map_err(|error| {

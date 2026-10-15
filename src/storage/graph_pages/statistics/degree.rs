@@ -2,7 +2,19 @@
 
 use std::collections::BTreeMap;
 
-use super::{checked_page_no, codec::*};
+use super::{
+	checked_page_no,
+	codec::{
+		invalid_page,
+		read_u16,
+		read_u32,
+		read_u64,
+		validate_zero,
+		write_u16,
+		write_u32,
+		write_u64,
+	},
+};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::AtomKind,
@@ -19,14 +31,22 @@ use crate::{
 	},
 };
 
+/// Configured kind value.
 const KIND: usize = 32;
+/// Configured direction value.
 const DIRECTION: usize = 33;
+/// Configured bucket count value.
 const BUCKET_COUNT: usize = 34;
+/// Configured label id value.
 const LABEL_ID: usize = 36;
+/// Configured buckets value.
 const BUCKETS: usize = 40;
+/// Configured bucket bytes value.
 const BUCKET_BYTES: usize = 16;
+/// Configured null label value.
 const NULL_LABEL: u32 = u32::MAX;
 
+/// Encodes degree statistics.
 pub(super) fn encode_degree_statistics(
 	statistics: &crate::stats::GraphStatistics,
 	dictionary: &LabelDictionary,
@@ -43,6 +63,7 @@ pub(super) fn encode_degree_statistics(
 	Ok(pages)
 }
 
+/// Decodes degree statistics.
 pub(in crate::storage) fn decode_degree_statistics<ReadPage>(
 	mut read_page: ReadPage,
 	layout: super::StatisticsLayout,
@@ -66,6 +87,7 @@ where
 	Ok(result)
 }
 
+/// Encodes page.
 fn encode_page(
 	page_no: PageNo,
 	page_lsn: PageLsn,
@@ -100,6 +122,7 @@ fn encode_page(
 	Ok(page)
 }
 
+/// Decodes page.
 fn decode_page(
 	page: &AlignedPage,
 	page_no: PageNo,
@@ -157,6 +180,7 @@ fn decode_page(
 	))
 }
 
+/// Validates buckets.
 fn validate_buckets(buckets: &[DegreeBucket]) -> FerrosGrynnResult<()> {
 	if buckets.len() > HISTOGRAM_BUCKETS
 		|| buckets.iter().any(|bucket| bucket.minimum > bucket.maximum || bucket.node_count == 0)
@@ -167,6 +191,7 @@ fn validate_buckets(buckets: &[DegreeBucket]) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

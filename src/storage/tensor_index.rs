@@ -361,8 +361,11 @@ fn invalid(reason: &str) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for tensor index behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 
 	/// Tiny canonical section fixture shared by both physical representations.
 	fn fixture(format: TensorCacheTag) -> (TensorCacheLayout, [Vec<u8>; 8]) {
@@ -384,7 +387,7 @@ mod tests {
 			format,
 			rooted: true,
 		};
-		let layout = TensorCacheLayout::new(header).unwrap();
+		let layout = TensorCacheLayout::new(header).assert_ok();
 		let mut data: [Vec<u8>; 8] = std::array::from_fn(|_| Vec::new());
 		data[0] = vec![1, 2];
 		data[1] = vec![3, 4, 5];
@@ -401,6 +404,8 @@ mod tests {
 		(layout, data)
 	}
 
+	/// Verifies tensor sections round trip and reject forged extents ordinals
+	/// and padding.
 	#[test]
 	fn tensor_sections_round_trip_and_reject_forged_extents_ordinals_and_padding() {
 		for format in [TensorCacheTag::Csr, TensorCacheTag::Dense] {
@@ -413,7 +418,7 @@ mod tests {
 							.sections
 							.iter()
 							.position(|section| section.kind == kind)
-							.unwrap();
+							.assert_some();
 						let at = ordinal as usize * destination.len();
 						destination.copy_from_slice(&data[section][at..at + destination.len()]);
 						Ok(())
@@ -427,14 +432,14 @@ mod tests {
 					},
 					&mut || Ok(()),
 				)
-				.unwrap();
+				.assert_ok();
 			assert_eq!(&pages[0].as_bytes()[32..40], &[7, 0, 0, 0, 2, 0, 0, 0]);
 			let restored = TensorCacheLayout::decode_header(
 				&pages[0],
 				layout.header.identity,
 				pages.len() as u64,
 			)
-			.unwrap();
+			.assert_ok();
 			assert_eq!(restored, layout);
 			let loaded = restored
 				.load_sections(
@@ -447,19 +452,26 @@ mod tests {
 					},
 					&mut || Ok(()),
 				)
-				.unwrap();
+				.assert_ok();
 			assert_eq!(loaded, data);
+			let read_calls = std::cell::Cell::new(0);
 			assert!(
 				restored
-					.load_sections(100, |_, _| panic!("admission precedes page reads"), &mut || Ok(
-						()
-					))
+					.load_sections(
+						100,
+						|_, _| {
+							read_calls.set(read_calls.get() + 1);
+							Ok(())
+						},
+						&mut || Ok(())
+					)
 					.is_err()
 			);
+			assert_eq!(read_calls.get(), 0, "admission precedes page reads");
 			for at in [128, 129, 130, 136, 200] {
 				let old = pages[0].as_bytes()[at];
 				pages[0].as_bytes_mut()[at] = 255;
-				pages[0].seal().unwrap();
+				pages[0].seal().assert_ok();
 				assert!(
 					TensorCacheLayout::decode_header(
 						&pages[0],
@@ -469,7 +481,7 @@ mod tests {
 					.is_err()
 				);
 				pages[0].as_bytes_mut()[at] = old;
-				pages[0].seal().unwrap();
+				pages[0].seal().assert_ok();
 			}
 			let mut forged = data.clone();
 			if format == TensorCacheTag::Csr {

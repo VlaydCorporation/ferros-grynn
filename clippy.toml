@@ -9,3 +9,16 @@ too-many-arguments-threshold = 9
 cognitive-complexity-threshold = 30
 
 inherent-impl-lint-scope = "file"
+
+# Regex keys depend only on their immutable pattern; Matcher keys use RuntimeId.
+# Cache/cursor mutation laws are checked in values/runtime/laws.rs.
+# SDK Regex also compares only immutable pattern text; its cache/key laws live
+# in bridge/surreal/tests.rs. Keep these exceptions at the leaf types so new
+# interior-mutable key fields remain visible.
+# Clippy also uses this list for mutable constants and repeated if conditions.
+ignore-interior-mutability = [
+    "bytes::Bytes",
+    "ferros_grynn::values::runtime::regex::Regex",
+    "ferros_grynn::values::runtime::matcher::Matcher",
+    "surrealdb_types::value::regex::Regex",
+]

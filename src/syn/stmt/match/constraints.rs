@@ -29,6 +29,7 @@ impl Parser<'_> {
 		Ok((constraints, custom_cost))
 	}
 
+	/// Matches constraints until.
 	fn match_constraints_until(
 		&mut self,
 		terminator: Option<Symbol>,

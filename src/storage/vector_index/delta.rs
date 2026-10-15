@@ -22,33 +22,47 @@ use crate::{
 	},
 };
 
+/// Format version for delta format.
 const DELTA_FORMAT_VERSION: u16 = 1;
+/// Configured delta flag value.
 const DELTA_FLAG: u8 = 1;
+/// Configured null page value.
 const NULL_PAGE: u64 = u64::MAX;
+/// Configured header fixed end value.
 const HEADER_FIXED_END: usize = 96;
+/// Configured stream header bytes value.
 const STREAM_HEADER_BYTES: usize = 48;
+/// Configured stream payload bytes value.
 const STREAM_PAYLOAD_BYTES: usize = PAGE_SIZE - STREAM_HEADER_BYTES;
 
 /// Logical identity captured by one exact vector delta generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VectorDeltaSpec {
+pub struct VectorDeltaSpec {
+	/// Base associated with this vector delta spec.
 	pub(crate) base: VectorBuildSpec,
+	/// Revision identifying this version of the data.
 	pub(crate) revision: u64,
 }
 
 /// Complete replacement or deletion for one stable row address.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum VectorDeltaRecord {
+pub enum VectorDeltaRecord {
+	/// Upsert case of vector delta record.
 	Upsert {
+		/// Atom associated with this vector delta record.
 		atom: DiskAtomRef,
+		/// Vector associated with this vector delta record.
 		vector: Vector,
 	},
+	/// Delete case of vector delta record.
 	Delete {
+		/// Atom associated with this vector delta record.
 		atom: DiskAtomRef,
 	},
 }
 
 impl VectorDeltaRecord {
+	/// Returns the atom result.
 	pub(crate) const fn atom(&self) -> DiskAtomRef {
 		match self {
 			Self::Upsert {
@@ -64,18 +78,23 @@ impl VectorDeltaRecord {
 
 /// Fully validated exact delta projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodedVectorDelta {
+pub struct DecodedVectorDelta {
+	/// Spec associated with this decoded vector delta.
 	pub(crate) spec: VectorDeltaSpec,
+	/// Records associated with this decoded vector delta.
 	pub(crate) records: Vec<VectorDeltaRecord>,
 }
 
+/// Stream location state.
 struct StreamLocation {
+	/// First associated with this stream location.
 	first: u64,
+	/// Pages associated with this stream location.
 	pages: u64,
 }
 
 /// Builds one deterministic delta file from complete row replacements.
-pub(crate) fn build_vector_delta(
+pub fn build_vector_delta(
 	spec: VectorDeltaSpec,
 	mut records: Vec<VectorDeltaRecord>,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
@@ -140,7 +159,7 @@ pub(crate) fn build_vector_delta(
 }
 
 /// Decodes one delta against the exact catalog/base definition.
-pub(crate) fn decode_vector_delta(
+pub fn decode_vector_delta(
 	pages: &[AlignedPage],
 	expected: VectorBuildSpec,
 ) -> FerrosGrynnResult<DecodedVectorDelta> {
@@ -162,6 +181,7 @@ pub(crate) fn decode_vector_delta(
 	})
 }
 
+/// Encodes header.
 fn encode_header(
 	page: &mut AlignedPage,
 	spec: VectorDeltaSpec,
@@ -200,6 +220,7 @@ fn encode_header(
 	page.seal()
 }
 
+/// Decodes header.
 fn decode_header(
 	page: &AlignedPage,
 	expected: VectorBuildSpec,
@@ -244,6 +265,7 @@ fn decode_header(
 	))
 }
 
+/// Decodes records.
 fn decode_records(
 	spec: VectorDeltaSpec,
 	record_count: u32,
@@ -305,6 +327,7 @@ fn decode_records(
 	Ok(records)
 }
 
+/// Returns the page count result.
 fn page_count(bytes: usize) -> FerrosGrynnResult<u64> {
 	if bytes == 0 {
 		return Ok(0);
@@ -313,6 +336,7 @@ fn page_count(bytes: usize) -> FerrosGrynnResult<u64> {
 		.map_err(|_error| invalid("vector delta page count exceeds u64"))
 }
 
+/// Encodes stream.
 fn encode_stream(pages: &mut [AlignedPage], payload: &[u8]) -> FerrosGrynnResult<StreamLocation> {
 	let count = page_count(payload.len())?;
 	if count == 0 {
@@ -364,6 +388,7 @@ fn encode_stream(pages: &mut [AlignedPage], payload: &[u8]) -> FerrosGrynnResult
 	})
 }
 
+/// Decodes stream.
 fn decode_stream(pages: &[AlignedPage], location: StreamLocation) -> FerrosGrynnResult<Vec<u8>> {
 	if location.pages == 0 {
 		if location.first != NULL_PAGE {
@@ -410,26 +435,32 @@ fn decode_stream(pages: &[AlignedPage], location: StreamLocation) -> FerrosGrynn
 	Ok(output)
 }
 
+/// Writes u32 vec.
 fn write_u32_vec(output: &mut Vec<u8>, value: u32) {
 	output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64 vec.
 fn write_u64_vec(output: &mut Vec<u8>, value: u64) {
 	output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u16.
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 	bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u32.
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 	bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Writes u64.
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 	bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Reads u16.
 fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 	bytes
 		.get(offset..offset + 2)
@@ -438,6 +469,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u16> {
 		.ok_or_else(|| invalid("vector delta u16 field crosses its input"))
 }
 
+/// Reads u32.
 fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 	bytes
 		.get(offset..offset + 4)
@@ -446,6 +478,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u32> {
 		.ok_or_else(|| invalid("vector delta u32 field crosses its input"))
 }
 
+/// Reads u64.
 fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 	bytes
 		.get(offset..offset + 8)
@@ -454,15 +487,19 @@ fn read_u64(bytes: &[u8], offset: usize) -> FerrosGrynnResult<u64> {
 		.ok_or_else(|| invalid("vector delta u64 field crosses its input"))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for delta behavior.
 mod tests {
 	use std::num::NonZeroU16;
 
 	use super::{VectorDeltaRecord, VectorDeltaSpec, build_vector_delta, decode_vector_delta};
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{
 			ClassId,
@@ -478,21 +515,22 @@ mod tests {
 		values::{PropertyKeyId, Vector, VectorKind, storage::DiskAtomRef},
 	};
 
+	/// Verifies replacement and tombstone round trip canonically.
 	#[test]
 	fn replacement_and_tombstone_round_trip_canonically() {
 		let base = VectorBuildSpec {
-			index: IndexId::new(9).unwrap(),
+			index: IndexId::new(9).assert_some(),
 			index_version: SchemaVersion::INITIAL,
 			scope: IndexScope::Base,
-			class: ClassId::new(4).unwrap(),
+			class: ClassId::new(4).assert_some(),
 			field: PropertyKeyId::new(3),
 			options: ClassIndexOptions::Hnsw(
 				HnswIndexOptions::defaults(
 					VectorKind::F32,
-					NonZeroU16::new(2).unwrap(),
+					NonZeroU16::new(2).assert_some(),
 					VectorDistance::Euclidean,
 				)
-				.unwrap(),
+				.assert_ok(),
 			),
 			build_revision: 7,
 			build_seed: 8,
@@ -501,8 +539,8 @@ mod tests {
 			base,
 			revision: 12,
 		};
-		let first = DiskAtomRef::from_parts(AtomKind::Node, 1).unwrap();
-		let second = DiskAtomRef::from_parts(AtomKind::Node, 2).unwrap();
+		let first = DiskAtomRef::from_parts(AtomKind::Node, 1).assert_ok();
+		let second = DiskAtomRef::from_parts(AtomKind::Node, 2).assert_ok();
 		let records = vec![
 			VectorDeltaRecord::Delete {
 				atom: second,
@@ -512,8 +550,8 @@ mod tests {
 				vector: Vector::from(vec![1.0_f32, 2.0]),
 			},
 		];
-		let pages = build_vector_delta(spec, records.clone()).unwrap();
-		let decoded = decode_vector_delta(&pages, base).unwrap();
+		let pages = build_vector_delta(spec, records.clone()).assert_ok();
+		let decoded = decode_vector_delta(&pages, base).assert_ok();
 		assert_eq!(decoded.spec, spec);
 		assert_eq!(decoded.records, records.into_iter().rev().collect::<Vec<_>>());
 	}

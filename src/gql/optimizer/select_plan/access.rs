@@ -41,6 +41,7 @@ use crate::{
 	syn::BinaryOperator,
 };
 
+/// Resolves hints.
 pub(super) fn resolve_hints(
 	logical: &LogicalSelect,
 	snapshot: &PlannerSnapshot,
@@ -111,6 +112,7 @@ pub(super) fn resolve_hints(
 }
 
 #[allow(clippy::too_many_arguments, reason = "source planning owns one bounded candidate set")]
+/// Returns the plan source result.
 pub(super) fn plan_source(
 	source: &LogicalSelectSource,
 	offset: usize,
@@ -343,6 +345,7 @@ pub(super) fn plan_source(
 	Ok((operator, cardinality, cost, warnings))
 }
 
+/// Returns the search access operator result.
 fn search_access_operator(
 	filter: Option<&TypedExpr>,
 	index: &PlannerIndex,
@@ -444,6 +447,7 @@ fn spatial_constant(expression: &TypedExpr) -> bool {
 		)
 }
 
+/// Validates forced index.
 fn validate_forced_index(
 	index: &PlannerIndex,
 	source: &str,
@@ -469,10 +473,12 @@ fn validate_forced_index(
 	Ok(())
 }
 
+/// Returns the index hint error result.
 fn index_hint_error(index: &str, source: &str, reason: &str) -> FerrosGrynnError {
 	FerrosGrynnError::index_hint_not_usable(index, source, reason)
 }
 
+/// Returns the scalar access kind result.
 fn scalar_access_kind(
 	source: &LogicalSelectSource,
 	offset: usize,
@@ -506,10 +512,13 @@ fn scalar_access_kind(
 }
 
 #[derive(Clone, Copy)]
+/// Index ordering state.
 struct IndexOrdering {
+	/// Direction associated with this index ordering.
 	direction: IndexDirection,
 }
 
+/// Returns the index ordering result.
 fn index_ordering(
 	logical: &LogicalSelect,
 	source: &LogicalSelectSource,
@@ -531,9 +540,7 @@ fn index_ordering(
 			if order.random || order.collate || order.numeric {
 				return None;
 			}
-			let Some(column) = order_source_column(logical, &order.expression) else {
-				return None;
-			};
+			let column = order_source_column(logical, &order.expression)?;
 			if column != offset + source.schema.index_of(field.as_str())? {
 				return None;
 			}
@@ -572,6 +579,7 @@ fn index_ordering(
 	}
 }
 
+/// Returns the order source column result.
 fn order_source_column(logical: &LogicalSelect, expression: &TypedExpr) -> Option<usize> {
 	let TypedExprKind::Column(column) = expression.kind else {
 		return None;
@@ -619,6 +627,7 @@ fn order_source_column(logical: &LogicalSelect, expression: &TypedExpr) -> Optio
 	None
 }
 
+/// Sorts eliminated.
 pub(super) fn sort_eliminated(
 	logical: &LogicalSelect,
 	snapshot: &PlannerSnapshot,
@@ -647,12 +656,17 @@ pub(super) fn sort_eliminated(
 }
 
 #[derive(Clone, Copy)]
+/// Constraint shape alternatives.
 enum ConstraintShape {
+	/// Equality case of constraint shape.
 	Equality,
+	/// In case of constraint shape.
 	In,
+	/// Range case of constraint shape.
 	Range,
 }
 
+/// Collects constraint shapes.
 fn collect_constraint_shapes(
 	expression: &TypedExpr,
 	output: &mut BTreeMap<usize, ConstraintShape>,
@@ -700,6 +714,7 @@ fn collect_constraint_shapes(
 	output.insert(column, shape);
 }
 
+/// Returns the source cardinality result.
 pub(super) fn source_cardinality(
 	source: &LogicalSelectSource,
 	snapshot: &PlannerSnapshot,
@@ -777,6 +792,7 @@ pub(super) fn source_cardinality(
 	})
 }
 
+/// Returns the source class result.
 fn source_class(source: &LogicalSelectSource) -> Option<&str> {
 	match &source.kind {
 		LogicalSelectSourceKind::Atoms {
@@ -796,6 +812,7 @@ fn source_class(source: &LogicalSelectSource) -> Option<&str> {
 	}
 }
 
+/// Returns the source scope result.
 fn source_scope(source: &LogicalSelectSource) -> Option<IndexScope> {
 	match &source.kind {
 		LogicalSelectSourceKind::Atoms {
@@ -825,6 +842,7 @@ fn source_scope(source: &LogicalSelectSource) -> Option<IndexScope> {
 	}
 }
 
+/// Returns the index join probe result.
 pub(super) fn index_join_probe(
 	source: &LogicalSelectSource,
 	source_index: usize,
@@ -872,6 +890,7 @@ pub(super) fn index_join_probe(
 	))
 }
 
+/// Counts rewrite.
 fn count_rewrite(select: &LogicalSelect) -> bool {
 	select.joins.is_empty()
 		&& select.filter.is_none()

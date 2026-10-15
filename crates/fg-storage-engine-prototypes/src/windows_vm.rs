@@ -463,11 +463,20 @@ enum HomeReserveDecision {
 	/// The observed loading generation completed before its signal was cloned.
 	Retry,
 	/// Another caller published the requested page.
-	Resident(HomeLocator),
+	Resident(
+		/// Another caller published the requested page.
+		HomeLocator,
+	),
 	/// Another caller owns the requested load.
-	Loading(Arc<VmLoadSignal>),
+	Loading(
+		/// Another caller owns the requested load.
+		Arc<VmLoadSignal>,
+	),
 	/// This caller owns the committed writable page.
-	Reserved(HomeLoadReservation),
+	Reserved(
+		/// This caller owns the committed writable page.
+		HomeLoadReservation,
+	),
 }
 
 /// Unique ownership of one committed loading address.
@@ -618,10 +627,13 @@ enum VmPinResult {
 
 /// Opaque pre-resolved exact home or WAL address.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct VmResolvedHandle(VmResolvedHandleKind);
+pub(super) struct VmResolvedHandle(
+	/// Opaque pre-resolved exact home or WAL address.
+	VmResolvedHandleKind,
+);
 
 /// Private representation preventing safe callers from forging raw addresses.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum VmResolvedHandleKind {
 	/// Fixed home address plus its current generation.
 	Home {
@@ -636,25 +648,34 @@ enum VmResolvedHandleKind {
 	},
 	/// Bounded WAL-slab locator.
 	Wal {
-		/// Complete WAL-exact key.
-		key: PageCacheKey,
+		/// Retains the exact-key field and measured handle layout after the
+		/// unused generic fallback is removed.
+		_key: PageCacheKey,
 		/// Atomic-arena locator.
 		handle: ResolvedFrameHandle,
 	},
 }
 
-impl VmResolvedHandle {
-	/// Returns the exact immutable key embedded in the handle.
-	const fn key(&self) -> PageCacheKey {
-		match &self.0 {
-			VmResolvedHandleKind::Home {
+impl std::fmt::Debug for VmResolvedHandleKind {
+	/// Preserves the original variant fields and key label in diagnostics.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Home {
+				cache_id,
 				key,
-				..
-			}
-			| VmResolvedHandleKind::Wal {
-				key,
-				..
-			} => *key,
+				locator,
+				address,
+			} => f
+				.debug_struct("Home")
+				.field("cache_id", cache_id)
+				.field("key", key)
+				.field("locator", locator)
+				.field("address", address)
+				.finish(),
+			Self::Wal {
+				_key: key,
+				handle,
+			} => f.debug_struct("Wal").field("key", key).field("handle", handle).finish(),
 		}
 	}
 }
@@ -764,6 +785,11 @@ impl VmCache {
 				})?
 				.get_or_load(key, loader)
 				.map(VmPageGuard::Wal),
+
+			_ => Err(FerrosGrynnError::invalid_storage_page(
+				key.page_no().get(),
+				"unsupported cache-source version",
+			)),
 		}
 	}
 
@@ -971,7 +997,7 @@ impl VmCache {
 		match key.version() {
 			PageCacheVersion::Wal(_) => self.wal.as_ref()?.resolve(key).map(|handle| {
 				VmResolvedHandle(VmResolvedHandleKind::Wal {
-					key,
+					_key: key,
 					handle,
 				})
 			}),
@@ -997,6 +1023,8 @@ impl VmCache {
 					address,
 				}))
 			}
+
+			_ => None,
 		}
 	}
 
@@ -1048,35 +1076,6 @@ impl VmCache {
 				}
 			}
 		}
-	}
-
-	/// Uses a valid handle or falls back to generic resolution and refreshes
-	/// it.
-	///
-	/// # Errors
-	///
-	/// Returns the same errors as [`Self::get_or_load`].
-	pub(super) fn get_resolved_or_load<Loader>(
-		&self,
-		handle: &mut VmResolvedHandle,
-		key: PageCacheKey,
-		loader: Loader,
-	) -> FerrosGrynnResult<VmPageGuard<'_>>
-	where
-		Loader: FnOnce(&mut AlignedPage) -> FerrosGrynnResult<PageHeader>,
-	{
-		if handle.key() == key {
-			if let Some(guard) = self.get_resolved(handle)? {
-				return Ok(guard);
-			}
-		}
-		let guard = self.get_or_load(key, loader)?;
-		*handle = self.resolve(key).ok_or_else(|| {
-			FerrosGrynnError::storage_io_failure(
-				"VM page was not resolvable immediately after a pinned load",
-			)
-		})?;
-		Ok(guard)
 	}
 
 	/// Returns the total reserved home address-space bytes.
@@ -1157,7 +1156,7 @@ impl VmCache {
 						generation: generation(state),
 					};
 					match self.try_pin_home(locator) {
-						VmPinResult::Pinned => return Ok(self.home_guard(locator)?),
+						VmPinResult::Pinned => return self.home_guard(locator),
 						VmPinResult::Stale => continue,
 						VmPinResult::Exhausted => return Err(pin_exhausted(key)),
 					}
@@ -1173,7 +1172,7 @@ impl VmCache {
 				VmLifecycle::Free => match self.reserve_home(key, source_index, page_index)? {
 					HomeReserveDecision::Retry => continue,
 					HomeReserveDecision::Resident(locator) => match self.try_pin_home(locator) {
-						VmPinResult::Pinned => return Ok(self.home_guard(locator)?),
+						VmPinResult::Pinned => return self.home_guard(locator),
 						VmPinResult::Stale => continue,
 						VmPinResult::Exhausted => return Err(pin_exhausted(key)),
 					},
@@ -1617,9 +1616,15 @@ impl Drop for VmHomeGuard<'_> {
 /// Borrowed page guard over either fixed home VM or bounded WAL slab storage.
 pub(super) enum VmPageGuard<'cache> {
 	/// Fixed home address.
-	Home(VmHomeGuard<'cache>),
+	Home(
+		/// Fixed home address.
+		VmHomeGuard<'cache>,
+	),
 	/// Stable WAL arena frame.
-	Wal(AtomicPageGuard<'cache>),
+	Wal(
+		/// Stable WAL arena frame.
+		AtomicPageGuard<'cache>,
+	),
 }
 
 impl VmPageGuard<'_> {
@@ -1711,6 +1716,7 @@ fn windows_failure(operation: &'static str, source: windows::core::Error) -> Fer
 	clippy::panic_in_result_fn,
 	reason = "fallible VM tests return Result while assertions report contract failures"
 )]
+/// Regression tests for windows vm behavior.
 mod tests {
 	use std::{
 		error::Error,
@@ -1778,11 +1784,19 @@ mod tests {
 			PageCacheVersion::Home {
 				..
 			} => PageLsn::new(10),
+
+			_ => {
+				return Err(FerrosGrynnError::invalid_storage_page(
+					key.page_no().get(),
+					"unsupported cache-source version",
+				));
+			}
 		};
 		*page = AlignedPage::new(PageType::NodeHot, PageFlags::empty(), page_lsn, key.page_no());
 		page.validate(key.page_no())
 	}
 
+	/// Verifies reservation recommits the same fixed address.
 	#[test]
 	fn reservation_recommits_the_same_fixed_address() -> Result<(), Box<dyn Error>> {
 		let reservation = VmReservation::reserve(2)?;
@@ -1799,6 +1813,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm lifecycle component probe completes.
 	#[test]
 	fn vm_lifecycle_component_probe_completes() -> Result<(), Box<dyn Error>> {
 		let sample = probe_vm_lifecycle()?;
@@ -1812,6 +1827,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies home resolved handle stales after decommit and recommit.
 	#[test]
 	fn home_resolved_handle_stales_after_decommit_and_recommit() -> Result<(), Box<dyn Error>> {
 		let key0 = home_key(1, 1, 0)?;
@@ -1833,6 +1849,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm direct to frame batch publishes all or none.
 	#[test]
 	fn vm_direct_to_frame_batch_publishes_all_or_none() -> Result<(), Box<dyn Error>> {
 		let keys = [home_key(1, 1, 0)?, home_key(1, 1, 1)?, home_key(1, 1, 2)?];
@@ -1872,6 +1889,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent vm batches cannot retain mutually blocking partial
+	/// capacity.
 	#[test]
 	fn concurrent_vm_batches_cannot_retain_mutually_blocking_partial_capacity()
 	-> Result<(), Box<dyn Error>> {
@@ -1952,6 +1971,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies panicking vm loader rolls back committed capacity.
 	#[test]
 	fn panicking_vm_loader_rolls_back_committed_capacity() -> Result<(), Box<dyn Error>> {
 		let key = home_key(1, 1, 0)?;
@@ -1968,6 +1988,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies vm bytes corrupted after header validation are never published.
 	#[test]
 	fn vm_bytes_corrupted_after_header_validation_are_never_published() -> Result<(), Box<dyn Error>>
 	{
@@ -1985,9 +2006,12 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies distinct failed home pages do not retain source sized signals.
 	#[test]
 	fn distinct_failed_home_pages_do_not_retain_source_sized_signals() -> Result<(), Box<dyn Error>>
 	{
+		/// Distinct failing home pages used to verify that failure signals stay
+		/// bounded.
 		const PAGE_COUNT: usize = 32;
 		let first = home_key(1, 1, 0)?;
 		let source = HomeSourceSpec::from_key(first, NonZeroUsize::new(PAGE_COUNT).ok_or("zero")?)?;
@@ -2012,6 +2036,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies stale loading signal observation retries after reuse.
 	#[test]
 	fn stale_loading_signal_observation_retries_after_reuse() -> Result<(), Box<dyn Error>> {
 		let key = home_key(1, 1, 0)?;
@@ -2085,6 +2110,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies failed decommit quarantines without hanging and retries
+	/// cleanup.
 	#[test]
 	fn failed_decommit_quarantines_without_hanging_and_retries_cleanup()
 	-> Result<(), Box<dyn Error>> {
@@ -2139,6 +2166,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent vm miss is coalesced to one loader.
 	#[test]
 	fn concurrent_vm_miss_is_coalesced_to_one_loader() -> Result<(), Box<dyn Error>> {
 		let key = home_key(1, 1, 0)?;
@@ -2188,6 +2216,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies pinned vm page applies backpressure until guard drop.
 	#[test]
 	fn pinned_vm_page_applies_backpressure_until_guard_drop() -> Result<(), Box<dyn Error>> {
 		let first = home_key(1, 1, 0)?;
@@ -2222,6 +2251,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies resolved home handle cannot cross vm cache ownership.
 	#[test]
 	fn resolved_home_handle_cannot_cross_vm_cache_ownership() -> Result<(), Box<dyn Error>> {
 		let key = home_key(1, 1, 0)?;
@@ -2235,6 +2265,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies multiple files and epochs share one home budget.
 	#[test]
 	fn multiple_files_and_epochs_share_one_home_budget() -> Result<(), Box<dyn Error>> {
 		let mut keys = (1..=8)
@@ -2262,6 +2293,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies wal versions use the bounded atomic slab.
 	#[test]
 	fn wal_versions_use_the_bounded_atomic_slab() -> Result<(), Box<dyn Error>> {
 		let home = home_key(1, 1, 0)?;
@@ -2275,6 +2307,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies failed validation never leaves committed resident bytes.
 	#[test]
 	fn failed_validation_never_leaves_committed_resident_bytes() -> Result<(), Box<dyn Error>> {
 		let key = home_key(1, 1, 0)?;

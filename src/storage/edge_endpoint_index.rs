@@ -313,29 +313,33 @@ fn invalid(reason: &str) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for edge endpoint index behavior.
 mod tests {
 	use super::*;
 	use crate::datastore::{IndexId, SystemIndexKind};
 
+	/// Verifies endpoint pages distinguish scopes and check metadata and
+	/// reserved keys.
 	#[test]
-	fn endpoint_pages_distinguish_scopes_and_check_metadata_and_reserved_keys()
-	-> FerrosGrynnResult<()> {
-		let graph = GraphId::new(1).ok_or_else(|| invalid("test graph id"))?;
+	fn endpoint_pages_distinguish_scopes_and_check_metadata_and_reserved_keys() {
+		use crate::test_assertions::AssertResult as _;
+
+		let graph = GraphId::new(1).ok_or_else(|| invalid("test graph id")).assert_ok();
 		let capability = SystemIndex::new(
-			IndexId::new(9).ok_or_else(|| invalid("test index id"))?,
+			IndexId::new(9).ok_or_else(|| invalid("test index id")).assert_ok(),
 			SystemIndexKind::EdgeEndpoint,
 		);
-		let endpoint = DiskAtomRef::from_parts(AtomKind::Edge, 17)?;
+		let endpoint = DiskAtomRef::from_parts(AtomKind::Edge, 17).assert_ok();
 		let scratch = std::env::temp_dir();
 		let mut sorter = ExternalIndexSorter::with_budget(&scratch, 8192);
 		for index in 0..5000_u64 {
-			let connector = DiskAtomRef::from_parts(AtomKind::Edge, index)?;
+			let connector = DiskAtomRef::from_parts(AtomKind::Edge, index).assert_ok();
 			let mut key = prefix((index % 2) as u32, endpoint).to_vec();
 			key.extend_from_slice(&connector.raw().to_be_bytes());
 			key.extend_from_slice(&[u8::from(index % 3 == 0), 0, 0, 0]);
-			sorter.push(key, connector)?;
+			sorter.push(key, connector).assert_ok();
 		}
-		let records = sorter.finish()?;
+		let records = sorter.finish().assert_ok();
 		let seed = EndpointHeader {
 			graph,
 			capability,
@@ -344,8 +348,8 @@ mod tests {
 			page_count: 0,
 			posting_count: 5000,
 		};
-		let mut pages = buffered(&records, seed, &scratch)?;
-		let header = decode_header(&pages[0], graph, capability, 7, pages.len() as u64)?;
+		let mut pages = buffered(&records, seed, &scratch).assert_ok();
+		let header = decode_header(&pages[0], graph, capability, 7, pages.len() as u64).assert_ok();
 		assert!(pages.len() > 3);
 		assert_eq!(&pages[0].as_bytes()[32..40], &[9, 0, 0, 0, 1, 0, 0, 0]);
 		for scope in [0, 1, 2] {
@@ -357,7 +361,8 @@ mod tests {
 				header,
 				scope,
 				endpoint,
-			)?;
+			)
+			.assert_ok();
 			assert_eq!(
 				actual.len(),
 				if scope < 2 {
@@ -373,14 +378,14 @@ mod tests {
 		}
 		assert!(decode_header(&pages[0], graph, capability, 8, pages.len() as u64).is_err());
 		pages[0].as_bytes_mut()[80] = 1;
-		pages[0].seal()?;
+		pages[0].seal().assert_ok();
 		assert!(decode_header(&pages[0], graph, capability, 7, pages.len() as u64).is_err());
 		let mut sorter = ExternalIndexSorter::new(&scratch);
 		let mut malformed = prefix(0, endpoint).to_vec();
 		malformed.extend_from_slice(&endpoint.raw().to_be_bytes());
 		malformed.extend_from_slice(&[0, 1, 0, 0]);
-		sorter.push(malformed, endpoint)?;
-		let records = sorter.finish()?;
+		sorter.push(malformed, endpoint).assert_ok();
+		let records = sorter.finish().assert_ok();
 		let pages = buffered(
 			&records,
 			EndpointHeader {
@@ -388,8 +393,9 @@ mod tests {
 				..seed
 			},
 			&scratch,
-		)?;
-		let header = decode_header(&pages[0], graph, capability, 7, pages.len() as u64)?;
+		)
+		.assert_ok();
+		let header = decode_header(&pages[0], graph, capability, 7, pages.len() as u64).assert_ok();
 		assert!(
 			lookup(
 				|number, output| {
@@ -402,6 +408,5 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 }

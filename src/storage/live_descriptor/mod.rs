@@ -55,7 +55,10 @@ mod owned_value;
 )]
 pub(crate) enum LiveDescriptor {
 	/// One reactive read-only query.
-	Query(LiveQuery),
+	Query(
+		/// One reactive read-only query.
+		LiveQuery,
+	),
 	/// One reactive value with ordinary parameter captures.
 	Binding {
 		/// Logical expression; a value replacement is a literal expression.
@@ -69,7 +72,10 @@ pub(crate) enum LiveDescriptor {
 #[derive(Clone, Copy)]
 pub(crate) enum LiveDescriptorRef<'recipe> {
 	/// One reactive query, without cloning captures or expression children.
-	Query(&'recipe LiveQuery),
+	Query(
+		/// One reactive query, without cloning captures or expression children.
+		&'recipe LiveQuery,
+	),
 	/// One reactive expression with frozen ordinary inputs.
 	Binding {
 		/// Logical expression; executable typed IR remains private to GQL.
@@ -225,6 +231,7 @@ fn encode_frame(
 
 /// Checks framing before dictionary allocation and reconstructs an owned
 /// recipe.
+#[cfg(test)]
 pub(crate) fn decode(bytes: &[u8], maximum: usize) -> FerrosGrynnResult<LiveDescriptor> {
 	checked_payload(bytes.len() as u64)?;
 	let mut budget = CodecBudget::new(maximum, bytes.len())?;
@@ -1393,6 +1400,7 @@ fn decode_operator(tag: u8) -> FerrosGrynnResult<LiveBinaryOperator> {
 }
 
 #[cfg(test)]
+/// Regression tests for live descriptor behavior.
 mod tests {
 	use super::*;
 	use crate::values::Uuid;
@@ -1400,7 +1408,9 @@ mod tests {
 	/// Caller cancellation/work rejection occurs during admission, before
 	/// copying payloads.
 	#[test]
-	fn borrowed_descriptor_controlled_payload_and_cancellation() -> FerrosGrynnResult<()> {
+	fn borrowed_descriptor_controlled_payload_and_cancellation() {
+		use crate::test_assertions::AssertResult as _;
+
 		let expression = LiveExpr::Literal(Value::from("x".repeat(32 * 1024)));
 		let parameters = Object::new();
 		let descriptor = LiveDescriptorRef::Binding {
@@ -1428,17 +1438,18 @@ mod tests {
 				.is_err()
 		);
 		assert_eq!(
-			encode_ref_controlled(descriptor, 1 << 20, &|_| Ok(()))?,
-			encode(&owned, 1 << 20)?
+			encode_ref_controlled(descriptor, 1 << 20, &|_| Ok(())).assert_ok(),
+			encode(&owned, 1 << 20).assert_ok()
 		);
-		Ok(())
 	}
 
 	/// Scope recipes share canonical depth/byte guards with WHERE expressions.
 	#[test]
-	fn live_scope_expression_descriptors_are_checked() -> FerrosGrynnResult<()> {
-		let binding = LiveBindingId::from_uuid(Uuid::from(uuid::Uuid::from_u128(42)))?;
-		let class = crate::datastore::ClassId::from_storage(1)?;
+	fn live_scope_expression_descriptors_are_checked() {
+		use crate::test_assertions::AssertResult as _;
+
+		let binding = LiveBindingId::from_uuid(Uuid::from(uuid::Uuid::from_u128(42))).assert_ok();
+		let class = crate::datastore::ClassId::from_storage(1).assert_ok();
 		for source in [
 			LiveSource::GraphExpr(Box::new(LiveExpr::Binding(binding))),
 			LiveSource::GraphClassExpr {
@@ -1447,7 +1458,7 @@ mod tests {
 			},
 			LiveSource::GraphRecordExpr {
 				graph: Box::new(LiveExpr::Binding(binding)),
-				record: "person:a".parse()?,
+				record: "person:a".parse().assert_ok(),
 			},
 		] {
 			let query = LiveQuery::new(source);
@@ -1457,13 +1468,14 @@ mod tests {
 				&mut body,
 				&query,
 				&mut context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					observe: None,
 					remaining: MAX_NODES,
 				},
 				0,
-			)?;
+			)
+			.assert_ok();
 			let (binding_start, expected) = match query.source() {
 				LiveSource::GraphExpr(_) => (2, vec![7, 3]),
 				LiveSource::GraphClassExpr {
@@ -1472,7 +1484,13 @@ mod tests {
 				LiveSource::GraphRecordExpr {
 					..
 				} => (2, vec![6, 3]),
-				_ => return Err(invalid("scope codec fixture has unexpected source")),
+				_ => {
+					return {
+						let test_result: FerrosGrynnResult<()> =
+							Err(invalid("scope codec fixture has unexpected source"));
+						test_result.assert_ok();
+					};
+				}
 			};
 			assert_eq!(&body[..binding_start], expected.as_slice());
 			assert_eq!(
@@ -1485,7 +1503,7 @@ mod tests {
 				decode_query(
 					&mut Decoder::new(&nil),
 					&context,
-					&mut CodecBudget::new(1 << 20, 0)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: MAX_NODES
@@ -1495,8 +1513,8 @@ mod tests {
 				.is_err()
 			);
 			let descriptor = LiveDescriptor::Query(query);
-			let bytes = encode(&descriptor, 1 << 20)?;
-			assert_eq!(decode(&bytes, 1 << 20)?, descriptor);
+			let bytes = encode(&descriptor, 1 << 20).assert_ok();
+			assert_eq!(decode(&bytes, 1 << 20).assert_ok(), descriptor);
 			for end in 0..bytes.len() {
 				assert!(decode(&bytes[..end], 1 << 20).is_err());
 			}
@@ -1516,11 +1534,13 @@ mod tests {
 		] {
 			assert!(encode(&LiveDescriptor::Query(LiveQuery::new(source)), 1 << 20).is_err());
 		}
-		Ok(())
 	}
 
+	/// Verifies borrowed binding value matches canonical logical descriptor.
 	#[test]
-	fn borrowed_binding_value_matches_canonical_logical_descriptor() -> FerrosGrynnResult<()> {
+	fn borrowed_binding_value_matches_canonical_logical_descriptor() {
+		use crate::test_assertions::AssertResult as _;
+
 		for value in [
 			Value::from(9_007_199_254_740_993_i64),
 			Value::Null,
@@ -1532,25 +1552,28 @@ mod tests {
 					parameters: Object::new(),
 				},
 				1024 * 1024,
-			)?;
-			let actual = encode_binding_value(&value, 1024 * 1024)?;
+			)
+			.assert_ok();
+			let actual = encode_binding_value(&value, 1024 * 1024).assert_ok();
 			assert_eq!(actual, expected);
-			assert_eq!(decode(&actual, 1024 * 1024)?, LiveDescriptor::Binding {
+			assert_eq!(decode(&actual, 1024 * 1024).assert_ok(), LiveDescriptor::Binding {
 				expression: LiveExpr::Literal(value),
 				parameters: Object::new()
 			});
 		}
 		assert!(encode_binding_value(&Value::from("oversized"), 16).is_err());
-		Ok(())
 	}
 
+	/// Verifies golden logical descriptor rejects malformed frames.
 	#[test]
-	fn golden_logical_descriptor_rejects_malformed_frames() -> FerrosGrynnResult<()> {
+	fn golden_logical_descriptor_rejects_malformed_frames() {
+		use crate::test_assertions::AssertResult as _;
+
 		let query = LiveQuery::new(LiveSource::Class(
-			ClassId::new(1).ok_or_else(|| invalid("test class invalid"))?,
+			ClassId::new(1).ok_or_else(|| invalid("test class invalid")).assert_ok(),
 		));
 		let descriptor = LiveDescriptor::Query(query);
-		let bytes = encode(&descriptor, 1024 * 1024)?;
+		let bytes = encode(&descriptor, 1024 * 1024).assert_ok();
 		let mut golden = b"FGLD\x02\x00\x00\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&27_u64.to_le_bytes());
@@ -1558,7 +1581,7 @@ mod tests {
 		golden.extend_from_slice(&[0, 1, 0, 0, 0]);
 		golden.extend_from_slice(&[0; 22]);
 		assert_eq!(bytes, golden);
-		assert_eq!(decode(&bytes, 1024 * 1024)?, descriptor);
+		assert_eq!(decode(&bytes, 1024 * 1024).assert_ok(), descriptor);
 		for length in 0..bytes.len() {
 			assert!(decode(&bytes[..length], 1024 * 1024).is_err());
 		}
@@ -1572,22 +1595,23 @@ mod tests {
 		assert!(decode(&trailing, 1024 * 1024).is_err());
 		assert!(encode(&descriptor, 8).is_err());
 		assert!(decode(&bytes, bytes.len()).is_err());
-		Ok(())
 	}
 
 	/// Source aliases add a checked optional tail without changing default
 	/// bytes.
 	#[test]
-	fn live_window_source_alias_descriptor_tail() -> FerrosGrynnResult<()> {
-		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?));
-		let descriptor = LiveDescriptor::Query(base.clone().with_alias("p")?);
-		let frame = encode(&descriptor, 1 << 20)?;
+	fn live_window_source_alias_descriptor_tail() {
+		use crate::test_assertions::AssertResult as _;
+
+		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()));
+		let descriptor = LiveDescriptor::Query(base.clone().with_alias("p").assert_ok());
+		let frame = encode(&descriptor, 1 << 20).assert_ok();
 		assert_eq!(frame.len(), 76);
 		assert_eq!(frame[66], 16);
 		assert_eq!(&frame[67..75], &1_u64.to_le_bytes());
 		assert_eq!(frame[75], b'p');
-		assert_eq!(decode(&frame, 1 << 20)?, descriptor);
-		assert_eq!(encode(&LiveDescriptor::Query(base.clone()), 1 << 20)?.len(), 67);
+		assert_eq!(decode(&frame, 1 << 20).assert_ok(), descriptor);
+		assert_eq!(encode(&LiveDescriptor::Query(base.clone()), 1 << 20).assert_ok().len(), 67);
 		for byte in [0, 255] {
 			let mut bad = frame.clone();
 			bad[75] = byte;
@@ -1609,21 +1633,27 @@ mod tests {
 		assert!(encode(&descriptor, 64).is_err());
 		assert!(decode(&frame, frame.len()).is_err());
 		let nested = LiveDescriptor::Query(
-			base.with_alias("p")?
-				.with_split(vec![LiveExpr::Field(LivePath::new(vec!["p".into(), "tags".into()])?)])
+			base.with_alias("p")
+				.assert_ok()
+				.with_split(vec![LiveExpr::Field(
+					LivePath::new(vec!["p".into(), "tags".into()]).assert_ok(),
+				)])
 				.with_projection(LiveProjection::Value(LiveExpr::Select(Box::new(
-					LiveQuery::new(LiveSource::Record("person:a".parse()?)).with_alias("p")?,
+					LiveQuery::new(LiveSource::Record("person:a".parse().assert_ok()))
+						.with_alias("p")
+						.assert_ok(),
 				)))),
 		);
-		assert_eq!(decode(&encode(&nested, 1 << 20)?, 1 << 20)?, nested);
-		Ok(())
+		assert_eq!(decode(&encode(&nested, 1 << 20).assert_ok(), 1 << 20).assert_ok(), nested);
 	}
 
 	/// Query flags keep default bytes and reject reserved bits before
 	/// publication.
 	#[test]
-	fn live_window_only_descriptor_flags() -> FerrosGrynnResult<()> {
-		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?));
+	fn live_window_only_descriptor_flags() {
+		use crate::test_assertions::AssertResult as _;
+
+		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()));
 		for (mode, output) in
 			[(LiveOutputMode::Full, 0_u8), (LiveOutputMode::Diff, 1), (LiveOutputMode::Patch, 2)]
 		{
@@ -1635,34 +1665,37 @@ mod tests {
 					&mut body,
 					&query,
 					&mut context,
-					&mut CodecBudget::new(1 << 20, 0)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: MAX_NODES,
 					},
 					0,
-				)?;
+				)
+				.assert_ok();
 				assert_eq!(body.len(), 27);
 				assert_eq!(body.last(), Some(&(output | (u8::from(only) << 2))));
 				let decoded = decode_query(
 					&mut Decoder::new(&body),
 					&context,
-					&mut CodecBudget::new(1 << 20, 0)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: MAX_NODES,
 					},
 					0,
-				)?;
+				)
+				.assert_ok();
 				assert_eq!(decoded, query);
 				for flags in [3, 7, 8, 16, 128, 255] {
 					let mut bad = body.clone();
-					*bad.last_mut().ok_or_else(|| invalid("ONLY golden flag absent"))? = flags;
+					*bad.last_mut().ok_or_else(|| invalid("ONLY golden flag absent")).assert_ok() =
+						flags;
 					assert!(
 						decode_query(
 							&mut Decoder::new(&bad),
 							&context,
-							&mut CodecBudget::new(1 << 20, 0)?,
+							&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 							&mut Work {
 								observe: None,
 								remaining: MAX_NODES
@@ -1673,27 +1706,31 @@ mod tests {
 					);
 				}
 				let descriptor = LiveDescriptor::Query(query.clone());
-				let frame = encode(&descriptor, 1 << 20)?;
+				let frame = encode(&descriptor, 1 << 20).assert_ok();
 				assert_eq!(frame.len(), 67);
-				assert_eq!(decode(&frame, 1 << 20)?, descriptor);
+				assert_eq!(decode(&frame, 1 << 20).assert_ok(), descriptor);
 				for length in 0..frame.len() {
 					assert!(decode(&frame[..length], 1 << 20).is_err());
 				}
 				let nested = LiveDescriptor::Query(
-					LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?))
+					LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()))
 						.with_projection(LiveProjection::Value(LiveExpr::Select(Box::new(query)))),
 				);
-				assert_eq!(decode(&encode(&nested, 1 << 20)?, 1 << 20)?, nested);
+				assert_eq!(
+					decode(&encode(&nested, 1 << 20).assert_ok(), 1 << 20).assert_ok(),
+					nested
+				);
 			}
 		}
-		Ok(())
 	}
 
 	/// An optional SPLIT tail preserves default bytes and validates its own
 	/// positive count, flags, nesting and retained allocation before decoding.
 	#[test]
-	fn live_window_split_descriptor_tail() -> FerrosGrynnResult<()> {
-		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?));
+	fn live_window_split_descriptor_tail() {
+		use crate::test_assertions::AssertResult as _;
+
+		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()));
 		let mut context = EncodeContext::default();
 		let query = base.clone().with_split(vec![LiveExpr::Range {
 			start: None,
@@ -1705,13 +1742,14 @@ mod tests {
 			&mut body,
 			&query,
 			&mut context,
-			&mut CodecBudget::new(1 << 20, 0)?,
+			&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 			&mut Work {
 				observe: None,
 				remaining: MAX_NODES,
 			},
 			0,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(&body[26..31], &[8, 1, 0, 0, 0]);
 		assert_eq!(body.len(), 33);
 		let decode_body = |bytes: &[u8], maximum, work| -> FerrosGrynnResult<_> {
@@ -1726,7 +1764,7 @@ mod tests {
 				0,
 			)
 		};
-		assert_eq!(decode_body(&body, 1 << 20, MAX_NODES)?, query);
+		assert_eq!(decode_body(&body, 1 << 20, MAX_NODES).assert_ok(), query);
 		for count in [0_u32, u32::MAX] {
 			let mut bad = body.clone();
 			bad[27..31].copy_from_slice(&count.to_le_bytes());
@@ -1742,98 +1780,111 @@ mod tests {
 		for size in 0..body.len() {
 			assert!(decode_body(&body[..size], 1 << 20, MAX_NODES).is_err());
 		}
-		for split in [vec![], vec![LiveExpr::field("tags")?], vec![
-			LiveExpr::field("left")?,
-			LiveExpr::field("right")?,
+		for split in [vec![], vec![LiveExpr::field("tags").assert_ok()], vec![
+			LiveExpr::field("left").assert_ok(),
+			LiveExpr::field("right").assert_ok(),
 		]] {
 			let query = base.clone().with_split(split);
 			let descriptor = LiveDescriptor::Query(query.clone());
-			assert_eq!(decode(&encode(&descriptor, 1 << 20)?, 1 << 20)?, descriptor);
+			assert_eq!(
+				decode(&encode(&descriptor, 1 << 20).assert_ok(), 1 << 20).assert_ok(),
+				descriptor
+			);
 			let nested = LiveDescriptor::Query(
 				base.clone()
 					.with_projection(LiveProjection::Value(LiveExpr::Select(Box::new(query)))),
 			);
-			assert_eq!(decode(&encode(&nested, 1 << 20)?, 1 << 20)?, nested);
+			assert_eq!(decode(&encode(&nested, 1 << 20).assert_ok(), 1 << 20).assert_ok(), nested);
 		}
 		let empty = LiveDescriptor::Query(base);
-		assert_eq!(encode(&empty, 1 << 20)?.len(), 67);
-		Ok(())
+		assert_eq!(encode(&empty, 1 << 20).assert_ok().len(), 67);
 	}
 
+	/// Verifies descriptors preserve exact values bindings and nested queries.
 	#[test]
-	fn descriptors_preserve_exact_values_bindings_and_nested_queries() -> FerrosGrynnResult<()> {
-		let binding = LiveBindingId::from_uuid(Uuid::now_v7())?;
+	fn descriptors_preserve_exact_values_bindings_and_nested_queries() {
+		use crate::test_assertions::AssertResult as _;
+
+		let binding = LiveBindingId::from_uuid(Uuid::now_v7()).assert_ok();
 		let mut parameters = Object::new();
 		parameters.insert("age", (1_u64 << 53) + 1);
-		let query = LiveQuery::new(LiveSource::Record("person:alice".parse()?))
+		let query = LiveQuery::new(LiveSource::Record("person:alice".parse().assert_ok()))
 			.with_filter(
-				LiveExpr::field("age")?
+				LiveExpr::field("age")
+					.assert_ok()
 					.binary(LiveBinaryOperator::GreaterOrEqual, LiveExpr::Binding(binding)),
 			)
-			.with_fetch(vec![LivePath::new(vec!["manager".into(), "address".into()])?])
+			.with_fetch(vec![LivePath::new(vec!["manager".into(), "address".into()]).assert_ok()])
 			.with_omit(vec![
-				LivePath::field("id")?,
-				LivePath::new(vec!["private".into(), "token".into()])?,
+				LivePath::field("id").assert_ok(),
+				LivePath::new(vec!["private".into(), "token".into()]).assert_ok(),
 			])
 			.with_projection(LiveProjection::Fields(vec![LiveField {
 				expression: LiveExpr::Parameter("age".into()),
-				alias: Some(LivePath::field("exact")?),
+				alias: Some(LivePath::field("exact").assert_ok()),
 			}]))
 			.with_parameters(parameters.clone())
-			.with_group_by(vec![LiveExpr::Binding(binding), LiveExpr::Parameter("age".into())])?
+			.with_group_by(vec![LiveExpr::Binding(binding), LiveExpr::Parameter("age".into())])
+			.assert_ok()
 			.with_output(LiveOutputMode::Patch);
 		for descriptor in [LiveDescriptor::Query(query.clone()), LiveDescriptor::Binding {
 			expression: LiveExpr::Select(Box::new(query)),
 			parameters,
 		}] {
-			let bytes = encode(&descriptor, 1024 * 1024)?;
-			assert_eq!(encode_ref(descriptor.as_ref(), 1024 * 1024)?, bytes);
+			let bytes = encode(&descriptor, 1024 * 1024).assert_ok();
+			assert_eq!(encode_ref(descriptor.as_ref(), 1024 * 1024).assert_ok(), bytes);
 			assert!(encode_ref(descriptor.as_ref(), 16).is_err());
-			assert_eq!(decode(&bytes, 1024 * 1024)?, descriptor);
-			assert_eq!(encode(&decode(&bytes, 1024 * 1024)?, 1024 * 1024)?, bytes);
+			assert_eq!(decode(&bytes, 1024 * 1024).assert_ok(), descriptor);
+			assert_eq!(
+				encode(&decode(&bytes, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+				bytes
+			);
 		}
-		Ok(())
 	}
 
 	/// Output paths retain order, boundaries and repetitions in canonical
 	/// bytes.
 	#[test]
-	fn live_omit_descriptor_checked_paths() -> FerrosGrynnResult<()> {
-		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?));
-		let nested = LivePath::new(vec!["private".into(), "token".into()])?;
+	fn live_omit_descriptor_checked_paths() {
+		use crate::test_assertions::AssertResult as _;
+
+		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()));
+		let nested = LivePath::new(vec!["private".into(), "token".into()]).assert_ok();
 		let query = base
 			.clone()
-			.with_omit(vec![nested.clone(), LivePath::field("literal.dot")?, nested])
-			.with_fetch(vec![LivePath::field("manager")?]);
+			.with_omit(vec![nested.clone(), LivePath::field("literal.dot").assert_ok(), nested])
+			.with_fetch(vec![LivePath::field("manager").assert_ok()]);
 		let descriptor = LiveDescriptor::Query(query.clone());
-		let bytes = encode(&descriptor, 1 << 20)?;
-		assert_eq!(decode(&bytes, 1 << 20)?, descriptor);
-		assert_ne!(bytes, encode(&LiveDescriptor::Query(base.clone()), 1 << 20)?);
+		let bytes = encode(&descriptor, 1 << 20).assert_ok();
+		assert_eq!(decode(&bytes, 1 << 20).assert_ok(), descriptor);
+		assert_ne!(bytes, encode(&LiveDescriptor::Query(base.clone()), 1 << 20).assert_ok());
 		assert_ne!(
 			bytes,
 			encode(
-				&LiveDescriptor::Query(query.with_omit(vec![LivePath::field("other")?])),
+				&LiveDescriptor::Query(query.with_omit(vec![LivePath::field("other").assert_ok()])),
 				1 << 20
-			)?
+			)
+			.assert_ok()
 		);
 		for end in 0..bytes.len() {
 			assert!(decode(&bytes[..end], 1 << 20).is_err());
 		}
 		assert!(decode(&bytes, 64).is_err());
-		let query = base.with_omit(vec![LivePath::field("x")?]);
+		let query = base.with_omit(vec![LivePath::field("x").assert_ok()]);
 		let mut body = Vec::new();
 		let mut context = EncodeContext::default();
 		encode_query(
 			&mut body,
 			&query,
 			&mut context,
-			&mut CodecBudget::new(1 << 20, 0)?,
+			&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 			&mut Work {
 				observe: None,
 				remaining: MAX_NODES,
 			},
 			0,
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(&body[14..18], &1_u32.to_le_bytes());
 		assert_eq!(&body[18..22], &1_u32.to_le_bytes());
 		assert_eq!(&body[22..30], &1_u64.to_le_bytes());
@@ -1872,7 +1923,7 @@ mod tests {
 				&mut Vec::new(),
 				&query,
 				&mut context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					observe: None,
 					remaining: 0
@@ -1881,24 +1932,27 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 
 	/// Clause tags, counts and recursive keys are checked before allocation.
 	#[test]
-	fn live_group_descriptor_checked_layout() -> FerrosGrynnResult<()> {
-		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1)?));
+	fn live_group_descriptor_checked_layout() {
+		use crate::test_assertions::AssertResult as _;
+
+		let base = LiveQuery::new(LiveSource::Class(ClassId::from_storage(1).assert_ok()));
 		for query in [
 			base.clone(),
 			base.clone().with_group_all(),
-			base.clone().with_group_by(vec![
-				LiveExpr::field("k")?,
-				LiveExpr::Literal(9_007_199_254_740_993_i64.into()),
-			])?,
+			base.clone()
+				.with_group_by(vec![
+					LiveExpr::field("k").assert_ok(),
+					LiveExpr::Literal(9_007_199_254_740_993_i64.into()),
+				])
+				.assert_ok(),
 		] {
 			let descriptor = LiveDescriptor::Query(query.clone());
-			let bytes = encode(&descriptor, 1 << 20)?;
-			assert_eq!(decode(&bytes, 1 << 20)?, descriptor);
+			let bytes = encode(&descriptor, 1 << 20).assert_ok();
+			assert_eq!(decode(&bytes, 1 << 20).assert_ok(), descriptor);
 			for end in 0..bytes.len() {
 				assert!(decode(&bytes[..end], 1 << 20).is_err());
 			}
@@ -1909,13 +1963,14 @@ mod tests {
 				&mut body,
 				&query,
 				&mut context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					observe: None,
 					remaining: MAX_NODES,
 				},
 				0,
-			)?;
+			)
+			.assert_ok();
 			assert_eq!(body[6], match query.group() {
 				None => 0,
 				Some([]) => 1,
@@ -1927,7 +1982,7 @@ mod tests {
 				decode_query(
 					&mut Decoder::new(&bad),
 					&context,
-					&mut CodecBudget::new(1 << 20, 0)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: MAX_NODES
@@ -1945,7 +2000,7 @@ mod tests {
 						decode_query(
 							&mut Decoder::new(&bad),
 							&context,
-							&mut CodecBudget::new(1 << 20, 0)?,
+							&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 							&mut Work {
 								observe: None,
 								remaining: MAX_NODES
@@ -1961,36 +2016,42 @@ mod tests {
 		for _ in 0..65 {
 			key = LiveExpr::Not(Box::new(key));
 		}
-		assert!(encode(&LiveDescriptor::Query(base.with_group_by(vec![key])?), 1 << 20).is_err());
-		Ok(())
+		assert!(
+			encode(&LiveDescriptor::Query(base.with_group_by(vec![key]).assert_ok()), 1 << 20)
+				.is_err()
+		);
 	}
 
 	/// Source tags are independent of Rust discriminants; graph slots and exact
 	/// RecordId values are checked before any descriptor can reach the
 	/// registry.
 	#[test]
-	fn live_graph_record_codec() -> FerrosGrynnResult<()> {
-		use crate::graph::{GraphId, GraphKind, GraphRef, GraphStorageMode};
+	fn live_graph_record_codec() {
+		use crate::{
+			graph::{GraphId, GraphKind, GraphRef, GraphStorageMode},
+			test_assertions::AssertResult as _,
+		};
 		let graph = GraphRef::new(
-			GraphId::new(7).ok_or_else(|| invalid("test graph invalid"))?,
+			GraphId::new(7).ok_or_else(|| invalid("test graph invalid")).assert_ok(),
 			"scope",
 			GraphKind::Graph,
 			GraphStorageMode::InMemory,
-		)?;
-		let record = "person:alice".parse()?;
+		)
+		.assert_ok();
+		let record = "person:alice".parse().assert_ok();
 		let query = LiveQuery::new(LiveSource::GraphRecord {
-			graph: graph.clone(),
+			graph,
 			record,
 		});
 		let descriptor = LiveDescriptor::Query(query.clone());
-		let frame = encode(&descriptor, 1 << 20)?;
-		assert_eq!(decode(&frame, 1 << 20)?, descriptor);
+		let frame = encode(&descriptor, 1 << 20).assert_ok();
+		assert_eq!(decode(&frame, 1 << 20).assert_ok(), descriptor);
 		for length in 0..frame.len() {
 			assert!(decode(&frame[..length], 1 << 20).is_err());
 		}
 		let mut body = Vec::new();
 		let mut context = EncodeContext::default();
-		let mut budget = CodecBudget::new(1 << 20, 0)?;
+		let mut budget = CodecBudget::new(1 << 20, 0).assert_ok();
 		encode_query(
 			&mut body,
 			&query,
@@ -2001,18 +2062,20 @@ mod tests {
 				remaining: MAX_NODES,
 			},
 			0,
-		)?;
+		)
+		.assert_ok();
 		let mut golden = vec![4];
 		golden.extend_from_slice(&1_u64.to_le_bytes());
 		let mut value_context = EncodeContext::default();
-		let mut value_budget = CodecBudget::new(1 << 20, 0)?;
+		let mut value_budget = CodecBudget::new(1 << 20, 0).assert_ok();
 		encode_value(
 			&mut golden,
-			&Value::from("person:alice".parse::<crate::values::RecordId>()?),
+			&Value::from("person:alice".parse::<crate::values::RecordId>().assert_ok()),
 			&mut value_context,
 			&mut value_budget,
 			None,
-		)?;
+		)
+		.assert_ok();
 		golden.extend_from_slice(&[0; 22]);
 		assert_eq!(body, golden);
 		for slot in [0_u64, 2, u64::MAX] {
@@ -2022,7 +2085,7 @@ mod tests {
 				decode_query(
 					&mut Decoder::new(&bad),
 					&context,
-					&mut CodecBudget::new(1 << 20, 0)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 					&mut Work {
 						observe: None,
 						remaining: MAX_NODES
@@ -2033,13 +2096,14 @@ mod tests {
 			);
 		}
 		let mut wrong_type = body[..9].to_vec();
-		encode_value(&mut wrong_type, &Value::Bool(true), &mut context, &mut budget, None)?;
+		encode_value(&mut wrong_type, &Value::Bool(true), &mut context, &mut budget, None)
+			.assert_ok();
 		wrong_type.extend_from_slice(&[0; 22]);
 		assert!(
 			decode_query(
 				&mut Decoder::new(&wrong_type),
 				&context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					observe: None,
 					remaining: MAX_NODES
@@ -2050,12 +2114,13 @@ mod tests {
 		);
 		assert!(encode(&descriptor, 16).is_err());
 		assert!(decode(&frame, frame.len()).is_err());
-		Ok(())
 	}
 
 	/// New logical nodes preserve ordered fields and reject untrusted counts.
 	#[test]
-	fn live_recipe_collections_and_unary_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_collections_and_unary_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		for (tag, expression) in [
 			(10, LiveExpr::Negate(Box::new(LiveExpr::Literal(1.into())))),
 			(11, LiveExpr::Positive(Box::new(LiveExpr::Literal(1.into())))),
@@ -2064,17 +2129,18 @@ mod tests {
 				expression,
 				parameters: Object::new(),
 			};
-			let bytes = encode(&descriptor, 1024 * 1024)?;
-			let mut golden = encode_binding_value(&Value::from(1), 1024 * 1024)?;
+			let bytes = encode(&descriptor, 1024 * 1024).assert_ok();
+			let mut golden = encode_binding_value(&Value::from(1), 1024 * 1024).assert_ok();
 			let length = u64::from_le_bytes(
 				golden[16..24]
 					.try_into()
-					.map_err(|_error| invalid("golden body length missing"))?,
+					.map_err(|_error| invalid("golden body length missing"))
+					.assert_ok(),
 			);
 			golden[16..24].copy_from_slice(&(length + 1).to_le_bytes());
 			golden.insert(40, tag);
 			assert_eq!(bytes, golden);
-			assert_eq!(decode(&bytes, 1024 * 1024)?, descriptor);
+			assert_eq!(decode(&bytes, 1024 * 1024).assert_ok(), descriptor);
 		}
 		let ordered = LiveDescriptor::Binding {
 			expression: LiveExpr::Object(
@@ -2090,13 +2156,13 @@ mod tests {
 		golden.extend_from_slice(&51_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
 		golden.extend_from_slice(&[9, 3, 0, 0, 0]);
-		for key in [b'z', b'a', b'z'] {
+		for key in *b"zaz" {
 			golden.extend_from_slice(&1_u64.to_le_bytes());
 			golden.extend_from_slice(&[key, 8, 0, 0, 0, 0]);
 		}
 		golden.extend_from_slice(&[0; 4]);
-		assert_eq!(encode(&ordered, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, ordered);
+		assert_eq!(encode(&ordered, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), ordered);
 		for (tag, expression) in
 			[(8, LiveExpr::Array(Vec::new())), (9, LiveExpr::Object(Vec::new()))]
 		{
@@ -2104,7 +2170,7 @@ mod tests {
 				expression,
 				parameters: Object::new(),
 			};
-			let bytes = encode(&descriptor, 1024 * 1024)?;
+			let bytes = encode(&descriptor, 1024 * 1024).assert_ok();
 			let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 			golden.extend_from_slice(&16_u64.to_le_bytes());
 			golden.extend_from_slice(&9_u64.to_le_bytes());
@@ -2112,13 +2178,13 @@ mod tests {
 			golden.push(tag);
 			golden.extend_from_slice(&[0; 8]);
 			assert_eq!(bytes, golden);
-			assert_eq!(decode(&bytes, 1024 * 1024)?, descriptor);
+			assert_eq!(decode(&bytes, 1024 * 1024).assert_ok(), descriptor);
 			let mut bad = bytes.clone();
 			bad[41..45].copy_from_slice(&u32::MAX.to_le_bytes());
 			assert!(decode(&bad, 1024 * 1024).is_err());
 			assert!(decode(&bytes, bytes.len()).is_err());
 		}
-		let id = LiveBindingId::from_uuid(Uuid::now_v7())?;
+		let id = LiveBindingId::from_uuid(Uuid::now_v7()).assert_ok();
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Object(vec![
 				("same".into(), LiveExpr::Literal(0.into())),
@@ -2132,8 +2198,8 @@ mod tests {
 			]),
 			parameters: Object::from_iter([("fixed", Value::from(9_007_199_254_740_993_i64))]),
 		};
-		let bytes = encode(&descriptor, 1024 * 1024)?;
-		assert_eq!(decode(&bytes, 1024 * 1024)?, descriptor);
+		let bytes = encode(&descriptor, 1024 * 1024).assert_ok();
+		assert_eq!(decode(&bytes, 1024 * 1024).assert_ok(), descriptor);
 		for length in 0..bytes.len() {
 			assert!(decode(&bytes[..length], 1024 * 1024).is_err());
 		}
@@ -2142,12 +2208,13 @@ mod tests {
 			parameters: Object::new(),
 		};
 		assert!(encode(&oversized, 64 * 1024 * 1024).is_err());
-		Ok(())
 	}
 
 	/// Fixed tags/flags retain literal names and reject malformed child frames.
 	#[test]
-	fn live_recipe_access_index_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_access_index_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		for null_safe in [false, true] {
 			let descriptor = LiveDescriptor::Binding {
 				expression: LiveExpr::Access {
@@ -2165,8 +2232,8 @@ mod tests {
 			golden.extend_from_slice(&1_u64.to_le_bytes());
 			golden.extend_from_slice(&[b'x', 8]);
 			golden.extend_from_slice(&[0; 8]);
-			assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-			assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
+			assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+			assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
 			let mut bad = golden.clone();
 			bad[41] = 2;
 			assert!(decode(&bad, 1024 * 1024).is_err());
@@ -2192,14 +2259,15 @@ mod tests {
 		golden.extend_from_slice(&[13, 8, 0, 0, 0, 0, 2]);
 		golden.extend_from_slice(&1_u64.to_le_bytes());
 		golden.extend_from_slice(&[b'i', 0, 0, 0, 0]);
-		assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
-		Ok(())
+		assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
 	}
 
 	/// IF child order is fixed and every child is decoded under the same cap.
 	#[test]
-	fn live_recipe_conditional_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_conditional_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Conditional {
 				condition: Box::new(LiveExpr::Parameter("c".into())),
@@ -2216,9 +2284,12 @@ mod tests {
 		golden.extend_from_slice(&1_u64.to_le_bytes());
 		golden.extend_from_slice(&[b'c', 8, 0, 0, 0, 0, 9, 0, 0, 0, 0]);
 		golden.extend_from_slice(&[0; 4]);
-		assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
-		assert_eq!(encode(&decode(&golden, 1024 * 1024)?, 1024 * 1024)?, golden);
+		assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
+		assert_eq!(
+			encode(&decode(&golden, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+			golden
+		);
 		assert!(decode(&golden, golden.len()).is_err());
 		for length in 0..golden.len() {
 			assert!(decode(&golden[..length], 1024 * 1024).is_err());
@@ -2229,13 +2300,14 @@ mod tests {
 		bad = golden;
 		bad[52..56].copy_from_slice(&u32::MAX.to_le_bytes());
 		assert!(decode(&bad, 1024 * 1024).is_err());
-		Ok(())
 	}
 
 	/// Recipe bytes retain input order and duplicates before runtime Set
 	/// construction.
 	#[test]
-	fn live_recipe_set_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_set_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Set(vec![
 				LiveExpr::Parameter("a".into()),
@@ -2250,15 +2322,18 @@ mod tests {
 		golden.extend_from_slice(&[0; 16]);
 		golden.push(15);
 		golden.extend_from_slice(&3_u32.to_le_bytes());
-		for name in [b'a', b'b', b'a'] {
+		for name in *b"aba" {
 			golden.push(2);
 			golden.extend_from_slice(&1_u64.to_le_bytes());
 			golden.push(name);
 		}
 		golden.extend_from_slice(&[0; 4]);
-		assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
-		assert_eq!(encode(&decode(&golden, 1024 * 1024)?, 1024 * 1024)?, golden);
+		assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
+		assert_eq!(
+			encode(&decode(&golden, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+			golden
+		);
 		assert!(decode(&golden, golden.len()).is_err());
 		for length in 0..golden.len() {
 			assert!(decode(&golden[..length], 1024 * 1024).is_err());
@@ -2269,12 +2344,13 @@ mod tests {
 		bad = golden;
 		bad[41..45].copy_from_slice(&u32::MAX.to_le_bytes());
 		assert!(decode(&bad, 1024 * 1024).is_err());
-		Ok(())
 	}
 
 	/// CASE bytes distinguish every ordered branch and checked optional child.
 	#[test]
-	fn live_recipe_case_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_case_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Case {
 				operand: None,
@@ -2301,9 +2377,12 @@ mod tests {
 		golden.extend_from_slice(&1_u64.to_le_bytes());
 		golden.push(b'c');
 		golden.extend_from_slice(&[0; 4]);
-		assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
-		assert_eq!(encode(&decode(&golden, 1024 * 1024)?, 1024 * 1024)?, golden);
+		assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
+		assert_eq!(
+			encode(&decode(&golden, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+			golden
+		);
 		assert!(decode(&golden, golden.len()).is_err());
 		for length in 0..golden.len() {
 			assert!(decode(&golden[..length], 1024 * 1024).is_err());
@@ -2326,7 +2405,10 @@ mod tests {
 			},
 			parameters: Object::new(),
 		};
-		assert_eq!(decode(&encode(&simple, 1024 * 1024)?, 1024 * 1024)?, simple);
+		assert_eq!(
+			decode(&encode(&simple, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+			simple
+		);
 		let empty = LiveDescriptor::Binding {
 			expression: LiveExpr::Case {
 				operand: None,
@@ -2336,12 +2418,13 @@ mod tests {
 			parameters: Object::new(),
 		};
 		assert!(encode(&empty, 1024 * 1024).is_err());
-		Ok(())
 	}
 
 	/// Explicit CAST framing checks target bytes before copying or parsing.
 	#[test]
-	fn live_recipe_cast_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_cast_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Cast {
 				target: "int".into(),
@@ -2360,9 +2443,12 @@ mod tests {
 		golden.extend_from_slice(&1_u64.to_le_bytes());
 		golden.push(b'x');
 		golden.extend_from_slice(&[0; 4]);
-		assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
-		assert_eq!(encode(&decode(&golden, 1024 * 1024)?, 1024 * 1024)?, golden);
+		assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
+		assert_eq!(
+			encode(&decode(&golden, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+			golden
+		);
 		assert!(decode(&golden, golden.len()).is_err());
 		for length in 0..golden.len() {
 			assert!(decode(&golden[..length], 1024 * 1024).is_err());
@@ -2381,7 +2467,8 @@ mod tests {
 		bad.extend_from_slice(&golden[52..]);
 		let error = decode(&bad, 1024 * 1024)
 			.err()
-			.ok_or_else(|| invalid("oversized invalid UTF-8 cast target admitted"))?;
+			.ok_or_else(|| invalid("oversized invalid UTF-8 cast target admitted"))
+			.assert_ok();
 		assert!(
 			error.cause().is_some_and(|cause| cause.to_string().contains("node count")),
 			"{error:?}"
@@ -2406,12 +2493,13 @@ mod tests {
 			};
 			assert!(encode(&bad, 1024 * 1024).is_err());
 		}
-		Ok(())
 	}
 
 	/// Scalar operator tags and synthetic truthiness have fixed logical bytes.
 	#[test]
-	fn live_recipe_scalar_operator_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_scalar_operator_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		for (offset, operator) in [
 			LiveBinaryOperator::Power,
 			LiveBinaryOperator::Remainder,
@@ -2449,14 +2537,14 @@ mod tests {
 			golden.extend_from_slice(&26_u64.to_le_bytes());
 			golden.extend_from_slice(&[0; 16]);
 			golden.extend_from_slice(&[5, 14 + offset as u8]);
-			for name in [b'x', b'y'] {
+			for name in *b"xy" {
 				golden.push(2);
 				golden.extend_from_slice(&1_u64.to_le_bytes());
 				golden.push(name);
 			}
 			golden.extend_from_slice(&[0; 4]);
-			assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-			assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
+			assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+			assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
 			assert!(decode(&golden, golden.len()).is_err());
 			for tag in [36, u8::MAX] {
 				let mut bad = golden.clone();
@@ -2471,16 +2559,17 @@ mod tests {
 			expression: LiveExpr::Parameter("x".into()).truthy(),
 			parameters: Object::new(),
 		};
-		let bytes = encode(&descriptor, 1024 * 1024)?;
+		let bytes = encode(&descriptor, 1024 * 1024).assert_ok();
 		assert_eq!(&bytes[40..43], &[4, 4, 2]);
-		assert_eq!(decode(&bytes, 1024 * 1024)?, descriptor);
-		Ok(())
+		assert_eq!(decode(&bytes, 1024 * 1024).assert_ok(), descriptor);
 	}
 
 	/// Modified calls retain ordered names and checked type/DISTINCT flags;
 	/// the original positional call keeps its existing bytes.
 	#[test]
-	fn live_recipe_call_modifiers_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_call_modifiers_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		for modified in [false, true] {
 			let expression = if modified {
 				LiveExpr::CallWithOptions {
@@ -2526,8 +2615,8 @@ mod tests {
 			golden.extend_from_slice(&(body.len() as u64).to_le_bytes());
 			golden.extend_from_slice(&[0; 16]);
 			golden.extend_from_slice(&body);
-			assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-			assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
+			assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+			assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
 			assert!(decode(&golden, golden.len()).is_err());
 			for length in 0..golden.len() {
 				assert!(decode(&golden[..length], 1024 * 1024).is_err());
@@ -2553,7 +2642,10 @@ mod tests {
 				},
 				parameters: Object::new(),
 			};
-			assert_eq!(decode(&encode(&descriptor, 1024 * 1024)?, 1024 * 1024)?, descriptor);
+			assert_eq!(
+				decode(&encode(&descriptor, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+				descriptor
+			);
 		}
 		for (name, target) in [
 			("", "int".to_owned()),
@@ -2571,12 +2663,13 @@ mod tests {
 			};
 			assert!(encode(&descriptor, 1024 * 1024).is_err());
 		}
-		Ok(())
 	}
 
 	/// Range flags and optional children have one checked durable encoding.
 	#[test]
-	fn live_recipe_range_codec() -> FerrosGrynnResult<()> {
+	fn live_recipe_range_codec() {
+		use crate::test_assertions::AssertResult as _;
+
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Range {
 				start: Some(Box::new(LiveExpr::Parameter("x".into()))),
@@ -2590,15 +2683,18 @@ mod tests {
 		golden.extend_from_slice(&26_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
 		golden.extend_from_slice(&[18, 7]);
-		for name in [b'x', b'y'] {
+		for name in *b"xy" {
 			golden.push(2);
 			golden.extend_from_slice(&1_u64.to_le_bytes());
 			golden.push(name);
 		}
 		golden.extend_from_slice(&[0; 4]);
-		assert_eq!(encode(&descriptor, 1024 * 1024)?, golden);
-		assert_eq!(decode(&golden, 1024 * 1024)?, descriptor);
-		assert_eq!(encode(&decode(&golden, 1024 * 1024)?, 1024 * 1024)?, golden);
+		assert_eq!(encode(&descriptor, 1024 * 1024).assert_ok(), golden);
+		assert_eq!(decode(&golden, 1024 * 1024).assert_ok(), descriptor);
+		assert_eq!(
+			encode(&decode(&golden, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+			golden
+		);
 		assert!(decode(&golden, golden.len()).is_err());
 		for length in 0..golden.len() {
 			assert!(decode(&golden[..length], 1024 * 1024).is_err());
@@ -2617,7 +2713,10 @@ mod tests {
 				},
 				parameters: Object::new(),
 			};
-			assert_eq!(decode(&encode(&optional, 1024 * 1024)?, 1024 * 1024)?, optional);
+			assert_eq!(
+				decode(&encode(&optional, 1024 * 1024).assert_ok(), 1024 * 1024).assert_ok(),
+				optional
+			);
 		}
 		let mut deep = LiveExpr::Parameter("x".into());
 		for _ in 0..66 {
@@ -2637,12 +2736,16 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 
+	/// Verifies descriptor limits reject runtime captures and deep expressions.
 	#[test]
-	fn descriptor_limits_reject_runtime_captures_and_deep_expressions() -> FerrosGrynnResult<()> {
-		let regex = crate::values::Regex::new("a+").map_err(|error| invalid(&error.to_string()))?;
+	fn descriptor_limits_reject_runtime_captures_and_deep_expressions() {
+		use crate::test_assertions::AssertResult as _;
+
+		let regex = crate::values::Regex::new("a+")
+			.map_err(|error| invalid(&error.to_string()))
+			.assert_ok();
 		let runtime_capture = LiveDescriptor::Binding {
 			expression: LiveExpr::Literal(Value::Regex(regex)),
 			parameters: Object::new(),
@@ -2662,7 +2765,7 @@ mod tests {
 			)
 			.is_err()
 		);
-		let invalid_fields = LiveQuery::new(LiveSource::Record("person:a".parse()?))
+		let invalid_fields = LiveQuery::new(LiveSource::Record("person:a".parse().assert_ok()))
 			.with_projection(LiveProjection::Fields(vec![]));
 		assert!(encode(&LiveDescriptor::Query(invalid_fields), 1024 * 1024).is_err());
 		let invalid_parameter = LiveDescriptor::Binding {
@@ -2670,18 +2773,23 @@ mod tests {
 			parameters: Object::new(),
 		};
 		assert!(encode(&invalid_parameter, 1024 * 1024).is_err());
-		Ok(())
 	}
 
+	/// Verifies descriptor rejects unused historical dictionary entries.
 	#[test]
-	fn descriptor_rejects_unused_historical_dictionary_entries() -> FerrosGrynnResult<()> {
+	fn descriptor_rejects_unused_historical_dictionary_entries() {
+		use crate::test_assertions::AssertResult as _;
+
 		let descriptor = LiveDescriptor::Binding {
 			expression: LiveExpr::Literal(Value::Null),
 			parameters: Object::new(),
 		};
-		let canonical = encode(&descriptor, 1024 * 1024)?;
+		let canonical = encode(&descriptor, 1024 * 1024).assert_ok();
 		let dictionary_length = u64::from_le_bytes(
-			canonical[8..16].try_into().map_err(|_error| invalid("test dictionary length"))?,
+			canonical[8..16]
+				.try_into()
+				.map_err(|_error| invalid("test dictionary length"))
+				.assert_ok(),
 		) as usize;
 		let mut dictionary = Vec::new();
 		dictionary.extend_from_slice(&0_u32.to_le_bytes());
@@ -2694,7 +2802,6 @@ mod tests {
 		malformed.extend_from_slice(&dictionary);
 		malformed.extend_from_slice(&canonical[HEADER_BYTES + dictionary_length..]);
 		assert!(decode(&malformed, 1024 * 1024).is_err());
-		assert_eq!(decode(&canonical, 1024 * 1024)?, descriptor);
-		Ok(())
+		assert_eq!(decode(&canonical, 1024 * 1024).assert_ok(), descriptor);
 	}
 }

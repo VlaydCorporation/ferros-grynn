@@ -1,6 +1,17 @@
 //! Prefix EXPLAIN syntax.
 
-use super::*;
+use super::{
+	FerrosGrynnResult,
+	InfoStatement,
+	InfoTarget,
+	LetStatement,
+	LetValue,
+	Parser,
+	Statement,
+	StatementKind,
+	Stk,
+	keywords,
+};
 
 /// Detail and execution mode requested by EXPLAIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +29,9 @@ pub enum ExplainMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExplainFormat {
+	/// Human-readable textual explanation.
 	Text,
+	/// Structured JSON-like explanation value.
 	Json,
 }
 
@@ -26,12 +39,16 @@ pub enum ExplainFormat {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ExplainStatement {
+	/// Execution or declaration policy selected by this clause.
 	pub mode: ExplainMode,
+	/// Textual or structured representation requested for EXPLAIN output.
 	pub format: ExplainFormat,
+	/// Statement whose plan or execution is being explained.
 	pub statement: Box<Statement>,
 }
 
 impl Parser<'_> {
+	/// Parses the explain statement syntax.
 	pub(in crate::syn) async fn explain_statement(
 		&mut self,
 		context: &mut Stk,
@@ -74,6 +91,7 @@ impl Parser<'_> {
 	}
 }
 
+/// Returns whether the explainable condition holds.
 fn explainable(statement: &StatementKind) -> bool {
 	if matches!(
 		statement,

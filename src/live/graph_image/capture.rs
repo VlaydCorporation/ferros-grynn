@@ -48,9 +48,15 @@ type Mapping<'a> =
 #[derive(Clone, Copy)]
 enum Reader<'a> {
 	/// Borrows the selected top-level concrete result family.
-	Root(&'a MaterializedGraph),
+	Root(
+		/// Borrows the selected top-level concrete result family.
+		&'a MaterializedGraph,
+	),
 	/// Borrows one immutable child retained by a containment owner.
-	Child(&'a Graph<Frozen>),
+	Child(
+		/// Borrows one immutable child retained by a containment owner.
+		&'a Graph<Frozen>,
+	),
 }
 
 impl<'a> Reader<'a> {
@@ -151,9 +157,15 @@ impl<'a> Reader<'a> {
 /// Query capture uses a dense source dictionary; mutable SDK keys are sparse.
 enum Names<'a> {
 	/// Resolves source handles through the accepted datastore dictionary.
-	Dictionary(&'a PropertyDictionary),
+	Dictionary(
+		/// Resolves source handles through the accepted datastore dictionary.
+		&'a PropertyDictionary,
+	),
 	/// Resolves stable SDK handles through its private sparse registry.
-	Owned(&'a BTreeMap<PropertyKeyId, Text>),
+	Owned(
+		/// Resolves stable SDK handles through its private sparse registry.
+		&'a BTreeMap<PropertyKeyId, Text>,
+	),
 }
 
 impl Names<'_> {
@@ -490,37 +502,42 @@ fn invalid(message: &str) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for capture behavior.
 mod tests {
 	use super::*;
 	use crate::graph::{GraphMut, Mutable};
 
+	/// Verifies shared scope capture rejects divergent views even at equal
+	/// revisions.
 	#[test]
-	fn shared_scope_capture_rejects_divergent_views_even_at_equal_revisions()
-	-> FerrosGrynnResult<()> {
+	fn shared_scope_capture_rejects_divergent_views_even_at_equal_revisions() {
+		use crate::test_assertions::AssertResult as _;
+
 		let key = PropertyKeyId::new(0);
 		let names = BTreeMap::from([(key, Text::from("score"))]);
 		let mut child = Graph::<Mutable>::new();
-		let node = child.add_node(None, PropertyMap::from_iter([(key, 1.into())]))?;
+		let node = child.add_node(None, PropertyMap::from_iter([(key, 1.into())])).assert_ok();
 		let child = child.freeze();
 		let mut parent = Graph::<Mutable>::new();
-		let first = parent.add_metavertex(child.clone(), None, PropertyMap::new())?;
-		let second = parent.add_metavertex(child.clone(), None, PropertyMap::new())?;
+		let first = parent.add_metavertex(child.clone(), None, PropertyMap::new()).assert_ok();
+		let second = parent.add_metavertex(child.clone(), None, PropertyMap::new()).assert_ok();
 		assert_ne!(first, second);
 		let image = LiveGraphImage::capture_with_names(
 			&MaterializedGraph::Graph(parent.freeze()),
 			&names,
 			&|_, _| Ok(()),
 			&|_, _| Ok(None),
-		)?;
+		)
+		.assert_ok();
 		assert_eq!(image.scopes.len(), 2);
 		let mut left = child.clone().thaw();
-		left.node_properties_mut(node)?.insert(key, 99);
+		left.node_properties_mut(node).assert_ok().insert(key, 99);
 		let mut right = child.thaw();
-		right.node_properties_mut(node)?.insert(key, 100);
+		right.node_properties_mut(node).assert_ok().insert(key, 100);
 		assert_eq!(left.revision(), right.revision());
 		let mut parent = Graph::<Mutable>::new();
-		let first = parent.add_metavertex(left.freeze(), None, PropertyMap::new())?;
-		let second = parent.add_metavertex(right.freeze(), None, PropertyMap::new())?;
+		let first = parent.add_metavertex(left.freeze(), None, PropertyMap::new()).assert_ok();
+		let second = parent.add_metavertex(right.freeze(), None, PropertyMap::new()).assert_ok();
 		assert_ne!(first, second);
 		assert!(
 			LiveGraphImage::capture_with_names(
@@ -531,6 +548,5 @@ mod tests {
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 }

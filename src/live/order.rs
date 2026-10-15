@@ -11,10 +11,17 @@ use crate::{
 #[non_exhaustive]
 pub enum LiveOrderKey {
 	/// A source-qualified logical expression.
-	Expression(LiveExpr),
+	Expression(
+		/// A source-qualified logical expression.
+		LiveExpr,
+	),
 	/// A single identifier, resolved as a projected name or source column by
 	/// ordinary SELECT. Dots remain literal identifier bytes.
-	Name(Text),
+	Name(
+		/// A single identifier, resolved as a projected name or source column
+		/// by ordinary SELECT. Dots remain literal identifier bytes.
+		Text,
+	),
 }
 
 /// Direction of one deterministic comparison.

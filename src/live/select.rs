@@ -28,12 +28,12 @@ macro_rules! live_graph_select {
 }
 
 #[cfg(test)]
+/// Regression tests for select behavior.
 mod tests {
 	use std::{
 		future::Future,
 		pin::pin,
-		sync::Arc,
-		task::{Context, Poll, Wake, Waker},
+		task::{Context, Poll, Waker},
 	};
 
 	/// A selector stub isolates syntax/hygiene from an executor dependency.
@@ -44,14 +44,10 @@ mod tests {
 		}};
 	}
 
+	/// Verifies branch macro evaluates one future once and preserves patterns.
 	#[test]
 	fn branch_macro_evaluates_one_future_once_and_preserves_patterns() {
-		struct Noop;
-		impl Wake for Noop {
-			fn wake(self: Arc<Self>) {}
-		}
-		let waker = Waker::from(Arc::new(Noop));
-		let mut context = Context::from_waker(&waker);
+		let mut context = Context::from_waker(Waker::noop());
 		let mut calls = 0;
 		let outcome = 99;
 		let operation = async {

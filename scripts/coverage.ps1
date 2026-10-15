@@ -1,4 +1,7 @@
-param([string]$Toolchain = 'stable')
+param(
+    [string]$Toolchain = 'stable',
+    [ValidateSet('Core', 'Workspace')][string]$Scope = 'Core'
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -9,21 +12,31 @@ if ($LASTEXITCODE -ne 0 -or -not ($llvmTools -match '^llvm-tools')) {
 }
 & cargo "+$Toolchain" llvm-cov --version
 if ($LASTEXITCODE -ne 0) { throw 'cargo-llvm-cov is required.' }
-New-Item -ItemType Directory -Path 'target/coverage' -Force | Out-Null
+if ($Scope -eq 'Workspace') {
+    $reportRoot = 'target/coverage-workspace'
+    $testArguments = @('--workspace', '--lib', '--bins', '--tests')
+    $exclude = '(^|[/\\])tests[/\\]|(^|[/\\])([^/\\]*_)?tests\.rs$'
+    $description = 'Windows; workspace; default features; library, binary and integration tests'
+} else {
+    $reportRoot = 'target/coverage'
+    $testArguments = @('-p', 'ferros-grynn', '--no-default-features', '--lib', '--tests')
+    $exclude = '(^|[/\\])(tests|crates|ferros-grynn-bench)[/\\]|(^|[/\\])([^/\\]*_)?tests\.rs$'
+    $description = 'Windows; ferros-grynn; no-default-features; lib and integration tests'
+}
+New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
 # --no-report retains profiles, so clear the coverage workspace before this run.
 & cargo "+$Toolchain" llvm-cov clean --workspace
 if ($LASTEXITCODE -ne 0) { throw 'Coverage profile cleanup failed.' }
-& cargo "+$Toolchain" llvm-cov --locked -p ferros-grynn --no-default-features --lib --tests --no-report -- --test-threads=1
+& cargo "+$Toolchain" llvm-cov --locked @testArguments --no-report -- --test-threads=1
 if ($LASTEXITCODE -ne 0) { throw 'Coverage test execution failed; no percentage will be published.' }
-# Dedicated tests and other workspace packages are outside this root-source metric.
-$exclude = '[/\\](tests|crates|ferros-grynn-bench)[/\\]|[/\\]tests\.rs$'
-& cargo "+$Toolchain" llvm-cov report --json --summary-only --ignore-filename-regex $exclude --output-path target/coverage/summary.json
+# Dedicated test files are excluded; inline unit tests can contribute to totals.
+& cargo "+$Toolchain" llvm-cov report --json --summary-only --ignore-filename-regex $exclude --output-path (Join-Path $reportRoot 'summary.json')
 if ($LASTEXITCODE -ne 0) { throw 'JSON coverage export failed.' }
-& cargo "+$Toolchain" llvm-cov report --html --ignore-filename-regex $exclude --output-dir target/coverage/html
+& cargo "+$Toolchain" llvm-cov report --html --ignore-filename-regex $exclude --output-dir (Join-Path $reportRoot 'html')
 if ($LASTEXITCODE -ne 0) { throw 'HTML coverage export failed.' }
-& (Join-Path $PSScriptRoot 'coverage-badge.ps1') -Report target/coverage/summary.json -Output target/coverage/coverage.json
+& (Join-Path $PSScriptRoot 'coverage-badge.ps1') -Report (Join-Path $reportRoot 'summary.json') -Output (Join-Path $reportRoot 'coverage.json') -Scope $description
 if ($env:GITHUB_STEP_SUMMARY) {
-    $badge = Get-Content -LiteralPath target/coverage/coverage.json -Raw | ConvertFrom-Json
-    "### Windows core coverage`n`n$($badge.message) of lines ($($badge.covered)/$($badge.lines)).`n`nScope: root sources; no default features; unit and integration tests; dedicated test files and other workspace packages excluded. Inline unit-test sections can contribute to the line metric. Doctests and optional features are not part of this percentage." |
+    $badge = Get-Content -LiteralPath (Join-Path $reportRoot 'coverage.json') -Raw | ConvertFrom-Json
+    "### Windows $Scope coverage`n`n$($badge.message) of lines ($($badge.covered)/$($badge.lines)).`n`nScope: $description. Dedicated test files are excluded; inline unit tests can contribute to the line metric. Doctests and additional optional features are outside this percentage." |
         Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
 }

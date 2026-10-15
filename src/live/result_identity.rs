@@ -7,12 +7,23 @@ use crate::values::{AtomOccurrenceRef, RecordId, Value};
 #[non_exhaustive]
 pub enum LiveIdentity {
 	/// One database-global source record.
-	Record(RecordId),
+	Record(
+		/// One database-global source record.
+		RecordId,
+	),
 	/// One graph-qualified occurrence, including repeated base atoms in scopes.
-	Occurrence(AtomOccurrenceRef),
+	Occurrence(
+		/// One graph-qualified occurrence, including repeated base atoms in
+		/// scopes.
+		AtomOccurrenceRef,
+	),
 	/// One aggregate group, identified by its exact ordered group keys.
 	/// Empty keys denote an aggregate over the complete selected source.
-	Aggregate(Vec<Value>),
+	Aggregate(
+		/// One aggregate group, identified by its exact ordered group keys.
+		/// Empty keys denote an aggregate over the complete selected source.
+		Vec<Value>,
+	),
 	/// Expanded row participants in FROM/JOIN order, followed by zero-based
 	/// SPLIT positions in clause order. Unmatched LEFT participants are
 	/// explicit. The primary source is required and at least two parts must
@@ -30,7 +41,13 @@ pub enum LiveIdentity {
 	/// # Ok(())
 	/// # }
 	/// ```
-	Composite(Vec<LiveIdentityPart>),
+	Composite(
+		/// Expanded row participants in FROM/JOIN order, followed by zero-based
+		/// SPLIT positions in clause order. Unmatched LEFT participants are
+		/// explicit. The primary source is required and at least two parts must
+		/// be present. GROUP results retain their Aggregate identity. ```
+		Vec<LiveIdentityPart>,
+	),
 }
 
 impl LiveIdentity {
@@ -80,17 +97,21 @@ impl LiveIdentity {
 }
 
 impl PartialEq for LiveIdentity {
+	/// Compares this `LiveIdentity` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other).is_eq()
 	}
 }
 impl Eq for LiveIdentity {}
 impl PartialOrd for LiveIdentity {
+	/// Compares this `LiveIdentity` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
 		Some(self.cmp(other))
 	}
 }
 impl Ord for LiveIdentity {
+	/// Compares this `LiveIdentity` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
 		match (self, other) {
 			(Self::Record(left), Self::Record(right)) => left.cmp(right),
@@ -104,6 +125,7 @@ impl Ord for LiveIdentity {
 	}
 }
 impl std::hash::Hash for LiveIdentity {
+	/// Feeds this `LiveIdentity` into the supplied hasher.
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		match self {
 			Self::Record(record) => {
@@ -132,14 +154,23 @@ impl std::hash::Hash for LiveIdentity {
 #[non_exhaustive]
 pub enum LiveIdentityPart {
 	/// One database-global participant at its declaration position.
-	Record(RecordId),
+	Record(
+		/// One database-global participant at its declaration position.
+		RecordId,
+	),
 	/// One qualified participant, independent of its graph's display name.
-	Occurrence(AtomOccurrenceRef),
+	Occurrence(
+		/// One qualified participant, independent of its graph's display name.
+		AtomOccurrenceRef,
+	),
 	/// No right participant in a LEFT JOIN; distinct from a present record
 	/// whose projected fields are NONE or NULL.
 	Unmatched,
 	/// Zero-based position in one SPLIT clause, retaining array duplicates.
-	Split(u64),
+	Split(
+		/// Zero-based position in one SPLIT clause, retaining array duplicates.
+		u64,
+	),
 }
 
 impl LiveIdentityPart {
@@ -154,17 +185,22 @@ impl LiveIdentityPart {
 	}
 }
 impl PartialEq for LiveIdentityPart {
+	/// Compares this `LiveIdentityPart` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other).is_eq()
 	}
 }
 impl Eq for LiveIdentityPart {}
 impl PartialOrd for LiveIdentityPart {
+	/// Compares this `LiveIdentityPart` with another value when they are
+	/// ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
 		Some(self.cmp(other))
 	}
 }
 impl Ord for LiveIdentityPart {
+	/// Compares this `LiveIdentityPart` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
 		match (self, other) {
 			(Self::Record(left), Self::Record(right)) => left.cmp(right),
@@ -178,6 +214,7 @@ impl Ord for LiveIdentityPart {
 	}
 }
 impl std::hash::Hash for LiveIdentityPart {
+	/// Feeds this `LiveIdentityPart` into the supplied hasher.
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		self.rank().hash(state);
 		match self {
@@ -214,6 +251,7 @@ pub fn valid_composite_parts(parts: &[LiveIdentityPart]) -> bool {
 }
 
 #[cfg(test)]
+/// Regression tests for result identity behavior.
 mod tests {
 	use std::{
 		collections::BTreeSet,
@@ -230,8 +268,10 @@ mod tests {
 	/// Scope, logical slot order and exact positions distinguish bag copies;
 	/// graph presentation changes preserve equality and hashing.
 	#[test]
-	fn live_composite_identity_order_hash_and_shape() -> FerrosGrynnResult<()> {
-		let record: RecordId = "item:a".parse()?;
+	fn live_composite_identity_order_hash_and_shape() {
+		use crate::test_assertions::AssertResult as _;
+
+		let record: RecordId = "item:a".parse().assert_ok();
 		let qualified = |id, name| -> FerrosGrynnResult<_> {
 			Ok(LiveIdentityPart::Occurrence(AtomOccurrenceRef::new(
 				AtomRef::new(AtomKind::Node, record.clone()),
@@ -245,17 +285,17 @@ mod tests {
 			)))
 		};
 		let first = vec![
-			qualified(1, "before")?,
+			qualified(1, "before").assert_ok(),
 			LiveIdentityPart::Unmatched,
 			LiveIdentityPart::Split(u64::MAX),
 		];
 		let renamed = vec![
-			qualified(1, "after")?,
+			qualified(1, "after").assert_ok(),
 			LiveIdentityPart::Unmatched,
 			LiveIdentityPart::Split(u64::MAX),
 		];
 		let other = vec![
-			qualified(2, "before")?,
+			qualified(2, "before").assert_ok(),
 			LiveIdentityPart::Unmatched,
 			LiveIdentityPart::Split(u64::MAX),
 		];
@@ -302,6 +342,5 @@ mod tests {
 			LiveIdentityPart::Record(record.clone()),
 			LiveIdentityPart::Record(record)
 		]));
-		Ok(())
 	}
 }

@@ -1,8 +1,12 @@
-use super::error::{NativeMemoryAllocationRefusedRepr, Result};
-use std::alloc::{Layout, alloc, dealloc};
-use std::ptr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::{
+	alloc::{Layout, alloc, dealloc},
+	ptr,
+	sync::atomic::{AtomicI64, AtomicU64, Ordering},
+};
 
+use super::error::{NativeMemoryAllocationRefusedRepr, Result};
+
+/// Returns page size for this module.
 pub fn page_size() -> usize {
 	#[cfg(unix)]
 	{
@@ -64,24 +68,30 @@ pub unsafe fn copy_memory(src: *const u8, dest: *mut u8, bytes: usize) {
 }
 
 // Atomic operations
+/// Compares and swap u64 for this module.
 pub fn compare_and_swap_u64(target: &AtomicU64, expected: u64, update: u64) -> bool {
 	target.compare_exchange(expected, update, Ordering::SeqCst, Ordering::SeqCst).is_ok()
 }
 
+/// Compares and swap i64 for this module.
 pub fn compare_and_swap_i64(target: &AtomicI64, expected: i64, update: i64) -> bool {
 	target.compare_exchange(expected, update, Ordering::SeqCst, Ordering::SeqCst).is_ok()
 }
 
+/// Looks up and add i64 for this module.
 pub fn get_and_add_i64(target: &AtomicI64, delta: i64) -> i64 {
 	target.fetch_add(delta, Ordering::SeqCst)
 }
 
+/// Looks up and set i64 for this module.
 pub fn get_and_set_i64(target: &AtomicI64, value: i64) -> i64 {
 	target.swap(value, Ordering::SeqCst)
 }
 
-// Byte-wise operations for unaligned access
+// Copy through byte arrays so callers do not need alignment for typed integer
+// loads or stores.
 
+/// Looks up short byte wise little endian for this module.
 pub unsafe fn get_short_byte_wise_little_endian(p: *const u8) -> i16 {
 	let mut bytes = [0u8; 2];
 	unsafe {
@@ -90,6 +100,7 @@ pub unsafe fn get_short_byte_wise_little_endian(p: *const u8) -> i16 {
 	i16::from_le_bytes(bytes)
 }
 
+/// Returns put short byte wise little endian for this module.
 pub unsafe fn put_short_byte_wise_little_endian(p: *mut u8, value: i16) {
 	let bytes = value.to_le_bytes();
 	unsafe {
@@ -97,6 +108,7 @@ pub unsafe fn put_short_byte_wise_little_endian(p: *mut u8, value: i16) {
 	}
 }
 
+/// Looks up int byte wise little endian for this module.
 pub unsafe fn get_int_byte_wise_little_endian(p: *const u8) -> i32 {
 	let mut bytes = [0u8; 4];
 	unsafe {
@@ -105,6 +117,7 @@ pub unsafe fn get_int_byte_wise_little_endian(p: *const u8) -> i32 {
 	i32::from_le_bytes(bytes)
 }
 
+/// Returns put int byte wise little endian for this module.
 pub unsafe fn put_int_byte_wise_little_endian(p: *mut u8, value: i32) {
 	let bytes = value.to_le_bytes();
 	unsafe {
@@ -112,6 +125,7 @@ pub unsafe fn put_int_byte_wise_little_endian(p: *mut u8, value: i32) {
 	}
 }
 
+/// Looks up long byte wise little endian for this module.
 pub unsafe fn get_long_byte_wise_little_endian(p: *const u8) -> i64 {
 	let mut bytes = [0u8; 8];
 	unsafe {
@@ -120,6 +134,7 @@ pub unsafe fn get_long_byte_wise_little_endian(p: *const u8) -> i64 {
 	i64::from_le_bytes(bytes)
 }
 
+/// Returns put long byte wise little endian for this module.
 pub unsafe fn put_long_byte_wise_little_endian(p: *mut u8, value: i64) {
 	let bytes = value.to_le_bytes();
 	unsafe {

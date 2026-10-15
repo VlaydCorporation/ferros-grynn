@@ -27,6 +27,7 @@ mod physical_traversal;
 mod statistics;
 
 #[cfg(test)]
+/// Regression tests for local store behavior.
 mod tests;
 
 use std::{
@@ -37,16 +38,16 @@ use std::{
 	time::{Duration, Instant},
 };
 
-pub(crate) use changefeed_reader::LocalChangefeedSnapshot;
+pub use changefeed_reader::LocalChangefeedSnapshot;
 use parking_lot::Mutex;
-pub(crate) use physical_index::{
+pub use physical_index::{
 	PhysicalIndexAtom,
 	PhysicalIndexDelta,
 	PhysicalIndexEntries,
 	PhysicalIndexRead,
 	PhysicalScalarGroup,
 };
-pub(crate) use physical_traversal::{
+pub use physical_traversal::{
 	LocalQuerySnapshot,
 	PhysicalTraversalFieldsRead,
 	PhysicalTraversalInnerRead,
@@ -122,38 +123,58 @@ use crate::{
 	values::{RecordId, Uuid, Vector},
 };
 
+/// Configured job catalog path value.
 const JOB_CATALOG_PATH: &str = "admin/jobs.fgb";
 
+/// Injected interruption point used to verify physical-generation publication.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GenerationFailurePoint {
+	/// Do not inject a generation-publication failure.
 	None,
+	/// Interrupt after building the candidate generation.
 	AfterBuild,
+	/// Interrupt after synchronizing the candidate files.
 	AfterFileSync,
+	/// Interrupt after staging the candidate catalog state.
 	AfterCatalogStage,
+	/// Interrupt immediately before the WAL commit boundary.
 	BeforeWalCommit,
 }
 
 #[cfg(test)]
 thread_local! {
+	/// Publication boundary at which generation-building tests on this thread inject a failure.
 	static GENERATION_FAILURE_POINT: std::cell::Cell<GenerationFailurePoint> =
 		const { std::cell::Cell::new(GenerationFailurePoint::None) };
 }
 
 /// Physical bindings retained with one current catalog generation.
 pub(super) struct GraphBinding {
+	/// Identifier of the graph owning this state.
 	pub(super) graph_id: GraphId,
+	/// Generation identifying this version of the data.
 	pub(super) generation: u64,
+	/// Files associated with this graph binding.
 	pub(super) files: GraphFileSet,
+	/// Membership associated with this graph binding.
 	pub(super) membership: PhysicalIndexBinding,
+	/// Edge endpoint associated with this graph binding.
 	pub(super) edge_endpoint: Option<PhysicalIndexBinding>,
+	/// Arena associated with this graph binding.
 	pub(super) arena: GraphArenaBindings,
 }
 
+/// Mutable catalog, physical file bindings and history handles owned by one
+/// local datastore.
 struct LocalState {
+	/// Database superblock path associated with this local state.
 	database_superblock_path: PathBuf,
+	/// Database superblock associated with this local state.
 	database_superblock: DatabaseSuperblock,
+	/// File catalog associated with this local state.
 	file_catalog: FileCatalog,
+	/// Database catalog associated with this local state.
 	_database_catalog: DatabaseCatalog,
 	/// Shared segment descriptors retained by logical snapshots.
 	changefeed_segments: crate::storage::ChangefeedSegments,
@@ -166,16 +187,24 @@ struct LocalState {
 	event_outbox: std::sync::Arc<crate::datastore::EventOutbox>,
 	/// Ordered authoritative journal segments, shared with immutable MVCC
 	/// roots.
-	event_outbox_segments: std::sync::Arc<Vec<crate::storage::HistorySegment>>,
+	event_outbox_segments: std::sync::Arc<[crate::storage::HistorySegment]>,
 	/// Physical pins shared by exact query snapshots and feed readers.
 	changefeed_files: changefeed::ChangefeedFiles,
+	/// Bindings associated with this local state.
 	bindings: GenerationBindings,
+	/// Registry associated with this local state.
 	registry: FileRegistry,
+	/// Atom superblock associated with this local state.
 	atom_superblock: AtomStoreSuperblock,
+	/// Graph superblocks associated with this local state.
 	graph_superblocks: BTreeMap<GraphId, GraphSuperblock>,
+	/// Physical indexes associated with this local state.
 	physical_indexes: BTreeMap<IndexId, std::sync::Arc<PhysicalIndexFile>>,
+	/// Physical statistics associated with this local state.
 	physical_statistics: Option<std::sync::Arc<PhysicalStatisticsFiles>>,
+	/// Job catalog associated with this local state.
 	job_catalog: JobCatalog,
+	/// Retired generations associated with this local state.
 	retired_generations: Vec<RetiredGeneration>,
 	/// Retired individual feed files, unlinked only after all map pins
 	/// disappear.
@@ -189,19 +218,29 @@ struct LocalState {
 			>,
 		>,
 	>,
+	/// Generation cleanup failures associated with this local state.
 	generation_cleanup_failures: u64,
+	/// Last checkpoint associated with this local state.
 	last_checkpoint: Instant,
 }
 
 /// One exclusively owned local database and its database-level frame WAL.
-pub(crate) struct LocalStore {
+pub struct LocalStore {
+	/// Root associated with this local store.
 	root: PathBuf,
+	/// Lock associated with this local store.
 	_lock: DatabaseLock,
+	/// Io associated with this local store.
 	io: PageIo,
+	/// Engine associated with this local store.
 	engine: HybridReadEngine,
+	/// Wal associated with this local store.
 	wal: FrameWal,
+	/// State associated with this local store.
 	state: Mutex<LocalState>,
+	/// Checkpoint page threshold associated with this local store.
 	checkpoint_page_threshold: usize,
+	/// Checkpoint interval associated with this local store.
 	checkpoint_interval: Duration,
 }
 
@@ -280,6 +319,7 @@ impl LocalStore {
 		result
 	}
 
+	/// Creates in directory.
 	fn create_in_directory(
 		root: &Path,
 		pool_pages: NonZeroUsize,
@@ -290,7 +330,7 @@ impl LocalStore {
 		let lock = DatabaseLock::acquire(root)?;
 		cleanup_external_index_sort(root)?;
 		cleanup_query_runs(root)?;
-		let io = PageIo::new(io_mode)?;
+		let io = PageIo::try_from(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let database = DatabaseRoot::default();
 		let generation = build_generation(&database, 1)?;
@@ -378,7 +418,7 @@ impl LocalStore {
 		let lock = DatabaseLock::acquire(root)?;
 		cleanup_external_index_sort(root)?;
 		cleanup_query_runs(root)?;
-		let io = PageIo::new(io_mode)?;
+		let io = PageIo::try_from(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let (wal, opened) = open_local_state(root, &engine, io.file_open_mode())?;
 		let job_catalog = select_metadata_bytes(
@@ -561,6 +601,7 @@ impl LocalStore {
 		}
 	}
 
+	/// Returns the persist graph catalog result.
 	fn persist_graph_catalog(
 		&self,
 		database: &DatabaseRoot,
@@ -677,7 +718,7 @@ impl LocalStore {
 			segments = Some(catalog::decode_changefeed_segments(&catalog));
 			live_segments = Some(catalog::decode_live_segments(&catalog));
 			live_graph_segments = Some(catalog::decode_live_graph_segments(&catalog));
-			event_segments = Some(std::sync::Arc::new(catalog.event_outbox_segments.clone()));
+			event_segments = Some(std::sync::Arc::from(catalog.event_outbox_segments.as_slice()));
 			file_catalog = Some(files);
 		}
 		#[cfg(test)]
@@ -816,6 +857,7 @@ impl LocalStore {
 		)
 	}
 
+	/// Returns the persist generation result.
 	fn persist_generation(
 		&self,
 		database: &DatabaseRoot,
@@ -919,7 +961,7 @@ impl LocalStore {
 		let live_segments = catalog::decode_live_segments(&generation.database_catalog);
 		let live_graph_segments = catalog::decode_live_graph_segments(&generation.database_catalog);
 		let event_segments =
-			std::sync::Arc::new(generation.database_catalog.event_outbox_segments.clone());
+			std::sync::Arc::from(generation.database_catalog.event_outbox_segments.as_slice());
 		#[cfg(test)]
 		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
 		let mut pending_feeds =
@@ -1036,6 +1078,7 @@ impl LocalStore {
 		Ok(advanced)
 	}
 
+	/// Returns the checkpoint if due result.
 	fn checkpoint_if_due(&self, state: &mut LocalState) -> FerrosGrynnResult<()> {
 		let pending = self.wal.unbackfilled_page_count();
 		if pending != 0
@@ -1186,6 +1229,7 @@ fn sweep_retired_generations(state: &mut LocalState) {
 	state.generation_cleanup_failures = state.generation_cleanup_failures.saturating_add(failures);
 }
 
+/// Returns inject generation failure for this module.
 #[cfg(test)]
 fn inject_generation_failure(point: GenerationFailurePoint) -> FerrosGrynnResult<()> {
 	GENERATION_FAILURE_POINT.with(|selected| {
@@ -1197,6 +1241,7 @@ fn inject_generation_failure(point: GenerationFailurePoint) -> FerrosGrynnResult
 	})
 }
 
+/// Returns the database name result.
 fn database_name(path: &Path) -> FerrosGrynnResult<String> {
 	path.file_name()
 		.and_then(|name| name.to_str())
@@ -1205,6 +1250,7 @@ fn database_name(path: &Path) -> FerrosGrynnResult<String> {
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("local database path has no UTF-8 name"))
 }
 
+/// Returns the io failure result.
 fn io_failure(operation: impl Into<String>, source: std::io::Error) -> FerrosGrynnError {
 	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
 }

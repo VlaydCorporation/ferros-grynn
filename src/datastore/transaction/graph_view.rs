@@ -13,7 +13,7 @@ use crate::{
 		DatabaseRoot,
 		GraphOccurrence,
 		GraphRoot,
-		OccurrenceState,
+		OccurrenceStateRef,
 		OverlayValue,
 		occurrence::PropertyOverlay,
 	},
@@ -39,40 +39,55 @@ pub struct TransactionGraphView<'tx> {
 	/// Optional SSI observer; maintenance captures retain only the immutable
 	/// root.
 	transaction: Option<&'tx Transaction>,
+	/// Root associated with this transaction graph view.
 	root: Arc<DatabaseRoot>,
+	/// Graph associated with this transaction graph view.
 	graph: Arc<GraphRoot>,
+	/// Reference associated with this transaction graph view.
 	reference: GraphRef,
+	/// Snapshot associated with this transaction graph view.
 	snapshot: SnapshotId,
+	/// Last recorded associated with this transaction graph view.
 	last_recorded: AtomicU64,
 }
 
 /// Snapshot-borrowed effective node projection returned by a transaction graph
 /// view.
 pub struct TransactionNodeRead<'view> {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: AtomId,
+	/// Stable record identifier of the associated atom.
 	record_id: &'view RecordId,
+	/// Label associated with this transaction node read.
 	label: Option<&'view Text>,
+	/// Properties associated with this transaction node read.
 	properties: EffectiveProperties<'view>,
+	/// Inner graph associated with this transaction node read.
 	inner_graph: Option<&'view GraphRef>,
 }
 
 impl NodeRead for TransactionNodeRead<'_> {
+	/// Returns the stored id of this `TransactionNodeRead<'_>`.
 	fn id(&self) -> AtomId {
 		self.id
 	}
 
+	/// Records id for `TransactionNodeRead<'_>`.
 	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
 		Ok(Cow::Borrowed(self.record_id))
 	}
 
+	/// Returns label text for `TransactionNodeRead<'_>`.
 	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
 		Ok(self.label.map(Cow::Borrowed))
 	}
 
+	/// Returns properties for `TransactionNodeRead<'_>`.
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		Ok(self.properties.resolve())
 	}
 
+	/// Returns inner graph ref for `TransactionNodeRead<'_>`.
 	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		Ok(self.inner_graph.map(Cow::Borrowed))
 	}
@@ -81,40 +96,54 @@ impl NodeRead for TransactionNodeRead<'_> {
 /// Snapshot-borrowed effective edge projection returned by a transaction graph
 /// view.
 pub struct TransactionEdgeRead<'view> {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: AtomId,
+	/// Stable record identifier of the associated atom.
 	record_id: &'view RecordId,
+	/// Topology associated with this transaction edge read.
 	topology: &'view EdgeTopology,
+	/// Label associated with this transaction edge read.
 	label: Option<&'view Text>,
+	/// Properties associated with this transaction edge read.
 	properties: EffectiveProperties<'view>,
+	/// Weight associated with this transaction edge read.
 	weight: Option<Number>,
+	/// Transition graph associated with this transaction edge read.
 	transition_graph: Option<&'view GraphRef>,
 }
 
 impl EdgeRead for TransactionEdgeRead<'_> {
+	/// Returns the stored id of this `TransactionEdgeRead<'_>`.
 	fn id(&self) -> AtomId {
 		self.id
 	}
 
+	/// Records id for `TransactionEdgeRead<'_>`.
 	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
 		Ok(Cow::Borrowed(self.record_id))
 	}
 
+	/// Returns topology for `TransactionEdgeRead<'_>`.
 	fn topology(&self) -> FerrosGrynnResult<Cow<'_, EdgeTopology>> {
 		Ok(Cow::Borrowed(self.topology))
 	}
 
+	/// Returns label text for `TransactionEdgeRead<'_>`.
 	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
 		Ok(self.label.map(Cow::Borrowed))
 	}
 
+	/// Returns properties for `TransactionEdgeRead<'_>`.
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		Ok(self.properties.resolve())
 	}
 
+	/// Returns the stored weight of this `TransactionEdgeRead<'_>`.
 	fn weight(&self) -> Option<Number> {
 		self.weight
 	}
 
+	/// Returns transition graph ref for `TransactionEdgeRead<'_>`.
 	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		Ok(self.transition_graph.map(Cow::Borrowed))
 	}
@@ -184,6 +213,7 @@ impl GraphRefReader for Transaction {
 	where
 		Self: 'tx;
 
+	/// Reads graph for `Transaction`.
 	fn read_graph(&self, reference: &GraphRef) -> FerrosGrynnResult<Self::View<'_>> {
 		self.ensure_live()?;
 		let snapshot = QuerySnapshot {
@@ -237,10 +267,12 @@ impl TransactionGraphView<'_> {
 		}
 	}
 
+	/// Records incidence.
 	fn record_incidence(&self, id: AtomId) {
 		self.record_read(ConflictKey::GraphIncidence(self.reference.id(), id));
 	}
 
+	/// Records occurrence.
 	fn record_occurrence(&self, occurrence: &GraphOccurrence) {
 		let local = occurrence.local_id();
 		if self.last_recorded.load(Ordering::Acquire) == local.raw() {
@@ -254,16 +286,18 @@ impl TransactionGraphView<'_> {
 			ConflictKey::GraphOverlay(graph, global),
 			ConflictKey::GraphIncidence(graph, local),
 		]);
-		// ponytail: cache one exact hot key; add a bounded per-view table only
+		// shortcut: cache one exact hot key; add a bounded per-view table only
 		// if alternating point-read profiles justify its metadata and lookup
 		// cost.
 		self.last_recorded.store(local.raw(), Ordering::Release);
 	}
 
-	fn occurrence(&self, id: AtomId) -> FerrosGrynnResult<Option<&GraphOccurrence>> {
-		Ok(self.graph.occurrence(id))
+	/// Returns the occurrence result.
+	fn occurrence(&self, id: AtomId) -> Option<&GraphOccurrence> {
+		self.graph.occurrence(id)
 	}
 
+	/// Returns the effective properties result.
 	fn effective_properties<'view>(
 		&'view self,
 		occurrence: &'view GraphOccurrence,
@@ -279,10 +313,11 @@ impl TransactionGraphView<'_> {
 		})
 	}
 
-	fn graph_reference<'view>(
-		&'view self,
+	/// Returns the graph reference result.
+	fn graph_reference(
+		&self,
 		id: Option<crate::graph::GraphId>,
-	) -> FerrosGrynnResult<Option<&'view GraphRef>> {
+	) -> FerrosGrynnResult<Option<&GraphRef>> {
 		id.map(|id| {
 			self.root.schema.graphs.get(&id).map(|schema| schema.reference()).ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
@@ -312,18 +347,22 @@ impl GraphRead for TransactionGraphView<'_> {
 	where
 		Self: 'a;
 
+	/// Returns identity for `TransactionGraphView<'_>`.
 	fn identity(&self) -> Uuid {
 		uuid::Uuid::from_u128(u128::from(self.reference.id().get())).into()
 	}
 
+	/// Returns revision for `TransactionGraphView<'_>`.
 	fn revision(&self) -> u64 {
 		self.snapshot.timestamp()
 	}
 
+	/// Returns kind for `TransactionGraphView<'_>`.
 	fn kind(&self) -> crate::graph::GraphKind {
 		self.reference.kind()
 	}
 
+	/// Returns properties for `TransactionGraphView<'_>`.
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.record_read(ConflictKey::GraphDefinition(self.reference.id()));
 		let schema = self.root.schema.graphs.get(&self.reference.id()).ok_or_else(|| {
@@ -332,6 +371,7 @@ impl GraphRead for TransactionGraphView<'_> {
 		Ok(Cow::Borrowed(schema.properties()))
 	}
 
+	/// Returns topology constraints for `TransactionGraphView<'_>`.
 	fn topology_constraints(&self) -> crate::graph::GraphTopologyConstraints {
 		self.root
 			.schema
@@ -342,6 +382,7 @@ impl GraphRead for TransactionGraphView<'_> {
 			})
 	}
 
+	/// Returns node ids for `TransactionGraphView<'_>`.
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Node));
 		Ok(Box::new(
@@ -352,6 +393,7 @@ impl GraphRead for TransactionGraphView<'_> {
 		))
 	}
 
+	/// Returns edge ids for `TransactionGraphView<'_>`.
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		self.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
 		Ok(Box::new(
@@ -362,6 +404,7 @@ impl GraphRead for TransactionGraphView<'_> {
 		))
 	}
 
+	/// Returns edge endpoint connectors for `TransactionGraphView<'_>`.
 	fn edge_endpoint_connectors(
 		&self,
 		endpoint: &crate::graph::EdgeEndpoint,
@@ -397,14 +440,15 @@ impl GraphRead for TransactionGraphView<'_> {
 		Ok(Some(connectors))
 	}
 
+	/// Returns node for `TransactionGraphView<'_>`.
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
-		let Some(occurrence) = self.occurrence(id)? else {
+		let Some(occurrence) = self.occurrence(id) else {
 			self.record_incidence(id);
 			return Ok(None);
 		};
-		let OccurrenceState::Node {
+		let OccurrenceStateRef::Node {
 			nested_graph,
-		} = occurrence.state()
+		} = occurrence.state().view()
 		else {
 			self.record_incidence(id);
 			return Ok(None);
@@ -424,16 +468,17 @@ impl GraphRead for TransactionGraphView<'_> {
 		}))
 	}
 
+	/// Returns edge for `TransactionGraphView<'_>`.
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
-		let Some(occurrence) = self.occurrence(id)? else {
+		let Some(occurrence) = self.occurrence(id) else {
 			self.record_incidence(id);
 			return Ok(None);
 		};
-		let OccurrenceState::Edge {
+		let OccurrenceStateRef::Edge {
 			topology,
 			weight,
 			transition_graph,
-		} = occurrence.state()
+		} = occurrence.state().view()
 		else {
 			self.record_incidence(id);
 			return Ok(None);
@@ -455,58 +500,65 @@ impl GraphRead for TransactionGraphView<'_> {
 		}))
 	}
 
+	/// Returns storage mode for `TransactionGraphView<'_>`.
 	fn storage_mode(&self) -> GraphStorageMode {
 		self.reference.storage_mode()
 	}
 
+	/// Returns the stored snapshot of this `TransactionGraphView<'_>`.
 	fn snapshot_id(&self) -> SnapshotId {
 		self.snapshot
 	}
 
+	/// Returns graph ref for `TransactionGraphView<'_>`.
 	fn graph_ref(&self) -> Option<&GraphRef> {
 		Some(&self.reference)
 	}
 }
 
 #[cfg(test)]
+/// Regression tests for graph view behavior.
 mod tests {
 	use std::borrow::Cow;
 
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{ClassSchema, Datastore},
 		graph::{AtomKind, GraphKind},
 		values::{PropertyKeyId, PropertyMap, RecordId, Value},
 	};
 
+	/// Verifies effective projection borrows base until an overlay exists.
 	#[test]
 	fn effective_projection_borrows_base_until_an_overlay_exists() {
 		let store = Datastore::in_memory();
-		let record = "person:shared".parse::<RecordId>().unwrap();
+		let record = "person:shared".parse::<RecordId>().assert_ok();
 		let key = PropertyKeyId::new(1);
 		let mut properties = PropertyMap::new();
 		properties.insert(key, "base");
 		let mut seed = store.begin();
-		seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-		let graph = seed.define_graph("view", GraphKind::Graph).unwrap();
-		seed.create_atom(record.clone(), properties).unwrap();
-		let local = seed.attach_node(graph.id(), &record, None, None).unwrap();
-		seed.commit().unwrap();
+		seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let graph = seed.define_graph("view", GraphKind::Graph).assert_ok();
+		seed.create_atom(record.clone(), properties).assert_ok();
+		let local = seed.attach_node(graph.id(), &record, None, None).assert_ok();
+		seed.commit().assert_ok();
 
 		let read = store.begin();
-		let view = graph.read(&read).unwrap();
-		let node = view.node(local).unwrap().unwrap();
-		assert!(matches!(node.properties().unwrap(), Cow::Borrowed(_)));
+		let view = graph.read(&read).assert_ok();
+		let node = view.node(local).assert_ok().assert_some();
+		assert!(matches!(node.properties().assert_ok(), Cow::Borrowed(_)));
 		drop(view);
 		drop(read);
 
 		let mut update = store.begin();
-		update.set_overlay(graph.id(), &record, key, Value::from("overlay")).unwrap();
-		update.commit().unwrap();
+		update.set_overlay(graph.id(), &record, key, Value::from("overlay")).assert_ok();
+		update.commit().assert_ok();
 		let read = store.begin();
-		let view = graph.read(&read).unwrap();
-		let node = view.node(local).unwrap().unwrap();
+		let view = graph.read(&read).assert_ok();
+		let node = view.node(local).assert_ok().assert_some();
 		assert!(node.properties.overlay.is_some());
-		assert!(matches!(node.properties().unwrap(), Cow::Owned(_)));
+		assert!(matches!(node.properties().assert_ok(), Cow::Owned(_)));
 	}
 }

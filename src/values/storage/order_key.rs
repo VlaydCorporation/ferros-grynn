@@ -92,7 +92,7 @@ pub fn encode_index_key(
 /// Encodes complete leading composite components for a prefix/range search.
 /// Every component receives the same escaping and separator it has before a
 /// following field in a complete key.
-pub(crate) fn encode_index_prefix(
+pub fn encode_index_prefix(
 	components: &[(&Value, &Type)],
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<Vec<u8>> {
@@ -110,6 +110,7 @@ pub(crate) fn encode_index_prefix(
 	Ok(output)
 }
 
+/// Encodes typed for this module.
 fn encode_typed(
 	value: &StorageValue,
 	value_type: &Type,
@@ -183,6 +184,7 @@ fn encode_typed(
 	Ok(encoded)
 }
 
+/// Encodes float for this module.
 fn encode_float(bits: u64) -> FerrosGrynnResult<Vec<u8>> {
 	let value = f64::from_bits(bits);
 	if value.is_nan() {
@@ -201,6 +203,7 @@ fn encode_float(bits: u64) -> FerrosGrynnResult<Vec<u8>> {
 	Ok(ordered.to_be_bytes().to_vec())
 }
 
+/// Encodes decimal for this module.
 fn encode_decimal(mut mantissa: i128, mut scale: u8) -> FerrosGrynnResult<Vec<u8>> {
 	while scale > 0 && mantissa % 10 == 0 {
 		mantissa /= 10;
@@ -242,6 +245,7 @@ fn encode_decimal(mut mantissa: i128, mut scale: u8) -> FerrosGrynnResult<Vec<u8
 	Ok(encoded)
 }
 
+/// Encodes duration for this module.
 fn encode_duration(value: &super::StorageDuration) -> FerrosGrynnResult<Vec<u8>> {
 	let sign = if value.negative {
 		-1_i128
@@ -278,6 +282,7 @@ fn encode_duration(value: &super::StorageDuration) -> FerrosGrynnResult<Vec<u8>>
 	Ok(encoded)
 }
 
+/// Encodes record for this module.
 fn encode_record(
 	value: &super::StorageRecordId,
 	context: &EncodeContext,
@@ -292,6 +297,7 @@ fn encode_record(
 	Ok(encoded)
 }
 
+/// Encodes record part for this module.
 fn encode_record_part(value: &StorageRecordIdPart) -> FerrosGrynnResult<Vec<u8>> {
 	let mut encoded = Vec::new();
 	match value {
@@ -331,6 +337,7 @@ fn encode_record_part(value: &StorageRecordIdPart) -> FerrosGrynnResult<Vec<u8>>
 	Ok(encoded)
 }
 
+/// Encodes record sequence for this module.
 fn encode_record_sequence(
 	output: &mut Vec<u8>,
 	values: &[StorageRecordValue],
@@ -344,6 +351,7 @@ fn encode_record_sequence(
 	Ok(())
 }
 
+/// Encodes record value for this module.
 fn encode_record_value(value: &StorageRecordValue) -> FerrosGrynnResult<Vec<u8>> {
 	let part = match value {
 		StorageRecordValue::Int(value) => StorageRecordIdPart::Int(*value),
@@ -356,6 +364,7 @@ fn encode_record_value(value: &StorageRecordValue) -> FerrosGrynnResult<Vec<u8>>
 	encode_record_part(&part)
 }
 
+/// Encodes sequence for this module.
 fn encode_sequence(
 	values: &[StorageValue],
 	element: &Type,
@@ -371,6 +380,7 @@ fn encode_sequence(
 	Ok(encoded)
 }
 
+/// Encodes range for this module.
 fn encode_range(
 	value: &super::StorageRange,
 	element: &Type,
@@ -406,6 +416,7 @@ fn encode_range(
 	Ok(encoded)
 }
 
+/// Appends escaped for this module.
 fn append_escaped(output: &mut Vec<u8>, bytes: &[u8]) {
 	for byte in bytes {
 		if *byte == ESCAPE {
@@ -416,23 +427,27 @@ fn append_escaped(output: &mut Vec<u8>, bytes: &[u8]) {
 	}
 }
 
+/// Returns ordered i32 for this module.
 fn ordered_i32(value: i32) -> [u8; 4] {
 	let mut bytes = value.to_be_bytes();
 	bytes[0] ^= 0x80;
 	bytes
 }
 
+/// Returns ordered i64 for this module.
 fn ordered_i64(value: i64) -> [u8; 8] {
 	let mut bytes = value.to_be_bytes();
 	bytes[0] ^= 0x80;
 	bytes
 }
 
+/// Returns index value error for this module.
 fn index_value_error(message: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(message)
 }
 
 #[cfg(test)]
+/// Regression tests for order key behavior.
 mod tests {
 	use std::ops::Bound;
 
@@ -446,80 +461,95 @@ mod tests {
 		graph::{AtomKind, AtomRef},
 	};
 
+	/// Returns encode for this module.
 	fn encode(value: &Value, value_type: &Type) -> FerrosGrynnResult<Vec<u8>> {
 		encode_index_key(&[(value, value_type)], &mut EncodeContext::new(PropertyDictionary::new()))
 	}
 
+	/// Verifies integer float and decimal keys preserve order.
 	#[test]
-	fn integer_float_and_decimal_keys_preserve_order() -> FerrosGrynnResult<()> {
+	fn integer_float_and_decimal_keys_preserve_order() {
+		use crate::test_assertions::AssertResult as _;
+
 		for pair in [(-10_i64, -1_i64), (-1, 0), (0, 1), (1, i64::MAX)] {
 			assert!(
-				encode(&Value::from(pair.0), &Type::Int)?
-					< encode(&Value::from(pair.1), &Type::Int)?
+				encode(&Value::from(pair.0), &Type::Int).assert_ok()
+					< encode(&Value::from(pair.1), &Type::Int).assert_ok()
 			);
 		}
 		for pair in [(-f64::INFINITY, -1.5), (-0.5, 0.0), (0.0, 3.0), (3.0, f64::INFINITY)] {
 			assert!(
-				encode(&Value::from(pair.0), &Type::Float)?
-					< encode(&Value::from(pair.1), &Type::Float)?
+				encode(&Value::from(pair.0), &Type::Float).assert_ok()
+					< encode(&Value::from(pair.1), &Type::Float).assert_ok()
 			);
 		}
-		let decimal =
-			|value: &str| Value::from(value.parse::<Decimal>().expect("valid test decimal"));
+		let decimal = |value: &str| {
+			Value::from(value.parse::<Decimal>().assert_ok_with("valid test decimal"))
+		};
 		for pair in [("-10", "-1"), ("-0.5", "0"), ("0.5", "1"), ("1", "10")] {
 			assert!(
-				encode(&decimal(pair.0), &Type::Decimal)?
-					< encode(&decimal(pair.1), &Type::Decimal)?
+				encode(&decimal(pair.0), &Type::Decimal).assert_ok()
+					< encode(&decimal(pair.1), &Type::Decimal).assert_ok()
 			);
 		}
 		assert_eq!(
-			encode(&decimal("1.0"), &Type::Decimal)?,
-			encode(&decimal("1.00"), &Type::Decimal)?
+			encode(&decimal("1.0"), &Type::Decimal).assert_ok(),
+			encode(&decimal("1.00"), &Type::Decimal).assert_ok()
 		);
 		assert_eq!(
-			encode(&Value::from(-0.0_f64), &Type::Float)?,
-			encode(&Value::from(0.0_f64), &Type::Float)?,
+			encode(&Value::from(-0.0_f64), &Type::Float).assert_ok(),
+			encode(&Value::from(0.0_f64), &Type::Float).assert_ok(),
 		);
-		Ok(())
 	}
 
+	/// Verifies composite strings escape zero without losing lexicographic
+	/// order.
 	#[test]
-	fn composite_strings_escape_zero_without_losing_lexicographic_order() -> FerrosGrynnResult<()> {
+	fn composite_strings_escape_zero_without_losing_lexicographic_order() {
+		use crate::test_assertions::AssertResult as _;
+
 		let left = Value::from("ab");
 		let middle = Value::from("ab\0");
 		let right = Value::from("ac");
 		let tail = Value::from(7_i64);
 		let mut context = EncodeContext::new(PropertyDictionary::new());
-		let left = encode_index_key(&[(&left, &Type::String), (&tail, &Type::Int)], &mut context)?;
+		let left = encode_index_key(&[(&left, &Type::String), (&tail, &Type::Int)], &mut context)
+			.assert_ok();
 		let middle =
-			encode_index_key(&[(&middle, &Type::String), (&tail, &Type::Int)], &mut context)?;
-		let right =
-			encode_index_key(&[(&right, &Type::String), (&tail, &Type::Int)], &mut context)?;
+			encode_index_key(&[(&middle, &Type::String), (&tail, &Type::Int)], &mut context)
+				.assert_ok();
+		let right = encode_index_key(&[(&right, &Type::String), (&tail, &Type::Int)], &mut context)
+			.assert_ok();
 		assert!(left < middle && middle < right);
-		Ok(())
 	}
 
+	/// Verifies none null and present values preserve runtime order.
 	#[test]
-	fn none_null_and_present_values_preserve_runtime_order() -> FerrosGrynnResult<()> {
-		let none = encode(&Value::None, &Type::Int)?;
-		let null = encode(&Value::Null, &Type::Int)?;
-		let present = encode(&Value::from(i64::MIN), &Type::Int)?;
+	fn none_null_and_present_values_preserve_runtime_order() {
+		use crate::test_assertions::AssertResult as _;
+
+		let none = encode(&Value::None, &Type::Int).assert_ok();
+		let null = encode(&Value::Null, &Type::Int).assert_ok();
+		let present = encode(&Value::from(i64::MIN), &Type::Int).assert_ok();
 		assert!(none < null && null < present);
-		Ok(())
 	}
 
+	/// Verifies record and atom keys ignore dictionary and physical allocation
+	/// order.
 	#[test]
-	fn record_and_atom_keys_ignore_dictionary_and_physical_allocation_order()
-	-> FerrosGrynnResult<()> {
-		let late: RecordId = "z:1".parse()?;
-		let early: RecordId = "a:1".parse()?;
+	fn record_and_atom_keys_ignore_dictionary_and_physical_allocation_order() {
+		use crate::test_assertions::AssertResult as _;
+
+		let late: RecordId = "z:1".parse().assert_ok();
+		let early: RecordId = "a:1".parse().assert_ok();
 		let late_value = Value::from(late.clone());
 		let early_value = Value::from(early.clone());
 		let mut context = EncodeContext::new(PropertyDictionary::new());
-		context.register_class_name(7, "z".into())?;
-		context.register_class_name(9, "a".into())?;
-		let late_key = encode_index_key(&[(&late_value, &Type::Record)], &mut context)?;
-		let early_key = encode_index_key(&[(&early_value, &Type::Record)], &mut context)?;
+		context.register_class_name(7, "z".into()).assert_ok();
+		context.register_class_name(9, "a".into()).assert_ok();
+		let late_key = encode_index_key(&[(&late_value, &Type::Record)], &mut context).assert_ok();
+		let early_key =
+			encode_index_key(&[(&early_value, &Type::Record)], &mut context).assert_ok();
 		assert!(early_key < late_key);
 
 		let late_atom = AtomRef::new(AtomKind::Node, late);
@@ -527,30 +557,39 @@ mod tests {
 		let late_value = Value::from(late_atom);
 		let early_value = Value::from(early_atom);
 		let value_type = Type::Atom(AtomKind::Node);
-		let late_key = encode_index_key(&[(&late_value, &value_type)], &mut context)?;
-		let early_key = encode_index_key(&[(&early_value, &value_type)], &mut context)?;
+		let late_key = encode_index_key(&[(&late_value, &value_type)], &mut context).assert_ok();
+		let early_key = encode_index_key(&[(&early_value, &value_type)], &mut context).assert_ok();
 		assert!(early_key < late_key);
-		Ok(())
 	}
 
+	/// Verifies range keys compare bounds after their values.
 	#[test]
-	fn range_keys_compare_bounds_after_their_values() -> FerrosGrynnResult<()> {
+	fn range_keys_compare_bounds_after_their_values() {
+		use crate::test_assertions::AssertResult as _;
+
 		let ranges = [
 			(
-				Range::new(Bound::Included(0_i64.into()), Bound::Included(200_i64.into()))?,
-				Range::new(Bound::Excluded(100_i64.into()), Bound::Included(200_i64.into()))?,
+				Range::new(Bound::Included(0_i64.into()), Bound::Included(200_i64.into()))
+					.assert_ok(),
+				Range::new(Bound::Excluded(100_i64.into()), Bound::Included(200_i64.into()))
+					.assert_ok(),
 			),
 			(
-				Range::new(Bound::Included(0_i64.into()), Bound::Included(10_i64.into()))?,
-				Range::new(Bound::Excluded(0_i64.into()), Bound::Included(10_i64.into()))?,
+				Range::new(Bound::Included(0_i64.into()), Bound::Included(10_i64.into()))
+					.assert_ok(),
+				Range::new(Bound::Excluded(0_i64.into()), Bound::Included(10_i64.into()))
+					.assert_ok(),
 			),
 			(
-				Range::new(Bound::Included(0_i64.into()), Bound::Included(10_i64.into()))?,
-				Range::new(Bound::Included(0_i64.into()), Bound::Excluded(10_i64.into()))?,
+				Range::new(Bound::Included(0_i64.into()), Bound::Included(10_i64.into()))
+					.assert_ok(),
+				Range::new(Bound::Included(0_i64.into()), Bound::Excluded(10_i64.into()))
+					.assert_ok(),
 			),
 			(
-				Range::new(Bound::Included(0_i64.into()), Bound::Included(10_i64.into()))?,
-				Range::new(Bound::Included(0_i64.into()), Bound::Unbounded)?,
+				Range::new(Bound::Included(0_i64.into()), Bound::Included(10_i64.into()))
+					.assert_ok(),
+				Range::new(Bound::Included(0_i64.into()), Bound::Unbounded).assert_ok(),
 			),
 		];
 		let value_type = Type::Range(Box::new(Type::Int));
@@ -558,11 +597,13 @@ mod tests {
 			let left = Value::from(left);
 			let right = Value::from(right);
 			assert!(left < right);
-			assert!(encode(&left, &value_type)? < encode(&right, &value_type)?);
+			assert!(
+				encode(&left, &value_type).assert_ok() < encode(&right, &value_type).assert_ok()
+			);
 		}
-		Ok(())
 	}
 
+	/// Verifies nan and types without total scalar order are rejected.
 	#[test]
 	fn nan_and_types_without_total_scalar_order_are_rejected() {
 		assert!(encode(&Value::from(f64::NAN), &Type::Float).is_err());

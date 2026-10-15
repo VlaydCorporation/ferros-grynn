@@ -17,6 +17,7 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 use rapidhash::{HashMapExt, HashSetExt, RapidHashMap, RapidHashSet};
+#[cfg(test)]
 use rayon::prelude::{
 	IndexedParallelIterator,
 	IntoParallelRefIterator,
@@ -24,9 +25,11 @@ use rayon::prelude::{
 	ParallelIterator,
 };
 
-pub use super::page_cache::{PageCacheKey, PageCacheVersion, validate_loaded_header};
+use super::page::{AlignedPage, PAGE_SIZE, PageHeader};
+pub use super::page_cache::{PageCacheKey, validate_loaded_header};
+#[cfg(test)]
 use super::{
-	page::{AlignedPage, PAGE_SIZE, PageHeader, PageLsn, PageNo},
+	page::{PageLsn, PageNo},
 	types::PageKey,
 };
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
@@ -36,8 +39,11 @@ mod batch;
 /// Clock-Pro replacement state machine.
 mod clock_pro;
 
+use batch::LoadSignal;
+#[cfg(test)]
 pub(in crate::storage) use batch::PageLoadExtent;
-use batch::{BatchLoadReservation, LoadSignal, load_reserved_extents};
+#[cfg(test)]
+use batch::{BatchLoadReservation, load_reserved_extents};
 use clock_pro::ClockPro;
 #[cfg(test)]
 use clock_pro::FrameState;
@@ -46,6 +52,7 @@ use clock_pro::FrameState;
 const CLOCK_SCAN_PASSES: usize = 4;
 
 /// Smallest extent for which parallel checksum work amortizes Rayon dispatch.
+#[cfg(test)]
 const PARALLEL_VALIDATION_MIN_PAGES: usize = 16;
 
 /// Shared immutable page backed by one permanently aligned frame allocation.
@@ -55,6 +62,7 @@ type CachedPage = Arc<Box<AlignedPage>>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct BufferPoolStats {
 	/// Aligned page-buffer allocations performed while creating fixed frames.
+	#[cfg(test)]
 	page_buffer_allocations: usize,
 	/// Requests served from an already resident frame.
 	hits: u64,
@@ -68,6 +76,7 @@ pub(super) struct BufferPoolStats {
 	backpressure_waits: u64,
 }
 
+#[cfg(test)]
 impl BufferPoolStats {
 	/// Returns the lifetime number of aligned page-buffer allocations.
 	pub(super) const fn page_buffer_allocations(self) -> usize {
@@ -106,7 +115,7 @@ pub struct PageGuard {
 	/// notification.
 	page: CachedPage,
 	/// Notification sent after the preceding page field releases its pin.
-	release: ReleaseNotifier,
+	_release: ReleaseNotifier,
 }
 
 impl PageGuard {
@@ -154,16 +163,11 @@ impl BufferPool {
 		Self {
 			shared: Arc::new(Shared {
 				state: Mutex::new(ClockPro::new(capacity)),
-				batch_admission: Mutex::new(()),
+				_batch_admission: Mutex::new(()),
 				capacity_available: Condvar::new(),
 				capacity_waiters: AtomicUsize::new(0),
 			}),
 		}
-	}
-
-	/// Returns the fixed number of permanently allocated page frames.
-	pub(super) fn capacity(&self) -> usize {
-		self.shared.state.lock().frames.len()
 	}
 
 	/// Returns a pinned page, loading and validating it on a miss.
@@ -245,6 +249,7 @@ impl BufferPool {
 	/// Returns an error when the unique batch exceeds pool capacity, a loader
 	/// fails, a page does not match its key, an in-flight load fails, or cache
 	/// metadata is inconsistent.
+	#[cfg(test)]
 	pub(super) fn get_or_load_batch<Loader>(
 		&self,
 		keys: &[PageCacheKey],
@@ -270,6 +275,7 @@ impl BufferPool {
 	///
 	/// Returns the same admission, load, validation, and metadata errors as
 	/// [`Self::get_or_load_batch`].
+	#[cfg(test)]
 	pub(super) fn get_or_load_batch_extents<Loader>(
 		&self,
 		keys: &[PageCacheKey],
@@ -308,7 +314,7 @@ impl BufferPool {
 			));
 		}
 
-		let batch_admission = self.shared.batch_admission.lock();
+		let batch_admission = self.shared._batch_admission.lock();
 		let mut resolved = vec![None; unique_keys.len()];
 		let mut waiting = Vec::with_capacity(unique_keys.len());
 		let mut loading = Vec::with_capacity(unique_keys.len());
@@ -466,18 +472,20 @@ impl BufferPool {
 	fn guard(&self, page: CachedPage) -> PageGuard {
 		PageGuard {
 			page,
-			release: ReleaseNotifier {
+			_release: ReleaseNotifier {
 				shared: Arc::clone(&self.shared),
 			},
 		}
 	}
 
 	/// Returns a consistent snapshot of cache counters.
+	#[cfg(test)]
 	pub(super) fn stats(&self) -> BufferPoolStats {
 		self.shared.state.lock().stats
 	}
 
 	/// Returns the number of resident or in-flight frame reservations.
+	#[cfg(test)]
 	pub(super) fn frame_count(&self) -> usize {
 		self.shared.state.lock().entries.len()
 	}
@@ -516,6 +524,7 @@ impl BufferPool {
 	}
 
 	/// Rolls back all unpublished frames from a failed batch.
+	#[cfg(test)]
 	fn abort_batch_loads(&self, reservations: Vec<BatchLoadReservation>, error: FerrosGrynnError) {
 		let mut state = self.shared.state.lock();
 		let mut signals = Vec::with_capacity(reservations.len());
@@ -538,9 +547,9 @@ struct Shared {
 	/// Serializes multi-frame admission so capacity waiters cannot retain
 	/// mutually blocking partial batch reservations.
 	///
-	/// ponytail: keep one admission lock until concurrent sync batch admission
+	/// shortcut: keep one admission lock until concurrent sync batch admission
 	/// is a measured bottleneck; I/O remains parallel after reservation.
-	batch_admission: Mutex<()>,
+	_batch_admission: Mutex<()>,
 	/// Notification for a loading completion or released page guard.
 	capacity_available: Condvar,
 	/// Callers registered to recheck frame capacity before sleeping.
@@ -550,9 +559,15 @@ struct Shared {
 /// Result of one metadata lookup.
 enum AccessDecision {
 	/// Resident immutable page, already pinned by its cloned [`Arc`].
-	Ready(CachedPage),
+	Ready(
+		/// Resident immutable page, already pinned by its cloned [`Arc`].
+		CachedPage,
+	),
 	/// Existing load whose result must be awaited.
-	Wait(Arc<LoadSignal>),
+	Wait(
+		/// Existing load whose result must be awaited.
+		Arc<LoadSignal>,
+	),
 	/// Newly reserved frame whose page must be loaded by this caller.
 	Load {
 		/// Fixed frame selected by the clock hand.
@@ -569,6 +584,7 @@ enum AccessDecision {
 	clippy::panic_in_result_fn,
 	reason = "fallible test setup returns Result while assertions report contract failures"
 )]
+/// Regression tests for buffer pool behavior.
 mod tests {
 	use std::{
 		error::Error,
@@ -593,6 +609,7 @@ mod tests {
 		graph::GraphId,
 		storage::{
 			page::{PAGE_HEADER_SIZE, PageFlags, PageType},
+			page_cache::PageCacheVersion,
 			types::{DataFileId, DataFileKind},
 		},
 	};
@@ -731,6 +748,7 @@ mod tests {
 		Ok((thread_count * operations_per_thread) as f64 / elapsed.as_secs_f64())
 	}
 
+	/// Verifies hit shares page and key separates versions.
 	#[test]
 	fn hit_shares_page_and_key_separates_versions() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(2)?);
@@ -759,6 +777,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies keys from different files share capacity without aliasing.
 	#[test]
 	fn keys_from_different_files_share_capacity_without_aliasing() -> Result<(), Box<dyn Error>> {
 		let first_file = DataFileId::new(1, DataFileKind::Index)
@@ -789,6 +808,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent miss coalesces without holding metadata lock.
 	#[test]
 	fn concurrent_miss_coalesces_without_holding_metadata_lock() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(2)?);
@@ -850,6 +870,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies pinned frame applies backpressure until guard drops.
 	#[test]
 	fn pinned_frame_applies_backpressure_until_guard_drops() -> Result<(), Box<dyn Error>> {
 		let pool = Arc::new(BufferPool::new(NonZeroUsize::MIN));
@@ -881,6 +902,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies guard drop without capacity waiters does not lock metadata.
 	#[test]
 	fn guard_drop_without_capacity_waiters_does_not_lock_metadata() -> Result<(), Box<dyn Error>> {
 		let pool = Arc::new(BufferPool::new(NonZeroUsize::MIN));
@@ -908,8 +930,13 @@ mod tests {
 	#[test]
 	#[ignore = "release-mode diagnostic for resident buffer-pool hit costs"]
 	fn resident_hit_cost_probe() -> Result<(), Box<dyn Error>> {
+		/// Resident frame count preloaded by the buffer-pool hit-cost
+		/// diagnostic.
 		const CAPACITY: usize = 4096;
+		/// Lookup iterations used by the single-thread resident-hit
+		/// measurement.
 		const ITERATIONS: usize = 1_000_000;
+		/// Lookup operations assigned to each concurrent resident-hit worker.
 		const CONCURRENT_OPERATIONS: usize = 100_000;
 		let pool = BufferPool::new(capacity(CAPACITY)?);
 		let mut keys = Vec::with_capacity(CAPACITY);
@@ -1090,6 +1117,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies released frames wake waiters and preserve coalescing.
 	#[test]
 	fn released_frames_wake_waiters_and_preserve_coalescing() -> Result<(), Box<dyn Error>> {
 		let pool = Arc::new(BufferPool::new(capacity(2)?));
@@ -1174,6 +1202,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies frame payload address is reused after eviction.
 	#[test]
 	fn frame_payload_address_is_reused_after_eviction() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(NonZeroUsize::MIN);
@@ -1191,6 +1220,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies batch preserves order duplicates and contiguous extents.
 	#[test]
 	fn batch_preserves_order_duplicates_and_contiguous_extents() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(8)?);
@@ -1230,6 +1260,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies large contiguous batch installs every validated page.
 	#[test]
 	fn large_contiguous_batch_installs_every_validated_page() -> Result<(), Box<dyn Error>> {
 		let page_count = PARALLEL_VALIDATION_MIN_PAGES;
@@ -1262,6 +1293,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies failed batch releases every unpublished reservation.
 	#[test]
 	fn failed_batch_releases_every_unpublished_reservation() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(4)?);
@@ -1283,6 +1315,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies batch handles resident loading missing and duplicate pages.
 	#[test]
 	fn batch_handles_resident_loading_missing_and_duplicate_pages() -> Result<(), Box<dyn Error>> {
 		let pool = Arc::new(BufferPool::new(capacity(4)?));
@@ -1349,6 +1382,8 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies concurrent batches cannot hold partial admission against each
+	/// other.
 	#[test]
 	fn concurrent_batches_cannot_hold_partial_admission_against_each_other()
 	-> Result<(), Box<dyn Error>> {
@@ -1379,7 +1414,7 @@ mod tests {
 			drop(first_tx.send(result));
 		});
 		assert!(wait_until(|| pool.stats().backpressure_waits() == 1));
-		assert!(pool.shared.batch_admission.try_lock().is_none());
+		assert!(pool.shared._batch_admission.try_lock().is_none());
 
 		let (second_tx, second_rx) = mpsc::channel();
 		let second_pool = Arc::clone(&pool);
@@ -1416,6 +1451,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies failed load releases reservation and error to waiters.
 	#[test]
 	fn failed_load_releases_reservation_and_error_to_waiters() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(NonZeroUsize::MIN);
@@ -1434,6 +1470,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies clock pro retains periodically referenced page during scan.
 	#[test]
 	fn clock_pro_retains_periodically_referenced_page_during_scan() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(8)?);

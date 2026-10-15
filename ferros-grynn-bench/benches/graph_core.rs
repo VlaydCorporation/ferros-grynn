@@ -36,8 +36,11 @@ use ferros_grynn::{
 	values::{PropertyKeyId, PropertyMap, RecordId, RecordIdPart},
 };
 
+/// Graph populations used by traversal, mutation and materialization
+/// benchmarks.
 const SIZES: [usize; 2] = [128, 4_096];
 
+/// Measures traversal with the benchmark harness.
 fn benchmark_traversal(criterion: &mut Criterion) {
 	let mut group = criterion.benchmark_group("graph/traversal_chain");
 	for size in SIZES {
@@ -70,6 +73,7 @@ fn benchmark_traversal(criterion: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures state and family conversions with the benchmark harness.
 fn benchmark_state_and_family_conversions(criterion: &mut Criterion) {
 	let mut group = criterion.benchmark_group("graph/conversion");
 	for size in SIZES {
@@ -113,6 +117,7 @@ fn benchmark_state_and_family_conversions(criterion: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures access modes with the benchmark harness.
 fn benchmark_access_modes(criterion: &mut Criterion) {
 	let mut group = criterion.benchmark_group("graph/access_mode");
 	for size in SIZES {
@@ -143,6 +148,7 @@ fn benchmark_access_modes(criterion: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures path and live publication with the benchmark harness.
 fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 	let path = path(256);
 	let copied_steps = path.steps().to_vec();
@@ -161,7 +167,10 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 				next.add_node(None, PropertyMap::new()).unwrap();
 				(LiveGraph::new(current), next.freeze())
 			},
-			|(live, next)| black_box(live.publish(next).unwrap()),
+			|(live, next)| {
+				live.publish(next).unwrap();
+				black_box(())
+			},
 			BatchSize::LargeInput,
 		);
 	});
@@ -177,7 +186,10 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 				});
 				(LiveGraph::new(current), update)
 			},
-			|(live, update)| black_box(live.apply_update(&update).unwrap()),
+			|(live, update)| {
+				live.apply_update(&update).unwrap();
+				black_box(())
+			},
 			BatchSize::LargeInput,
 		);
 	});
@@ -207,6 +219,7 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 	group.finish();
 }
 
+/// Returns general chain for this module.
 fn general_chain(size: usize) -> (Graph<Frozen>, ferros_grynn::graph::AtomId) {
 	let mut graph = Graph::<Mutable>::with_capacity(size, size.saturating_sub(1));
 	let root = graph.add_node(None, PropertyMap::new()).unwrap();
@@ -221,6 +234,7 @@ fn general_chain(size: usize) -> (Graph<Frozen>, ferros_grynn::graph::AtomId) {
 	(graph.freeze(), root)
 }
 
+/// Returns tree chain for this module.
 fn tree_chain(size: usize) -> (Tree<Frozen>, ferros_grynn::graph::AtomId) {
 	let mut tree =
 		RootedTree::<Mutable>::new(TreeOrientation::OutArborescence, None, PropertyMap::new())
@@ -235,6 +249,7 @@ fn tree_chain(size: usize) -> (Tree<Frozen>, ferros_grynn::graph::AtomId) {
 	(Tree::from(tree).freeze(), root)
 }
 
+/// Returns dag chain for this module.
 fn dag_chain(size: usize) -> (Dag<Frozen>, ferros_grynn::graph::AtomId) {
 	let mut dag = Dag::<Mutable>::new();
 	let root = dag.add_node(None, PropertyMap::new()).unwrap();
@@ -247,6 +262,7 @@ fn dag_chain(size: usize) -> (Dag<Frozen>, ferros_grynn::graph::AtomId) {
 	(dag.freeze(), root)
 }
 
+/// Returns path for this module.
 fn path(length: usize) -> Path {
 	let graph = Arc::new(
 		GraphRef::new(

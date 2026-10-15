@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][string]$Report,
     [Parameter(Mandatory)][string]$Output,
-    [string]$Commit = $env:GITHUB_SHA
+    [string]$Commit = $env:GITHUB_SHA,
+    [string]$Scope = 'Windows; ferros-grynn; no-default-features; lib and integration tests'
 )
 
 # Reject empty or inconsistent reports rather than presenting fabricated coverage.
@@ -26,7 +27,7 @@ $badge = [ordered]@{
     lines = $count
     covered = $covered
     commit = $Commit
-    scope = 'Windows; ferros-grynn; no-default-features; lib and integration tests'
+    scope = $Scope
 }
 New-Item -ItemType Directory -Path (Split-Path ([IO.Path]::GetFullPath($Output)) -Parent) -Force | Out-Null
 $badge | ConvertTo-Json | Set-Content -LiteralPath $Output -Encoding utf8NoBOM

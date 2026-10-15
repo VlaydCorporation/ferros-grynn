@@ -1,5 +1,9 @@
 //! Differential bounded path and immutable landmark binding evidence.
 
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{
 		ClassSchema,
@@ -22,6 +26,9 @@ use crate::{
 	values::{Number, Object, PropertyMap, RecordId, Value},
 };
 
+/// Independent path cost, connector choices and visited vertices.
+type OraclePath = (Number, Vec<(usize, usize)>, Vec<usize>);
+
 /// Builds equal canonical routes, a cycle and a longer detour to the target.
 fn routes() -> Datastore {
 	routes_kind(GraphKind::Graph)
@@ -31,21 +38,21 @@ fn routes() -> Datastore {
 fn routes_kind(kind: GraphKind) -> Datastore {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = tx.define_graph("routes", kind).unwrap();
+	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = tx.define_graph("routes", kind).assert_ok();
 	let mut local = Vec::new();
 	for ordinal in 0..18 {
-		let record = format!("person:n{ordinal}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
-		local.push(tx.attach_node(graph.id(), &record, None, None).unwrap());
+		let record = format!("person:n{ordinal}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		local.push(tx.attach_node(graph.id(), &record, None, None).assert_ok());
 	}
 	let mut edges = vec![(0, 1), (1, 3), (0, 2), (2, 3), (1, 0), (0, 0), (0, 4), (17, 3)];
 	edges.extend((4..17).map(|from| (from, from + 1)));
 	let mut connectors = Vec::new();
 	for (ordinal, (from, to)) in edges.into_iter().enumerate() {
-		let record = format!("link:e{ordinal}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		let record = format!("link:e{ordinal}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 		connectors.push(
 			tx.attach_edge(
 				graph.id(),
@@ -55,24 +62,24 @@ fn routes_kind(kind: GraphKind) -> Datastore {
 				None,
 				None,
 			)
-			.unwrap(),
+			.assert_ok(),
 		);
 	}
 	for (name, from, to) in
 		[("to_edge", local[0], connectors[0]), ("from_edge", connectors[0], local[3])]
 	{
-		let record = format!("link:{name}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		let record = format!("link:{name}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 		tx.attach_edge(graph.id(), &record, None, EdgeTopology::directed([from], [to]), None, None)
-			.unwrap();
+			.assert_ok();
 	}
 	for (name, topology) in [
 		("bidirectional", EdgeTopology::bidirectional([local[1]], [local[2]])),
 		("undirected", EdgeTopology::undirected([local[2], local[3]])),
 	] {
-		let record = format!("link:{name}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
-		tx.attach_edge(graph.id(), &record, None, topology, None, None).unwrap();
+		let record = format!("link:{name}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		tx.attach_edge(graph.id(), &record, None, topology, None, None).assert_ok();
 	}
 	for mode in [TraversalSemantics::Node, TraversalSemantics::Atom] {
 		for direction in
@@ -90,29 +97,30 @@ fn routes_kind(kind: GraphKind) -> Datastore {
 					},
 					Some(1 << 20),
 				)
-				.unwrap()
+				.assert_ok()
 				.with_mode(mode)
 				.with_direction(direction);
-				tx.define_graph_index("routes", index).unwrap();
+				tx.define_graph_index("routes", index).assert_ok();
 			}
 		}
 	}
-	tx.commit().unwrap();
+	tx.commit().assert_ok();
 	store
 }
 
 /// Returns owned public rows, preserving bag multiplicity and canonical order.
 fn result(tx: &mut Transaction, query: &str) -> Value {
-	let mut rows = tx.execute(query, &Object::new()).unwrap();
+	let mut rows = tx.execute(query, &Object::new()).assert_ok();
 	let outcome = rows.remove(0).result;
 	assert!(outcome.is_ok(), "{query}: {outcome:?}");
-	outcome.unwrap().value().clone()
+	outcome.assert_ok().value().clone()
 }
 
 /// Maintenance uses the production Datastore entrypoint, outside a transaction.
 fn rebuild_named(store: &Datastore, name: &str) {
-	let rows =
-		store.execute(&format!("REBUILD INDEX {name} ON GRAPH routes;"), &Object::new()).unwrap();
+	let rows = store
+		.execute(&format!("REBUILD INDEX {name} ON GRAPH routes;"), &Object::new())
+		.assert_ok();
 	assert!(rows[0].result.is_ok(), "{:?}", rows[0].result);
 }
 
@@ -128,7 +136,7 @@ fn rebuild(store: &Datastore) {
 						&format!("REBUILD INDEX {prefix}_{mode:?}_{direction:?} ON GRAPH routes;"),
 						&Object::new(),
 					)
-					.unwrap();
+					.assert_ok();
 				assert!(rows[0].result.is_ok(), "{:?}", rows[0].result);
 			}
 		}
@@ -140,14 +148,14 @@ fn rebuild(store: &Datastore) {
 fn weighted_traversal_routes(kind: GraphKind, weights: [Number; 8]) -> Datastore {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = tx.define_graph("routes", kind).unwrap();
+	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = tx.define_graph("routes", kind).assert_ok();
 	let nodes = (0..5)
 		.map(|ordinal| {
-			let record = format!("person:n{ordinal}").parse::<RecordId>().unwrap();
-			tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
-			tx.attach_node(graph.id(), &record, None, None).unwrap()
+			let record = format!("person:n{ordinal}").parse::<RecordId>().assert_ok();
+			tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+			tx.attach_node(graph.id(), &record, None, None).assert_ok()
 		})
 		.collect::<Vec<_>>();
 	for (ordinal, ((from, to), weight)) in
@@ -156,8 +164,8 @@ fn weighted_traversal_routes(kind: GraphKind, weights: [Number; 8]) -> Datastore
 			.zip(weights)
 			.enumerate()
 	{
-		let record = format!("link:e{ordinal}").parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		let record = format!("link:e{ordinal}").parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 		tx.attach_edge(
 			graph.id(),
 			&record,
@@ -166,11 +174,11 @@ fn weighted_traversal_routes(kind: GraphKind, weights: [Number; 8]) -> Datastore
 			Some(weight),
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
 	if kind == GraphKind::Hypergraph {
-		let record = "link:hyper".parse::<RecordId>().unwrap();
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		let record = "link:hyper".parse::<RecordId>().assert_ok();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 		tx.attach_edge(
 			graph.id(),
 			&record,
@@ -179,7 +187,7 @@ fn weighted_traversal_routes(kind: GraphKind, weights: [Number; 8]) -> Datastore
 			Some(Number::Int(0)),
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
 	for (name, mode) in
 		[("weighted", TraversalSemantics::Node), ("atom_weighted", TraversalSemantics::Atom)]
@@ -195,20 +203,20 @@ fn weighted_traversal_routes(kind: GraphKind, weights: [Number; 8]) -> Datastore
 				},
 				Some(1 << 20),
 			)
-			.unwrap()
+			.assert_ok()
 			.with_mode(mode),
 		)
-		.unwrap();
+		.assert_ok();
 	}
-	tx.commit().unwrap();
+	tx.commit().assert_ok();
 	store
 }
 
 /// Snapshot ids differ after publication; the public path and exact numeric
 /// result must retain the same steps, predecessor order, type and value.
 fn assert_traversal_results(actual: &Value, expected: &Value) {
-	let actual = actual.as_array().unwrap();
-	let expected = expected.as_array().unwrap();
+	let actual = actual.as_array().assert_some();
+	let expected = expected.as_array().assert_some();
 	assert_eq!(actual.len(), expected.len());
 	for (actual, expected) in actual.iter().zip(expected) {
 		if let (Some(actual), Some(expected)) = (actual.as_path(), expected.as_path()) {
@@ -229,9 +237,11 @@ fn assert_traversal_results(actual: &Value, expected: &Value) {
 	}
 }
 
+/// Verifies landmark traversal weighted all pairs preserves dijkstra paths and
+/// numeric types.
 #[test]
 fn landmark_traversal_weighted_all_pairs_preserves_dijkstra_paths_and_numeric_types() {
-	let decimal = |value: &str| Number::Decimal(value.parse().unwrap());
+	let decimal = |value: &str| Number::Decimal(value.parse().assert_ok());
 	for (weights, pruning_safe) in [
 		(
 			[
@@ -330,11 +340,11 @@ fn landmark_traversal_weighted_all_pairs_preserves_dijkstra_paths_and_numeric_ty
 			assert_eq!(
 				incompatible
 					.as_object()
-					.unwrap()
+					.assert_some()
 					.get("analyze")
-					.unwrap()
+					.assert_some()
 					.as_object()
-					.unwrap()
+					.assert_some()
 					.get("landmark_lookups"),
 				Some(&Value::from(0_u64))
 			);
@@ -344,21 +354,21 @@ fn landmark_traversal_weighted_all_pairs_preserves_dijkstra_paths_and_numeric_ty
 				assert_traversal_results(&result(&mut ready, query), expected);
 			}
 			let indexed = result(&mut ready, explain);
-			let indexed = indexed.as_object().unwrap();
+			let indexed = indexed.as_object().assert_some();
 			let node = indexed
 				.get("nodes")
-				.unwrap()
+				.assert_some()
 				.as_array()
-				.unwrap()
+				.assert_some()
 				.iter()
 				.filter_map(Value::as_object)
 				.find(|node| node.get("operator") == Some(&Value::from("LandmarkWeighted")))
-				.unwrap();
+				.assert_some();
 			assert_eq!(node.get("cost"), Some(&Value::from("WEIGHT")));
 			assert_eq!(node.get("mode"), Some(&Value::from("NODE")));
-			let metrics = indexed.get("analyze").unwrap().as_object().unwrap();
+			let metrics = indexed.get("analyze").assert_some().as_object().assert_some();
 			assert_eq!(
-				metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64),
+				metrics.get("landmark_lookups").assert_some() > &Value::from(0_u64),
 				pruning_safe
 			);
 			assert_eq!(
@@ -366,19 +376,27 @@ fn landmark_traversal_weighted_all_pairs_preserves_dijkstra_paths_and_numeric_ty
 				Some(&Value::from(u64::from(!pruning_safe)))
 			);
 			let old_plan = result(&mut old, explain);
-			assert_ne!(indexed.get("plan_hash"), old_plan.as_object().unwrap().get("plan_hash"));
-			let graph =
-				ready.graphs().unwrap().iter().find(|graph| graph.name() == "routes").unwrap().id();
-			ready.detach_occurrence(graph, &"link:e0".parse().unwrap(), true).unwrap();
+			assert_ne!(
+				indexed.get("plan_hash"),
+				old_plan.as_object().assert_some().get("plan_hash")
+			);
+			let graph = ready
+				.graphs()
+				.assert_ok()
+				.iter()
+				.find(|graph| graph.name() == "routes")
+				.assert_some()
+				.id();
+			ready.detach_occurrence(graph, &"link:e0".parse().assert_ok(), true).assert_ok();
 			let private = result(&mut ready, explain);
 			assert_eq!(
 				private
 					.as_object()
-					.unwrap()
+					.assert_some()
 					.get("analyze")
-					.unwrap()
+					.assert_some()
 					.as_object()
-					.unwrap()
+					.assert_some()
 					.get("landmark_lookups"),
 				Some(&Value::from(0_u64))
 			);
@@ -388,6 +406,8 @@ fn landmark_traversal_weighted_all_pairs_preserves_dijkstra_paths_and_numeric_ty
 	}
 }
 
+/// Verifies landmark traversal weighted preserves errors and enforces query
+/// limits.
 #[test]
 fn landmark_traversal_weighted_preserves_errors_and_enforces_query_limits() {
 	for weights in [
@@ -413,9 +433,9 @@ fn landmark_traversal_weighted_preserves_errors_and_enforces_query_limits() {
 		],
 		[
 			Number::Float(1.0),
-			Number::Decimal("1".parse().unwrap()),
+			Number::Decimal("1".parse().assert_ok()),
 			Number::Float(1.0),
-			Number::Decimal("1".parse().unwrap()),
+			Number::Decimal("1".parse().assert_ok()),
 			Number::Int(0),
 			Number::Int(0),
 			Number::Int(0),
@@ -429,10 +449,10 @@ fn landmark_traversal_weighted_preserves_errors_and_enforces_query_limits() {
 			let query =
 				format!("TRAVERSE FROM person:n0 IN GRAPH @routes |> tv::{method}(person:n0);");
 			let before =
-				store.execute(&query, &Object::new()).unwrap().remove(0).result.unwrap_err();
+				store.execute(&query, &Object::new()).assert_ok().remove(0).result.assert_err();
 			rebuild_named(&store, "weighted");
 			let after =
-				store.execute(&query, &Object::new()).unwrap().remove(0).result.unwrap_err();
+				store.execute(&query, &Object::new()).assert_ok().remove(0).result.assert_err();
 			assert_eq!(after.status().code(), before.status().code());
 			assert_eq!(after.to_string(), before.to_string());
 		}
@@ -451,17 +471,19 @@ fn landmark_traversal_weighted_preserves_errors_and_enforces_query_limits() {
 					..Default::default()
 				},
 				crate::gql::QueryExecutionOptions {
-					barrier_memory_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+					barrier_memory_bytes: std::num::NonZeroUsize::new(2048).assert_some(),
 					..Default::default()
 				},
 			] {
-				let rows = store.execute_with_options(&query, &Object::new(), options).unwrap();
+				let rows = store.execute_with_options(&query, &Object::new(), options).assert_ok();
 				assert!(rows[0].result.is_err(), "{query} ready={ready}");
 			}
 		}
 	}
 }
 
+/// Verifies landmark traversal weighted bound reduces expansions without
+/// changing ties.
 #[test]
 fn landmark_traversal_weighted_bound_reduces_expansions_without_changing_ties() {
 	let store = routes();
@@ -477,20 +499,22 @@ fn landmark_traversal_weighted_bound_reduces_expansions_without_changing_ties() 
 	let expansions = |value: &Value| {
 		value
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("path_expansions")
-			.unwrap()
+			.assert_some()
 			.clone()
 	};
 	assert!(expansions(&after) < expansions(&before));
 	let distance = result(&mut ready, &query.replace("weightedShortestPath", "distanceTo"));
-	assert_eq!(distance.as_array().unwrap().get(0), Some(&Value::from(2_i64)));
+	assert_eq!(distance.as_array().assert_some().get(0), Some(&Value::from(2_i64)));
 }
 
+/// Verifies landmark traversal hop all pairs preserves fifo paths and node
+/// domain.
 #[test]
 fn landmark_traversal_hop_all_pairs_preserves_fifo_paths_and_node_domain() {
 	// Builds publish a new SnapshotId; public steps and exact cost must remain
@@ -498,13 +522,13 @@ fn landmark_traversal_hop_all_pairs_preserves_fifo_paths_and_node_domain() {
 	let comparable = |value: Value| {
 		value
 			.as_array()
-			.unwrap()
+			.assert_some()
 			.iter()
 			.map(|value| {
 				if matches!(value, Value::None) {
 					None
 				} else {
-					let path = value.as_path().unwrap();
+					let path = value.as_path().assert_some();
 					Some((path.steps().to_vec(), path.cost()))
 				}
 			})
@@ -541,46 +565,51 @@ fn landmark_traversal_hop_all_pairs_preserves_fifo_paths_and_node_domain() {
 		let query = "TRAVERSE FROM person:n0 IN GRAPH @routes |> tv::shortestPath(person:n3);";
 		let explain = format!("EXPLAIN ANALYZE FORMAT JSON {query}");
 		let indexed = result(&mut ready, &explain);
-		let indexed = indexed.as_object().unwrap();
+		let indexed = indexed.as_object().assert_some();
 		let node = indexed
 			.get("nodes")
-			.unwrap()
+			.assert_some()
 			.as_array()
-			.unwrap()
+			.assert_some()
 			.iter()
 			.filter_map(Value::as_object)
 			.find(|node| node.get("operator") == Some(&Value::from("LandmarkShortest")))
-			.unwrap();
+			.assert_some();
 		assert_eq!(node.get("mode"), Some(&Value::from("NODE")));
 		assert_eq!(node.get("cost"), Some(&Value::from("HOP")));
-		let metrics = indexed.get("analyze").unwrap().as_object().unwrap();
-		assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64));
+		let metrics = indexed.get("analyze").assert_some().as_object().assert_some();
+		assert!(metrics.get("landmark_lookups").assert_some() > &Value::from(0_u64));
 		assert_eq!(metrics.get("landmark_fallbacks"), Some(&Value::from(0_u64)));
 		let old = result(&mut before, &explain);
-		assert_ne!(indexed.get("plan_hash"), old.as_object().unwrap().get("plan_hash"));
+		assert_ne!(indexed.get("plan_hash"), old.as_object().assert_some().get("plan_hash"));
 		assert_eq!(
 			old.as_object()
-				.unwrap()
+				.assert_some()
 				.get("analyze")
-				.unwrap()
+				.assert_some()
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("landmark_lookups"),
 			Some(&Value::from(0_u64))
 		);
-		let graph =
-			ready.graphs().unwrap().iter().find(|graph| graph.name() == "routes").unwrap().id();
-		let edge = "link:e0".parse::<RecordId>().unwrap();
-		ready.detach_occurrence(graph, &edge, true).unwrap();
+		let graph = ready
+			.graphs()
+			.assert_ok()
+			.iter()
+			.find(|graph| graph.name() == "routes")
+			.assert_some()
+			.id();
+		let edge = "link:e0".parse::<RecordId>().assert_ok();
+		ready.detach_occurrence(graph, &edge, true).assert_ok();
 		let private = result(&mut ready, &explain);
 		assert_eq!(
 			private
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("analyze")
-				.unwrap()
+				.assert_some()
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("landmark_lookups"),
 			Some(&Value::from(0_u64))
 		);
@@ -593,16 +622,18 @@ fn landmark_traversal_hop_all_pairs_preserves_fifo_paths_and_node_domain() {
 				..Default::default()
 			},
 			crate::gql::QueryExecutionOptions {
-				barrier_memory_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+				barrier_memory_bytes: std::num::NonZeroUsize::new(2048).assert_some(),
 				..Default::default()
 			},
 		] {
-			let rows = store.execute_with_options(query, &Object::new(), options).unwrap();
+			let rows = store.execute_with_options(query, &Object::new(), options).assert_ok();
 			assert!(rows[0].result.is_err());
 		}
 	}
 }
 
+/// Verifies landmark traversal keeps seed multiplicity and bounds retained path
+/// results.
 #[test]
 fn landmark_traversal_keeps_seed_multiplicity_and_bounds_retained_path_results() {
 	let store = routes();
@@ -616,26 +647,28 @@ fn landmark_traversal_keeps_seed_multiplicity_and_bounds_retained_path_results()
 			rebuild(&store);
 		}
 		let mut read = store.begin();
-		assert_eq!(result(&mut read, duplicates).as_array().unwrap().len(), 2);
+		assert_eq!(result(&mut read, duplicates).as_array().assert_some().len(), 2);
 		let rows = result(&mut read, &large);
-		assert_eq!(rows.as_array().unwrap().len(), 64);
+		assert_eq!(rows.as_array().assert_some().len(), 64);
 		assert!(rows.estimated_heap_bytes() > 96 * 1024);
 		let limited = crate::gql::QueryExecutionOptions {
-			barrier_memory_bytes: std::num::NonZeroUsize::new(96 * 1024).unwrap(),
+			barrier_memory_bytes: std::num::NonZeroUsize::new(96 * 1024).assert_some(),
 			..Default::default()
 		};
-		let rows = store.execute_with_options(&large, &Object::new(), limited).unwrap();
+		let rows = store.execute_with_options(&large, &Object::new(), limited).assert_ok();
 		assert!(
 			rows[0].result.is_err(),
 			"partial traversal results must not escape resource exhaustion"
 		);
 		for step in ["reachable", "weightedShortestPath", "distanceTo"] {
 			let query = duplicates.replace("shortestPath", step);
-			assert_eq!(result(&mut read, &query).as_array().unwrap().len(), 2, "{step}");
+			assert_eq!(result(&mut read, &query).as_array().assert_some().len(), 2, "{step}");
 		}
 	}
 }
 
+/// Verifies landmark match hop all pairs modes bounds directions and canonical
+/// ties.
 #[test]
 fn landmark_match_hop_all_pairs_modes_bounds_directions_and_canonical_ties() {
 	let store = routes();
@@ -703,21 +736,23 @@ fn landmark_match_hop_all_pairs_modes_bounds_directions_and_canonical_ties() {
 	let rows = result(&mut after, tie);
 	let atoms = rows
 		.as_array()
-		.unwrap()
+		.assert_some()
 		.get(0)
-		.unwrap()
+		.assert_some()
 		.as_object()
-		.unwrap()
+		.assert_some()
 		.get("atoms")
-		.unwrap()
+		.assert_some()
 		.as_array()
-		.unwrap();
+		.assert_some();
 	assert_eq!(
-		atoms.get(2).unwrap().as_atom_occurrence().unwrap().atom().id().to_string(),
+		atoms.get(2).assert_some().as_atom_occurrence().assert_some().atom().id().to_string(),
 		"person:n1"
 	);
 }
 
+/// Verifies landmark match binding explain expansions fallback and private
+/// snapshot.
 #[test]
 fn landmark_match_binding_explain_expansions_fallback_and_private_snapshot() {
 	let store = routes();
@@ -729,36 +764,47 @@ fn landmark_match_binding_explain_expansions_fallback_and_private_snapshot() {
 	rebuild(&store);
 	let mut tx = store.begin();
 	let ready = result(&mut tx, &explain);
-	let ready = ready.as_object().unwrap();
-	assert_ne!(ready.get("plan_hash"), exact.as_object().unwrap().get("plan_hash"));
-	let metrics = ready.get("analyze").unwrap().as_object().unwrap();
-	assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_i64));
-	assert!(metrics.get("landmark_artifact_bytes").unwrap() > &Value::from(0_i64));
-	let baseline = exact.as_object().unwrap().get("analyze").unwrap().as_object().unwrap();
-	assert!(metrics.get("path_expansions").unwrap() < baseline.get("path_expansions").unwrap());
+	let ready = ready.as_object().assert_some();
+	assert_ne!(ready.get("plan_hash"), exact.as_object().assert_some().get("plan_hash"));
+	let metrics = ready.get("analyze").assert_some().as_object().assert_some();
+	assert!(metrics.get("landmark_lookups").assert_some() > &Value::from(0_i64));
+	assert!(metrics.get("landmark_artifact_bytes").assert_some() > &Value::from(0_i64));
+	let baseline =
+		exact.as_object().assert_some().get("analyze").assert_some().as_object().assert_some();
+	assert!(
+		metrics.get("path_expansions").assert_some()
+			< baseline.get("path_expansions").assert_some()
+	);
 	let text = result(&mut tx, &format!("EXPLAIN ANALYZE FORMAT TEXT {query}"));
-	assert!(text.as_text().unwrap().as_str().contains("landmark_lookups="));
+	assert!(text.as_text().assert_some().as_str().contains("landmark_lookups="));
 	let all_targets = result(
 		&mut tx,
 		"EXPLAIN ANALYZE FORMAT JSON MATCH path = (person:n0 AS a)-[link*1..3 SHORTEST]->(person \
 		 AS b) IN GRAPH routes RETURN b;",
 	);
-	let metrics = all_targets.as_object().unwrap().get("analyze").unwrap().as_object().unwrap();
+	let metrics = all_targets
+		.as_object()
+		.assert_some()
+		.get("analyze")
+		.assert_some()
+		.as_object()
+		.assert_some();
 	assert_eq!(metrics.get("landmark_lookups"), Some(&Value::from(0_i64)));
 	assert_eq!(metrics.get("landmark_fallbacks"), Some(&Value::from(1_i64)));
 	let snapshot = result(&mut tx, query);
-	let graph = tx.graphs().unwrap()[0].reference().id();
-	tx.set_occurrence_label(graph, &"link:e0".parse().unwrap(), Some("changed".into())).unwrap();
+	let graph = tx.graphs().assert_ok()[0].reference().id();
+	tx.set_occurrence_label(graph, &"link:e0".parse().assert_ok(), Some("changed".into()))
+		.assert_ok();
 	let private = result(&mut tx, &explain);
 	assert_eq!(
-		private.as_object().unwrap().get("plan_hash"),
-		exact.as_object().unwrap().get("plan_hash")
+		private.as_object().assert_some().get("plan_hash"),
+		exact.as_object().assert_some().get("plan_hash")
 	);
 	drop(tx);
 	assert_eq!(result(&mut store.begin(), query), snapshot);
 	assert_eq!(
-		result(&mut old, &explain).as_object().unwrap().get("plan_hash"),
-		exact.as_object().unwrap().get("plan_hash")
+		result(&mut old, &explain).as_object().assert_some().get("plan_hash"),
+		exact.as_object().assert_some().get("plan_hash")
 	);
 }
 
@@ -774,7 +820,7 @@ fn weighted_oracle(
 	mode: &str,
 ) -> Option<(Number, Vec<usize>)> {
 	let mut pending = vec![(source, Number::Int(0), Vec::new(), vec![source])];
-	let mut best: Option<(Number, Vec<(usize, usize)>, Vec<usize>)> = None;
+	let mut best: Option<OraclePath> = None;
 	while let Some((vertex, cost, used, vertices)) = pending.pop() {
 		let canonical =
 			used.iter().copied().zip(vertices.iter().copied().skip(1)).collect::<Vec<_>>();
@@ -784,7 +830,7 @@ fn weighted_oracle(
 		{
 			best = Some((cost, canonical, used.clone()));
 		}
-		if used.len() == max || mode == "SIMPLE" && used.len() != 0 && vertex == source {
+		if used.len() == max || mode == "SIMPLE" && !used.is_empty() && vertex == source {
 			continue;
 		}
 		for (ordinal, &(from, to, weight)) in edges.iter().enumerate() {
@@ -800,7 +846,7 @@ fn weighted_oracle(
 			{
 				continue;
 			}
-			let cost = crate::gql::execution::cursor::add_path_cost(cost, weight).unwrap();
+			let cost = crate::gql::execution::cursor::add_path_cost(cost, weight).assert_ok();
 			let mut next = used.clone();
 			next.push(ordinal);
 			let mut next_vertices = vertices.clone();
@@ -811,49 +857,53 @@ fn weighted_oracle(
 	best.map(|(cost, _, path)| (cost, path))
 }
 
+/// Verifies landmark weighted matches exhaustive reduction and zero cost ties.
 #[test]
 fn landmark_weighted_matches_exhaustive_reduction_and_zero_cost_ties() {
 	weighted_matches_exhaustive(GraphKind::Graph, false);
 }
 
+/// Verifies scoped weighted matches exhaustive reduction and zero cost ties.
 #[test]
 fn scoped_weighted_matches_exhaustive_reduction_and_zero_cost_ties() {
 	weighted_matches_exhaustive(GraphKind::Metagraph, false);
 }
 
+/// Verifies scoped weighted keeps distinct qualified targets and exact cross
+/// level fallback.
 #[test]
 fn scoped_weighted_keeps_distinct_qualified_targets_and_exact_cross_level_fallback() {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
-	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let root = tx.define_graph("routes", GraphKind::Metagraph).unwrap();
+	tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let root = tx.define_graph("routes", GraphKind::Metagraph).assert_ok();
 	let children = [
-		tx.define_graph("left", GraphKind::Graph).unwrap(),
-		tx.define_graph("right", GraphKind::Graph).unwrap(),
+		tx.define_graph("left", GraphKind::Graph).assert_ok(),
+		tx.define_graph("right", GraphKind::Graph).assert_ok(),
 	];
 	let records = ["person:n0", "person:n1", "person:n2", "link:e0", "link:e1"]
-		.map(|record| record.parse::<RecordId>().unwrap());
+		.map(|record| record.parse::<RecordId>().assert_ok());
 	for record in &records {
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 	}
 	let owners = [
-		tx.attach_node(root.id(), &records[0], None, Some(children[0].id())).unwrap(),
-		tx.attach_node(root.id(), &records[2], None, Some(children[1].id())).unwrap(),
+		tx.attach_node(root.id(), &records[0], None, Some(children[0].id())).assert_ok(),
+		tx.attach_node(root.id(), &records[2], None, Some(children[1].id())).assert_ok(),
 	];
 	for index in 0..2 {
-		let target = tx.attach_node(children[index].id(), &records[1], None, None).unwrap();
+		let target = tx.attach_node(children[index].id(), &records[1], None, None).assert_ok();
 		tx.attach_edge(
 			root.id(),
 			&records[3 + index],
 			None,
 			EdgeTopology::directed([EdgeEndpoint::Local(owners[0])], [EdgeEndpoint::Nested(
-				QualifiedAtomId::new([owners[index]], target).unwrap(),
+				QualifiedAtomId::new([owners[index]], target).assert_ok(),
 			)]),
 			Some(Number::Int(2 + index as i64)),
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
 	tx.define_graph_index(
 		"routes",
@@ -866,56 +916,58 @@ fn scoped_weighted_keeps_distinct_qualified_targets_and_exact_cross_level_fallba
 			},
 			Some(1 << 20),
 		)
-		.unwrap(),
+		.assert_ok(),
 	)
-	.unwrap();
-	tx.commit().unwrap();
+	.assert_ok();
+	tx.commit().assert_ok();
 	let query = "MATCH path = (person:n0 AS a)-[link*1..2 WEIGHTED SHORTEST]->(person:n1 AS b) IN \
 	             GRAPH routes RETURN b, path::cost(path) AS cost;";
 	let exact = result(&mut store.begin(), query);
-	assert_eq!(exact.as_array().unwrap().len(), 2);
+	assert_eq!(exact.as_array().assert_some().len(), 2);
 	let scopes = exact
 		.as_array()
-		.unwrap()
+		.assert_some()
 		.iter()
 		.map(|row| {
-			let row = row.as_object().unwrap();
+			let row = row.as_object().assert_some();
 			(
-				row.get("b").unwrap().as_atom_occurrence().unwrap().graph().id(),
-				row.get("cost").unwrap().clone(),
+				row.get("b").assert_some().as_atom_occurrence().assert_some().graph().id(),
+				row.get("cost").assert_some().clone(),
 			)
 		})
 		.collect::<Vec<_>>();
 	assert!(scopes.contains(&(children[0].id(), Value::from(2_i64))));
 	assert!(scopes.contains(&(children[1].id(), Value::from(3_i64))));
-	let rebuilt = store.execute("REBUILD INDEX cross ON GRAPH routes;", &Object::new()).unwrap();
+	let rebuilt = store.execute("REBUILD INDEX cross ON GRAPH routes;", &Object::new()).assert_ok();
 	assert!(rebuilt[0].result.is_ok(), "{rebuilt:?}");
 	assert_eq!(result(&mut store.begin(), query), exact);
 	let explain = result(&mut store.begin(), &format!("EXPLAIN ANALYZE FORMAT JSON {query}"));
 	assert_eq!(
 		explain
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("landmark_lookups"),
 		Some(&Value::from(0_i64))
 	);
 	assert_eq!(
 		explain
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("analyze")
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("landmark_fallbacks"),
 		Some(&Value::from(1_i64))
 	);
 }
 
+/// Verifies stateful match cost uses exact prefixes and never additive
+/// artifacts.
 #[test]
 fn stateful_match_cost_uses_exact_prefixes_and_never_additive_artifacts() {
 	for kind in [GraphKind::Graph, GraphKind::Metagraph] {
@@ -928,7 +980,7 @@ fn stateful_match_cost_uses_exact_prefixes_and_never_additive_artifacts() {
 				 ON_DEMAND COST fn::state;",
 				&Object::new(),
 			)
-			.unwrap()
+			.assert_ok()
 		{
 			assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 		}
@@ -939,7 +991,7 @@ fn stateful_match_cost_uses_exact_prefixes_and_never_additive_artifacts() {
 					 fn::state WITH (MAX_BYTES = 1048576);",
 					&Object::new()
 				)
-				.unwrap()[0]
+				.assert_ok()[0]
 				.result
 				.is_err()
 		);
@@ -949,22 +1001,27 @@ fn stateful_match_cost_uses_exact_prefixes_and_never_additive_artifacts() {
 				 fn::state]->(person:n3 AS b) IN GRAPH routes RETURN path::cost(path) AS cost;"
 			);
 			let rows = result(&mut store.begin(), &query);
-			assert!(!rows.as_array().unwrap().is_empty());
-			for row in rows.as_array().unwrap().iter() {
-				assert_eq!(row.as_object().unwrap().get("cost"), Some(&Value::from(3_i64)));
+			assert!(!rows.as_array().assert_some().is_empty());
+			for row in rows.as_array().assert_some().iter() {
+				assert_eq!(row.as_object().assert_some().get("cost"), Some(&Value::from(3_i64)));
 			}
 			let explain =
 				result(&mut store.begin(), &format!("EXPLAIN ANALYZE FORMAT JSON {query}"));
-			let explain = explain.as_object().unwrap();
+			let explain = explain.as_object().assert_some();
 			assert!(
-				explain.get("nodes").unwrap().as_array().unwrap().iter().any(|node| node
+				explain.get("nodes").assert_some().as_array().assert_some().iter().any(|node| node
 					.as_object()
-					.unwrap()
+					.assert_some()
 					.get("cost_stateful")
 					== Some(&Value::Bool(true)))
 			);
 			assert_eq!(
-				explain.get("analyze").unwrap().as_object().unwrap().get("landmark_lookups"),
+				explain
+					.get("analyze")
+					.assert_some()
+					.as_object()
+					.assert_some()
+					.get("landmark_lookups"),
 				Some(&Value::from(0_i64))
 			);
 		}
@@ -974,7 +1031,7 @@ fn stateful_match_cost_uses_exact_prefixes_and_never_additive_artifacts() {
 				 PURE FUNCTION fn::ordinary(edge: any) -> int { RETURN 1; };",
 				&Object::new(),
 			)
-			.unwrap()
+			.assert_ok()
 		{
 			assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 		}
@@ -987,11 +1044,16 @@ fn stateful_match_cost_uses_exact_prefixes_and_never_additive_artifacts() {
 				"MATCH path = (person:n0 AS a)-[link*1..2 {objective}]->(person:n3 AS b) IN GRAPH \
 				 routes RETURN path;"
 			);
-			assert!(store.execute(&query, &Object::new()).unwrap()[0].result.is_err(), "{query}");
+			assert!(
+				store.execute(&query, &Object::new()).assert_ok()[0].result.is_err(),
+				"{query}"
+			);
 		}
 	}
 }
 
+/// Verifies global match cost normalizes local defaults overrides and stateful
+/// fallback.
 #[test]
 fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback() {
 	for kind in [GraphKind::Graph, GraphKind::Metagraph] {
@@ -1005,7 +1067,7 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 				 PATH ALGORITHM LANDMARK_SSSP(256) COST fn::cost WITH (MAX_BYTES = 1048576);",
 				&Object::new(),
 			)
-			.unwrap()
+			.assert_ok()
 		{
 			assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 		}
@@ -1028,9 +1090,9 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 					&format!(" IN GRAPH routes WITH COST fn::{function} WHERE"),
 				);
 				let local_rows = result(&mut tx, &local);
-				assert!(!local_rows.as_array().unwrap().is_empty());
-				for row in local_rows.as_array().unwrap() {
-					let row = row.as_object().unwrap();
+				assert!(!local_rows.as_array().assert_some().is_empty());
+				for row in local_rows.as_array().assert_some() {
+					let row = row.as_object().assert_some();
 					assert_eq!(row.get("cost"), row.get("recomputed"));
 				}
 				assert_eq!(result(&mut tx, &global), local_rows);
@@ -1039,18 +1101,18 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 				let global_explain =
 					result(&mut tx, &format!("EXPLAIN ANALYZE FORMAT JSON {global}"));
 				assert_eq!(
-					local_explain.as_object().unwrap().get("plan_hash"),
-					global_explain.as_object().unwrap().get("plan_hash")
+					local_explain.as_object().assert_some().get("plan_hash"),
+					global_explain.as_object().assert_some().get("plan_hash")
 				);
 				let metrics = global_explain
 					.as_object()
-					.unwrap()
+					.assert_some()
 					.get("analyze")
-					.unwrap()
+					.assert_some()
 					.as_object()
-					.unwrap();
+					.assert_some();
 				assert_eq!(
-					metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64),
+					metrics.get("landmark_lookups").assert_some() > &Value::from(0_u64),
 					ready
 						&& kind == GraphKind::Graph
 						&& objective == "WEIGHTED SHORTEST"
@@ -1064,10 +1126,16 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 				.replace(" WITH COST fn::cost", "")
 				.replace(" AS edge]", " AS edge COST fn::cost]");
 			assert_eq!(result(&mut tx, &local_fixed), rows);
-			let row = rows.as_array().unwrap().get(0).unwrap().as_object().unwrap();
+			let row = rows.as_array().assert_some().get(0).assert_some().as_object().assert_some();
 			assert_eq!(row.get("cost"), Some(&Value::from(2_i64)));
 			assert_eq!(
-				row.get("edge").unwrap().as_atom_occurrence().unwrap().atom().id().to_string(),
+				row.get("edge")
+					.assert_some()
+					.as_atom_occurrence()
+					.assert_some()
+					.atom()
+					.id()
+					.to_string(),
 				"link:e0"
 			);
 			for (query, expected) in [
@@ -1095,9 +1163,15 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 				),
 			] {
 				let rows = result(&mut tx, query);
-				assert_eq!(rows.as_array().unwrap().len(), 1, "{query}");
+				assert_eq!(rows.as_array().assert_some().len(), 1, "{query}");
 				assert_eq!(
-					rows.as_array().unwrap().get(0).unwrap().as_object().unwrap().get("cost"),
+					rows.as_array()
+						.assert_some()
+						.get(0)
+						.assert_some()
+						.as_object()
+						.assert_some()
+						.get("cost"),
 					Some(&Value::from(expected)),
 					"{query}"
 				);
@@ -1111,19 +1185,25 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 			let actual = result(&mut tx, graph_query);
 			let expected = result(&mut tx, &local_graph);
 			assert_eq!(
-				actual.as_materialized_graph().unwrap().node_count(),
-				expected.as_materialized_graph().unwrap().node_count()
+				actual.as_materialized_graph().assert_some().node_count(),
+				expected.as_materialized_graph().assert_some().node_count()
 			);
 			assert_eq!(
-				actual.as_materialized_graph().unwrap().edge_count(),
-				expected.as_materialized_graph().unwrap().edge_count()
+				actual.as_materialized_graph().assert_some().edge_count(),
+				expected.as_materialized_graph().assert_some().edge_count()
 			);
 			let override_query = "MATCH path = (person:n0)-[link*2 WALK WEIGHTED SHORTEST COST \
 			                      fn::override]->(person:n3) IN GRAPH routes WITH COST fn::cost \
 			                      RETURN path::cost(path) AS cost;";
 			let rows = result(&mut tx, override_query);
 			assert_eq!(
-				rows.as_array().unwrap().get(0).unwrap().as_object().unwrap().get("cost"),
+				rows.as_array()
+					.assert_some()
+					.get(0)
+					.assert_some()
+					.as_object()
+					.assert_some()
+					.get("cost"),
 				Some(&Value::from(2_i64))
 			);
 		}
@@ -1136,38 +1216,40 @@ fn global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback()
 			"MATCH (person:n0)-[link*1..3 COST fn::override]->(person:n3) IN GRAPH routes WITH \
 			 COST fn::missing RETURN 1;",
 		] {
-			assert!(store.execute(query, &Object::new()).unwrap()[0].result.is_err(), "{query}");
+			assert!(store.execute(query, &Object::new()).assert_ok()[0].result.is_err(), "{query}");
 		}
 	}
 }
 
+/// Verifies global match cost uses connector scope for nested and hyper paths.
 #[test]
 fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 	let store = routes_kind(GraphKind::Metagraph);
 	let mut tx = store.begin();
-	let parent = tx.named_graph("routes").unwrap().unwrap();
-	let child = tx.define_graph("child", GraphKind::Graph).unwrap();
-	let fee = tx.intern_property("fee").unwrap();
-	let owner = "person:owner".parse::<RecordId>().unwrap();
-	let cross = "link:cross".parse::<RecordId>().unwrap();
+	let parent = tx.named_graph("routes").assert_ok().assert_some();
+	let child = tx.define_graph("child", GraphKind::Graph).assert_ok();
+	let fee = tx.intern_property("fee").assert_ok();
+	let owner = "person:owner".parse::<RecordId>().assert_ok();
+	let cross = "link:cross".parse::<RecordId>().assert_ok();
 	for record in [&owner, &cross] {
-		tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 	}
-	let owner = tx.attach_node(parent.id(), &owner, None, Some(child.id())).unwrap();
-	let first = tx.attach_node(child.id(), &"person:n1".parse().unwrap(), None, None).unwrap();
-	let last = tx.attach_node(child.id(), &"person:n3".parse().unwrap(), None, None).unwrap();
+	let owner = tx.attach_node(parent.id(), &owner, None, Some(child.id())).assert_ok();
+	let first =
+		tx.attach_node(child.id(), &"person:n1".parse().assert_ok(), None, None).assert_ok();
+	let last = tx.attach_node(child.id(), &"person:n3".parse().assert_ok(), None, None).assert_ok();
 	tx.attach_edge(
 		parent.id(),
 		&cross,
 		None,
 		EdgeTopology::directed([EdgeEndpoint::Local(owner)], [EdgeEndpoint::Nested(
-			QualifiedAtomId::new([owner], first).unwrap(),
+			QualifiedAtomId::new([owner], first).assert_ok(),
 		)]),
 		None,
 		None,
 	)
-	.unwrap();
-	let local_edge = "link:e1".parse::<RecordId>().unwrap();
+	.assert_ok();
+	let local_edge = "link:e1".parse::<RecordId>().assert_ok();
 	tx.attach_edge(
 		child.id(),
 		&local_edge,
@@ -1176,12 +1258,12 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 		None,
 		None,
 	)
-	.unwrap();
-	tx.set_base_property(&cross, fee, Value::from(2_i64)).unwrap();
-	tx.set_base_property(&local_edge, fee, Value::from(2_i64)).unwrap();
-	tx.set_overlay(parent.id(), &cross, fee, Value::from(7_i64)).unwrap();
-	tx.set_overlay(child.id(), &local_edge, fee, Value::from(11_i64)).unwrap();
-	tx.commit().unwrap();
+	.assert_ok();
+	tx.set_base_property(&cross, fee, Value::from(2_i64)).assert_ok();
+	tx.set_base_property(&local_edge, fee, Value::from(2_i64)).assert_ok();
+	tx.set_overlay(parent.id(), &cross, fee, Value::from(7_i64)).assert_ok();
+	tx.set_overlay(child.id(), &local_edge, fee, Value::from(11_i64)).assert_ok();
+	tx.commit().assert_ok();
 	assert!(
 		store
 			.execute(
@@ -1189,7 +1271,7 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 				 <number>$edge.fee; };",
 				&Object::new(),
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_ok()
 	);
@@ -1197,12 +1279,18 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 	             local]->(person:n3) IN GRAPH routes WITH COST fn::cost RETURN cross, local, \
 	             path::cost(path) AS cost, path::cost(path, fn::cost) AS recomputed;";
 	let rows = result(&mut store.begin(), query);
-	assert_eq!(rows.as_array().unwrap().len(), 1);
-	let row = rows.as_array().unwrap().get(0).unwrap().as_object().unwrap();
+	assert_eq!(rows.as_array().assert_some().len(), 1);
+	let row = rows.as_array().assert_some().get(0).assert_some().as_object().assert_some();
 	assert_eq!(row.get("cost"), Some(&Value::from(18_i64)));
 	assert_eq!(row.get("recomputed"), row.get("cost"));
-	assert_eq!(row.get("cross").unwrap().as_atom_occurrence().unwrap().graph().id(), parent.id());
-	assert_eq!(row.get("local").unwrap().as_atom_occurrence().unwrap().graph().id(), child.id());
+	assert_eq!(
+		row.get("cross").assert_some().as_atom_occurrence().assert_some().graph().id(),
+		parent.id()
+	);
+	assert_eq!(
+		row.get("local").assert_some().as_atom_occurrence().assert_some().graph().id(),
+		child.id()
+	);
 	let local_query = query
 		.replace(" WITH COST fn::cost", "")
 		.replace(" AS cross]", " AS cross COST fn::cost]")
@@ -1213,11 +1301,11 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 		"TRAVERSE FROM person:owner IN GRAPH routes WITH COST fn::cost |> tv::out() |> tv::out() \
 		 |> tv::path();",
 	);
-	let path = paths.as_array().unwrap().get(0).unwrap().as_path().unwrap();
-	assert_eq!(paths.as_array().unwrap().len(), 1);
+	let path = paths.as_array().assert_some().get(0).assert_some().as_path().assert_some();
+	assert_eq!(paths.as_array().assert_some().len(), 1);
 	assert_eq!(path.cost(), Some(Number::Int(18)));
-	assert_eq!(path.steps()[1].via_edge().unwrap().graph().id(), parent.id());
-	assert_eq!(path.steps()[2].via_edge().unwrap().graph().id(), child.id());
+	assert_eq!(path.steps()[1].via_edge().assert_some().graph().id(), parent.id());
+	assert_eq!(path.steps()[2].via_edge().assert_some().graph().id(), child.id());
 
 	let hyper = weighted_traversal_routes(GraphKind::Hypergraph, [Number::Int(1); 8]);
 	assert!(
@@ -1226,7 +1314,7 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 				"DEFINE PURE COST FUNCTION fn::cost(edge: any) -> number { RETURN 7; };",
 				&Object::new(),
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_ok()
 	);
@@ -1235,9 +1323,9 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 		"MATCH path = (person:n1)-[link:hyper AS edge HYPEREDGES]->(person:n3) IN GRAPH routes \
 		 WITH COST fn::cost RETURN path::cost(path) AS cost;",
 	);
-	assert_eq!(rows.as_array().unwrap().len(), 1);
+	assert_eq!(rows.as_array().assert_some().len(), 1);
 	assert_eq!(
-		rows.as_array().unwrap().get(0).unwrap().as_object().unwrap().get("cost"),
+		rows.as_array().assert_some().get(0).assert_some().as_object().assert_some().get("cost"),
 		Some(&Value::from(7_i64))
 	);
 	let outcomes = hyper
@@ -1246,11 +1334,13 @@ fn global_match_cost_uses_connector_scope_for_nested_and_hyper_paths() {
 			 (person:n1)-[link:hyper]->(person:n3) IN GRAPH routes WITH COST fn::bad RETURN 1;",
 			&Object::new(),
 		)
-		.unwrap();
+		.assert_ok();
 	assert!(outcomes[0].result.is_ok());
 	assert!(outcomes[1].result.is_err());
 }
 
+/// Verifies custom path cost recomputes in order and preserves snapshot
+/// occurrences.
 #[test]
 fn custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences() {
 	for kind in [GraphKind::Graph, GraphKind::Metagraph] {
@@ -1262,7 +1352,7 @@ fn custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences() {
 				 prefix: number) -> number { RETURN $prefix + 1; };",
 				&Object::new(),
 			)
-			.unwrap()
+			.assert_ok()
 		{
 			assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 		}
@@ -1274,13 +1364,13 @@ fn custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences() {
 		);
 		let path_value = rows
 			.as_array()
-			.unwrap()
+			.assert_some()
 			.get(0)
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("path")
-			.unwrap()
+			.assert_some()
 			.clone();
 		let mut variables = Object::new();
 		variables.insert("path", path_value.clone());
@@ -1305,24 +1395,24 @@ fn custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences() {
 				Value::Array(vec![Value::from(4_i64)].into()),
 			),
 		] {
-			let rows = tx.execute(query, &variables).unwrap();
-			assert_eq!(rows[0].result.as_ref().unwrap().value(), &expected, "{query}");
+			let rows = tx.execute(query, &variables).assert_ok();
+			assert_eq!(rows[0].result.as_ref().assert_ok().value(), &expected, "{query}");
 		}
 		let select = tx
 			.execute("SELECT path::cost($path, fn::cost) AS cost FROM person LIMIT 1;", &variables)
-			.unwrap();
+			.assert_ok();
 		assert_eq!(
 			select[0]
 				.result
 				.as_ref()
-				.unwrap()
+				.assert_ok()
 				.value()
 				.as_array()
-				.unwrap()
+				.assert_some()
 				.get(0)
-				.unwrap()
+				.assert_some()
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("cost"),
 			Some(&Value::from(4_i64))
 		);
@@ -1333,52 +1423,60 @@ fn custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences() {
 				 cost;"
 			)
 			.as_array()
-			.unwrap()
+			.assert_some()
 			.get(0)
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("cost"),
 			Some(&Value::from(0_i64))
 		);
 		let mut writer = store.begin();
-		let fee = writer.intern_property("fee").unwrap();
-		writer.set_base_property(&"link:e0".parse().unwrap(), fee, Value::from(0_i64)).unwrap();
-		writer.commit().unwrap();
+		let fee = writer.intern_property("fee").assert_ok();
+		writer
+			.set_base_property(&"link:e0".parse().assert_ok(), fee, Value::from(0_i64))
+			.assert_ok();
+		writer.commit().assert_ok();
 		assert_eq!(
-			tx.execute("RETURN path::cost($path, fn::cost);", &variables).unwrap()[0]
+			tx.execute("RETURN path::cost($path, fn::cost);", &variables).assert_ok()[0]
 				.result
 				.as_ref()
-				.unwrap()
+				.assert_ok()
 				.value(),
 			&Value::from(4_i64)
 		);
 		let mut latest = store.begin();
 		assert_eq!(
-			latest.execute("RETURN path::cost($path);", &variables).unwrap()[0]
+			latest.execute("RETURN path::cost($path);", &variables).assert_ok()[0]
 				.result
 				.as_ref()
-				.unwrap()
+				.assert_ok()
 				.value(),
 			&Value::from(4_i64)
 		);
 		assert!(
-			latest.execute("RETURN path::cost($path, fn::cost);", &variables).unwrap()[0]
+			latest.execute("RETURN path::cost($path, fn::cost);", &variables).assert_ok()[0]
 				.result
 				.is_err()
 		);
 		let mut private = store.begin();
-		let graph = private.named_graph("routes").unwrap().unwrap();
+		let graph = private.named_graph("routes").assert_ok().assert_some();
 		private
-			.set_overlay(graph.id(), &"link:e0".parse().unwrap(), fee, Value::from(5_i64))
-			.unwrap();
+			.set_overlay(graph.id(), &"link:e0".parse().assert_ok(), fee, Value::from(5_i64))
+			.assert_ok();
 		let rows = result(
 			&mut private,
 			"MATCH path = (person:n0)-[link:e0]->(person:n1)-[link:e1]->(person:n3) IN GRAPH \
 			 routes RETURN path::cost(path, fn::cost) AS cost;",
 		);
 		assert_eq!(
-			rows.as_array().unwrap().get(0).unwrap().as_object().unwrap().get("cost"),
+			rows.as_array()
+				.assert_some()
+				.get(0)
+				.assert_some()
+				.as_object()
+				.assert_some()
+				.get("cost"),
 			Some(&Value::from(7_i64))
 		);
 		drop(private);
@@ -1388,14 +1486,20 @@ fn custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences() {
 			"MATCH path = (person:n0)-[link:e0]->(person:n1)-[link:e1]->(person:n3) IN GRAPH \
 			 routes RETURN path::cost(path, fn::cost) AS cost;",
 		);
-		serializable.create_atom("person:decision".parse().unwrap(), PropertyMap::new()).unwrap();
+		serializable
+			.create_atom("person:decision".parse().assert_ok(), PropertyMap::new())
+			.assert_ok();
 		let mut writer = store.begin();
-		writer.set_base_property(&"link:e1".parse().unwrap(), fee, Value::from(8_i64)).unwrap();
-		writer.commit().unwrap();
+		writer
+			.set_base_property(&"link:e1".parse().assert_ok(), fee, Value::from(8_i64))
+			.assert_ok();
+		writer.commit().assert_ok();
 		assert!(serializable.commit().is_err());
 	}
 }
 
+/// Verifies custom path cost rejects invalid scopes functions arithmetic and
+/// work limits.
 #[test]
 fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits() {
 	let store = routes();
@@ -1407,7 +1511,7 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 			 fn::ordinary(edge: any) -> number { RETURN 1; };",
 			&Object::new(),
 		)
-		.unwrap()
+		.assert_ok()
 	{
 		assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 	}
@@ -1419,7 +1523,7 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 				"ALTER FUNCTION fn::unit(any) { RETURN path::cost($edge, fn::unit); };",
 				&Object::new(),
 			)
-			.unwrap()[0]
+			.assert_ok()[0]
 			.result
 			.is_err()
 	);
@@ -1432,7 +1536,10 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 		query.replace("path, fn::max", "1, fn::unit"),
 		query.replace("path, fn::max", "path, fn::unit, 1"),
 	] {
-		assert!(store.execute(&invalid, &Object::new()).unwrap()[0].result.is_err(), "{invalid}");
+		assert!(
+			store.execute(&invalid, &Object::new()).assert_ok()[0].result.is_err(),
+			"{invalid}"
+		);
 	}
 	for case in 0..4 {
 		let mut tx = store.begin();
@@ -1442,15 +1549,15 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 		);
 		let original = rows
 			.as_array()
-			.unwrap()
+			.assert_some()
 			.get(0)
-			.unwrap()
+			.assert_some()
 			.as_object()
-			.unwrap()
+			.assert_some()
 			.get("path")
-			.unwrap()
+			.assert_some()
 			.as_path()
-			.unwrap();
+			.assert_some();
 		let mut steps = original.steps().to_vec();
 		let origin = if case == 0 {
 			uuid::Uuid::nil().into()
@@ -1471,8 +1578,8 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 			);
 		}
 		if case == 3 {
-			let graph = tx.named_graph("routes").unwrap().unwrap();
-			tx.detach_occurrence(graph.id(), &"link:e0".parse().unwrap(), true).unwrap();
+			let graph = tx.named_graph("routes").assert_ok().assert_some();
+			tx.detach_occurrence(graph.id(), &"link:e0".parse().assert_ok(), true).assert_ok();
 		}
 		let mut variables = Object::new();
 		variables.insert(
@@ -1480,7 +1587,7 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 			Value::Path(Box::new(crate::graph::Path::new(origin, snapshot, steps, None))),
 		);
 		assert!(
-			tx.execute("RETURN path::cost($path, fn::unit);", &variables).unwrap()[0]
+			tx.execute("RETURN path::cost($path, fn::unit);", &variables).assert_ok()[0]
 				.result
 				.is_err(),
 			"case={case}"
@@ -1494,19 +1601,30 @@ fn custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(
 	let mut variables = Object::new();
 	variables.insert(
 		"path",
-		rows.as_array().unwrap().get(0).unwrap().as_object().unwrap().get("path").unwrap().clone(),
+		rows.as_array()
+			.assert_some()
+			.get(0)
+			.assert_some()
+			.as_object()
+			.assert_some()
+			.get("path")
+			.assert_some()
+			.clone(),
 	);
-	let mut options = crate::gql::QueryExecutionOptions::default();
-	options.max_path_expansions = 1;
+	let options = crate::gql::QueryExecutionOptions {
+		max_path_expansions: 1,
+		..Default::default()
+	};
 	let outcomes = tx
 		.execute_with_options("RETURN path::cost($path, fn::unit);", &variables, options)
-		.unwrap();
+		.assert_ok();
 	assert_eq!(
-		outcomes[0].result.as_ref().unwrap_err().status().code(),
+		outcomes[0].result.as_ref().assert_err().status().code(),
 		crate::gql_status::FerrosGrynnError::path_expansion_limit_exceeded(1).status().code()
 	);
 }
 
+/// Verifies traverse cost matches full state paths and ready bindings.
 #[test]
 fn traverse_cost_matches_full_state_paths_and_ready_bindings() {
 	for family in [GraphKind::Graph, GraphKind::Metagraph, GraphKind::Hypergraph] {
@@ -1520,7 +1638,7 @@ fn traverse_cost_matches_full_state_paths_and_ready_bindings() {
 				 (MAX_BYTES = 1048576);",
 				&Object::new(),
 			)
-			.unwrap()
+			.assert_ok()
 		{
 			assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 		}
@@ -1549,9 +1667,11 @@ fn traverse_cost_matches_full_state_paths_and_ready_bindings() {
 						);
 						let expected = oracle
 							.as_array()
-							.unwrap()
+							.assert_some()
 							.get(0)
-							.map(|row| row.as_object().unwrap().get("path").unwrap().clone())
+							.map(|row| {
+								row.as_object().assert_some().get("path").assert_some().clone()
+							})
 							.unwrap_or(Value::None);
 						for atom in [false, true] {
 							for method in ["weightedShortestPath", "distanceTo"] {
@@ -1585,14 +1705,14 @@ fn traverse_cost_matches_full_state_paths_and_ready_bindings() {
 									&mut tx,
 									&format!("EXPLAIN ANALYZE FORMAT JSON {query}"),
 								);
-								let explain = explain.as_object().unwrap();
+								let explain = explain.as_object().assert_some();
 								let lookups = explain
 									.get("analyze")
-									.unwrap()
+									.assert_some()
 									.as_object()
-									.unwrap()
+									.assert_some()
 									.get("landmark_lookups")
-									.unwrap();
+									.assert_some();
 								if ready && function == "cost" && !expected.is_none() {
 									assert!(lookups > &Value::from(0_i64), "{query}");
 								} else if !ready || function == "state" {
@@ -1611,7 +1731,7 @@ fn traverse_cost_matches_full_state_paths_and_ready_bindings() {
 					.map(|value| {
 						value
 							.as_array()
-							.unwrap()
+							.assert_some()
 							.iter()
 							.map(|item| {
 								item.as_path().map(|path| (path.steps().to_vec(), path.cost()))
@@ -1629,6 +1749,7 @@ fn traverse_cost_matches_full_state_paths_and_ready_bindings() {
 	}
 }
 
+/// Verifies traverse cost navigation snapshots and fail closed limits.
 #[test]
 fn traverse_cost_navigation_snapshots_and_fail_closed_limits() {
 	let store = routes();
@@ -1642,7 +1763,7 @@ fn traverse_cost_navigation_snapshots_and_fail_closed_limits() {
 			 LANDMARK_SSSP(4) COST fn::cost WITH (MAX_BYTES = 1048576);",
 			&Object::new(),
 		)
-		.unwrap()
+		.assert_ok()
 	{
 		assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 	}
@@ -1652,7 +1773,7 @@ fn traverse_cost_navigation_snapshots_and_fail_closed_limits() {
 	let mut old = store.begin();
 	let path = result(&mut old, query);
 	assert_eq!(
-		path.as_array().unwrap().get(0).unwrap().as_path().unwrap().cost(),
+		path.as_array().assert_some().get(0).assert_some().as_path().assert_some().cost(),
 		Some(Number::Int(4))
 	);
 	let undirected = result(
@@ -1660,23 +1781,23 @@ fn traverse_cost_navigation_snapshots_and_fail_closed_limits() {
 		&query.replace("FROM person:n0", "FROM person:n3").replace("(person:n3)", "(person:n0)"),
 	);
 	assert_eq!(
-		undirected.as_array().unwrap().get(0).unwrap().as_path().unwrap().cost(),
+		undirected.as_array().assert_some().get(0).assert_some().as_path().assert_some().cost(),
 		Some(Number::Int(6))
 	);
 	let navigation = "TRAVERSE FROM person:n0 IN GRAPH routes WITH COST fn::state |> tv::out() |> \
 	                  tv::out() |> tv::path();";
-	for value in result(&mut old, navigation).as_array().unwrap().iter() {
-		assert_eq!(value.as_path().unwrap().cost(), Some(Number::Int(3)));
+	for value in result(&mut old, navigation).as_array().assert_some().iter() {
+		assert_eq!(value.as_path().assert_some().cost(), Some(Number::Int(3)));
 	}
 	let atom = result(
 		&mut old,
 		"TRAVERSE ATOM FROM link:e0 IN GRAPH routes WITH COST fn::state |> tv::out() |> \
 		 tv::path();",
 	);
-	assert_eq!(atom.as_array().unwrap().len(), 1);
-	let atom = atom.as_array().unwrap().get(0).unwrap().as_path().unwrap();
+	assert_eq!(atom.as_array().assert_some().len(), 1);
+	let atom = atom.as_array().assert_some().get(0).assert_some().as_path().assert_some();
 	assert_eq!(atom.cost(), Some(Number::Int(1)));
-	assert_eq!(atom.steps()[1].via_edge().unwrap().atom().id().to_string(), "link:from_edge");
+	assert_eq!(atom.steps()[1].via_edge().assert_some().atom().id().to_string(), "link:from_edge");
 	for invalid in [
 		query.replace("fn::cost", "fn::bad"),
 		query.replace("fn::cost", "fn::missing"),
@@ -1686,50 +1807,65 @@ fn traverse_cost_navigation_snapshots_and_fail_closed_limits() {
 		"TRAVERSE FROM person:n0 IN GRAPH routes WITH COST fn::bad |> tv::out() |> tv::count();"
 			.to_owned(),
 	] {
-		assert!(store.execute(&invalid, &Object::new()).unwrap()[0].result.is_err(), "{invalid}");
+		assert!(
+			store.execute(&invalid, &Object::new()).assert_ok()[0].result.is_err(),
+			"{invalid}"
+		);
 	}
-	let mut options = crate::gql::QueryExecutionOptions::default();
-	options.max_path_expansions = 2;
+	let options = crate::gql::QueryExecutionOptions {
+		max_path_expansions: 2,
+		..Default::default()
+	};
 	let zero_walk = "TRAVERSE CONSTRAINTS <WALK> FROM person:n0 IN GRAPH routes WITH COST \
 	                 fn::zero |> tv::weightedShortestPath(person:n3);";
-	let failures = store.begin().execute_with_options(zero_walk, &Object::new(), options).unwrap();
+	let failures =
+		store.begin().execute_with_options(zero_walk, &Object::new(), options).assert_ok();
 	assert_eq!(
-		failures[0].result.as_ref().unwrap_err().status().code(),
+		failures[0].result.as_ref().assert_err().status().code(),
 		crate::gql_status::FerrosGrynnError::path_expansion_limit_exceeded(2).status().code()
 	);
-	let mut options = crate::gql::QueryExecutionOptions::default();
-	options.barrier_memory_bytes = std::num::NonZeroUsize::new(128).unwrap();
+	let options = crate::gql::QueryExecutionOptions {
+		barrier_memory_bytes: std::num::NonZeroUsize::new(128).assert_some(),
+		..Default::default()
+	};
 	assert!(
-		store.begin().execute_with_options(query, &Object::new(), options).unwrap()[0]
+		store.begin().execute_with_options(query, &Object::new(), options).assert_ok()[0]
 			.result
 			.is_err()
 	);
 	let mut private = store.begin();
-	let graph = private.named_graph("routes").unwrap().unwrap();
-	let key = private.intern_property("fee").unwrap();
-	private.set_overlay(graph.id(), &"link:e0".parse().unwrap(), key, Value::from(0_i64)).unwrap();
+	let graph = private.named_graph("routes").assert_ok().assert_some();
+	let key = private.intern_property("fee").assert_ok();
+	private
+		.set_overlay(graph.id(), &"link:e0".parse().assert_ok(), key, Value::from(0_i64))
+		.assert_ok();
 	let private_path = result(&mut private, query);
 	assert_eq!(
-		private_path.as_array().unwrap().get(0).unwrap().as_path().unwrap().cost(),
+		private_path.as_array().assert_some().get(0).assert_some().as_path().assert_some().cost(),
 		Some(Number::Int(2))
 	);
 	drop(private);
 	let mut writer = store.begin();
-	writer.set_overlay(graph.id(), &"link:e0".parse().unwrap(), key, Value::from(0_i64)).unwrap();
-	writer.commit().unwrap();
+	writer
+		.set_overlay(graph.id(), &"link:e0".parse().assert_ok(), key, Value::from(0_i64))
+		.assert_ok();
+	writer.commit().assert_ok();
 	assert_eq!(result(&mut old, query), path);
 	let mut serializable = store.begin();
 	result(&mut serializable, query);
-	let key2 = serializable.intern_property("marker").unwrap();
+	let key2 = serializable.intern_property("marker").assert_ok();
 	serializable
-		.set_overlay(graph.id(), &"link:e1".parse().unwrap(), key2, Value::Bool(true))
-		.unwrap();
+		.set_overlay(graph.id(), &"link:e1".parse().assert_ok(), key2, Value::Bool(true))
+		.assert_ok();
 	let mut writer = store.begin();
-	writer.set_overlay(graph.id(), &"link:e0".parse().unwrap(), key, Value::from(1_i64)).unwrap();
-	writer.commit().unwrap();
+	writer
+		.set_overlay(graph.id(), &"link:e0".parse().assert_ok(), key, Value::from(1_i64))
+		.assert_ok();
+	writer.commit().assert_ok();
 	assert!(serializable.commit().is_err());
 }
 
+/// Verifies traverse cost respects connector filters.
 #[test]
 fn traverse_cost_respects_connector_filters() {
 	for family in [GraphKind::Graph, GraphKind::Hypergraph] {
@@ -1740,7 +1876,7 @@ fn traverse_cost_respects_connector_filters() {
 					"DEFINE PURE COST FUNCTION fn::cost(edge: any) -> number { RETURN 1; };",
 					&Object::new(),
 				)
-				.unwrap()[0]
+				.assert_ok()[0]
 				.result
 				.is_ok()
 		);
@@ -1755,7 +1891,7 @@ fn traverse_cost_respects_connector_filters() {
 						 WITH COST fn::cost |> tv::{method}(person:n3);"
 					),
 				);
-				let value = rows.as_array().unwrap().get(0).unwrap();
+				let value = rows.as_array().assert_some().get(0).assert_some();
 				let accepted = filter == "WEIGHTED"
 					|| filter == "HYPEREDGES" && family == GraphKind::Hypergraph;
 				if !accepted {
@@ -1763,15 +1899,15 @@ fn traverse_cost_respects_connector_filters() {
 				} else if method == "distanceTo" {
 					assert_eq!(value, &Value::from(1_i64));
 				} else {
-					assert_eq!(value.as_path().unwrap().cost(), Some(Number::Int(1)));
+					assert_eq!(value.as_path().assert_some().cost(), Some(Number::Int(1)));
 					if filter == "HYPEREDGES" {
 						assert_eq!(
 							value
 								.as_path()
-								.unwrap()
+								.assert_some()
 								.edges()
 								.next()
-								.unwrap()
+								.assert_some()
 								.atom()
 								.id()
 								.to_string(),
@@ -1784,12 +1920,16 @@ fn traverse_cost_respects_connector_filters() {
 	}
 }
 
+/// Verifies landmark custom cost matches exhaustive reduction and zero cost
+/// ties.
 #[test]
 fn landmark_custom_cost_matches_exhaustive_reduction_and_zero_cost_ties() {
 	weighted_matches_exhaustive(GraphKind::Graph, true);
 	weighted_matches_exhaustive(GraphKind::Metagraph, true);
 }
 
+/// Verifies landmark custom cost private writes old snapshots dependencies and
+/// ssi.
 #[test]
 fn landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi() {
 	for consumer in [0, 1, 2] {
@@ -1802,13 +1942,13 @@ fn landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi() {
 				 ALGORITHM LANDMARK_SSSP(4) COST fn::cost WITH (MAX_BYTES = 1048576);",
 				&Object::new(),
 			)
-			.unwrap()
+			.assert_ok()
 		{
 			assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 		}
 		let rebuild = || {
 			let outcomes =
-				store.execute("REBUILD INDEX custom ON GRAPH routes;", &Object::new()).unwrap();
+				store.execute("REBUILD INDEX custom ON GRAPH routes;", &Object::new()).assert_ok();
 			assert!(outcomes[0].result.is_ok(), "{outcomes:?}");
 		};
 		rebuild();
@@ -1828,23 +1968,23 @@ fn landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi() {
 		let lookups = |value: &Value| {
 			value
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("analyze")
-				.unwrap()
+				.assert_some()
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("landmark_lookups")
-				.unwrap()
+				.assert_some()
 				> &Value::from(0_i64)
 		};
 		let mut old = store.begin();
 		let old_rows = result(&mut old, query);
 		assert!(lookups(&result(&mut old, &explain)));
-		let graph = store.schema_catalog().named_graph("routes").unwrap().id();
-		let record = "link:e0".parse::<RecordId>().unwrap();
+		let graph = store.schema_catalog().named_graph("routes").assert_some().id();
+		let record = "link:e0".parse::<RecordId>().assert_ok();
 		let mut private = store.begin();
-		let key = private.intern_property("fee").unwrap();
-		private.set_overlay(graph, &record, key, Value::from(0_i64)).unwrap();
+		let key = private.intern_property("fee").assert_ok();
+		private.set_overlay(graph, &record, key, Value::from(0_i64)).assert_ok();
 		assert!(!lookups(&result(&mut private, &explain)));
 		let private_rows = result(&mut private, query);
 		assert_ne!(private_rows, old_rows);
@@ -1856,10 +1996,14 @@ fn landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi() {
 		// properties.
 		let mut serializable = store.begin();
 		assert!(lookups(&result(&mut serializable, &explain)));
-		serializable.create_atom("person:decision".parse().unwrap(), PropertyMap::new()).unwrap();
+		serializable
+			.create_atom("person:decision".parse().assert_ok(), PropertyMap::new())
+			.assert_ok();
 		let mut writer = store.begin();
-		writer.set_base_property(&"link:e7".parse().unwrap(), key, Value::from(1_i64)).unwrap();
-		writer.commit().unwrap();
+		writer
+			.set_base_property(&"link:e7".parse().assert_ok(), key, Value::from(1_i64))
+			.assert_ok();
+		writer.commit().assert_ok();
 		assert!(serializable.commit().is_err());
 		assert_eq!(result(&mut old, query), old_rows);
 		assert!(lookups(&result(&mut old, &explain)));
@@ -1868,21 +2012,21 @@ fn landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi() {
 		assert!(lookups(&result(&mut store.begin(), &explain)));
 		let before = result(&mut store.begin(), &explain);
 		let mut old_fallback = store.begin();
-		old_fallback.set_overlay(graph, &record, key, Value::from(3_i64)).unwrap();
+		old_fallback.set_overlay(graph, &record, key, Value::from(3_i64)).assert_ok();
 		let fallback_before = result(&mut old_fallback, &explain);
 		assert!(!lookups(&fallback_before));
 		let altered =
-			store.execute("ALTER FUNCTION fn::fee(any) { RETURN 1; };", &Object::new()).unwrap();
+			store.execute("ALTER FUNCTION fn::fee(any) { RETURN 1; };", &Object::new()).assert_ok();
 		assert!(altered[0].result.is_ok(), "{altered:?}");
 		let fallback_after = result(&mut store.begin(), &explain);
 		assert!(!lookups(&fallback_after));
 		assert_ne!(
-			fallback_before.as_object().unwrap().get("plan_hash"),
-			fallback_after.as_object().unwrap().get("plan_hash")
+			fallback_before.as_object().assert_some().get("plan_hash"),
+			fallback_after.as_object().assert_some().get("plan_hash")
 		);
 		assert_eq!(
-			result(&mut old_fallback, &explain).as_object().unwrap().get("plan_hash"),
-			fallback_before.as_object().unwrap().get("plan_hash")
+			result(&mut old_fallback, &explain).as_object().assert_some().get("plan_hash"),
+			fallback_before.as_object().assert_some().get("plan_hash")
 		);
 		let exact = result(&mut store.begin(), query);
 		assert_ne!(exact, old_rows);
@@ -1892,8 +2036,8 @@ fn landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi() {
 		let after = result(&mut store.begin(), &explain);
 		assert!(lookups(&after));
 		assert_ne!(
-			before.as_object().unwrap().get("plan_hash"),
-			after.as_object().unwrap().get("plan_hash")
+			before.as_object().assert_some().get("plan_hash"),
+			after.as_object().assert_some().get("plan_hash")
 		);
 		assert!(lookups(&result(&mut old, &explain)));
 	}
@@ -1918,8 +2062,8 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 			Number::Int(0),
 		],
 		[
-			Number::Decimal("0.0000000000000000000000000001".parse().unwrap()),
-			Number::Decimal("9007199254740993.123456789".parse().unwrap()),
+			Number::Decimal("0.0000000000000000000000000001".parse().assert_ok()),
+			Number::Decimal("9007199254740993.123456789".parse().assert_ok()),
 			Number::Int(9_007_199_254_740_993),
 			Number::Int(0),
 			Number::Int(0),
@@ -1939,13 +2083,15 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 					 number { RETURN fn::fee($edge); };",
 					&Object::new(),
 				)
-				.unwrap();
+				.assert_ok();
 			assert!(definitions.iter().all(|result| result.result.is_ok()), "{definitions:?}");
 			let catalog = store.schema_catalog();
-			let function =
-				catalog.functions().find(|function| function.name().as_str() == "cost").unwrap();
+			let function = catalog
+				.functions()
+				.find(|function| function.name().as_str() == "cost")
+				.assert_some();
 			GraphIndexCost::Function {
-				function: function.id().unwrap(),
+				function: function.id().assert_some(),
 				version: function.version(),
 			}
 		} else {
@@ -1957,21 +2103,21 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 			"WEIGHTED SHORTEST"
 		};
 		let mut tx = store.begin();
-		tx.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-		tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-		let graph = tx.define_graph("routes", kind).unwrap();
-		let fee = tx.intern_property("fee").unwrap();
+		tx.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		tx.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+		let graph = tx.define_graph("routes", kind).assert_ok();
+		let fee = tx.intern_property("fee").assert_ok();
 		let mut nodes = Vec::new();
 		for vertex in 0..3 {
-			let record = format!("person:n{vertex}").parse::<RecordId>().unwrap();
-			tx.create_atom(record.clone(), PropertyMap::new()).unwrap();
-			nodes.push(tx.attach_node(graph.id(), &record, None, None).unwrap());
+			let record = format!("person:n{vertex}").parse::<RecordId>().assert_ok();
+			tx.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+			nodes.push(tx.attach_node(graph.id(), &record, None, None).assert_ok());
 		}
 		for (ordinal, &(from, to, cost)) in edges.iter().enumerate() {
-			let record = format!("link:e{ordinal}").parse::<RecordId>().unwrap();
+			let record = format!("link:e{ordinal}").parse::<RecordId>().assert_ok();
 			let mut properties = PropertyMap::new();
 			properties.insert(fee, Value::Number(cost));
-			tx.create_atom(record.clone(), properties).unwrap();
+			tx.create_atom(record.clone(), properties).assert_ok();
 			tx.attach_edge(
 				graph.id(),
 				&record,
@@ -1984,7 +2130,7 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 				}),
 				None,
 			)
-			.unwrap();
+			.assert_ok();
 		}
 		for (name, direction) in [
 			("weighted_out", TraversalDirection::Forward),
@@ -2001,18 +2147,18 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 					},
 					Some(1 << 20),
 				)
-				.unwrap()
+				.assert_ok()
 				.with_direction(direction),
 			)
-			.unwrap();
+			.assert_ok();
 		}
-		tx.commit().unwrap();
+		tx.commit().assert_ok();
 		for ready in [false, true] {
 			if ready {
 				for name in ["weighted_out", "weighted_in"] {
 					let rows = store
 						.execute(&format!("REBUILD INDEX {name} ON GRAPH routes;"), &Object::new())
-						.unwrap();
+						.assert_ok();
 					assert!(rows[0].result.is_ok(), "{:?}", rows[0].result);
 				}
 			}
@@ -2024,26 +2170,33 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 					 edges, path::cost(path) AS cost;"
 				),
 			);
-			let rows = all_targets.as_array().unwrap();
+			let rows = all_targets.as_array().assert_some();
 			assert_eq!(rows.len(), 3);
 			for target in 0..3 {
-				let expected = weighted_oracle(&edges, 0, target, false, 2, 4, "WALK").unwrap();
+				let expected =
+					weighted_oracle(&edges, 0, target, false, 2, 4, "WALK").assert_some();
 				let row = rows
 					.iter()
-					.map(|value| value.as_object().unwrap())
+					.map(|value| value.as_object().assert_some())
 					.find(|row| {
-						row.get("b").unwrap().as_atom_occurrence().unwrap().atom().id().to_string()
+						row.get("b")
+							.assert_some()
+							.as_atom_occurrence()
+							.assert_some()
+							.atom()
+							.id()
+							.to_string()
 							== format!("person:n{target}")
 					})
-					.unwrap();
+					.assert_some();
 				assert_eq!(row.get("cost"), Some(&Value::Number(expected.0)));
 				let records = row
 					.get("edges")
-					.unwrap()
+					.assert_some()
 					.as_array()
-					.unwrap()
+					.assert_some()
 					.iter()
-					.map(|atom| atom.as_atom_occurrence().unwrap().atom().id().to_string())
+					.map(|atom| atom.as_atom_occurrence().assert_some().atom().id().to_string())
 					.collect::<Vec<_>>();
 				assert_eq!(
 					records,
@@ -2059,13 +2212,13 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 			);
 			let lookups = explain
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("analyze")
-				.unwrap()
+				.assert_some()
 				.as_object()
-				.unwrap()
+				.assert_some()
 				.get("landmark_lookups")
-				.unwrap();
+				.assert_some();
 			assert_eq!(lookups > &Value::from(0_i64), ready && kind == GraphKind::Graph);
 			for backward in [false, true] {
 				let (left, right) = if backward {
@@ -2087,14 +2240,14 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 								let expected = weighted_oracle(
 									&edges, source, target, backward, min, max, mode,
 								);
-								let rows = rows.as_array().unwrap();
+								let rows = rows.as_array().assert_some();
 								assert_eq!(
 									rows.len(),
 									usize::from(expected.is_some()),
 									"{query} ready={ready}"
 								);
 								if let Some((cost, path)) = expected {
-									let row = rows.get(0).unwrap().as_object().unwrap();
+									let row = rows.get(0).assert_some().as_object().assert_some();
 									assert_eq!(
 										row.get("cost"),
 										Some(&Value::Number(cost)),
@@ -2102,13 +2255,13 @@ fn weighted_matches_exhaustive(kind: GraphKind, custom: bool) {
 									);
 									let records = row
 										.get("edges")
-										.unwrap()
+										.assert_some()
 										.as_array()
-										.unwrap()
+										.assert_some()
 										.iter()
 										.map(|atom| {
 											atom.as_atom_occurrence()
-												.unwrap()
+												.assert_some()
 												.atom()
 												.id()
 												.to_string()

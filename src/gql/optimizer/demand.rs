@@ -25,11 +25,17 @@ use crate::{
 };
 
 #[derive(Clone)]
+/// Atom columns state.
 struct AtomColumns {
+	/// Start associated with this atom columns.
 	start: usize,
+	/// Width associated with this atom columns.
 	width: usize,
+	/// Class associated with this atom columns.
 	class: Box<str>,
+	/// Scope associated with this atom columns.
 	scope: Option<StatisticsScope>,
+	/// Columns associated with this atom columns.
 	columns: Vec<Box<str>>,
 }
 
@@ -124,10 +130,10 @@ impl PlannerDemand {
 								(&expand.source, &expand.edge, &expand.target, expand.direction)
 							}
 							MatchOp::PathExpand(expand) => {
-								demand.tensor_caches |= expand
+								demand.artifacts.tensor_caches |= expand
 									.objective
 									.is_some_and(crate::syn::MatchPathObjective::is_all);
-								demand.landmark_paths |=
+								demand.artifacts.landmark_paths |=
 									expand.objective.is_some_and(|objective| !objective.is_all());
 								(&expand.source, &expand.edge, &expand.target, expand.direction)
 							}
@@ -195,15 +201,15 @@ impl PlannerDemand {
 			}
 		}
 		for step in &statement.steps {
-			demand.tensor_caches |= step.kind.is_tensor_analytics()
+			demand.artifacts.tensor_caches |= step.kind.is_tensor_analytics()
 				|| matches!(
 					step.kind,
 					crate::gql::ir::TraverseStepKind::AllShortestPaths
 						| crate::gql::ir::TraverseStepKind::AllWeightedShortestPaths
 				);
-			demand.neighbourhood_sketches |=
+			demand.artifacts.neighbourhood_sketches |=
 				step.kind == crate::gql::ir::TraverseStepKind::KHopEstimate;
-			demand.landmark_paths |= matches!(
+			demand.artifacts.landmark_paths |= matches!(
 				step.kind,
 				crate::gql::ir::TraverseStepKind::ShortestPath
 					| crate::gql::ir::TraverseStepKind::WeightedShortestPath
@@ -292,13 +298,14 @@ impl PlannerDemand {
 						demand.classes.insert(record.class.clone());
 						demand.graphs.insert(graph.id());
 					}
-					LogicalGraphDmlStatement::Relate {
-						source,
-						edge,
-						target,
-						graph,
-						..
-					} => {
+					LogicalGraphDmlStatement::Relate(relate) => {
+						let crate::gql::ir::LogicalRelate {
+							source,
+							edge,
+							target,
+							graph,
+							..
+						} = relate.as_ref();
 						for endpoint in [source, target] {
 							if let crate::gql::ir::LogicalRelateEndpoint::Record(record) = endpoint
 							{
@@ -362,13 +369,14 @@ impl PlannerDemand {
 		}
 	}
 
+	/// Merges planner demand.
 	fn merge(&mut self, other: Self) {
 		self.classes.extend(other.classes);
 		self.graphs.extend(other.graphs);
 		self.all_graphs |= other.all_graphs;
-		self.neighbourhood_sketches |= other.neighbourhood_sketches;
-		self.landmark_paths |= other.landmark_paths;
-		self.tensor_caches |= other.tensor_caches;
+		self.artifacts.neighbourhood_sketches |= other.artifacts.neighbourhood_sketches;
+		self.artifacts.landmark_paths |= other.artifacts.landmark_paths;
+		self.artifacts.tensor_caches |= other.artifacts.tensor_caches;
 		self.properties.extend(other.properties);
 		for (graph, keys) in other.degrees {
 			self.degrees.entry(graph).or_default().extend(keys);
@@ -376,6 +384,7 @@ impl PlannerDemand {
 	}
 }
 
+/// Collects match binding.
 fn collect_match_binding(binding: &MatchBinding, demand: &mut PlannerDemand) {
 	match &binding.selector {
 		LogicalMatchSelector::Class(class) => {
@@ -388,6 +397,7 @@ fn collect_match_binding(binding: &MatchBinding, demand: &mut PlannerDemand) {
 	}
 }
 
+/// Returns the degree directions result.
 fn degree_directions(direction: crate::syn::MatchDirection) -> Vec<DegreeDirection> {
 	match direction {
 		crate::syn::MatchDirection::Forward => vec![DegreeDirection::Out],
@@ -399,6 +409,7 @@ fn degree_directions(direction: crate::syn::MatchDirection) -> Vec<DegreeDirecti
 	}
 }
 
+/// Collects source.
 fn collect_source(
 	source: &LogicalSelectSource,
 	start: usize,
@@ -485,6 +496,7 @@ fn collect_source(
 	}
 }
 
+/// Collects expr.
 fn collect_expr(
 	expression: Option<&TypedExpr>,
 	owners: &[AtomColumns],
@@ -649,9 +661,10 @@ fn collect_expr(
 	}
 }
 
+/// Performs the demand column operation.
 fn demand_column(
 	column: usize,
-	nested: Option<&Box<str>>,
+	nested: Option<&str>,
 	owners: &[AtomColumns],
 	demand: &mut PlannerDemand,
 ) {
@@ -660,23 +673,19 @@ fn demand_column(
 	}
 }
 
+/// Resolves column.
 fn resolve_column(
 	column: usize,
-	nested: Option<&Box<str>>,
+	nested: Option<&str>,
 	owners: &[AtomColumns],
 ) -> Option<PlannerPropertyDemand> {
-	let Some(owner) =
-		owners.iter().find(|owner| column >= owner.start && column < owner.start + owner.width)
-	else {
-		return None;
-	};
-	let Some(scope) = owner.scope else {
-		return None;
-	};
+	let owner =
+		owners.iter().find(|owner| column >= owner.start && column < owner.start + owner.width)?;
+	let scope = owner.scope?;
 	let local = column - owner.start;
 	let field = match (owner.columns.get(local).map(Box::as_ref), nested) {
-		(Some("properties"), Some(field)) => field.clone(),
-		(Some(field), _) if matches!(field, "id" | "class" | "kind" | "label" | "properties") => {
+		(Some("properties"), Some(field)) => field.into(),
+		(Some("id" | "class" | "kind" | "label" | "properties"), _) => {
 			return None;
 		}
 		(None, _) => return None,
@@ -694,7 +703,7 @@ fn resolve_column(
 pub(in crate::gql) fn property_demand(
 	select: &LogicalSelect,
 	column: usize,
-	nested: Option<&Box<str>>,
+	nested: Option<&str>,
 ) -> Option<PlannerPropertyDemand> {
 	let mut demand = PlannerDemand::default();
 	let mut owners = Vec::new();

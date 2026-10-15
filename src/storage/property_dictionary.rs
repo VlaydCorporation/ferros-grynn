@@ -807,9 +807,11 @@ fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for property dictionary behavior.
 mod tests {
 	use super::*;
 
+	/// Returns dictionary for this module.
 	fn dictionary(
 		names: impl IntoIterator<Item = String>,
 	) -> FerrosGrynnResult<PropertyDictionary> {
@@ -820,6 +822,7 @@ mod tests {
 		Ok(dictionary)
 	}
 
+	/// Returns copied pages for this module.
 	fn copied_pages(pages: &[AlignedPage]) -> Vec<AlignedPage> {
 		pages
 			.iter()
@@ -831,10 +834,13 @@ mod tests {
 			.collect()
 	}
 
+	/// Verifies root entry and hash pages have exact offsets.
 	#[test]
-	fn root_entry_and_hash_pages_have_exact_offsets() -> FerrosGrynnResult<()> {
-		let dictionary = dictionary(["name".to_owned(), "weight".to_owned()])?;
-		let image = build_property_dictionary(&dictionary, PageLsn::new(7))?;
+	fn root_entry_and_hash_pages_have_exact_offsets() {
+		use crate::test_assertions::AssertResult as _;
+
+		let dictionary = dictionary(["name".to_owned(), "weight".to_owned()]).assert_ok();
+		let image = build_property_dictionary(&dictionary, PageLsn::new(7)).assert_ok();
 		let root = image.pages[0].as_bytes();
 		assert_eq!(read_u32(root, ROOT_ENTRY_COUNT_OFFSET), 2);
 		assert_eq!(read_u32(root, ROOT_ENTRY_PAGE_COUNT_OFFSET), 1);
@@ -851,59 +857,65 @@ mod tests {
 		assert_eq!(read_u16(entry, ENTRY_USED_BYTES_OFFSET), 14);
 		assert_eq!(&entry[ENTRY_DATA_OFFSET..ENTRY_DATA_OFFSET + 6], b"\x04\0name");
 
-		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
+		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64).assert_ok();
 		assert_eq!(reopened.get("name").map(PropertyKeyId::get), Some(0));
 		assert_eq!(reopened.get("weight").map(PropertyKeyId::get), Some(1));
-		Ok(())
 	}
 
+	/// Verifies empty dictionary append installs first chain and preserves old
+	/// snapshot.
 	#[test]
-	fn empty_dictionary_append_installs_first_chain_and_preserves_old_snapshot()
-	-> FerrosGrynnResult<()> {
+	fn empty_dictionary_append_installs_first_chain_and_preserves_old_snapshot() {
+		use crate::test_assertions::AssertResult as _;
+
 		let original = PropertyDictionary::new();
-		let image = build_property_dictionary(&original, PageLsn::new(1))?;
+		let image = build_property_dictionary(&original, PageLsn::new(1)).assert_ok();
 		let before = copied_pages(&image.pages);
-		let expanded = dictionary(["driven".to_owned()])?;
-		let image = extend_property_dictionary(image, &expanded, PageLsn::new(2))?;
-		let root = decode_root(&image.pages[0])?;
+		let expanded = dictionary(["driven".to_owned()]).assert_ok();
+		let image = extend_property_dictionary(image, &expanded, PageLsn::new(2)).assert_ok();
+		let root = decode_root(&image.pages[0]).assert_ok();
 		assert_eq!(root.entry_first_page, PageNo::new(1));
 		assert_eq!(root.entry_last_page, PageNo::new(1));
 		assert_eq!(root.entry_page_count, 1);
-		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
+		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64).assert_ok();
 		assert_eq!(reopened.get("driven"), Some(PropertyKeyId::new(0)));
-		assert!(open_property_dictionary(&before, before.len() as u64)?.is_empty());
+		assert!(open_property_dictionary(&before, before.len() as u64).assert_ok().is_empty());
 		let mut appended = expanded;
-		appended.intern("drive")?;
-		let image = extend_property_dictionary(image, &appended, PageLsn::new(3))?;
-		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
+		appended.intern("drive").assert_ok();
+		let image = extend_property_dictionary(image, &appended, PageLsn::new(3)).assert_ok();
+		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64).assert_ok();
 		assert_eq!(reopened.get("driven"), Some(PropertyKeyId::new(0)));
 		assert_eq!(reopened.get("drive"), Some(PropertyKeyId::new(1)));
-		Ok(())
 	}
 
+	/// Verifies resize appends entries and replacement hash range.
 	#[test]
-	fn resize_appends_entries_and_replacement_hash_range() -> FerrosGrynnResult<()> {
-		let original = dictionary((0..8).map(|id| format!("key-{id}")))?;
-		let image = build_property_dictionary(&original, PageLsn::new(1))?;
+	fn resize_appends_entries_and_replacement_hash_range() {
+		use crate::test_assertions::AssertResult as _;
+
+		let original = dictionary((0..8).map(|id| format!("key-{id}"))).assert_ok();
+		let image = build_property_dictionary(&original, PageLsn::new(1)).assert_ok();
 		let old_len = image.pages.len();
-		let mut expanded = original.clone();
+		let mut expanded = original;
 		for id in 8..900 {
-			expanded.intern(format!("key-{id}"))?;
+			expanded.intern(format!("key-{id}")).assert_ok();
 		}
-		let image = extend_property_dictionary(image, &expanded, PageLsn::new(2))?;
+		let image = extend_property_dictionary(image, &expanded, PageLsn::new(2)).assert_ok();
 		assert!(image.pages.len() > old_len);
-		let root = decode_root(&image.pages[0])?;
+		let root = decode_root(&image.pages[0]).assert_ok();
 		assert!(root.hash_first_page.get() >= old_len as u64);
 		assert!(root.hash_page_count >= 2);
-		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
+		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64).assert_ok();
 		assert_eq!(reopened.len(), 900);
 		assert_eq!(reopened.get("key-0").map(PropertyKeyId::get), Some(0));
 		assert_eq!(reopened.get("key-899").map(PropertyKeyId::get), Some(899));
-		Ok(())
 	}
 
+	/// Verifies collision resolution compares complete name bytes.
 	#[test]
-	fn collision_resolution_compares_complete_name_bytes() -> FerrosGrynnResult<()> {
+	fn collision_resolution_compares_complete_name_bytes() {
+		use crate::test_assertions::AssertResult as _;
+
 		let locations = [
 			NameLocation {
 				page: PageNo::new(1),
@@ -921,10 +933,12 @@ mod tests {
 				hash: 7,
 				id: PropertyKeyId::new(
 					u32::try_from(id)
-						.map_err(|_error| invalid("test property key ID exceeds u32"))?,
+						.map_err(|_error| invalid("test property key ID exceeds u32"))
+						.assert_ok(),
 				),
 				location,
-			})?;
+			})
+			.assert_ok();
 		}
 		assert_eq!(
 			find_bucket(&buckets, 7, "second", |id| names.get(id.get() as usize).copied()),
@@ -934,67 +948,75 @@ mod tests {
 			find_bucket(&buckets, 7, "missing", |id| { names.get(id.get() as usize).copied() }),
 			None
 		);
-		Ok(())
 	}
 
+	/// Verifies rejects duplicate utf8 invalid tail and truncated ceiling.
 	#[test]
-	fn rejects_duplicate_utf8_invalid_tail_and_truncated_ceiling() -> FerrosGrynnResult<()> {
-		let duplicate_source = dictionary(["alpha".to_owned(), "bravo".to_owned()])?;
-		let mut image = build_property_dictionary(&duplicate_source, PageLsn::ZERO)?;
+	fn rejects_duplicate_utf8_invalid_tail_and_truncated_ceiling() {
+		use crate::test_assertions::AssertResult as _;
+
+		let duplicate_source = dictionary(["alpha".to_owned(), "bravo".to_owned()]).assert_ok();
+		let mut image = build_property_dictionary(&duplicate_source, PageLsn::ZERO).assert_ok();
 		let second_offset = ENTRY_DATA_OFFSET + 2 + "alpha".len();
 		write_u16(image.pages[1].as_bytes_mut(), second_offset, 5);
 		image.pages[1].as_bytes_mut()[second_offset + 2..second_offset + 7]
 			.copy_from_slice(b"alpha");
-		image.pages[1].seal()?;
+		image.pages[1].seal().assert_ok();
 		assert!(open_property_dictionary(&image.pages, image.pages.len() as u64).is_err());
 
-		let valid = dictionary(["valid".to_owned()])?;
-		let mut invalid_utf8 = build_property_dictionary(&valid, PageLsn::ZERO)?;
+		let valid = dictionary(["valid".to_owned()]).assert_ok();
+		let mut invalid_utf8 = build_property_dictionary(&valid, PageLsn::ZERO).assert_ok();
 		invalid_utf8.pages[1].as_bytes_mut()[ENTRY_DATA_OFFSET + 2] = 0xff;
-		invalid_utf8.pages[1].seal()?;
+		invalid_utf8.pages[1].seal().assert_ok();
 		assert!(
 			open_property_dictionary(
 				&invalid_utf8.pages,
 				u64::try_from(invalid_utf8.pages.len())
-					.map_err(|_error| invalid("test page count exceeds u64"))?,
+					.map_err(|_error| invalid("test page count exceeds u64"))
+					.assert_ok(),
 			)
 			.is_err()
 		);
 
-		let mut image = build_property_dictionary(&valid, PageLsn::ZERO)?;
+		let mut image = build_property_dictionary(&valid, PageLsn::ZERO).assert_ok();
 		image.pages[1].as_bytes_mut()[PAGE_SIZE - 1] = 1;
-		image.pages[1].seal()?;
+		image.pages[1].seal().assert_ok();
 		assert!(
 			open_property_dictionary(
 				&image.pages,
 				u64::try_from(image.pages.len())
-					.map_err(|_error| invalid("test page count exceeds u64"))?,
+					.map_err(|_error| invalid("test page count exceeds u64"))
+					.assert_ok(),
 			)
 			.is_err()
 		);
 		assert!(open_property_dictionary(&image.pages, 1).is_err());
-		Ok(())
 	}
 
+	/// Verifies rejects root counts that exceed the materialized ceiling.
 	#[test]
-	fn rejects_root_counts_that_exceed_the_materialized_ceiling() -> FerrosGrynnResult<()> {
-		let dictionary = dictionary(["name".to_owned()])?;
-		let image = build_property_dictionary(&dictionary, PageLsn::ZERO)?;
-		let mut root = decode_root(&image.pages[0])?;
+	fn rejects_root_counts_that_exceed_the_materialized_ceiling() {
+		use crate::test_assertions::AssertResult as _;
+
+		let dictionary = dictionary(["name".to_owned()]).assert_ok();
+		let image = build_property_dictionary(&dictionary, PageLsn::ZERO).assert_ok();
+		let mut root = decode_root(&image.pages[0]).assert_ok();
 		root.hash_page_count = u32::MAX;
 		root.hash_capacity = u32::MAX;
 		assert!(validate_root_ceiling(root, image.pages.len()).is_err());
 
-		let mut root = decode_root(&image.pages[0])?;
+		let mut root = decode_root(&image.pages[0]).assert_ok();
 		root.entry_count = u32::MAX;
 		assert!(validate_root_ceiling(root, image.pages.len()).is_err());
-		Ok(())
 	}
 
+	/// Verifies rejects wrong types flags reserved bytes and checksum.
 	#[test]
-	fn rejects_wrong_types_flags_reserved_bytes_and_checksum() -> FerrosGrynnResult<()> {
-		let dictionary = dictionary(["name".to_owned()])?;
-		let image = build_property_dictionary(&dictionary, PageLsn::ZERO)?;
+	fn rejects_wrong_types_flags_reserved_bytes_and_checksum() {
+		use crate::test_assertions::AssertResult as _;
+
+		let dictionary = dictionary(["name".to_owned()]).assert_ok();
+		let image = build_property_dictionary(&dictionary, PageLsn::ZERO).assert_ok();
 
 		let mut wrong_root_type = copied_pages(&image.pages);
 		wrong_root_type[0].reset(
@@ -1018,12 +1040,11 @@ mod tests {
 
 		let mut reserved = copied_pages(&image.pages);
 		reserved[0].as_bytes_mut()[ROOT_RESERVED_OFFSET] = 1;
-		reserved[0].seal()?;
+		reserved[0].seal().assert_ok();
 		assert!(open_property_dictionary(&reserved, reserved.len() as u64).is_err());
 
 		let mut checksum = copied_pages(&image.pages);
 		checksum[1].as_bytes_mut()[ENTRY_DATA_OFFSET + 2] ^= 1;
 		assert!(open_property_dictionary(&checksum, checksum.len() as u64).is_err());
-		Ok(())
 	}
 }

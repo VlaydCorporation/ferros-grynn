@@ -4,23 +4,31 @@ use std::path::PathBuf;
 
 use super::*;
 
+/// Row set alternatives.
 pub(super) enum RowSet {
+	/// Memory case of row set.
 	Memory {
+		/// Rows associated with this row set.
 		rows: Vec<Row>,
+		/// Memory admission account retained for the lifetime of this value.
 		_account: BarrierAccount,
 	},
+	/// Disk case of row set.
 	Disk {
+		/// Spool associated with this row set.
 		spool: crate::gql::spill::QuerySpool,
+		/// Position relative to the beginning of the associated buffer.
 		offset: u64,
 	},
 }
 
 impl RowSet {
+	/// Returns the first result.
 	pub(super) fn first(&self) -> FerrosGrynnResult<Option<Row>> {
 		match self {
 			Self::Memory {
 				rows,
-				_account: _,
+				..
 			} => Ok(rows.first().cloned()),
 			Self::Disk {
 				spool,
@@ -29,6 +37,7 @@ impl RowSet {
 		}
 	}
 
+	/// Visits row set.
 	pub(super) fn visit(
 		&self,
 		mut visit: impl FnMut(Row) -> FerrosGrynnResult<()>,
@@ -36,7 +45,7 @@ impl RowSet {
 		match self {
 			Self::Memory {
 				rows,
-				_account: _,
+				..
 			} => rows.iter().cloned().try_for_each(visit),
 			Self::Disk {
 				spool,
@@ -45,6 +54,7 @@ impl RowSet {
 		}
 	}
 
+	/// Returns the consume result.
 	pub(super) fn consume(
 		self,
 		mut visit: impl FnMut(Row) -> FerrosGrynnResult<()>,
@@ -85,17 +95,26 @@ impl RowSet {
 	}
 }
 
+/// Row collector state.
 pub(super) struct RowCollector {
+	/// Memory associated with this row collector.
 	memory: Vec<Row>,
+	/// Memory bytes associated with this row collector.
 	memory_bytes: usize,
+	/// Memory admission account retained with the owned data.
 	account: BarrierAccount,
+	/// Root associated with this row collector.
 	root: PathBuf,
+	/// Sorter associated with this row collector.
 	sorter: Option<QuerySorter>,
+	/// Next ordinal associated with this row collector.
 	next_ordinal: usize,
+	/// Force disk associated with this row collector.
 	force_disk: bool,
 }
 
 impl RowCollector {
+	/// Creates a new `RowCollector` value.
 	pub(super) fn new<Read: QueryRead>(
 		read: &Read,
 		control: &ExecutionControl,
@@ -112,6 +131,7 @@ impl RowCollector {
 		}
 	}
 
+	/// Pushes row collector.
 	pub(super) fn push<Read: QueryRead>(
 		&mut self,
 		read: &Read,
@@ -136,7 +156,7 @@ impl RowCollector {
 				}],
 				std::mem::replace(&mut self.account, BarrierAccount::new(0)),
 				true,
-			)?;
+			);
 			for row in self.memory.drain(..) {
 				sorter.push(row_record(row, self.next_ordinal))?;
 				self.next_ordinal += 1;
@@ -156,6 +176,7 @@ impl RowCollector {
 		Ok(())
 	}
 
+	/// Finishes row collector.
 	pub(super) fn finish(self) -> FerrosGrynnResult<RowSet> {
 		let Some(sorter) = self.sorter else {
 			return Ok(RowSet::Memory {
@@ -186,6 +207,7 @@ impl RowCollector {
 	}
 }
 
+/// Returns the consume records result.
 pub(super) fn consume_records(
 	records: SortedRecords,
 	visit: impl FnMut(CursorRecord) -> FerrosGrynnResult<()>,
@@ -202,10 +224,12 @@ pub(super) fn consume_records(
 	}
 }
 
+/// Returns the estimated row bytes result.
 pub(super) fn estimated_row_bytes(row: &Row) -> usize {
 	row.estimated_heap_bytes()
 }
 
+/// Returns the row record result.
 pub(super) fn row_record(row: Row, ordinal: usize) -> CursorRecord {
 	let graph = row.graph.map(Value::from).unwrap_or(Value::None);
 	CursorRecord {
@@ -272,6 +296,7 @@ pub(super) fn row_record(row: Row, ordinal: usize) -> CursorRecord {
 	}
 }
 
+/// Returns the row from record result.
 pub(super) fn row_from_record(record: CursorRecord) -> FerrosGrynnResult<Row> {
 	let Value::Array(values) = record.value else {
 		return Err(FerrosGrynnError::invalid_storage_file(
@@ -332,6 +357,7 @@ pub(super) fn row_from_record(record: CursorRecord) -> FerrosGrynnResult<Row> {
 	Ok(row)
 }
 
+/// Takes array value.
 fn take_array_value(value: Option<Value>, name: &str) -> FerrosGrynnResult<Array> {
 	match value {
 		Some(Value::Array(values)) => Ok(values),
@@ -341,6 +367,7 @@ fn take_array_value(value: Option<Value>, name: &str) -> FerrosGrynnResult<Array
 	}
 }
 
+/// Decodes fulltext match.
 fn decode_fulltext_match(value: Value) -> FerrosGrynnResult<FulltextMatch> {
 	let Value::Array(fields) = value else {
 		return Err(FerrosGrynnError::invalid_storage_file(
@@ -349,13 +376,13 @@ fn decode_fulltext_match(value: Value) -> FerrosGrynnResult<FulltextMatch> {
 	};
 	let mut fields = fields.into_iter();
 	let predicate = decode_u64(fields.next(), "fulltext predicate").and_then(|value| {
-		u32::try_from(value).map_err(|_| invalid_row_number("fulltext predicate"))
+		u32::try_from(value).map_err(|_conversion_error| invalid_row_number("fulltext predicate"))
 	})?;
 	let slot = match fields.next() {
 		Some(Value::None) => None,
 		value => Some(
 			u16::try_from(decode_u64(value, "fulltext slot")?)
-				.map_err(|_| invalid_row_number("fulltext slot"))?,
+				.map_err(|_conversion_error| invalid_row_number("fulltext slot"))?,
 		),
 	};
 	let Some(Value::Bool(matched)) = fields.next() else {
@@ -384,9 +411,9 @@ fn decode_fulltext_match(value: Value) -> FerrosGrynnResult<FulltextMatch> {
 			};
 			let mut span = span.into_iter();
 			let start = u32::try_from(decode_u64(span.next(), "fulltext span start")?)
-				.map_err(|_| invalid_row_number("fulltext span start"))?;
+				.map_err(|_conversion_error| invalid_row_number("fulltext span start"))?;
 			let end = u32::try_from(decode_u64(span.next(), "fulltext span end")?)
-				.map_err(|_| invalid_row_number("fulltext span end"))?;
+				.map_err(|_conversion_error| invalid_row_number("fulltext span end"))?;
 			if span.next().is_some() {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"query row fulltext span has trailing fields",
@@ -411,13 +438,14 @@ fn decode_fulltext_match(value: Value) -> FerrosGrynnResult<FulltextMatch> {
 	})
 }
 
+/// Decodes knn match.
 fn decode_knn_match(value: Value) -> FerrosGrynnResult<KnnMatch> {
 	let Value::Array(fields) = value else {
 		return Err(FerrosGrynnError::invalid_storage_file("query row KNN result is not an array"));
 	};
 	let mut fields = fields.into_iter();
 	let predicate = u32::try_from(decode_u64(fields.next(), "KNN predicate")?)
-		.map_err(|_| invalid_row_number("KNN predicate"))?;
+		.map_err(|_conversion_error| invalid_row_number("KNN predicate"))?;
 	let distance_bits = decode_u64(fields.next(), "KNN distance")?;
 	if fields.next().is_some() {
 		return Err(FerrosGrynnError::invalid_storage_file(
@@ -430,13 +458,15 @@ fn decode_knn_match(value: Value) -> FerrosGrynnResult<KnnMatch> {
 	})
 }
 
+/// Decodes u64.
 fn decode_u64(value: Option<Value>, name: &str) -> FerrosGrynnResult<u64> {
 	let Some(Value::Number(number)) = value else {
 		return Err(invalid_row_number(name));
 	};
-	u64::try_from(number).map_err(|_| invalid_row_number(name))
+	u64::try_from(number).map_err(|_conversion_error| invalid_row_number(name))
 }
 
+/// Returns the invalid row number result.
 fn invalid_row_number(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(format!("query row run has invalid {name}"))
 }

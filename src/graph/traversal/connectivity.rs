@@ -20,6 +20,11 @@ use crate::{
 	},
 };
 
+/// Returns bfs for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn bfs<R: GraphRead>(
 	graph: &R,
 	root: AtomId,
@@ -29,7 +34,8 @@ pub fn bfs<R: GraphRead>(
 	bfs_with_check(graph, root, direction, max_depth, &mut || Ok(()))
 }
 
-pub(crate) fn bfs_with_check<R: GraphRead, Check>(
+/// Returns the bfs with check result.
+pub fn bfs_with_check<R: GraphRead, Check>(
 	graph: &R,
 	root: AtomId,
 	direction: TraversalDirection,
@@ -64,6 +70,11 @@ where
 	Ok(order)
 }
 
+/// Returns dfs for this module.
+///
+/// # Errors
+///
+/// Propagates errors returned by the underlying operation.
 pub fn dfs<R: GraphRead>(
 	graph: &R,
 	root: AtomId,
@@ -84,6 +95,8 @@ pub fn dfs<R: GraphRead>(
 		if max_depth.is_some_and(|limit| depth >= limit) {
 			continue;
 		}
+		// Reverse pushes preserve the adjacency visit order when the LIFO stack
+		// is popped.
 		for target in local_steps(&index, node, direction)
 			.filter_map(|step| step.target.local_id().filter(|id| id.is_node()))
 			.rev()
@@ -96,11 +109,17 @@ pub fn dfs<R: GraphRead>(
 	Ok(order)
 }
 
+/// Returns topological sort for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn topological_sort<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<AtomId>> {
 	topological_sort_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn topological_sort_with_check<R: GraphRead, Check>(
+/// Returns the topological sort with check result.
+pub fn topological_sort_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<Vec<AtomId>>
@@ -113,13 +132,19 @@ where
 	})
 }
 
+/// Returns strongly connected components for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn strongly_connected_components<R: GraphRead>(
 	graph: &R,
 ) -> FerrosGrynnResult<Vec<Vec<AtomId>>> {
 	strongly_connected_components_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn strongly_connected_components_with_check<R: GraphRead, Check>(
+/// Returns the strongly connected components with check result.
+pub fn strongly_connected_components_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<Vec<Vec<AtomId>>>
@@ -160,6 +185,8 @@ where
 		if !visited.insert(start) {
 			continue;
 		}
+		// Retain each adjacency iterator to record DFS finish order without
+		// recursive calls.
 		let mut stack = vec![(start, steps(start, TraversalDirection::Forward))];
 		while let Some((node, neighbours)) = stack.last_mut() {
 			check()?;
@@ -206,31 +233,42 @@ where
 /// they belong to another graph identity.
 #[derive(Debug, Clone)]
 pub struct Condensation {
+	/// Component of associated with this condensation.
 	component_of: RapidHashMap<AtomId, usize>,
+	/// Components associated with this condensation.
 	components: Box<[Box<[AtomId]>]>,
+	/// Edges associated with this condensation.
 	edges: Box<[(usize, usize)]>,
 }
 
 impl Condensation {
+	/// Returns component of for `Condensation`.
 	pub fn component_of(&self, atom: AtomId) -> Option<usize> {
 		self.component_of.get(&atom).copied()
 	}
 
+	/// Borrows the stored components of this `Condensation`.
 	pub fn components(&self) -> &[Box<[AtomId]>] {
 		&self.components
 	}
 
+	/// Borrows the stored edges of this `Condensation`.
 	pub fn edges(&self) -> &[(usize, usize)] {
 		&self.edges
 	}
 }
 
 /// Builds the acyclic component graph used by `tv::condensation()`.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn condensation<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Condensation> {
 	condensation_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn condensation_with_check<R: GraphRead, Check>(
+/// Returns the condensation with check result.
+pub fn condensation_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<Condensation>
@@ -281,11 +319,17 @@ where
 	})
 }
 
+/// Returns weakly connected components for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn weakly_connected_components<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<Vec<AtomId>>> {
 	weakly_connected_components_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn weakly_connected_components_with_check<R: GraphRead, Check>(
+/// Returns the weakly connected components with check result.
+pub fn weakly_connected_components_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<Vec<Vec<AtomId>>>
@@ -324,19 +368,35 @@ where
 	Ok(components)
 }
 
+/// Reports whether the value is connected for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn is_connected<R: GraphRead>(graph: &R) -> FerrosGrynnResult<bool> {
 	Ok(weakly_connected_components(graph)?.len() <= 1)
 }
 
+/// Reports whether the value has cycle directed for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn has_cycle_directed<R: GraphRead>(graph: &R) -> FerrosGrynnResult<bool> {
 	has_cycle_directed_with_check(graph, &mut || Ok(()))
 }
 
+/// Reports whether the value has cycle undirected for this module.
+///
+/// # Errors
+///
+/// Propagates validation or execution failures from the underlying operation.
 pub fn has_cycle_undirected<R: GraphRead>(graph: &R) -> FerrosGrynnResult<bool> {
 	has_cycle_undirected_with_check(graph, &mut || Ok(()))
 }
 
-pub(crate) fn has_cycle_directed_with_check<R: GraphRead, Check>(
+/// Returns whether this value has cycle directed with check.
+pub fn has_cycle_directed_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<bool>
@@ -347,7 +407,8 @@ where
 	Ok(topological_sort_with_index(graph, &index, check)?.is_none())
 }
 
-pub(crate) fn has_cycle_undirected_with_check<R: GraphRead, Check>(
+/// Returns whether this value has cycle undirected with check.
+pub fn has_cycle_undirected_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
 ) -> FerrosGrynnResult<bool>
@@ -376,6 +437,7 @@ where
 	Ok(false)
 }
 
+/// Ensures node.
 pub(super) fn ensure_node<R: GraphRead>(graph: &R, id: AtomId) -> FerrosGrynnResult<()> {
 	if id.kind() != Some(AtomKind::Node) {
 		return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -383,10 +445,12 @@ pub(super) fn ensure_node<R: GraphRead>(graph: &R, id: AtomId) -> FerrosGrynnRes
 	graph.node(id)?.map(|_| ()).ok_or_else(|| atom_does_not_exist(id))
 }
 
+/// Collects node ids.
 pub(super) fn collect_node_ids<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<AtomId>> {
 	graph.node_ids()?.collect()
 }
 
+/// Collects node ids with check.
 pub(super) fn collect_node_ids_with_check<R: GraphRead, Check>(
 	graph: &R,
 	check: &mut Check,
@@ -404,6 +468,7 @@ where
 		.collect()
 }
 
+/// Returns the topological sort with index result.
 pub(super) fn topological_sort_with_index<R: GraphRead>(
 	graph: &R,
 	index: &TraversalIndex,
@@ -451,6 +516,7 @@ pub(super) fn topological_sort_with_index<R: GraphRead>(
 	Ok((order.len() == nodes.len()).then_some(order))
 }
 
+/// Checks candidate.
 fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
 where
 	Check: FnMut() -> FerrosGrynnResult<()>,

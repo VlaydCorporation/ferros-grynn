@@ -19,17 +19,9 @@ use crate::{
 		ChangefeedSegments,
 		HistoryOwner,
 		HistorySegment,
-		catalog::{CatalogPath, DatabaseCatalog, FileCatalog, FileCatalogEntry},
-		changefeed::{
-			CodecBudget,
-			SegmentHeader,
-			encode_group,
-			encode_header,
-			encode_pages,
-			payload_pages,
-		},
+		catalog::{DatabaseCatalog, FileCatalog},
+		changefeed::{CodecBudget, encode_group},
 		file_registry::{DataFileRole, FileRegistry, RegisteredDataFile},
-		page::{AlignedPage, PAGE_SIZE, PageNo},
 		types::{DataFileId, DataFileKind},
 	},
 };
@@ -57,7 +49,10 @@ pub(super) fn segment_target() -> u64 {
 
 /// Restores the per-thread rotation target after a focused lifecycle test.
 #[cfg(test)]
-pub(super) struct SegmentTargetGuard(u64);
+pub(super) struct SegmentTargetGuard(
+	/// Previous thread-local segment rotation threshold restored on drop.
+	u64,
+);
 
 #[cfg(test)]
 impl SegmentTargetGuard {
@@ -69,6 +64,8 @@ impl SegmentTargetGuard {
 
 #[cfg(test)]
 impl Drop for SegmentTargetGuard {
+	/// Runs cleanup for this `SegmentTargetGuard` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		TEST_SEGMENT_TARGET.with(|current| current.set(self.0));
 	}

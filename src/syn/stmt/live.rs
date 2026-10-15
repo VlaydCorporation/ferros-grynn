@@ -176,27 +176,39 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
+/// Regression tests for live behavior.
 mod tests {
 	use crate::syn::{LetValue, ParserSettings, StatementKind, parse};
 
 	/// Binding declarations retain expression syntax and UTF-8 name spans;
 	/// malformed administrative forms fail at the syntax boundary.
 	#[test]
-	fn live_let_parser_lifecycle_and_boundaries() -> crate::gql_status::FerrosGrynnResult<()> {
+	fn live_let_parser_lifecycle_and_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
 		let source = "LIVE LET $`порог` = 18; ALTER LIVE LET $`порог` VALUE (SELECT VALUE count() \
 		              FROM person); INFO FOR LIVE LET $`порог`; REMOVE LIVE LET $`порог`;";
-		let program = parse(source, ParserSettings::default())?;
+		let program = parse(source, ParserSettings::default()).assert_ok();
 		assert_eq!(program.statements.len(), 4);
 		let StatementKind::LiveLet(binding) = &program.statements[0].kind else {
-			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-				"LIVE LET syntax missing",
-			));
+			return {
+				let test_result: crate::gql_status::FerrosGrynnResult<()> =
+					Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+						"LIVE LET syntax missing",
+					));
+				test_result.assert_ok();
+			};
 		};
 		assert_eq!(binding.name.value.as_ref(), "порог");
 		assert!(source.is_char_boundary(binding.name.span.offset as usize));
-		let end = binding.name.span.end().ok_or_else(|| {
-			crate::gql_status::FerrosGrynnError::operation_overflow("fixture name span")
-		})?;
+		let end = binding
+			.name
+			.span
+			.end()
+			.ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::operation_overflow("fixture name span")
+			})
+			.assert_ok();
 		assert!(source.is_char_boundary(end as usize));
 		for source in [
 			"LIVE LET name = 1;",
@@ -208,18 +220,19 @@ mod tests {
 		] {
 			assert!(parse(source, ParserSettings::default()).is_err(), "{source}");
 		}
-		Ok(())
 	}
 
 	/// Standalone and LET registration preserve SELECT syntax and policy.
 	#[test]
-	fn live_select_parser_registration_and_boundaries() -> crate::gql_status::FerrosGrynnResult<()>
-	{
+	fn live_select_parser_registration_and_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
 		let program = parse(
 			"LET $sub = LIVE SELECT age FROM person WHERE age >= $min FETCH manager SINCE $stamp \
 			 ON OVERFLOW BLOCK BUFFER 12; LIVE SELECT * FROM person;",
 			ParserSettings::default(),
-		)?;
+		)
+		.assert_ok();
 		assert!(
 			matches!(&program.statements[0].kind, StatementKind::Let(binding) if matches!(&binding.value, LetValue::LiveSelect(select) if select.since.is_some() && select.buffer.is_some()))
 		);
@@ -231,6 +244,5 @@ mod tests {
 		] {
 			assert!(parse(source, ParserSettings::default()).is_err(), "{source}");
 		}
-		Ok(())
 	}
 }

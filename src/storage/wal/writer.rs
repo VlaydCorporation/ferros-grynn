@@ -8,7 +8,7 @@ use super::*;
 /// Test-only durability boundaries; failures poison the writer like real I/O.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitFailurePoint {
+pub enum CommitFailurePoint {
 	/// Ordinary production behavior.
 	None,
 	/// No transaction bytes have been appended.
@@ -29,7 +29,10 @@ thread_local! {
 
 /// Restores the previous failure boundary when the test leaves its scope.
 #[cfg(test)]
-pub(crate) struct CommitFailureGuard(CommitFailurePoint);
+pub struct CommitFailureGuard(
+	/// Restores the previous failure boundary when the test leaves its scope.
+	CommitFailurePoint,
+);
 
 #[cfg(test)]
 impl CommitFailureGuard {
@@ -41,6 +44,8 @@ impl CommitFailureGuard {
 
 #[cfg(test)]
 impl Drop for CommitFailureGuard {
+	/// Runs cleanup for this `CommitFailureGuard` before its fields are
+	/// released.
 	fn drop(&mut self) {
 		COMMIT_FAILURE_POINT.set(self.0);
 	}
@@ -117,6 +122,7 @@ impl FrameWal {
 	///
 	/// Returns an error for I/O failure, corruption before the final segment,
 	/// an invalid committed record, an LSN gap, or clock overflow.
+	#[cfg(test)]
 	pub(in crate::storage) fn open(directory: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
 		Self::open_with_seed(directory, RecoverySeed::EMPTY)
 	}
@@ -270,9 +276,6 @@ impl FrameWal {
 		Ok(())
 	}
 
-	/// Discards a private in-memory write-set without writing WAL records.
-	pub(in crate::storage) fn abort_tx(_tx: TxHandle) {}
-
 	/// Commits all staged pages as one contiguous and durable WAL batch.
 	///
 	/// This transport enforces conservative page-level first-committer-wins.
@@ -292,8 +295,10 @@ impl FrameWal {
 		if tx.staged.is_empty() {
 			let snapshot = self.snapshot();
 			return Ok(CommitOutcome {
+				#[cfg(test)]
 				tx_id: tx.id,
 				commit_ts: snapshot.commit_ts(),
+				#[cfg(test)]
 				commit_lsn: snapshot.visible_lsn(),
 			});
 		}
@@ -430,8 +435,10 @@ impl FrameWal {
 		}
 
 		Ok(CommitOutcome {
+			#[cfg(test)]
 			tx_id: tx.id,
 			commit_ts,
+			#[cfg(test)]
 			commit_lsn,
 		})
 	}

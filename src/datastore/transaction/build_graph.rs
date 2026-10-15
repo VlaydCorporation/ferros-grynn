@@ -37,54 +37,83 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+/// Install built graph tree state.
 pub(super) struct InstallBuiltGraphTree {
+	/// Root schema associated with this install built graph tree.
 	root_schema: GraphSchema,
+	/// Create root associated with this install built graph tree.
 	create_root: bool,
+	/// Removed children associated with this install built graph tree.
 	removed_children: Vec<GraphId>,
+	/// Child schemas associated with this install built graph tree.
 	child_schemas: Vec<GraphSchema>,
+	/// Graphs associated with this install built graph tree.
 	graphs: Vec<BuiltGraph>,
 }
 
 #[derive(Debug, Clone)]
+/// Built graph state.
 struct BuiltGraph {
+	/// Graph associated with this built graph.
 	graph: GraphId,
+	/// Nodes associated with this built graph.
 	nodes: Vec<BuiltNode>,
+	/// Edges associated with this built graph.
 	edges: Vec<BuiltEdge>,
 }
 
 #[derive(Debug, Clone)]
+/// Built node state.
 struct BuiltNode {
+	/// Local associated with this built node.
 	local: AtomId,
+	/// Global associated with this built node.
 	global: GlobalAtomId,
+	/// Record associated with this built node.
 	record: RecordId,
+	/// Label associated with this built node.
 	label: Option<Text>,
+	/// Properties associated with this built node.
 	properties: PropertyMap,
+	/// Nested graph associated with this built node.
 	nested_graph: Option<GraphId>,
 }
 
 #[derive(Debug, Clone)]
+/// Built edge state.
 struct BuiltEdge {
+	/// Local associated with this built edge.
 	local: AtomId,
+	/// Global associated with this built edge.
 	global: GlobalAtomId,
+	/// Record associated with this built edge.
 	record: RecordId,
+	/// Label associated with this built edge.
 	label: Option<Text>,
+	/// Properties associated with this built edge.
 	properties: PropertyMap,
+	/// Topology associated with this built edge.
 	topology: EdgeTopology,
+	/// Weight associated with this built edge.
 	weight: Option<Number>,
+	/// Transition graph associated with this built edge.
 	transition_graph: Option<GraphId>,
 }
 
 impl InstallBuiltGraphTree {
+	/// Returns the root result.
 	pub(super) fn root(&self) -> GraphId {
 		self.root_schema.id()
 	}
 
+	/// Returns the graph ids result.
 	pub(super) fn graph_ids(&self) -> impl Iterator<Item = GraphId> + '_ {
 		std::iter::once(self.root())
 			.chain(self.removed_children.iter().copied())
 			.chain(self.child_schemas.iter().map(GraphSchema::id))
 	}
 
+	/// Applies install built graph tree.
 	pub(super) fn apply(
 		&self,
 		root: &mut DatabaseRoot,
@@ -156,6 +185,7 @@ impl InstallBuiltGraphTree {
 		Ok(())
 	}
 
+	/// Returns the estimated bytes result.
 	fn estimated_bytes(&self) -> usize {
 		self.graphs.iter().fold(size_of::<Self>(), |bytes, graph| {
 			let node_bytes = graph.nodes.iter().fold(0_usize, |bytes, node| {
@@ -194,6 +224,7 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the install built graph inner result.
 	fn install_built_graph_inner(
 		&mut self,
 		name: &str,
@@ -274,7 +305,7 @@ impl Transaction {
 			child_schemas.push(schema);
 		}
 		for schema in &mut child_schemas {
-			let indexes = schema.system_indexes().cloned().collect::<Vec<_>>();
+			let indexes = schema.system_indexes().copied().collect::<Vec<_>>();
 			let name =
 				Text::from(format!("$fg$build_{:016x}_{:016x}", root_id.get(), schema.id().get()));
 			*schema = GraphSchema::new(
@@ -285,8 +316,8 @@ impl Transaction {
 					GraphKind::Graph,
 					self.store.inner.graph_storage_mode(),
 				)?,
-				indexes[0].clone(),
-				indexes[1].clone(),
+				indexes[0],
+				indexes[1],
 				schema.properties().clone(),
 				GraphTopologyConstraints::empty(),
 				None,
@@ -387,6 +418,7 @@ impl Transaction {
 		Ok(reference)
 	}
 
+	/// Prepares built graph.
 	fn prepare_built_graph(
 		&self,
 		graph_id: GraphId,
@@ -448,6 +480,7 @@ impl Transaction {
 		})
 	}
 
+	/// Returns the require built atom result.
 	fn require_built_atom(
 		&self,
 		record: &RecordId,
@@ -460,6 +493,7 @@ impl Transaction {
 		Ok(global)
 	}
 
+	/// Registers built graph write set.
 	fn register_built_graph_write_set(
 		&mut self,
 		mutation: &InstallBuiltGraphTree,
@@ -534,6 +568,7 @@ impl Transaction {
 	}
 }
 
+/// Collects nested graphs.
 fn collect_nested_graphs(root: &Graph<Frozen>) -> FerrosGrynnResult<BTreeMap<Uuid, Graph<Frozen>>> {
 	let mut graphs = BTreeMap::new();
 	let mut ancestry = BTreeSet::from([root.identity()]);
@@ -541,6 +576,7 @@ fn collect_nested_graphs(root: &Graph<Frozen>) -> FerrosGrynnResult<BTreeMap<Uui
 	Ok(graphs)
 }
 
+/// Collects children.
 fn collect_children(
 	graph: &Graph<Frozen>,
 	ancestry: &mut BTreeSet<Uuid>,
@@ -597,6 +633,7 @@ fn clear_graph(
 	Ok(())
 }
 
+/// Validates base atom.
 fn validate_base_atom(
 	root: &DatabaseRoot,
 	global: GlobalAtomId,
@@ -616,6 +653,7 @@ fn validate_base_atom(
 	Ok(())
 }
 
+/// Applies effective properties.
 fn apply_effective_properties(
 	root: &mut DatabaseRoot,
 	graph: GraphId,
@@ -641,6 +679,7 @@ fn apply_effective_properties(
 	Ok(())
 }
 
+/// Returns the rooted record result.
 fn rooted_record(graph: &MaterializedGraph) -> FerrosGrynnResult<Option<RecordId>> {
 	let Some(rooted) = graph.as_rooted_tree() else {
 		return Ok(None);
@@ -649,6 +688,7 @@ fn rooted_record(graph: &MaterializedGraph) -> FerrosGrynnResult<Option<RecordId
 	Ok(Some(root.record_id().clone()))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::graph_constraint_violation("BUILD GRAPH", reason.into())
 }

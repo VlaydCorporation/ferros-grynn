@@ -2,7 +2,24 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::*;
+use super::{
+	AtomId,
+	AtomKind,
+	BarrierAccount,
+	EdgeEndpoint,
+	ExecutionControl,
+	FerrosGrynnError,
+	FerrosGrynnResult,
+	GraphRef,
+	GraphSelection,
+	QueryRead,
+	Snapshot,
+	Value,
+	check_limit,
+	invalid,
+	missing,
+	reserve_accounted,
+};
 use crate::graph::{
 	AtomRef,
 	EdgeRead,
@@ -15,22 +32,33 @@ use crate::graph::{
 };
 
 #[derive(Clone)]
+/// Containment link state.
 struct ContainmentLink {
+	/// Parent associated with this containment link.
 	parent: GraphId,
+	/// Owner associated with this containment link.
 	owner: AtomId,
+	/// Owner ref associated with this containment link.
 	owner_ref: AtomRef,
+	/// Child associated with this containment link.
 	child: GraphRef,
 }
 
 #[derive(Default)]
+/// Containment index state.
 struct ContainmentIndex {
+	/// Graphs associated with this containment index.
 	graphs: BTreeMap<GraphId, GraphRef>,
+	/// Links associated with this containment index.
 	links: BTreeMap<(GraphId, AtomId), ContainmentLink>,
+	/// Children associated with this containment index.
 	children: BTreeMap<GraphId, Vec<ContainmentLink>>,
+	/// Parents associated with this containment index.
 	parents: BTreeMap<GraphId, Vec<ContainmentLink>>,
 }
 
 impl ContainmentIndex {
+	/// Inserts containment index.
 	fn insert(&mut self, link: ContainmentLink) -> FerrosGrynnResult<()> {
 		if let Some(existing) = self.links.get(&(link.parent, link.owner)) {
 			if existing.child.id() != link.child.id() {
@@ -45,6 +73,7 @@ impl ContainmentIndex {
 		Ok(())
 	}
 
+	/// Returns the child result.
 	fn child(&self, parent: GraphId, owner: AtomId) -> FerrosGrynnResult<&ContainmentLink> {
 		self.links
 			.get(&(parent, owner))
@@ -52,17 +81,24 @@ impl ContainmentIndex {
 	}
 }
 
+/// Built graph state.
 struct BuiltGraph {
+	/// Graph associated with this built graph.
 	graph: Graph,
+	/// Ids associated with this built graph.
 	ids: BTreeMap<AtomId, AtomId>,
 }
 
 #[derive(Clone, Copy)]
+/// Selection origin alternatives.
 enum SelectionOrigin {
+	/// Selected case of selection origin.
 	Selected,
+	/// Closure case of selection origin.
 	Closure,
 }
 
+/// Resolves root.
 pub(super) fn resolve_root<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -106,6 +142,7 @@ pub(super) fn resolve_root<Read: QueryRead>(
 		.ok_or_else(|| invalid("graph assembly root disappeared"))
 }
 
+/// Materializes hierarchy.
 pub(super) fn materialize_hierarchy<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -151,6 +188,7 @@ pub(super) fn materialize_hierarchy<Read: QueryRead>(
 		.ok_or_else(|| invalid("assembled root graph is absent"))
 }
 
+/// Loads index.
 fn load_index<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -198,6 +236,7 @@ fn load_index<Read: QueryRead>(
 	Ok(index)
 }
 
+/// Validates containment acyclic.
 fn validate_containment_acyclic(index: &ContainmentIndex) -> FerrosGrynnResult<()> {
 	let mut indegree =
 		index.graphs.keys().map(|graph| (*graph, 0_usize)).collect::<BTreeMap<_, _>>();
@@ -232,6 +271,7 @@ fn validate_containment_acyclic(index: &ContainmentIndex) -> FerrosGrynnResult<(
 	Ok(())
 }
 
+/// Returns the queue child result.
 fn queue_child(
 	index: &mut ContainmentIndex,
 	queue: &mut VecDeque<(GraphRef, Vec<GraphId>)>,
@@ -247,6 +287,7 @@ fn queue_child(
 	index.insert(link)
 }
 
+/// Closes selections.
 fn close_selections<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -324,6 +365,7 @@ fn close_selections<Read: QueryRead>(
 	Ok(())
 }
 
+/// Returns the include minimal owners result.
 fn include_minimal_owners(
 	root: GraphId,
 	target: GraphId,
@@ -369,6 +411,7 @@ fn include_minimal_owners(
 	Ok(())
 }
 
+/// Closes edge.
 fn close_edge<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -423,6 +466,7 @@ fn close_edge<Read: QueryRead>(
 	Ok(())
 }
 
+/// Returns the atom ref result.
 fn atom_ref<Reader: GraphRead>(graph: &Reader, id: AtomId) -> FerrosGrynnResult<AtomRef> {
 	match id.kind() {
 		Some(AtomKind::Node) => {
@@ -435,6 +479,7 @@ fn atom_ref<Reader: GraphRead>(graph: &Reader, id: AtomId) -> FerrosGrynnResult<
 	}
 }
 
+/// Inserts atom.
 fn insert_atom(
 	selections: &mut BTreeMap<GraphId, GraphSelection>,
 	graph: GraphId,
@@ -446,6 +491,7 @@ fn insert_atom(
 	insert_selection_atom(selection, atom, SelectionOrigin::Closure, memory, control)
 }
 
+/// Inserts selection atom.
 fn insert_selection_atom(
 	selection: &mut GraphSelection,
 	atom: AtomRef,
@@ -477,6 +523,7 @@ fn insert_selection_atom(
 	Ok(())
 }
 
+/// Returns the selection size result.
 fn selection_size(selections: &BTreeMap<GraphId, GraphSelection>) -> usize {
 	selections
 		.values()
@@ -494,6 +541,7 @@ fn selection_size(selections: &BTreeMap<GraphId, GraphSelection>) -> usize {
 	clippy::too_many_arguments,
 	reason = "recursive assembly carries one explicit bounded context"
 )]
+/// Builds graph.
 fn build_graph<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -682,6 +730,7 @@ fn clone_built_child(
 	Ok(child.graph.clone())
 }
 
+/// Returns the remap endpoint result.
 fn remap_endpoint(
 	root: GraphId,
 	endpoint: &EdgeEndpoint,

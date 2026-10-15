@@ -2,7 +2,7 @@
 
 /// Bounded cardinality estimate carried between planning phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct Cardinality {
+pub struct Cardinality {
 	/// Proven lower bound.
 	pub(crate) lower: u64,
 	/// Most likely row count.
@@ -47,7 +47,7 @@ impl Cardinality {
 
 /// Saturating fixed-point cost broken down for EXPLAIN.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub(crate) struct PlanCost {
+pub struct PlanCost {
 	/// One-time operator startup work.
 	pub(crate) startup: u64,
 	/// Sequential rows visited.

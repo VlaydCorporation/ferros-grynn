@@ -709,22 +709,22 @@ fn same_suppressed_target(
 			return Ok(false);
 		}
 	}
-	match (left_occurrence.state(), right_occurrence.state()) {
+	match (left_occurrence.state().view(), right_occurrence.state().view()) {
 		(
-			crate::datastore::OccurrenceState::Node {
+			crate::datastore::OccurrenceStateRef::Node {
 				nested_graph: left,
 			},
-			crate::datastore::OccurrenceState::Node {
+			crate::datastore::OccurrenceStateRef::Node {
 				nested_graph: right,
 			},
 		) => Ok(left == right),
 		(
-			crate::datastore::OccurrenceState::Edge {
+			crate::datastore::OccurrenceStateRef::Edge {
 				topology: left,
 				weight: lw,
 				transition_graph: lg,
 			},
-			crate::datastore::OccurrenceState::Edge {
+			crate::datastore::OccurrenceStateRef::Edge {
 				topology: right,
 				weight: rw,
 				transition_graph: rg,
@@ -815,11 +815,12 @@ fn same_suppressed_endpoint(
 		{
 			return Ok(false);
 		}
-		let child = |occurrence: &crate::datastore::GraphOccurrence| match occurrence.state() {
-			crate::datastore::OccurrenceState::Node {
+		let child = |occurrence: &crate::datastore::GraphOccurrence| match occurrence.state().view()
+		{
+			crate::datastore::OccurrenceStateRef::Node {
 				nested_graph,
 			} => *nested_graph,
-			crate::datastore::OccurrenceState::Edge {
+			crate::datastore::OccurrenceStateRef::Edge {
 				transition_graph,
 				..
 			} => *transition_graph,
@@ -842,6 +843,7 @@ fn same_suppressed_endpoint(
 }
 
 #[cfg(test)]
+/// Regression tests for changefeed import behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -880,10 +882,14 @@ mod tests {
 		Ok((store, record, feed, key))
 	}
 
+	/// Verifies changefeed import on preserves accepted item images across
+	/// seals.
 	#[test]
-	fn changefeed_import_on_preserves_accepted_item_images_across_seals() -> FerrosGrynnResult<()> {
+	fn changefeed_import_on_preserves_accepted_item_images_across_seals() {
+		use crate::test_assertions::AssertResult as _;
+
 		for segment_size in [1, 3, 64] {
-			let (store, record, feed, key) = fixture()?;
+			let (store, record, feed, key) = fixture().assert_ok();
 			let old = store.inner.current_root();
 			let expected_stamp = old.commit_ts + 1;
 			let options = ImportOptions {
@@ -893,30 +899,37 @@ mod tests {
 				reject_limit: Some(1),
 				..ImportOptions::default()
 			};
-			let report = store.import(options, |session| {
-				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
-				session.apply_item(|tx| tx.create_atom(record.clone(), PropertyMap::new()))?;
-				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(3)))?;
-				session
-					.apply_item(|tx| tx.remove_base_property(&record, PropertyKeyId::new(99)))?;
-				session.apply_item(|tx| tx.delete_atom(&record))?;
-				session.apply_item(|tx| {
-					let mut properties = PropertyMap::new();
-					properties.insert(key, 3);
-					tx.create_atom(record.clone(), properties)
-				})?;
-				assert!(old.change_history().is_empty());
-				assert_eq!(store.inner.current_root().commit_ts, old.commit_ts);
-				Ok(())
-			})?;
+			let report = store
+				.import(options, |session| {
+					session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
+					session.apply_item(|tx| tx.create_atom(record.clone(), PropertyMap::new()))?;
+					session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(3)))?;
+					session.apply_item(|tx| {
+						tx.remove_base_property(&record, PropertyKeyId::new(99))
+					})?;
+					session.apply_item(|tx| tx.delete_atom(&record))?;
+					session.apply_item(|tx| {
+						let mut properties = PropertyMap::new();
+						properties.insert(key, 3);
+						tx.create_atom(record.clone(), properties)
+					})?;
+					assert!(old.change_history().is_empty());
+					assert_eq!(store.inner.current_root().commit_ts, old.commit_ts);
+					Ok(())
+				})
+				.assert_ok();
 			assert_eq!(report.segments(), 5_usize.div_ceil(segment_size) as u64);
 			assert_eq!(report.applied_items(), 5);
 			assert_eq!(report.skipped_items(), 1);
 			let root = store.inner.current_root();
 			assert_eq!(root.commit_ts, expected_stamp);
-			let group = root.change_history().get(&(feed, expected_stamp)).ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("fixture import history is absent")
-			})?;
+			let group = root
+				.change_history()
+				.get(&(feed, expected_stamp))
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("fixture import history is absent")
+				})
+				.assert_ok();
 			assert_eq!(group.net.entries().len(), 1);
 			assert_eq!(
 				group.net.entries()[0].before().and_then(|image| image.properties().get("value")),
@@ -926,9 +939,13 @@ mod tests {
 				group.net.entries()[0].after().and_then(|image| image.properties().get("value")),
 				Some(&Value::from(3))
 			);
-			let full = group.full.as_ref().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("fixture FULL import history is absent")
-			})?;
+			let full = group
+				.full
+				.as_ref()
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("fixture FULL import history is absent")
+				})
+				.assert_ok();
 			assert_eq!(full.entries().len(), 5);
 			assert!(full.entries()[3].after().is_none());
 			assert!(full.entries()[4].before().is_none());
@@ -945,20 +962,27 @@ mod tests {
 				root.committed_at_ns
 			);
 		}
-		Ok(())
 	}
 
+	/// Verifies changefeed import seal failure cannot be swallowed before end.
 	#[test]
-	fn changefeed_import_seal_failure_cannot_be_swallowed_before_end() -> FerrosGrynnResult<()> {
+	fn changefeed_import_seal_failure_cannot_be_swallowed_before_end() {
+		use crate::test_assertions::AssertResult as _;
+
 		for segment_size in [8, 64] {
-			let (store, record, _feed, _key) = fixture()?;
+			let (store, record, _feed, _key) = fixture().assert_ok();
 			let mut populate = store.begin();
-			let payload = populate.intern_property("payload")?;
-			populate.set_base_property(&record, payload, Value::from("x".repeat(16 * 1024)))?;
-			populate.commit()?;
+			let payload = populate.intern_property("payload").assert_ok();
+			populate
+				.set_base_property(&record, payload, Value::from("x".repeat(16 * 1024)))
+				.assert_ok();
+			populate.commit().assert_ok();
 			let before = store.inner.current_root();
-			let mut limits = InMemoryOptions::default();
-			limits.max_write_set_bytes = 16 * 1024;
+			let limits_defaults = InMemoryOptions::default();
+			let limits = InMemoryOptions {
+				max_write_set_bytes: 16 * 1024,
+				..limits_defaults
+			};
 			let limited = Datastore::from_root_for_test(limits, (*before).clone());
 			let mut rejected = false;
 			let result = limited.import(
@@ -994,54 +1018,65 @@ mod tests {
 				before.atom_by_record(&record).map(|atom| atom.properties())
 			);
 		}
-		Ok(())
 	}
 
+	/// Verifies changefeed import empty capture releases replay scratch.
 	#[test]
-	fn changefeed_import_empty_capture_releases_replay_scratch() -> FerrosGrynnResult<()> {
-		let (store, _record, _feed, _key) = fixture()?;
+	fn changefeed_import_empty_capture_releases_replay_scratch() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, _feed, _key) = fixture().assert_ok();
 		let mut setup = store.begin();
-		setup.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
-		let record: RecordId = "other:a".parse()?;
-		setup.create_atom(record.clone(), PropertyMap::new())?;
-		setup.commit()?;
+		setup.define_class(ClassSchema::new("other", AtomKind::Node, []).assert_ok()).assert_ok();
+		let record: RecordId = "other:a".parse().assert_ok();
+		setup.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		setup.commit().assert_ok();
 		let before = store.inner.current_root();
-		let mut limits = InMemoryOptions::default();
-		limits.max_write_set_bytes = 4096;
+		let limits_defaults = InMemoryOptions::default();
+		let limits = InMemoryOptions {
+			max_write_set_bytes: 4096,
+			..limits_defaults
+		};
 		let limited = Datastore::from_root_for_test(limits, (*before).clone());
-		let report = limited.import(
-			ImportOptions {
-				changefeed: ImportChangefeedMode::On,
-				segment_size: 1,
-				..ImportOptions::default()
-			},
-			|session| {
-				for _item in 0..200 {
-					session.apply_item(|tx| {
-						tx.remove_base_property(&record, PropertyKeyId::new(99))
-					})?;
-				}
-				Ok(())
-			},
-		)?;
+		let report = limited
+			.import(
+				ImportOptions {
+					changefeed: ImportChangefeedMode::On,
+					segment_size: 1,
+					..ImportOptions::default()
+				},
+				|session| {
+					for _item in 0..200 {
+						session.apply_item(|tx| {
+							tx.remove_base_property(&record, PropertyKeyId::new(99))
+						})?;
+					}
+					Ok(())
+				},
+			)
+			.assert_ok();
 		assert_eq!(report.applied_items(), 200);
 		assert_eq!(limited.inner.current_root().commit_ts, before.commit_ts);
 		assert!(limited.inner.current_root().change_history().is_empty());
-		Ok(())
 	}
 
+	/// Verifies changefeed import off emits gap and rejected or empty imports
+	/// emit nothing.
 	#[test]
-	fn changefeed_import_off_emits_gap_and_rejected_or_empty_imports_emit_nothing()
-	-> FerrosGrynnResult<()> {
-		let (store, record, feed, key) = fixture()?;
+	fn changefeed_import_off_emits_gap_and_rejected_or_empty_imports_emit_nothing() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, feed, key) = fixture().assert_ok();
 		let options = ImportOptions {
 			segment_size: 1,
 			..ImportOptions::default()
 		};
-		store.import(options, |session| {
-			session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
-			Ok(())
-		})?;
+		store
+			.import(options, |session| {
+				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
+				Ok(())
+			})
+			.assert_ok();
 		let root = store.inner.current_root();
 		let stamp = root.commit_ts;
 		assert_eq!(
@@ -1051,37 +1086,47 @@ mod tests {
 				.map(ChangefeedGap::reason),
 			Some(ChangefeedGapReason::ImportSuppressed)
 		);
-		store.import(options, |_session| Ok(()))?;
+		store.import(options, |_session| Ok(())).assert_ok();
 		assert_eq!(store.inner.current_root().commit_ts, stamp);
 		let rejected = ImportOptions {
 			on_violation: ImportViolationPolicy::Skip,
 			reject_limit: Some(1),
 			..options
 		};
-		store.import(rejected, |session| {
-			session.apply_item(|tx| tx.create_atom(record.clone(), PropertyMap::new()))?;
-			Ok(())
-		})?;
+		store
+			.import(rejected, |session| {
+				session.apply_item(|tx| tx.create_atom(record.clone(), PropertyMap::new()))?;
+				Ok(())
+			})
+			.assert_ok();
 		assert_eq!(store.inner.current_root().commit_ts, stamp);
 		let full_noop = ImportOptions {
 			changefeed: ImportChangefeedMode::On,
 			..options
 		};
-		store.import(full_noop, |session| {
-			session.apply_item(|tx| tx.remove_base_property(&record, PropertyKeyId::new(99)))?;
-			Ok(())
-		})?;
+		store
+			.import(full_noop, |session| {
+				session
+					.apply_item(|tx| tx.remove_base_property(&record, PropertyKeyId::new(99)))?;
+				Ok(())
+			})
+			.assert_ok();
 		assert_eq!(store.inner.current_root().commit_ts, stamp + 1);
-		Ok(())
 	}
 
+	/// Verifies changefeed import spool rejection publishes neither primary nor
+	/// history.
 	#[test]
-	fn changefeed_import_spool_rejection_publishes_neither_primary_nor_history()
-	-> FerrosGrynnResult<()> {
-		let (store, record, _feed, _key) = fixture()?;
+	fn changefeed_import_spool_rejection_publishes_neither_primary_nor_history() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, _feed, _key) = fixture().assert_ok();
 		let before = store.inner.current_root();
-		let mut limits = InMemoryOptions::default();
-		limits.max_write_set_bytes = 4096;
+		let limits_defaults = InMemoryOptions::default();
+		let limits = InMemoryOptions {
+			max_write_set_bytes: 4096,
+			..limits_defaults
+		};
 		let limited = Datastore::from_root_for_test(limits, (*before).clone());
 		let options = ImportOptions {
 			changefeed: ImportChangefeedMode::On,
@@ -1099,25 +1144,34 @@ mod tests {
 		let after = limited.inner.current_root();
 		assert_eq!(after.commit_ts, before.commit_ts);
 		assert!(after.change_history().is_empty());
-		Ok(())
 	}
 
+	/// Verifies changefeed import off avoids oversized images and net restore
+	/// gaps.
 	#[test]
-	fn changefeed_import_off_avoids_oversized_images_and_net_restore_gaps() -> FerrosGrynnResult<()>
-	{
-		let (store, record, feed, key) = fixture()?;
+	fn changefeed_import_off_avoids_oversized_images_and_net_restore_gaps() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, feed, key) = fixture().assert_ok();
 		let mut populate = store.begin();
-		let payload = populate.intern_property("payload")?;
-		populate.set_base_property(&record, payload, Value::from("x".repeat(64 * 1024)))?;
-		populate.commit()?;
+		let payload = populate.intern_property("payload").assert_ok();
+		populate
+			.set_base_property(&record, payload, Value::from("x".repeat(64 * 1024)))
+			.assert_ok();
+		populate.commit().assert_ok();
 		let root = store.inner.current_root();
-		let mut options = InMemoryOptions::default();
-		options.max_write_set_bytes = 8192;
+		let options_defaults = InMemoryOptions::default();
+		let options = InMemoryOptions {
+			max_write_set_bytes: 8192,
+			..options_defaults
+		};
 		let limited = Datastore::from_root_for_test(options, (*root).clone());
-		limited.import(ImportOptions::default(), |session| {
-			session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
-			Ok(())
-		})?;
+		limited
+			.import(ImportOptions::default(), |session| {
+				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
+				Ok(())
+			})
+			.assert_ok();
 		let next = limited.inner.current_root();
 		assert_eq!(
 			next.change_history()
@@ -1142,68 +1196,83 @@ mod tests {
 		let class = configure
 			.working
 			.atom_by_record(&record)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture atom is absent"))?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture atom is absent"))
+			.assert_ok()
 			.class_id();
 		let duration = "P1D"
 			.parse()
-			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))?;
-		configure.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::new(duration)?,
-		)?;
-		configure.commit()?;
-		store.import(
-			ImportOptions {
-				segment_size: 1,
-				..ImportOptions::default()
-			},
-			|session| {
-				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(8)))?;
-				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(1)))?;
-				Ok(())
-			},
-		)?;
+			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))
+			.assert_ok();
+		configure
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::new(duration).assert_ok(),
+			)
+			.assert_ok();
+		configure.commit().assert_ok();
+		store
+			.import(
+				ImportOptions {
+					segment_size: 1,
+					..ImportOptions::default()
+				},
+				|session| {
+					session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(8)))?;
+					session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(1)))?;
+					Ok(())
+				},
+			)
+			.assert_ok();
 		let root = store.inner.current_root();
 		assert!(!root.change_history().contains_key(&(feed, root.commit_ts)));
-		Ok(())
 	}
 
+	/// Verifies changefeed import off graph fanout respects masks and full
+	/// history.
 	#[test]
-	fn changefeed_import_off_graph_fanout_respects_masks_and_full_history() -> FerrosGrynnResult<()>
-	{
-		let (store, record, _feed, key) = fixture()?;
+	fn changefeed_import_off_graph_fanout_respects_masks_and_full_history() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, _feed, key) = fixture().assert_ok();
 		let mut setup = store.begin();
-		let graph = setup.define_graph("scope", crate::graph::GraphKind::Graph)?;
-		setup.attach_node(graph.id(), &record, None, None)?;
+		let graph = setup.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
+		setup.attach_node(graph.id(), &record, None, None).assert_ok();
 		let duration = "P1D"
 			.parse()
-			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))?;
-		let feed = setup.configure_changefeed(
-			ChangefeedSource::Graph(graph.id()),
-			ChangefeedConfig::new(duration)?.with_full(true),
-		)?;
-		setup.hide_property(graph.id(), &record, key)?;
-		setup.commit()?;
-		store.import(ImportOptions::default(), |session| {
-			session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
-			Ok(())
-		})?;
+			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))
+			.assert_ok();
+		let feed = setup
+			.configure_changefeed(
+				ChangefeedSource::Graph(graph.id()),
+				ChangefeedConfig::new(duration).assert_ok().with_full(true),
+			)
+			.assert_ok();
+		setup.hide_property(graph.id(), &record, key).assert_ok();
+		setup.commit().assert_ok();
+		store
+			.import(ImportOptions::default(), |session| {
+				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
+				Ok(())
+			})
+			.assert_ok();
 		let root = store.inner.current_root();
 		assert!(!root.change_history().contains_key(&(feed, root.commit_ts)));
 		let mut reset = store.begin();
-		reset.reset_property(graph.id(), &record, key)?;
-		reset.commit()?;
-		store.import(
-			ImportOptions {
-				segment_size: 1,
-				..ImportOptions::default()
-			},
-			|session| {
-				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(3)))?;
-				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
-				Ok(())
-			},
-		)?;
+		reset.reset_property(graph.id(), &record, key).assert_ok();
+		reset.commit().assert_ok();
+		store
+			.import(
+				ImportOptions {
+					segment_size: 1,
+					..ImportOptions::default()
+				},
+				|session| {
+					session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(3)))?;
+					session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(2)))?;
+					Ok(())
+				},
+			)
+			.assert_ok();
 		let root = store.inner.current_root();
 		assert_eq!(
 			root.change_history()
@@ -1213,123 +1282,141 @@ mod tests {
 			Some(ChangefeedGapReason::ImportSuppressed)
 		);
 		for changefeed in [ImportChangefeedMode::On, ImportChangefeedMode::Off] {
-			store.import(
-				ImportOptions {
-					changefeed,
-					..ImportOptions::default()
-				},
-				|session| {
-					session.apply_item(|tx| {
-						tx.set_base_property(&record, key, Value::from(9))?;
-						tx.set_base_property(&record, key, Value::from(2))?;
+			store
+				.import(
+					ImportOptions {
+						changefeed,
+						..ImportOptions::default()
+					},
+					|session| {
+						session.apply_item(|tx| {
+							tx.set_base_property(&record, key, Value::from(9))?;
+							tx.set_base_property(&record, key, Value::from(2))?;
+							Ok(())
+						})?;
 						Ok(())
-					})?;
-					Ok(())
-				},
-			)?;
+					},
+				)
+				.assert_ok();
 			let root = store.inner.current_root();
 			assert!(!root.change_history().contains_key(&(feed, root.commit_ts)));
 		}
-		Ok(())
 	}
 
+	/// Verifies changefeed import handled failed setter does not leave
+	/// suppression.
 	#[test]
-	fn changefeed_import_handled_failed_setter_does_not_leave_suppression() -> FerrosGrynnResult<()>
-	{
-		use crate::datastore::{ClassField, ClassIndex, ClassIndexKind, IndexScope};
+	fn changefeed_import_handled_failed_setter_does_not_leave_suppression() {
+		use crate::{
+			datastore::{ClassField, ClassIndex, ClassIndexKind, IndexScope},
+			test_assertions::AssertResult as _,
+		};
 		let store = Datastore::in_memory();
 		let mut setup = store.begin();
 		let schema = ClassSchema::new("item", AtomKind::Node, [ClassField::new(
 			"value",
 			crate::values::Type::Int,
-		)])?
-		.with_index(ClassIndex::new(
-			"unique_value",
-			ClassIndexKind::Unique,
-			IndexScope::Base,
-			["value"],
-		)?)?;
-		let class = setup.define_class(schema)?;
-		let key = setup.intern_property("value")?;
-		let graph = setup.define_graph("scope", crate::graph::GraphKind::Graph)?;
-		let first = "item:a".parse::<RecordId>()?;
-		for (record, value) in [(first.clone(), 1), ("item:b".parse::<RecordId>()?, 2)] {
+		)])
+		.assert_ok()
+		.with_index(
+			ClassIndex::new("unique_value", ClassIndexKind::Unique, IndexScope::Base, ["value"])
+				.assert_ok(),
+		)
+		.assert_ok();
+		let class = setup.define_class(schema).assert_ok();
+		let key = setup.intern_property("value").assert_ok();
+		let graph = setup.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
+		let first = "item:a".parse::<RecordId>().assert_ok();
+		for (record, value) in [(first.clone(), 1), ("item:b".parse::<RecordId>().assert_ok(), 2)] {
 			let mut properties = PropertyMap::new();
 			properties.insert(key, value);
-			setup.create_atom(record.clone(), properties)?;
-			setup.attach_node(graph.id(), &record, None, None)?;
+			setup.create_atom(record.clone(), properties).assert_ok();
+			setup.attach_node(graph.id(), &record, None, None).assert_ok();
 		}
-		setup.commit()?;
+		setup.commit().assert_ok();
 		let mut configure = store.begin();
 		let duration = "P1D"
 			.parse()
-			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))?;
-		configure.configure_changefeed(
-			ChangefeedSource::Class(class),
-			ChangefeedConfig::new(duration)?.with_full(true),
-		)?;
-		configure.configure_changefeed(
-			ChangefeedSource::Graph(graph.id()),
-			ChangefeedConfig::new(duration)?.with_full(true),
-		)?;
-		configure.commit()?;
+			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))
+			.assert_ok();
+		configure
+			.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::new(duration).assert_ok().with_full(true),
+			)
+			.assert_ok();
+		configure
+			.configure_changefeed(
+				ChangefeedSource::Graph(graph.id()),
+				ChangefeedConfig::new(duration).assert_ok().with_full(true),
+			)
+			.assert_ok();
+		configure.commit().assert_ok();
 		let before = store.inner.current_root();
-		store.import(
-			ImportOptions {
-				indexes: crate::datastore::ImportIndexMode::Maintained,
-				..ImportOptions::default()
-			},
-			|session| {
-				session.apply_item(|tx| {
-					assert!(tx.set_base_property(&first, key, Value::from(2)).is_err());
-					Ok(())
-				})?;
-				Ok(())
-			},
-		)?;
-		let after = store.inner.current_root();
-		assert_eq!(after.commit_ts, before.commit_ts);
-		assert!(after.change_history().is_empty());
-		Ok(())
-	}
-
-	#[test]
-	fn changefeed_import_full_on_off_agree_when_created_targets_disappear_in_one_item()
-	-> FerrosGrynnResult<()> {
-		let (store, _record, class_feed, key) = fixture()?;
-		let mut setup = store.begin();
-		let graph = setup.define_graph("scope", crate::graph::GraphKind::Graph)?;
-		let duration = "P1D"
-			.parse()
-			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))?;
-		let graph_feed = setup.configure_changefeed(
-			ChangefeedSource::Graph(graph.id()),
-			ChangefeedConfig::new(duration)?.with_full(true),
-		)?;
-		setup.commit()?;
-		let temporary = "item:temporary".parse::<RecordId>()?;
-		for changefeed in [ImportChangefeedMode::On, ImportChangefeedMode::Off] {
-			store.import(
+		store
+			.import(
 				ImportOptions {
-					changefeed,
+					indexes: crate::datastore::ImportIndexMode::Maintained,
 					..ImportOptions::default()
 				},
 				|session| {
 					session.apply_item(|tx| {
-						tx.create_atom(temporary.clone(), PropertyMap::new())?;
-						tx.attach_node(graph.id(), &temporary, None, None)?;
-						tx.set_base_property(&temporary, key, Value::from(1))?;
-						tx.delete_atom_cascade(&temporary, true)?;
+						assert!(tx.set_base_property(&first, key, Value::from(2)).is_err());
 						Ok(())
 					})?;
 					Ok(())
 				},
-			)?;
+			)
+			.assert_ok();
+		let after = store.inner.current_root();
+		assert_eq!(after.commit_ts, before.commit_ts);
+		assert!(after.change_history().is_empty());
+	}
+
+	/// Verifies changefeed import full on off agree when created targets
+	/// disappear in one item.
+	#[test]
+	fn changefeed_import_full_on_off_agree_when_created_targets_disappear_in_one_item() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, class_feed, key) = fixture().assert_ok();
+		let mut setup = store.begin();
+		let graph = setup.define_graph("scope", crate::graph::GraphKind::Graph).assert_ok();
+		let duration = "P1D"
+			.parse()
+			.map_err(|error: jiff::Error| FerrosGrynnError::invalid_argument(error.to_string()))
+			.assert_ok();
+		let graph_feed = setup
+			.configure_changefeed(
+				ChangefeedSource::Graph(graph.id()),
+				ChangefeedConfig::new(duration).assert_ok().with_full(true),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
+		let temporary = "item:temporary".parse::<RecordId>().assert_ok();
+		for changefeed in [ImportChangefeedMode::On, ImportChangefeedMode::Off] {
+			store
+				.import(
+					ImportOptions {
+						changefeed,
+						..ImportOptions::default()
+					},
+					|session| {
+						session.apply_item(|tx| {
+							tx.create_atom(temporary.clone(), PropertyMap::new())?;
+							tx.attach_node(graph.id(), &temporary, None, None)?;
+							tx.set_base_property(&temporary, key, Value::from(1))?;
+							tx.delete_atom_cascade(&temporary, true)?;
+							Ok(())
+						})?;
+						Ok(())
+					},
+				)
+				.assert_ok();
 			let root = store.inner.current_root();
 			assert!(!root.change_history().contains_key(&(class_feed, root.commit_ts)));
 			assert!(!root.change_history().contains_key(&(graph_feed, root.commit_ts)));
 			assert!(root.resolve_atom(&temporary).is_none());
 		}
-		Ok(())
 	}
 }

@@ -10,7 +10,6 @@ use super::{
 	ClassFieldCatalogEntry,
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
-	FunctionCatalogEntry,
 	GraphCatalogEntry,
 	GraphPropertyCatalogEntry,
 	ParameterCatalogEntry,
@@ -49,6 +48,7 @@ use crate::{
 	values::{PropertyKeyId, VectorKind},
 };
 
+/// Configured magic value.
 const MAGIC: [u8; 4] = *b"FGDC";
 /// Current development layout; older catalogs are deliberately rejected.
 const VERSION: u16 = 15;
@@ -56,8 +56,10 @@ const VERSION: u16 = 15;
 const HEADER_BYTES: usize = 248;
 /// Independent cap for the complete logical database catalog.
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Configured max string bytes value.
 const MAX_STRING_BYTES: usize = 4096;
 
+/// Encodes the current state.
 pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	validate(catalog)?;
 	let mut output = Vec::with_capacity(HEADER_BYTES);
@@ -147,6 +149,7 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	Ok(output)
 }
 
+/// Decodes the current state.
 pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	if bytes.len() > MAX_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -387,6 +390,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	Ok(catalog)
 }
 
+/// Encodes class.
 fn encode_class(output: &mut Vec<u8>, class: &ClassCatalogEntry) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(&class.id.get().to_le_bytes());
 	output.extend_from_slice(&class.version.get().to_le_bytes());
@@ -410,6 +414,7 @@ fn encode_class(output: &mut Vec<u8>, class: &ClassCatalogEntry) -> FerrosGrynnR
 	Ok(())
 }
 
+/// Decodes class.
 fn decode_class(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassCatalogEntry> {
 	let id = ClassId::from_storage(decoder.read_u32()?)?;
 	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
@@ -446,6 +451,7 @@ fn decode_class(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassCatalogEntr
 	})
 }
 
+/// Encodes index.
 fn encode_index(output: &mut Vec<u8>, index: &ClassIndexCatalogEntry) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(&index.id.get().to_le_bytes());
 	output.extend_from_slice(&index.version.get().to_le_bytes());
@@ -466,7 +472,7 @@ fn encode_index(output: &mut Vec<u8>, index: &ClassIndexCatalogEntry) -> FerrosG
 		}
 	}
 	write_u16(output, index.fields.len(), "index field count")?;
-	let options = encode_index_options(index.options)?;
+	let options = encode_index_options(index.options);
 	write_u16(output, options.len(), "index options length")?;
 	output.extend_from_slice(&index.build_revision.to_le_bytes());
 	write_optional_binding(output, index.physical);
@@ -479,6 +485,7 @@ fn encode_index(output: &mut Vec<u8>, index: &ClassIndexCatalogEntry) -> FerrosG
 	Ok(())
 }
 
+/// Decodes index.
 fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalogEntry> {
 	let id = IndexId::from_storage(decoder.read_u32()?)?;
 	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
@@ -524,7 +531,8 @@ fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalo
 	})
 }
 
-fn encode_index_options(options: ClassIndexOptions) -> FerrosGrynnResult<Vec<u8>> {
+/// Encodes index options.
+fn encode_index_options(options: ClassIndexOptions) -> Vec<u8> {
 	let mut output = Vec::new();
 	match options {
 		ClassIndexOptions::Scalar => {}
@@ -567,9 +575,10 @@ fn encode_index_options(options: ClassIndexOptions) -> FerrosGrynnResult<Vec<u8>
 			encode_vector_distance(&mut output, options.distance);
 		}
 	}
-	Ok(output)
+	output
 }
 
+/// Decodes index options.
 fn decode_index_options(
 	kind: ClassIndexKind,
 	decoder: &mut Decoder<'_>,
@@ -663,6 +672,7 @@ fn decode_index_options(
 	}
 }
 
+/// Encodes vector distance.
 fn encode_vector_distance(output: &mut Vec<u8>, distance: VectorDistance) {
 	let (tag, function, version, parameter) = match distance {
 		VectorDistance::Euclidean => (0, 0, 0, 0),
@@ -683,6 +693,7 @@ fn encode_vector_distance(output: &mut Vec<u8>, distance: VectorDistance) {
 	output.extend_from_slice(&parameter.to_le_bytes());
 }
 
+/// Decodes vector distance.
 fn decode_vector_distance(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<VectorDistance> {
 	let tag = decoder.read_u8()?;
 	decoder.expect_zero(3, "vector distance reserved bytes")?;
@@ -704,10 +715,12 @@ fn decode_vector_distance(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<Vector
 	}
 }
 
+/// Returns the nonzero u16 result.
 fn nonzero_u16(value: u16, field: &str) -> FerrosGrynnResult<std::num::NonZeroU16> {
 	std::num::NonZeroU16::new(value).ok_or_else(|| invalid(format!("{field} is zero")))
 }
 
+/// Encodes graph.
 fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(&graph.id.get().to_le_bytes());
 	output.extend_from_slice(&graph.version.get().to_le_bytes());
@@ -765,6 +778,7 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 	Ok(())
 }
 
+/// Decodes graph.
 fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntry> {
 	let id = GraphId::new(decoder.read_u64()?)
 		.ok_or_else(|| invalid("graph catalog uses identity zero"))?;
@@ -892,6 +906,7 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 	})
 }
 
+/// Encodes parameter.
 fn encode_parameter(
 	output: &mut Vec<u8>,
 	parameter: &ParameterCatalogEntry,
@@ -910,6 +925,7 @@ fn encode_parameter(
 	Ok(())
 }
 
+/// Decodes parameter.
 fn decode_parameter(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ParameterCatalogEntry> {
 	let id = SchemaId::from_storage(decoder.read_u32()?)?;
 	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
@@ -928,6 +944,7 @@ fn decode_parameter(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ParameterCat
 	})
 }
 
+/// Encodes analyzer.
 fn encode_analyzer(output: &mut Vec<u8>, analyzer: &AnalyzerCatalogEntry) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(&analyzer.id.get().to_le_bytes());
 	output.extend_from_slice(&analyzer.version.get().to_le_bytes());
@@ -954,6 +971,7 @@ fn encode_analyzer(output: &mut Vec<u8>, analyzer: &AnalyzerCatalogEntry) -> Fer
 	Ok(())
 }
 
+/// Decodes analyzer.
 fn decode_analyzer(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<AnalyzerCatalogEntry> {
 	let id = AnalyzerId::from_storage(decoder.read_u32()?)?;
 	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
@@ -992,6 +1010,7 @@ fn decode_analyzer(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<AnalyzerCatal
 	})
 }
 
+/// Encodes analyzer filter.
 fn encode_analyzer_filter(
 	output: &mut Vec<u8>,
 	filter: &AnalyzerFilterCatalogEntry,
@@ -1031,6 +1050,7 @@ fn encode_analyzer_filter(
 	Ok(())
 }
 
+/// Decodes analyzer filter.
 fn decode_analyzer_filter(
 	decoder: &mut Decoder<'_>,
 ) -> FerrosGrynnResult<AnalyzerFilterCatalogEntry> {
@@ -1057,6 +1077,7 @@ fn decode_analyzer_filter(
 	}
 }
 
+/// Returns the tokenizer bits result.
 fn tokenizer_bits(tokenizers: &std::collections::BTreeSet<AnalyzerTokenizer>) -> u8 {
 	tokenizers.iter().fold(0, |bits, tokenizer| {
 		bits | match tokenizer {
@@ -1068,6 +1089,7 @@ fn tokenizer_bits(tokenizers: &std::collections::BTreeSet<AnalyzerTokenizer>) ->
 	})
 }
 
+/// Decodes tokenizer bits.
 fn decode_tokenizer_bits(
 	bits: u8,
 ) -> FerrosGrynnResult<std::collections::BTreeSet<AnalyzerTokenizer>> {
@@ -1088,6 +1110,7 @@ fn decode_tokenizer_bits(
 	Ok(result)
 }
 
+/// Returns the analyzer language result.
 const fn analyzer_language(language: AnalyzerLanguage) -> u8 {
 	match language {
 		AnalyzerLanguage::Arabic => 0,
@@ -1111,6 +1134,7 @@ const fn analyzer_language(language: AnalyzerLanguage) -> u8 {
 	}
 }
 
+/// Decodes analyzer language.
 fn decode_analyzer_language(value: u8) -> FerrosGrynnResult<AnalyzerLanguage> {
 	match value {
 		0 => Ok(AnalyzerLanguage::Arabic),
@@ -1135,6 +1159,7 @@ fn decode_analyzer_language(value: u8) -> FerrosGrynnResult<AnalyzerLanguage> {
 	}
 }
 
+/// Writes optional string.
 pub(super) fn write_optional_string(
 	output: &mut Vec<u8>,
 	value: Option<&str>,
@@ -1147,6 +1172,7 @@ pub(super) fn write_optional_string(
 	Ok(())
 }
 
+/// Reads optional string.
 pub(super) fn read_optional_string<'a>(
 	decoder: &mut Decoder<'a>,
 	field: &str,
@@ -1168,11 +1194,13 @@ pub(super) fn read_optional_string<'a>(
 	Ok(Some(value))
 }
 
+/// Writes binding.
 fn write_binding(output: &mut Vec<u8>, binding: PhysicalIndexBinding) {
 	output.extend_from_slice(&binding.file_id.get().to_le_bytes());
 	output.extend_from_slice(&binding.root.get().to_le_bytes());
 }
 
+/// Reads binding.
 fn read_binding(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<PhysicalIndexBinding> {
 	read_binding_kind(decoder, DataFileKind::Index)
 }
@@ -1194,6 +1222,7 @@ fn read_binding_kind(
 	})
 }
 
+/// Writes optional binding.
 fn write_optional_binding(output: &mut Vec<u8>, binding: Option<PhysicalIndexBinding>) {
 	match binding {
 		Some(binding) => write_binding(output, binding),
@@ -1204,6 +1233,7 @@ fn write_optional_binding(output: &mut Vec<u8>, binding: Option<PhysicalIndexBin
 	}
 }
 
+/// Reads optional binding.
 fn read_optional_binding(
 	decoder: &mut Decoder<'_>,
 ) -> FerrosGrynnResult<Option<PhysicalIndexBinding>> {
@@ -1232,6 +1262,7 @@ fn read_optional_binding_kind(
 	}))
 }
 
+/// Writes string.
 pub(super) fn write_string(
 	output: &mut Vec<u8>,
 	value: &str,
@@ -1247,6 +1278,7 @@ pub(super) fn write_string(
 	Ok(())
 }
 
+/// Reads string.
 pub(super) fn read_string(decoder: &mut Decoder<'_>, field: &str) -> FerrosGrynnResult<String> {
 	let length = usize::from(decoder.read_u16()?);
 	if length == 0 || length > MAX_STRING_BYTES {
@@ -1283,6 +1315,7 @@ pub(super) fn write_u32(output: &mut Vec<u8>, value: usize, field: &str) -> Ferr
 	Ok(())
 }
 
+/// Returns the atom kind result.
 const fn atom_kind(value: AtomKind) -> u8 {
 	match value {
 		AtomKind::Node => 0,
@@ -1290,6 +1323,7 @@ const fn atom_kind(value: AtomKind) -> u8 {
 	}
 }
 
+/// Decodes atom kind.
 fn decode_atom_kind(value: u8) -> FerrosGrynnResult<AtomKind> {
 	match value {
 		0 => Ok(AtomKind::Node),
@@ -1298,6 +1332,7 @@ fn decode_atom_kind(value: u8) -> FerrosGrynnResult<AtomKind> {
 	}
 }
 
+/// Returns the class mode result.
 const fn class_mode(value: ClassSchemaMode) -> u8 {
 	match value {
 		ClassSchemaMode::Schemaless => 0,
@@ -1305,6 +1340,7 @@ const fn class_mode(value: ClassSchemaMode) -> u8 {
 	}
 }
 
+/// Decodes class mode.
 fn decode_class_mode(value: u8) -> FerrosGrynnResult<ClassSchemaMode> {
 	match value {
 		0 => Ok(ClassSchemaMode::Schemaless),
@@ -1313,6 +1349,7 @@ fn decode_class_mode(value: u8) -> FerrosGrynnResult<ClassSchemaMode> {
 	}
 }
 
+/// Returns the index kind result.
 const fn index_kind(value: ClassIndexKind) -> u8 {
 	match value {
 		ClassIndexKind::Standard => 0,
@@ -1325,6 +1362,7 @@ const fn index_kind(value: ClassIndexKind) -> u8 {
 	}
 }
 
+/// Decodes index kind.
 fn decode_index_kind(value: u8) -> FerrosGrynnResult<ClassIndexKind> {
 	match value {
 		0 => Ok(ClassIndexKind::Standard),
@@ -1338,6 +1376,7 @@ fn decode_index_kind(value: u8) -> FerrosGrynnResult<ClassIndexKind> {
 	}
 }
 
+/// Returns the vector kind result.
 const fn vector_kind(value: VectorKind) -> u8 {
 	match value {
 		VectorKind::F64 => 0,
@@ -1351,6 +1390,7 @@ const fn vector_kind(value: VectorKind) -> u8 {
 	}
 }
 
+/// Decodes vector kind.
 fn decode_vector_kind(value: u8) -> FerrosGrynnResult<VectorKind> {
 	match value {
 		0 => Ok(VectorKind::F64),
@@ -1365,6 +1405,7 @@ fn decode_vector_kind(value: u8) -> FerrosGrynnResult<VectorKind> {
 	}
 }
 
+/// Returns the index state result.
 const fn index_state(value: ClassIndexState) -> u8 {
 	match value {
 		ClassIndexState::Ready => 0,
@@ -1373,6 +1414,7 @@ const fn index_state(value: ClassIndexState) -> u8 {
 	}
 }
 
+/// Decodes index state.
 fn decode_index_state(value: u8) -> FerrosGrynnResult<ClassIndexState> {
 	match value {
 		0 => Ok(ClassIndexState::Ready),
@@ -1382,6 +1424,7 @@ fn decode_index_state(value: u8) -> FerrosGrynnResult<ClassIndexState> {
 	}
 }
 
+/// Returns the index maintenance result.
 const fn index_maintenance(value: IndexMaintenanceMode) -> u8 {
 	match value {
 		IndexMaintenanceMode::Immediate => 0,
@@ -1389,6 +1432,7 @@ const fn index_maintenance(value: IndexMaintenanceMode) -> u8 {
 	}
 }
 
+/// Decodes index maintenance.
 fn decode_index_maintenance(value: u8) -> FerrosGrynnResult<IndexMaintenanceMode> {
 	match value {
 		0 => Ok(IndexMaintenanceMode::Immediate),
@@ -1397,6 +1441,7 @@ fn decode_index_maintenance(value: u8) -> FerrosGrynnResult<IndexMaintenanceMode
 	}
 }
 
+/// Returns the storage mode result.
 const fn storage_mode(value: GraphStorageMode) -> u8 {
 	match value {
 		GraphStorageMode::InMemory => 0,
@@ -1405,6 +1450,7 @@ const fn storage_mode(value: GraphStorageMode) -> u8 {
 	}
 }
 
+/// Decodes storage mode.
 fn decode_storage_mode(value: u8) -> FerrosGrynnResult<GraphStorageMode> {
 	match value {
 		0 => Ok(GraphStorageMode::InMemory),
@@ -1417,7 +1463,9 @@ fn decode_storage_mode(value: u8) -> FerrosGrynnResult<GraphStorageMode> {
 /// Consumes a bounded source descriptor without compatibility or executable-IR
 /// decoding.
 pub(in crate::storage) struct Decoder<'a> {
+	/// Bytes associated with this decoder.
 	bytes: &'a [u8],
+	/// Position associated with this decoder.
 	position: usize,
 	/// Frozen source decoding owns a ledger; ordinary catalog callers retain
 	/// their contract.
@@ -1462,6 +1510,7 @@ impl<'a> Decoder<'a> {
 			.map_or(0, crate::storage::history_codec::CodecBudget::admitted_bytes)
 	}
 
+	/// Reads exact.
 	pub(super) fn read_exact(&mut self, count: usize) -> FerrosGrynnResult<&'a [u8]> {
 		let end = self
 			.position
@@ -1475,10 +1524,12 @@ impl<'a> Decoder<'a> {
 		Ok(value)
 	}
 
+	/// Reads u8.
 	pub(super) fn read_u8(&mut self) -> FerrosGrynnResult<u8> {
 		Ok(self.read_exact(1)?[0])
 	}
 
+	/// Reads u16.
 	pub(super) fn read_u16(&mut self) -> FerrosGrynnResult<u16> {
 		Ok(u16::from_le_bytes(
 			self.read_exact(2)?
@@ -1487,6 +1538,7 @@ impl<'a> Decoder<'a> {
 		))
 	}
 
+	/// Reads u32.
 	pub(super) fn read_u32(&mut self) -> FerrosGrynnResult<u32> {
 		Ok(u32::from_le_bytes(
 			self.read_exact(4)?
@@ -1495,6 +1547,7 @@ impl<'a> Decoder<'a> {
 		))
 	}
 
+	/// Reads u64.
 	pub(super) fn read_u64(&mut self) -> FerrosGrynnResult<u64> {
 		Ok(u64::from_le_bytes(
 			self.read_exact(8)?
@@ -1503,11 +1556,13 @@ impl<'a> Decoder<'a> {
 		))
 	}
 
+	/// Reads count.
 	pub(super) fn read_count(&mut self, field: &str) -> FerrosGrynnResult<usize> {
 		usize::try_from(self.read_u32()?)
 			.map_err(|_error| invalid(format!("{field} does not fit usize")))
 	}
 
+	/// Returns the expect zero result.
 	pub(super) fn expect_zero(&mut self, count: usize, field: &str) -> FerrosGrynnResult<()> {
 		if self.read_exact(count)?.iter().any(|byte| *byte != 0) {
 			return Err(invalid(format!("{field} are non-zero")));
@@ -1525,6 +1580,7 @@ impl<'a> Decoder<'a> {
 	}
 }
 
+/// Returns the invalid result.
 pub(super) fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

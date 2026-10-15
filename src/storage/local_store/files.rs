@@ -37,6 +37,7 @@ pub(super) fn create_import_generation_files(
 	create_generation_files_with_mode(root, generation, false, true)
 }
 
+/// Creates generation files with mode.
 fn create_generation_files_with_mode(
 	root: &Path,
 	generation: &BuiltGeneration,
@@ -173,6 +174,7 @@ pub(super) fn stage_database_catalog(
 	Ok(())
 }
 
+/// Returns the page count result.
 fn page_count(image: &super::layout::FileImage) -> FerrosGrynnResult<u64> {
 	if let Some(page_count) = image.prewritten_page_count {
 		if !image.page_numbers.is_empty() || !image.pages.is_empty() {
@@ -188,6 +190,7 @@ fn page_count(image: &super::layout::FileImage) -> FerrosGrynnResult<u64> {
 	})
 }
 
+/// Returns the io failure result.
 fn io_failure(operation: impl Into<String>, source: std::io::Error) -> FerrosGrynnError {
 	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
 }

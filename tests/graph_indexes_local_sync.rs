@@ -1,8 +1,13 @@
+#![cfg(test)]
 #![cfg(windows)]
 #![allow(clippy::unwrap_used, reason = "Public catalog test stops on the first unexpected error")]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::path::PathBuf;
 
+#[path = "common/people.rs"]
 mod common;
 
 use ferros_grynn::{
@@ -23,8 +28,13 @@ use ferros_grynn::{
 };
 
 /// Removes the isolated database after all native handles have been dropped.
-struct Directory(PathBuf);
+struct Directory(
+	/// Removes the isolated database after all native handles have been
+	/// dropped.
+	PathBuf,
+);
 
+/// Verifies tensor cache sync sdk formats checkpoint reopen and snapshot.
 #[test]
 fn tensor_cache_sync_sdk_formats_checkpoint_reopen_and_snapshot() {
 	use ferros_grynn::{
@@ -122,11 +132,13 @@ fn tensor_cache_sync_sdk_formats_checkpoint_reopen_and_snapshot() {
 }
 
 impl Drop for Directory {
+	/// Runs cleanup for this `Directory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Verifies graph index definition commit abort conflict snapshot and reopen.
 #[test]
 fn graph_index_definition_commit_abort_conflict_snapshot_and_reopen() {
 	let directory = Directory(
@@ -189,6 +201,8 @@ fn graph_index_definition_commit_abort_conflict_snapshot_and_reopen() {
 	);
 }
 
+/// Verifies derived graph artifacts publish reuse reopen and invalidate in own
+/// graph.
 #[test]
 fn derived_graph_artifacts_publish_reuse_reopen_and_invalidate_in_own_graph() {
 	let directory = Directory(
@@ -225,99 +239,7 @@ fn derived_graph_artifacts_publish_reuse_reopen_and_invalidate_in_own_graph() {
 				.unwrap();
 		}
 	}
-	for (ordinal, algorithm) in [
-		ReachabilityAlgorithm::Grail(2),
-		ReachabilityAlgorithm::Ferrari(4),
-		ReachabilityAlgorithm::Bfl(160),
-		ReachabilityAlgorithm::ChainCover,
-	]
-	.into_iter()
-	.enumerate()
-	{
-		setup
-			.define_graph_index(
-				"network",
-				GraphIndex::new(
-					format!("reach{ordinal}"),
-					GraphIndexDefinition::Reachability {
-						algorithm,
-					},
-					Some(1 << 20),
-				)
-				.unwrap()
-				.with_mode(TraversalSemantics::Atom),
-			)
-			.unwrap();
-	}
-	setup
-		.define_graph_index(
-			"forest",
-			GraphIndex::new(
-				"tree",
-				GraphIndexDefinition::Reachability {
-					algorithm: ReachabilityAlgorithm::TreeCover,
-				},
-				Some(1 << 20),
-			)
-			.unwrap(),
-		)
-		.unwrap();
-	for (ordinal, algorithm) in [
-		NeighbourhoodAlgorithm::Exact,
-		NeighbourhoodAlgorithm::Sketch(12),
-		NeighbourhoodAlgorithm::Landmark(2),
-		NeighbourhoodAlgorithm::Auto,
-	]
-	.into_iter()
-	.enumerate()
-	{
-		setup
-			.define_graph_index(
-				"network",
-				GraphIndex::new(
-					format!("near{ordinal}"),
-					GraphIndexDefinition::Neighbourhood {
-						radius: 4,
-						algorithm,
-					},
-					Some(if ordinal == 3 {
-						1
-					} else {
-						1 << 20
-					}),
-				)
-				.unwrap()
-				.with_mode(TraversalSemantics::Atom),
-			)
-			.unwrap();
-	}
-	for (name, cost) in [
-		("path_hop", GraphIndexCost::Hop),
-		("path_weight", GraphIndexCost::Weighted),
-		("path_node", GraphIndexCost::Hop),
-		("path_node_weight", GraphIndexCost::Weighted),
-	] {
-		setup
-			.define_graph_index(
-				"network",
-				GraphIndex::new(
-					name,
-					GraphIndexDefinition::Path {
-						algorithm: PathIndexAlgorithm::LandmarkSssp(3),
-						cost,
-						patterns: Vec::new(),
-					},
-					Some(1 << 20),
-				)
-				.unwrap()
-				.with_mode(if matches!(name, "path_node" | "path_node_weight") {
-					TraversalSemantics::Node
-				} else {
-					TraversalSemantics::Atom
-				}),
-			)
-			.unwrap();
-	}
+	define_derived_index_matrix(&mut setup);
 	setup.commit().unwrap();
 	for outcome in store
 		.execute(
@@ -402,61 +324,7 @@ fn derived_graph_artifacts_publish_reuse_reopen_and_invalidate_in_own_graph() {
 		.as_object()
 		.unwrap();
 	assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64));
-	let paths = old
-		.execute(&traversal.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
-		.unwrap();
-	let path = paths[0]
-		.result
-		.as_ref()
-		.unwrap()
-		.value()
-		.as_array()
-		.unwrap()
-		.get(0)
-		.unwrap()
-		.as_path()
-		.unwrap();
-	assert_eq!(path.steps().len(), 3);
-	assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(2)));
-	for (custom, method) in [
-		(false, "weightedShortestPath"),
-		(false, "distanceTo"),
-		(true, "weightedShortestPath"),
-		(true, "distanceTo"),
-	] {
-		let mut query = traversal.replace("shortestPath", method);
-		if custom {
-			query = query.replace("IN GRAPH @network", "IN GRAPH @network WITH COST fn::cost");
-		}
-		let expected_cost = if custom {
-			4
-		} else {
-			2
-		};
-		let rows = old.execute(&query, &Object::new()).unwrap();
-		let metrics = rows[0]
-			.result
-			.as_ref()
-			.unwrap()
-			.value()
-			.as_object()
-			.unwrap()
-			.get("analyze")
-			.unwrap()
-			.as_object()
-			.unwrap();
-		assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64));
-		let rows = old
-			.execute(&query.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
-			.unwrap();
-		let value = rows[0].result.as_ref().unwrap().value().as_array().unwrap().get(0).unwrap();
-		if let Some(path) = value.as_path() {
-			assert_eq!(path.steps().len(), 3);
-			assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(expected_cost)));
-		} else {
-			assert_eq!(value, &Value::from(expected_cost));
-		}
-	}
+	assert_landmark_traversal_paths(&mut old, traversal);
 	let shortest = "EXPLAIN ANALYZE FORMAT JSON MATCH ATOM path = <(person:a AS a)>~[link*1..3 \
 	                SHORTEST]~><(person:c AS c)> IN GRAPH network RETURN path;";
 	let result = old.execute(shortest, &Object::new()).unwrap();
@@ -621,4 +489,171 @@ fn derived_graph_artifacts_publish_reuse_reopen_and_invalidate_in_own_graph() {
 			.state(),
 		ClassIndexState::Ready
 	);
+}
+
+/// Checks the existing hop, weighted and custom-cost paths on the old snapshot.
+///
+/// # Panics
+/// Panics if an original landmark, path shape or path-cost assertion fails.
+#[track_caller]
+fn assert_landmark_traversal_paths(
+	old: &mut ferros_grynn::datastore::Transaction,
+	traversal: &str,
+) {
+	let paths = old
+		.execute(&traversal.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
+		.unwrap();
+	let path = paths[0]
+		.result
+		.as_ref()
+		.unwrap()
+		.value()
+		.as_array()
+		.unwrap()
+		.get(0)
+		.unwrap()
+		.as_path()
+		.unwrap();
+	assert_eq!(path.steps().len(), 3);
+	assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(2)));
+	for (custom, method) in [
+		(false, "weightedShortestPath"),
+		(false, "distanceTo"),
+		(true, "weightedShortestPath"),
+		(true, "distanceTo"),
+	] {
+		let mut query = traversal.replace("shortestPath", method);
+		if custom {
+			query = query.replace("IN GRAPH @network", "IN GRAPH @network WITH COST fn::cost");
+		}
+		let expected_cost = if custom {
+			4
+		} else {
+			2
+		};
+		let rows = old.execute(&query, &Object::new()).unwrap();
+		let metrics = rows[0]
+			.result
+			.as_ref()
+			.unwrap()
+			.value()
+			.as_object()
+			.unwrap()
+			.get("analyze")
+			.unwrap()
+			.as_object()
+			.unwrap();
+		assert!(metrics.get("landmark_lookups").unwrap() > &Value::from(0_u64));
+		let rows = old
+			.execute(&query.replace("EXPLAIN ANALYZE FORMAT JSON ", ""), &Object::new())
+			.unwrap();
+		let value = rows[0].result.as_ref().unwrap().value().as_array().unwrap().get(0).unwrap();
+		if let Some(path) = value.as_path() {
+			assert_eq!(path.steps().len(), 3);
+			assert_eq!(path.cost(), Some(ferros_grynn::values::Number::Int(expected_cost)));
+		} else {
+			assert_eq!(value, &Value::from(expected_cost));
+		}
+	}
+}
+
+/// Defines the original reachability, neighbourhood and path index matrix.
+///
+/// # Panics
+/// Panics if any original index-definition assertion fails.
+#[track_caller]
+fn define_derived_index_matrix(setup: &mut ferros_grynn::datastore::Transaction) {
+	for (ordinal, algorithm) in [
+		ReachabilityAlgorithm::Grail(2),
+		ReachabilityAlgorithm::Ferrari(4),
+		ReachabilityAlgorithm::Bfl(160),
+		ReachabilityAlgorithm::ChainCover,
+	]
+	.into_iter()
+	.enumerate()
+	{
+		setup
+			.define_graph_index(
+				"network",
+				GraphIndex::new(
+					format!("reach{ordinal}"),
+					GraphIndexDefinition::Reachability {
+						algorithm,
+					},
+					Some(1 << 20),
+				)
+				.unwrap()
+				.with_mode(TraversalSemantics::Atom),
+			)
+			.unwrap();
+	}
+	setup
+		.define_graph_index(
+			"forest",
+			GraphIndex::new(
+				"tree",
+				GraphIndexDefinition::Reachability {
+					algorithm: ReachabilityAlgorithm::TreeCover,
+				},
+				Some(1 << 20),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+	for (ordinal, algorithm) in [
+		NeighbourhoodAlgorithm::Exact,
+		NeighbourhoodAlgorithm::Sketch(12),
+		NeighbourhoodAlgorithm::Landmark(2),
+		NeighbourhoodAlgorithm::Auto,
+	]
+	.into_iter()
+	.enumerate()
+	{
+		setup
+			.define_graph_index(
+				"network",
+				GraphIndex::new(
+					format!("near{ordinal}"),
+					GraphIndexDefinition::Neighbourhood {
+						radius: 4,
+						algorithm,
+					},
+					Some(if ordinal == 3 {
+						1
+					} else {
+						1 << 20
+					}),
+				)
+				.unwrap()
+				.with_mode(TraversalSemantics::Atom),
+			)
+			.unwrap();
+	}
+	for (name, cost) in [
+		("path_hop", GraphIndexCost::Hop),
+		("path_weight", GraphIndexCost::Weighted),
+		("path_node", GraphIndexCost::Hop),
+		("path_node_weight", GraphIndexCost::Weighted),
+	] {
+		setup
+			.define_graph_index(
+				"network",
+				GraphIndex::new(
+					name,
+					GraphIndexDefinition::Path {
+						algorithm: PathIndexAlgorithm::LandmarkSssp(3),
+						cost,
+						patterns: Vec::new(),
+					},
+					Some(1 << 20),
+				)
+				.unwrap()
+				.with_mode(if matches!(name, "path_node" | "path_node_weight") {
+					TraversalSemantics::Node
+				} else {
+					TraversalSemantics::Atom
+				}),
+			)
+			.unwrap();
+	}
 }

@@ -12,6 +12,9 @@ mod all_shortest;
 /// Qualified tensor-backed analytical barriers.
 mod analytics;
 mod barrier;
+/// Regression coverage for fixed layout-shell admission.
+#[cfg(test)]
+mod layout_tests;
 mod model;
 mod navigation;
 mod transform;
@@ -24,43 +27,84 @@ use rapidhash::RapidHashMap;
 use super::*;
 use crate::gql::ir::NamedFunctionKey;
 
+/// Compiled repeat body, stopping conditions and emission policy for a
+/// traversal step.
 #[derive(Clone)]
 struct PreparedRepeat {
+	/// Compiled closure evaluated for each repeat iteration.
 	body: Closure,
+	/// Optional fixed number of times the repeat body is evaluated.
 	times: Option<usize>,
+	/// Optional condition ending evaluation of the repeat body.
 	until: Option<Closure>,
+	/// Whether repeat iterations emit intermediate traversers.
 	emit: bool,
 }
 
+/// Traversal operator with evaluated arguments and resolved analytical plans.
 #[derive(Clone)]
 struct PreparedStep {
+	/// Selected operation or representation discriminator.
 	kind: TraverseStepKind,
+	/// Positional arguments supplied to the resolved operation.
 	arguments: Vec<Value>,
+	/// Resolved named-function identity used by the traversal step.
 	named_function: Option<NamedFunctionKey>,
+	/// Validated input type required by an analytical traversal operator.
 	algorithm_input: Option<Type>,
+	/// Resolved neighbourhood index selected for the traversal step.
 	neighbourhood_index: Option<crate::datastore::IndexId>,
+	/// Resolved landmark-path plan selected for the traversal step.
 	landmark_path: Option<crate::datastore::QueryLandmarkPath>,
+	/// Resolved tensor cache selected for analytical materialization.
 	tensor_cache: Option<crate::datastore::QueryTensorCache>,
+	/// Logical MATCH plan retained by the traversal operator.
 	match_plan: Option<Box<LogicalMatch>>,
+	/// Prepared repeat body and stopping policy, when this step repeats.
 	repeat: Option<PreparedRepeat>,
 }
 
+/// Retained progress of a streaming, bounded, graph-scan or barrier traversal
+/// stage.
 enum StageState {
+	/// Operator processes each traverser without retained bounded-stage state.
 	Streaming,
-	Limit(u64),
-	Skip(u64),
-	GraphScan(Option<GraphScan>),
-	Barrier(Option<barrier::BarrierCursor>),
+	/// Remaining number of outputs permitted by a limit step.
+	Limit(
+		/// Remaining number of outputs permitted by a limit step.
+		u64,
+	),
+	/// Remaining number of inputs discarded by a skip step.
+	Skip(
+		/// Remaining number of inputs discarded by a skip step.
+		u64,
+	),
+	/// Optional active scan over graph atoms for the current input.
+	GraphScan(
+		/// Optional active scan over graph atoms for the current input.
+		Option<GraphScan>,
+	),
+	/// Optional active materializing or sorting barrier.
+	Barrier(
+		/// Optional active materializing or sorting barrier.
+		Option<barrier::BarrierCursor>,
+	),
 }
 
+/// Traversal input and current offset while scanning one graph family.
 #[derive(Clone)]
 struct GraphScan {
+	/// Input traverser retained while producing a graph scan result.
 	input: Traverser,
+	/// Owned graph reference identifying the operation scope.
 	reference: Arc<GraphRef>,
+	/// Selected operation or representation discriminator.
 	kind: AtomKind,
+	/// Current offset into the serialized records or graph scan.
 	offset: usize,
 }
 
+/// Executes traverse for this module.
 pub(super) fn execute_traverse<Read: QueryRead>(
 	read: &mut Read,
 	snapshot: Snapshot,
@@ -89,6 +133,8 @@ pub(super) fn execute_traverse<Read: QueryRead>(
 	Ok(Value::Array(result))
 }
 
+/// Executes the prepared traversal and forwards produced values to the caller's
+/// fallible visitor.
 #[allow(
 	clippy::too_many_arguments,
 	reason = "traversal pull execution retains the VM and statement runtime context"
@@ -273,6 +319,7 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 	Ok(None)
 }
 
+/// Returns traversal source for this module.
 fn traversal_source<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -357,6 +404,7 @@ fn traversal_source<Read: QueryRead>(
 	Ok(traversers)
 }
 
+/// Prepares steps for this module.
 fn prepare_steps(
 	plan: &LogicalTraverse,
 	physical: Option<&crate::gql::optimizer::PhysicalTraversalPlan>,
@@ -469,7 +517,14 @@ fn prepare_steps(
 						}
 					})
 				}),
-				match_plan: step.match_plan.clone(),
+				match_plan: step
+					.match_plan
+					.as_ref()
+					.map(|plan| -> FerrosGrynnResult<_> {
+						fields.admit_retained(plan.boxed_layout_bytes)?;
+						Ok(plan.clone())
+					})
+					.transpose()?,
 				repeat,
 			})
 		})
@@ -490,6 +545,7 @@ fn resolve_record_atom<Graph: GraphRead>(
 	Err(FerrosGrynnError::atom_does_not_exist("atom", record.to_string()))
 }
 
+/// Returns closure value for this module.
 fn closure_value(value: Value) -> FerrosGrynnResult<Closure> {
 	match value {
 		Value::Closure(closure) => Ok(*closure),
@@ -500,6 +556,7 @@ fn closure_value(value: Value) -> FerrosGrynnResult<Closure> {
 	}
 }
 
+/// Returns eval usize value for this module.
 fn eval_usize_value(value: Value) -> FerrosGrynnResult<usize> {
 	value
 		.as_number()
@@ -513,32 +570,55 @@ fn eval_usize_value(value: Value) -> FerrosGrynnResult<usize> {
 		})
 }
 
+/// Execution state driving traversers through prepared operators and bounded
+/// queues.
 struct TraversalMachine<'a, Read: QueryRead> {
+	/// Transaction adapter used to resolve graph and record reads.
 	read: &'a mut Read,
+	/// Snapshot identity or retained read snapshot used by the operation.
 	snapshot: Snapshot,
+	/// Traversal or pattern steps retained in execution order.
 	steps: Vec<PreparedStep>,
+	/// Per-stage traverser queues connecting prepared operators.
 	queues: Vec<VecDeque<Traverser>>,
+	/// Progress retained for each prepared traversal stage.
 	states: Vec<StageState>,
+	/// Lexical values available to expressions and closures.
 	slots: &'a [Value],
+	/// Original query source used when reporting traversal diagnostics.
 	source: &'a str,
+	/// Cancellation, deadline and resource policy observed during traversal.
 	control: &'a ExecutionControl,
+	/// Mutable execution-control accounting for the current operation.
 	runtime: &'a mut ControlRuntime,
+	/// Arena retaining predecessor links for produced traversal paths.
 	trace_arena: PathTraceArena,
+	/// Memory admission retained by queued traversers.
 	queue_memory: BarrierAccount,
+	/// Memory admission retained by path-trace records.
 	trace_memory: BarrierAccount,
+	/// Whether traversal must retain the path used to reach each value.
 	path_tracking: bool,
+	/// Whether traversal treats edges as traversable atoms.
 	atom_semantics: bool,
+	/// Optional resolved cost function used when comparing weighted paths.
 	custom_cost: Option<crate::gql::ir::LogicalPathCost>,
+	/// Structural or path constraints applied to the selected graph operation.
 	constraints: crate::syn::MatchConstraints,
 	/// Declared graph root for qualified ROOTED domains.
 	graph: Option<GraphRef>,
+	/// Named side-effect values shared across the traversal execution.
 	side_effects: Object,
+	/// Stable graph-qualified occurrences associated with bound runtime atoms.
 	occurrences: std::collections::BTreeMap<BoundAtom, AtomOccurrenceRef>,
+	/// Cached local traversal indexes keyed by graph identity.
 	local_indexes: std::collections::BTreeMap<crate::graph::GraphId, Option<Rc<TraversalIndex>>>,
+	/// Cached scope-aware traversal indexes keyed by graph identity.
 	scoped_indexes: std::collections::BTreeMap<crate::graph::GraphId, Rc<ScopedTraversalIndex>>,
 }
 
 impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
+	/// Returns return row for `TraversalMachine<'a, Read>`.
 	fn return_row(&self, traverser: &Traverser, schema: &Schema) -> Row {
 		let values = schema
 			.columns
@@ -609,10 +689,13 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		})
 	}
 
+	/// Advances this `TraversalMachine<'a, Read>` and returns its next element,
+	/// if any.
 	fn next(&mut self) -> FerrosGrynnResult<Option<Traverser>> {
 		self.pull(self.steps.len())
 	}
 
+	/// Returns pull for `TraversalMachine<'a, Read>`.
 	fn pull(&mut self, stage: usize) -> FerrosGrynnResult<Option<Traverser>> {
 		self.control.check()?;
 		if let Some(value) = self.queues[stage].pop_front() {
@@ -666,6 +749,7 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		}
 	}
 
+	/// Extends queue for `TraversalMachine<'a, Read>`.
 	fn extend_queue(
 		&mut self,
 		stage: usize,
@@ -715,6 +799,7 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		)
 	}
 
+	/// Appends adjacent for `TraversalMachine<'a, Read>`.
 	fn append_adjacent(
 		&mut self,
 		stage: usize,
@@ -738,6 +823,7 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		Ok(())
 	}
 
+	/// Pushes trace node for `TraversalMachine<'a, Read>`.
 	fn push_trace_node(
 		&mut self,
 		previous: Option<PathTraceId>,
@@ -801,6 +887,7 @@ fn value_u64(value: &Value) -> FerrosGrynnResult<u64> {
 	u64::try_from(number)
 }
 
+/// Returns expand value for this module.
 fn expand_value(value: Value) -> FerrosGrynnResult<Vec<Value>> {
 	match value {
 		Value::Array(values) => Ok(values.into_iter().collect()),

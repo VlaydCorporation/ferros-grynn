@@ -33,6 +33,7 @@ pub(super) struct MutableLiveState<G: LiveFamily<State = Mutable, Mutable = G>> 
 }
 
 impl<G: LiveFamily<State = Mutable, Mutable = G>> Clone for MutableLiveState<G> {
+	/// Returns an owned clone of this `MutableLiveState<G>`.
 	fn clone(&self) -> Self {
 		Self {
 			base: self.base.clone(),

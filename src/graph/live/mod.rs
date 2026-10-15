@@ -91,14 +91,17 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveUpdate<G> {
 		}
 	}
 
+	/// Returns the stored origin of this `LiveUpdate<G>`.
 	pub const fn origin(&self) -> Uuid {
 		self.origin
 	}
 
+	/// Returns the stored remote revision of this `LiveUpdate<G>`.
 	pub const fn remote_revision(&self) -> u64 {
 		self.remote_revision
 	}
 
+	/// Borrows the stored changes of this `LiveUpdate<G>`.
 	pub const fn changes(&self) -> &BTreeSet<DirtyTarget> {
 		&self.changes
 	}
@@ -111,6 +114,7 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveUpdate<G> {
 }
 
 impl<G: LiveFamily<State = Mutable, Mutable = G>> Clone for LiveUpdate<G> {
+	/// Returns an owned clone of this `LiveUpdate<G>`.
 	fn clone(&self) -> Self {
 		Self {
 			origin: self.origin,
@@ -122,6 +126,7 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> Clone for LiveUpdate<G> {
 }
 
 impl<G: LiveFamily<State = Mutable, Mutable = G>> Debug for LiveUpdate<G> {
+	/// Formats `LiveUpdate<G>` using the requested formatter.
 	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("LiveUpdate")
@@ -132,24 +137,32 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> Debug for LiveUpdate<G> {
 	}
 }
 
+/// Result of applying, queuing or reconciling a remote live-graph update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LiveEvent {
+	/// Remote update was incorporated into the local materialization.
 	Applied {
 		/// Stores the last completely accepted remote watermark.
 		remote_revision: u64,
 	},
+	/// Remote update was retained until the local state permits application.
 	Queued {
 		/// Stores the last completely accepted remote watermark.
 		remote_revision: u64,
 	},
+	/// Remote and local changes require an explicit conflict decision.
 	Conflict {
+		/// Targets changed by the incoming remote update.
 		incoming_changes: Vec<DirtyTarget>,
+		/// Targets changed in the private local candidate.
 		local_changes: Vec<DirtyTarget>,
+		/// Targets changed incompatibly by both local and remote edits.
 		conflicts: Vec<DirtyTarget>,
 		/// Stores the last completely accepted remote watermark.
 		remote_revision: u64,
 	},
+	/// Live processing resumed after accepting a remote revision boundary.
 	Resumed {
 		/// Stores the last completely accepted remote watermark.
 		remote_revision: u64,
@@ -159,9 +172,16 @@ pub enum LiveEvent {
 /// Owns the concrete family layout through its matching state lock.
 enum LiveInner<G: LiveFamily<State = Mutable, Mutable = G>> {
 	/// Pins immutable revisions while new candidates publish independently.
-	Frozen(RwLock<Arc<G::Frozen>>),
+	Frozen(
+		/// Pins immutable revisions while new candidates publish independently.
+		RwLock<Arc<G::Frozen>>,
+	),
 	/// Protects local edits and whole incoming deltas under one state mutex.
-	Mutable(Mutex<MutableLiveState<G>>),
+	Mutable(
+		/// Protects local edits and whole incoming deltas under one state
+		/// mutex.
+		Mutex<MutableLiveState<G>>,
+	),
 }
 
 /// A live materialization retaining the selected family's concrete layout.
@@ -193,6 +213,7 @@ where
 }
 
 impl<G: LiveFamily<State = Frozen, Frozen = G>> LiveReadGuard<G> {
+	/// Returns revision for `LiveReadGuard<G>`.
 	pub fn revision(&self) -> u64 {
 		self.graph.revision()
 	}
@@ -201,12 +222,14 @@ impl<G: LiveFamily<State = Frozen, Frozen = G>> LiveReadGuard<G> {
 impl<G: LiveFamily<State = Frozen, Frozen = G>> Deref for LiveReadGuard<G> {
 	type Target = G;
 
+	/// Borrows the underlying value represented by this `LiveReadGuard<G>`.
 	fn deref(&self) -> &Self::Target {
 		&self.graph
 	}
 }
 
 impl<G: LiveFamily<State = Frozen, Frozen = G> + Clone> LiveGraph<Frozen, G> {
+	/// Constructs `LiveGraph<Frozen, G>` from the supplied initial state.
 	pub fn new(graph: G) -> Self {
 		Self {
 			inner: LiveInner::Frozen(RwLock::new(Arc::new(graph))),
@@ -293,6 +316,7 @@ impl<G: LiveFamily<State = Frozen, Frozen = G> + Clone> LiveGraph<Frozen, G> {
 }
 
 impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveGraph<Mutable, G> {
+	/// Returns new mutable for `LiveGraph<Mutable, G>`.
 	pub fn new_mutable(graph: G) -> Self {
 		Self {
 			inner: LiveInner::Mutable(Mutex::new(MutableLiveState::new(graph))),
@@ -509,32 +533,37 @@ fn invalid_state(reason: impl Into<String>) -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for live behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::values::{
 		PropertyMap,
 		Value,
 		runtime::graph::{AtomId, DirtyTarget, Graph, GraphMut, Mutable},
 	};
 
+	/// Verifies frozen guards keep the revision they observed.
 	#[test]
 	fn frozen_guards_keep_the_revision_they_observed() {
 		let mut graph = Graph::<Mutable>::new();
-		graph.add_node(None, PropertyMap::new()).unwrap();
+		graph.add_node(None, PropertyMap::new()).assert_ok();
 		let live = LiveGraph::new(graph.freeze());
-		let old = live.read().unwrap();
+		let old = live.read().assert_ok();
 		let mut next = (*old).clone().thaw();
-		next.add_node(None, PropertyMap::new()).unwrap();
-		live.publish(next.freeze()).unwrap();
+		next.add_node(None, PropertyMap::new()).assert_ok();
+		live.publish(next.freeze()).assert_ok();
 
 		assert_eq!(old.node_count(), 1);
-		assert_eq!(live.read().unwrap().node_count(), 2);
+		assert_eq!(live.read().assert_ok().node_count(), 2);
 	}
 
+	/// Verifies mutable live graph pauses on dirty intersection.
 	#[test]
 	fn mutable_live_graph_pauses_on_dirty_intersection() {
 		let mut graph = Graph::<Mutable>::new();
-		let node = graph.add_node(None, PropertyMap::new()).unwrap();
+		let node = graph.add_node(None, PropertyMap::new()).assert_ok();
 		let identity = graph.identity();
 		let remote_revision = graph.revision() + 10;
 		let live = LiveGraph::<Mutable>::new_mutable(graph);
@@ -542,78 +571,83 @@ mod tests {
 			graph.node_properties_mut(node)?.insert(1_u32.into(), 1);
 			Ok(())
 		})
-		.unwrap();
+		.assert_ok();
 		let update =
 			LiveUpdate::new(identity, remote_revision, [DirtyTarget::Atom(node)], move |graph| {
 				graph.node_properties_mut(node)?.insert(2_u32.into(), 2);
 				Ok(())
 			});
 
-		let event = live.ingest(update).unwrap();
+		let event = live.ingest(update).assert_ok();
 		assert!(matches!(event, LiveEvent::Conflict { .. }));
 		assert!(live.mutate_local([], |_| Ok(())).is_err());
 	}
 
+	/// Verifies disjoint remote update is applied automatically.
 	#[test]
 	fn disjoint_remote_update_is_applied_automatically() {
 		let mut graph = Graph::<Mutable>::new();
-		let local = graph.add_node(None, PropertyMap::new()).unwrap();
-		let remote = graph.add_node(None, PropertyMap::new()).unwrap();
+		let local = graph.add_node(None, PropertyMap::new()).assert_ok();
+		let remote = graph.add_node(None, PropertyMap::new()).assert_ok();
 		let identity = graph.identity();
 		let revision = graph.revision() + 10;
 		let live = LiveGraph::<Mutable>::new_mutable(graph);
-		live.mutate_local([DirtyTarget::Atom(local)], |_| Ok(())).unwrap();
+		live.mutate_local([DirtyTarget::Atom(local)], |_| Ok(())).assert_ok();
 		let update =
 			LiveUpdate::new(identity, revision, [DirtyTarget::Atom(remote)], move |graph| {
 				graph.node_properties_mut(remote)?.insert(9_u32.into(), 42);
 				Ok(())
 			});
-		let event = live.ingest(update).unwrap();
+		let event = live.ingest(update).assert_ok();
 
 		assert!(matches!(event, LiveEvent::Applied { .. }));
 		assert!(
 			live.with_graph(|graph| graph
 				.node(remote)
-				.unwrap()
+				.assert_some()
 				.properties()
 				.contains_key(9_u32.into()))
-				.unwrap()
+				.assert_ok()
 		);
 	}
 
+	/// Verifies accept remote discards local conflicting state.
 	#[test]
 	fn accept_remote_discards_local_conflicting_state() {
 		let (live, node) = conflicted_live_graph();
-		assert!(matches!(live.accept_remote().unwrap(), LiveEvent::Resumed { .. }));
+		assert!(matches!(live.accept_remote().assert_ok(), LiveEvent::Resumed { .. }));
 		assert!(!has_property(&live, node, 1));
 		assert!(has_property(&live, node, 2));
 	}
 
+	/// Verifies keep local discards the pending remote delta.
 	#[test]
 	fn keep_local_discards_the_pending_remote_delta() {
 		let (live, node) = conflicted_live_graph();
-		assert!(matches!(live.keep_local().unwrap(), LiveEvent::Resumed { .. }));
+		assert!(matches!(live.keep_local().assert_ok(), LiveEvent::Resumed { .. }));
 		assert!(has_property(&live, node, 1));
 		assert!(!has_property(&live, node, 2));
-		let state = live.mutable_state().unwrap();
+		let state = live.mutable_state().assert_ok();
 		assert!(
 			crate::graph::GraphRead::node(&state.base, node)
-				.unwrap()
-				.unwrap()
+				.assert_ok()
+				.assert_some()
 				.properties()
 				.contains_key(2_u32.into())
 		);
 		assert!(state.local_changes.contains(&DirtyTarget::Atom(node)));
 	}
 
+	/// Verifies discard local applies the pending remote delta.
 	#[test]
 	fn discard_local_applies_the_pending_remote_delta() {
 		let (live, node) = conflicted_live_graph();
-		assert!(matches!(live.discard_local().unwrap(), LiveEvent::Applied { .. }));
+		assert!(matches!(live.discard_local().assert_ok(), LiveEvent::Applied { .. }));
 		assert!(!has_property(&live, node, 1));
 		assert!(has_property(&live, node, 2));
 	}
 
+	/// Verifies rebase replays local changes over remote state.
 	#[test]
 	fn rebase_replays_local_changes_over_remote_state() {
 		let (live, node) = conflicted_live_graph();
@@ -622,16 +656,17 @@ mod tests {
 				graph.node_properties_mut(node)?.insert(1_u32.into(), Value::from("local"));
 				Ok(())
 			})
-			.unwrap(),
+			.assert_ok(),
 			LiveEvent::Resumed { .. },
 		));
 		assert!(has_property(&live, node, 1));
 		assert!(has_property(&live, node, 2));
 	}
 
+	/// Returns conflicted live graph for this module.
 	fn conflicted_live_graph() -> (LiveGraph<Mutable>, AtomId) {
 		let mut graph = Graph::<Mutable>::new();
-		let node = graph.add_node(None, PropertyMap::new()).unwrap();
+		let node = graph.add_node(None, PropertyMap::new()).assert_ok();
 		let identity = graph.identity();
 		let remote_revision = graph.revision() + 10;
 		let live = LiveGraph::<Mutable>::new_mutable(graph);
@@ -639,20 +674,21 @@ mod tests {
 			graph.node_properties_mut(node)?.insert(1_u32.into(), Value::from("local"));
 			Ok(())
 		})
-		.unwrap();
+		.assert_ok();
 		let update =
 			LiveUpdate::new(identity, remote_revision, [DirtyTarget::Atom(node)], move |graph| {
 				graph.node_properties_mut(node)?.insert(2_u32.into(), Value::from("remote"));
 				Ok(())
 			});
-		assert!(matches!(live.ingest(update).unwrap(), LiveEvent::Conflict { .. }));
+		assert!(matches!(live.ingest(update).assert_ok(), LiveEvent::Conflict { .. }));
 		(live, node)
 	}
 
+	/// Reports whether the value has property for this module.
 	fn has_property(live: &LiveGraph<Mutable>, node: AtomId, key: u32) -> bool {
 		live.with_graph(|graph| {
 			graph.node(node).is_some_and(|node| node.properties().contains_key(key.into()))
 		})
-		.unwrap()
+		.assert_ok()
 	}
 }

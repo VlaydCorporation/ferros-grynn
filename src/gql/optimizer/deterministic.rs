@@ -6,7 +6,6 @@ use crate::{
 		LogicalBlock,
 		LogicalDmlData,
 		LogicalDmlReturn,
-		LogicalDmlReturnItem,
 		LogicalDmlSelector,
 		LogicalDmlStatement,
 		LogicalExpect,
@@ -43,6 +42,7 @@ pub(in crate::gql) fn validate_deterministic_statement(
 	Ok(())
 }
 
+/// Returns whether the statement contains impure condition holds.
 fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 	match statement {
 		LogicalStatement::Explain(explain) => statement_contains_impure(&explain.statement),
@@ -129,6 +129,7 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 	}
 }
 
+/// Builds graph contains impure.
 fn build_graph_contains_impure(build: &crate::gql::ir::LogicalBuildGraph) -> bool {
 	let source = match &build.source {
 		crate::gql::ir::LogicalBuildGraphSource::Match(statement) => {
@@ -155,16 +156,19 @@ fn build_graph_contains_impure(build: &crate::gql::ir::LogicalBuildGraph) -> boo
 		|| build.edges.as_ref().is_some_and(expr_contains_impure)
 }
 
+/// Returns whether the return graph contains impure condition holds.
 fn return_graph_contains_impure(graph: &crate::gql::ir::LogicalReturnGraph) -> bool {
 	graph.root.as_ref().is_some_and(expr_contains_impure)
 		|| expr_contains_impure(&graph.nodes)
 		|| expr_contains_impure(&graph.edges)
 }
 
+/// Returns whether the block contains impure condition holds.
 fn block_contains_impure(block: &LogicalBlock) -> bool {
 	block.statements.iter().any(|statement| statement_contains_impure(&statement.statement))
 }
 
+/// Returns whether the schema contains impure condition holds.
 fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 	match statement {
 		LogicalSchemaStatement::RegisterLive(plan) => {
@@ -319,6 +323,7 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 	}
 }
 
+/// Returns whether the graph property mutation contains impure condition holds.
 fn graph_property_mutation_contains_impure(mutation: &LogicalGraphPropertyMutation) -> bool {
 	match mutation {
 		LogicalGraphPropertyMutation::Set(values) => {
@@ -328,6 +333,7 @@ fn graph_property_mutation_contains_impure(mutation: &LogicalGraphPropertyMutati
 	}
 }
 
+/// Returns whether the dml contains impure condition holds.
 fn dml_contains_impure(statement: &LogicalDmlStatement) -> bool {
 	statement.targets.iter().any(|target| {
 		selector_contains_impure(&target.selector)
@@ -338,6 +344,7 @@ fn dml_contains_impure(statement: &LogicalDmlStatement) -> bool {
 	})
 }
 
+/// Returns whether the selector contains impure condition holds.
 fn selector_contains_impure(selector: &LogicalDmlSelector) -> bool {
 	match selector {
 		LogicalDmlSelector::Record(value) => expr_contains_impure(value),
@@ -345,6 +352,7 @@ fn selector_contains_impure(selector: &LogicalDmlSelector) -> bool {
 	}
 }
 
+/// Returns whether the data contains impure condition holds.
 fn data_contains_impure(data: &LogicalDmlData) -> bool {
 	match data {
 		LogicalDmlData::Content(value)
@@ -358,15 +366,12 @@ fn data_contains_impure(data: &LogicalDmlData) -> bool {
 	}
 }
 
+/// Returns whether the return contains impure condition holds.
 fn return_contains_impure(returning: &LogicalDmlReturn) -> bool {
 	match returning {
-		LogicalDmlReturn::Fields(values) => values.iter().any(|value| match value {
-			LogicalDmlReturnItem::Expr {
-				value,
-				..
-			} => expr_contains_impure(value),
-			LogicalDmlReturnItem::Wildcard => false,
-		}),
+		LogicalDmlReturn::Fields(values) => values
+			.iter()
+			.any(|field| field.as_ref().is_some_and(|field| expr_contains_impure(&field.value))),
 		LogicalDmlReturn::Value(value) => expr_contains_impure(value),
 		LogicalDmlReturn::None
 		| LogicalDmlReturn::Before
@@ -375,10 +380,12 @@ fn return_contains_impure(returning: &LogicalDmlReturn) -> bool {
 	}
 }
 
+/// Returns whether the expect contains impure condition holds.
 fn expect_contains_impure(expect: &LogicalExpect) -> bool {
 	matches!(expect, LogicalExpect::Predicate(value) if expr_contains_impure(value))
 }
 
+/// Returns whether the graph dml contains impure condition holds.
 fn graph_dml_contains_impure(statement: &LogicalGraphDmlStatement) -> bool {
 	match statement {
 		LogicalGraphDmlStatement::Attach {
@@ -389,13 +396,14 @@ fn graph_dml_contains_impure(statement: &LogicalGraphDmlStatement) -> bool {
 			record,
 			..
 		} => expr_contains_impure(&record.key),
-		LogicalGraphDmlStatement::Relate {
-			source,
-			edge,
-			target,
-			weight,
-			..
-		} => {
+		LogicalGraphDmlStatement::Relate(relate) => {
+			let crate::gql::ir::LogicalRelate {
+				source,
+				edge,
+				target,
+				weight,
+				..
+			} = relate.as_ref();
 			expr_contains_impure(source.expression())
 				|| expr_contains_impure(target.expression())
 				|| edge.key.as_ref().is_some_and(expr_contains_impure)
@@ -407,6 +415,7 @@ fn graph_dml_contains_impure(statement: &LogicalGraphDmlStatement) -> bool {
 	}
 }
 
+/// Matches contains impure.
 fn match_contains_impure(statement: &LogicalMatch) -> bool {
 	statement.patterns.iter().any(|pattern| match &pattern.kind {
 		crate::gql::ir::LogicalMatchPatternKind::Linear(pattern) => {
@@ -439,6 +448,7 @@ fn match_contains_impure(statement: &LogicalMatch) -> bool {
 		|| statement.projection.iter().any(expr_contains_impure)
 }
 
+/// Returns whether the binding contains impure condition holds.
 fn binding_contains_impure(binding: &crate::gql::ir::MatchBinding) -> bool {
 	let selector = match &binding.selector {
 		LogicalMatchSelector::Record(record) => expr_contains_impure(&record.key),
@@ -449,6 +459,7 @@ fn binding_contains_impure(binding: &crate::gql::ir::MatchBinding) -> bool {
 		|| binding.predicate.as_ref().is_some_and(expr_contains_impure)
 }
 
+/// Returns whether the select contains impure condition holds.
 fn select_contains_impure(statement: &LogicalSelect) -> bool {
 	statement.return_graph.as_deref().is_some_and(return_graph_contains_impure)
 		|| statement.union_inputs.iter().any(select_contains_impure)
@@ -482,6 +493,7 @@ fn select_contains_impure(statement: &LogicalSelect) -> bool {
 		|| statement.limit.as_ref().is_some_and(expr_contains_impure)
 }
 
+/// Returns whether the source contains impure condition holds.
 fn source_contains_impure(source: &LogicalSelectSource) -> bool {
 	match &source.kind {
 		LogicalSelectSourceKind::Empty {
@@ -510,6 +522,7 @@ fn source_contains_impure(source: &LogicalSelectSource) -> bool {
 	}
 }
 
+/// Returns whether the expr contains impure condition holds.
 fn expr_contains_impure(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Builtin {

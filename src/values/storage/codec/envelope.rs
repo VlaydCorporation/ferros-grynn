@@ -7,6 +7,7 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 pub struct ArchiveEnvelope;
 
 impl ArchiveEnvelope {
+	/// Returns wrap for `ArchiveEnvelope`.
 	pub fn wrap(schema_id: u32, payload: &[u8]) -> FerrosGrynnResult<AlignedVec> {
 		let payload_length = u64::try_from(payload.len()).map_err(|_err| {
 			FerrosGrynnError::invalid_archive_envelope("payload length exceeds u64")
@@ -30,6 +31,7 @@ impl ArchiveEnvelope {
 		Ok(bytes)
 	}
 
+	/// Performs the open operation for `ArchiveEnvelope`.
 	pub fn open(bytes: &[u8], expected_schema_id: u32) -> FerrosGrynnResult<&[u8]> {
 		if bytes.len() < ARCHIVE_HEADER_LEN {
 			return Err(FerrosGrynnError::invalid_archive_envelope("header is truncated"));
@@ -74,6 +76,8 @@ impl ArchiveEnvelope {
 		let payload = bytes
 			.get(ARCHIVE_HEADER_LEN..)
 			.ok_or_else(|| FerrosGrynnError::invalid_archive_envelope("payload is truncated"))?;
+		// A valid length and checksum do not make a borrowed archive suitably
+		// aligned.
 		if payload.as_ptr().align_offset(AlignedVec::<16>::ALIGNMENT) != 0 {
 			return Err(FerrosGrynnError::invalid_archive_envelope(
 				"payload is not aligned for the archive schema",
@@ -88,6 +92,7 @@ impl ArchiveEnvelope {
 	}
 }
 
+/// Returns envelope array for this module.
 fn envelope_array<const LENGTH: usize>(
 	bytes: &[u8],
 	offset: usize,
@@ -103,6 +108,7 @@ fn envelope_array<const LENGTH: usize>(
 	Ok(value)
 }
 
+/// Returns crc32 for this module.
 pub(super) fn crc32(bytes: &[u8]) -> u32 {
 	let mut crc = u32::MAX;
 	for byte in bytes {

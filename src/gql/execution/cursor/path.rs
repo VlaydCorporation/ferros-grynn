@@ -6,8 +6,11 @@ use super::*;
 
 /// Prefix-sharing path trace charged to the statement-wide barrier budget.
 pub(in crate::gql::execution) struct MatchPathTrace {
+	/// Arena associated with this match path trace.
 	arena: PathTraceArena,
+	/// Memory admission account retained with the owned data.
 	account: BarrierAccount,
+	/// Memory limit associated with this match path trace.
 	memory_limit: usize,
 }
 
@@ -79,13 +82,19 @@ impl MatchPathTrace {
 
 /// Starts one named path after its seed endpoint has been bound.
 pub(in crate::gql::execution) struct PathTraceStartCursor<'a, Graph> {
+	/// Input associated with this path trace start cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Graph associated with this path trace start cursor.
 	pub(in crate::gql::execution) graph: Rc<Graph>,
+	/// Graph ref associated with this path trace start cursor.
 	pub(in crate::gql::execution) graph_ref: Arc<GraphRef>,
+	/// Arena associated with this path trace start cursor.
 	pub(in crate::gql::execution) arena: Rc<RefCell<MatchPathTrace>>,
 }
 
 impl<Graph: GraphRead> RowCursor for PathTraceStartCursor<'_, Graph> {
+	/// Advances this `PathTraceStartCursor<'_, Graph>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		let Some(mut row) = self.input.next(control)? else {
 			return Ok(None);
@@ -116,14 +125,20 @@ impl<Graph: GraphRead> RowCursor for PathTraceStartCursor<'_, Graph> {
 /// Materializes a complete named linear pattern after all fixed and variable
 /// segments have appended their trace steps.
 pub(in crate::gql::execution) struct PathBindCursor<'a> {
+	/// Input associated with this path bind cursor.
 	pub(in crate::gql::execution) input: Box<dyn RowCursor + 'a>,
+	/// Arena associated with this path bind cursor.
 	pub(in crate::gql::execution) arena: Rc<RefCell<MatchPathTrace>>,
+	/// Column associated with this path bind cursor.
 	pub(in crate::gql::execution) column: usize,
+	/// Origin associated with this path bind cursor.
 	pub(in crate::gql::execution) origin: crate::values::Uuid,
+	/// Snapshot associated with this path bind cursor.
 	pub(in crate::gql::execution) snapshot: crate::graph::SnapshotId,
 }
 
 impl RowCursor for PathBindCursor<'_> {
+	/// Advances this `PathBindCursor<'_>` and returns its next element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		let Some(mut row) = self.input.next(control)? else {
 			return Ok(None);
@@ -354,6 +369,8 @@ impl<Graph: GraphRead> PathExpandCursor<'_, Graph> {
 }
 
 impl<Graph: GraphRead> RowCursor for PathExpandCursor<'_, Graph> {
+	/// Advances this `PathExpandCursor<'_, Graph>` and returns its next
+	/// element, if any.
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
 			control.check()?;
@@ -391,8 +408,7 @@ impl<Graph: GraphRead> RowCursor for PathExpandCursor<'_, Graph> {
 						})?,
 						endpoint,
 						&self.hops,
-						self.graph.as_ref(),
-						&self.graph_ref,
+						(self.graph.as_ref(), &self.graph_ref),
 						self.predicate,
 						control,
 						self.trace.as_ref(),
@@ -446,12 +462,13 @@ pub(in crate::gql::execution) fn path_row<Graph: GraphRead>(
 	first: AtomId,
 	target: AtomId,
 	hops: &[TraversalCandidate],
-	graph: &Graph,
-	graph_ref: &Arc<GraphRef>,
+	graph_view: (&Graph, &Arc<GraphRef>),
 	predicate: MatchPredicateContext<'_>,
 	control: &ExecutionControl,
 	trace: Option<&Rc<RefCell<MatchPathTrace>>>,
 ) -> FerrosGrynnResult<Option<Row>> {
+	let (graph, graph_ref) = graph_view;
+
 	let mut row = input.clone();
 	let graph_id = graph_ref.id();
 	for (index, hop) in hops.iter().enumerate() {

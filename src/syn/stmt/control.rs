@@ -78,6 +78,7 @@ pub struct AssertInvariantsStatement {
 }
 
 impl Parser<'_> {
+	/// Parses the block syntax.
 	pub(in crate::syn) async fn block(&mut self, context: &mut Stk) -> FerrosGrynnResult<Block> {
 		let open = self.expect_symbol(Symbol::LeftBrace, "Expected `{` to open a block.")?;
 		let mut statements = Vec::new();
@@ -104,6 +105,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the if statement syntax.
 	pub(in crate::syn) async fn if_statement(
 		&mut self,
 		context: &mut Stk,
@@ -129,6 +131,7 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses the for statement syntax.
 	pub(in crate::syn) async fn for_statement(
 		&mut self,
 		context: &mut Stk,
@@ -147,6 +150,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the while statement syntax.
 	pub(in crate::syn) async fn while_statement(
 		&mut self,
 		context: &mut Stk,
@@ -161,6 +165,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Attempts statement.
 	pub(in crate::syn) async fn try_statement(
 		&mut self,
 		context: &mut Stk,
@@ -186,6 +191,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the assert invariants statement syntax.
 	pub(in crate::syn) fn assert_invariants_statement(
 		&mut self,
 	) -> FerrosGrynnResult<AssertInvariantsStatement> {
@@ -213,6 +219,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the if expression syntax.
 	pub(in crate::syn) async fn if_expression(
 		&mut self,
 		context: &mut Stk,
@@ -239,6 +246,7 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Parses the case expression syntax.
 	pub(in crate::syn) async fn case_expression(
 		&mut self,
 		context: &mut Stk,

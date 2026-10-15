@@ -77,10 +77,12 @@ fn occurrence(id: u64, name: &str, kind: AtomKind) -> FerrosGrynnResult<AtomOccu
 /// Independent tags/counts and exact large positions survive checked
 /// whole-commit history without consulting current records.
 #[test]
-fn live_composite_history_golden_roundtrip_and_limits() -> FerrosGrynnResult<()> {
+fn live_composite_history_golden_roundtrip_and_limits() {
+	use crate::test_assertions::AssertResult as _;
+
 	let identity = LiveIdentity::Composite(vec![
-		LiveIdentityPart::Record("item:a".parse()?),
-		LiveIdentityPart::Occurrence(occurrence(1, "original", AtomKind::Edge)?),
+		LiveIdentityPart::Record("item:a".parse().assert_ok()),
+		LiveIdentityPart::Occurrence(occurrence(1, "original", AtomKind::Edge).assert_ok()),
 		LiveIdentityPart::Unmatched,
 		LiveIdentityPart::Split(u64::MAX),
 	]);
@@ -90,11 +92,12 @@ fn live_composite_history_golden_roundtrip_and_limits() -> FerrosGrynnResult<()>
 		&mut encoded,
 		&identity,
 		&mut context,
-		&mut CodecBudget::new(1 << 20, 0)?,
+		&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 		&mut Work {
 			remaining: MAX_NODES,
 		},
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(&encoded[..6], &[3, 4, 0, 0, 0, 0]);
 	assert_eq!(&encoded[encoded.len() - 10..encoded.len() - 8], &[2, 3]);
 	assert_eq!(&encoded[encoded.len() - 8..], &u64::MAX.to_le_bytes());
@@ -108,7 +111,7 @@ fn live_composite_history_golden_roundtrip_and_limits() -> FerrosGrynnResult<()>
 			},
 		)
 	};
-	assert_eq!(decode_body(&encoded, 1 << 20, MAX_NODES)?, identity);
+	assert_eq!(decode_body(&encoded, 1 << 20, MAX_NODES).assert_ok(), identity);
 	assert!(decode_body(&encoded, 1 << 20, 3).is_err());
 	assert!(decode_body(&encoded, 1, MAX_NODES).is_err());
 	for length in 0..encoded.len() {
@@ -129,30 +132,35 @@ fn live_composite_history_golden_roundtrip_and_limits() -> FerrosGrynnResult<()>
 			&mut writer,
 			&identity,
 			&mut EncodeContext::default(),
-			&mut CodecBudget::new(1, 0)?,
+			&mut CodecBudget::new(1, 0).assert_ok(),
 			&mut Work {
 				remaining: MAX_NODES
 			}
 		)
 		.is_err()
 	);
-	let mut original = batch()?;
+	let mut original = batch().assert_ok();
 	original.events[0].identity = identity;
 	original.events[0].before = Some(Value::from("same"));
 	original.events[0].after = Some(Value::from("changed"));
-	let frame = bytes(&original)?;
-	let LivePayload::Batch(restored) = decode(&frame, 8 << 20)? else {
-		return Err(invalid("composite result history lost its batch"));
+	let frame = bytes(&original).assert_ok();
+	let LivePayload::Batch(restored) = decode(&frame, 8 << 20).assert_ok() else {
+		return {
+			let test_result: FerrosGrynnResult<()> =
+				Err(invalid("composite result history lost its batch"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(restored, original);
-	assert_eq!(bytes(&restored)?, frame);
-	Ok(())
+	assert_eq!(bytes(&restored).assert_ok(), frame);
 }
 
 /// Shape validation is shared by encoding and decoding, before publication.
 #[test]
-fn live_composite_history_rejects_noncanonical_shapes() -> FerrosGrynnResult<()> {
-	let record: crate::values::RecordId = "item:a".parse()?;
+fn live_composite_history_rejects_noncanonical_shapes() {
+	use crate::test_assertions::AssertResult as _;
+
+	let record: crate::values::RecordId = "item:a".parse().assert_ok();
 	let invalid_parts = [
 		vec![],
 		vec![LiveIdentityPart::Record(record.clone())],
@@ -171,7 +179,7 @@ fn live_composite_history_rejects_noncanonical_shapes() -> FerrosGrynnResult<()>
 				&mut encoded,
 				&LiveIdentity::Composite(parts.clone()),
 				&mut context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					remaining: MAX_NODES
 				}
@@ -180,22 +188,32 @@ fn live_composite_history_rejects_noncanonical_shapes() -> FerrosGrynnResult<()>
 		);
 		assert!(encoded.is_empty(), "invalid shape is rejected before writing its identity");
 		let mut malformed = vec![3];
-		canonical::write_count(&mut malformed, parts.len(), &mut CodecBudget::new(1 << 20, 0)?)?;
+		canonical::write_count(
+			&mut malformed,
+			parts.len(),
+			&mut CodecBudget::new(1 << 20, 0).assert_ok(),
+		)
+		.assert_ok();
 		for part in parts {
 			match part {
 				LiveIdentityPart::Record(record) => encode_record_identity(
 					&mut malformed,
 					&record,
 					&mut context,
-					&mut CodecBudget::new(1 << 20, 0)?,
-				)?,
+					&mut CodecBudget::new(1 << 20, 0).assert_ok(),
+				)
+				.assert_ok(),
 				LiveIdentityPart::Unmatched => malformed.push(2),
 				LiveIdentityPart::Split(position) => {
 					malformed.push(3);
 					malformed.extend_from_slice(&position.to_le_bytes());
 				}
 				LiveIdentityPart::Occurrence(_) => {
-					return Err(invalid("unexpected invalid fixture"));
+					return {
+						let test_result: FerrosGrynnResult<()> =
+							Err(invalid("unexpected invalid fixture"));
+						test_result.assert_ok();
+					};
 				}
 			}
 		}
@@ -203,7 +221,7 @@ fn live_composite_history_rejects_noncanonical_shapes() -> FerrosGrynnResult<()>
 			decode_identity(
 				&mut Decoder::new(&malformed),
 				&context,
-				&mut CodecBudget::new(1 << 20, 0)?,
+				&mut CodecBudget::new(1 << 20, 0).assert_ok(),
 				&mut Work {
 					remaining: MAX_NODES
 				}
@@ -211,15 +229,16 @@ fn live_composite_history_rejects_noncanonical_shapes() -> FerrosGrynnResult<()>
 			.is_err()
 		);
 	}
-	Ok(())
 }
 
 /// Header bytes are independent golden assertions, not encoder/decoder
 /// agreement.
 #[test]
-fn live_history_header_golden_and_exact_none() -> FerrosGrynnResult<()> {
-	let original = batch()?;
-	let encoded = bytes(&original)?;
+fn live_history_header_golden_and_exact_none() {
+	use crate::test_assertions::AssertResult as _;
+
+	let original = batch().assert_ok();
+	let encoded = bytes(&original).assert_ok();
 	assert_eq!(&encoded[..8], b"FGLB\x02\x00\x00\x00");
 	assert_eq!(&encoded[8..24], &[0x11; 16]);
 	assert_eq!(&encoded[24..32], &7_u64.to_le_bytes());
@@ -227,37 +246,45 @@ fn live_history_header_golden_and_exact_none() -> FerrosGrynnResult<()> {
 	assert_eq!(&encoded[40..56], &100_i128.to_le_bytes());
 	assert_eq!(&encoded[56..64], &[1, 0, 0, 0, 1, 0, 0, 0]);
 	assert_eq!(&encoded[80..96], &[0; 16]);
-	let LivePayload::Batch(restored) = decode(&encoded, 8 * 1024 * 1024)? else {
-		return Err(invalid("fixture batch kind"));
+	let LivePayload::Batch(restored) = decode(&encoded, 8 * 1024 * 1024).assert_ok() else {
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture batch kind"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(restored, original);
 	assert_eq!(restored.events()[0].before(), None);
 	assert_eq!(restored.events()[0].after(), Some(&Value::None));
-	assert_eq!(inspect(&encoded[..96], encoded.len() as u64)?.stamp, original.versionstamp().get());
-	Ok(())
+	assert_eq!(
+		inspect(&encoded[..96], encoded.len() as u64).assert_ok().stamp,
+		original.versionstamp().get()
+	);
 }
 
 /// The computed envelope uses existing continuation pages and one aggregate
 /// decode cap, including page buffers and the restored owned result.
 #[test]
-fn live_history_shared_continuations_keep_whole_commit_and_budget() -> FerrosGrynnResult<()> {
-	use crate::storage::{
-		HistoryOwner,
-		history_codec::pages::{
-			SegmentHeader,
-			decode_header,
-			decode_pages,
-			encode_header,
-			encode_pages,
+fn live_history_shared_continuations_keep_whole_commit_and_budget() {
+	use crate::{
+		storage::{
+			HistoryOwner,
+			history_codec::pages::{
+				SegmentHeader,
+				decode_header,
+				decode_pages,
+				encode_header,
+				encode_pages,
+			},
+			page::AlignedPage,
 		},
-		page::AlignedPage,
+		test_assertions::AssertResult as _,
 	};
-	let mut original = batch()?;
+	let mut original = batch().assert_ok();
 	original.events[0].after = Some(Value::from("x".repeat(33 * 1024)));
-	let encoded = bytes(&original)?;
-	let mut write_budget = CodecBudget::new(8 * 1024 * 1024, encoded.len())?;
+	let encoded = bytes(&original).assert_ok();
+	let mut write_budget = CodecBudget::new(8 * 1024 * 1024, encoded.len()).assert_ok();
 	let (locator, pages) =
-		encode_pages(&encoded, original.versionstamp().get(), 1, &mut write_budget)?;
+		encode_pages(&encoded, original.versionstamp().get(), 1, &mut write_budget).assert_ok();
 	assert!(locator.pages > 1);
 	let header = SegmentHeader {
 		database: uuid::Uuid::from_u128(1),
@@ -271,8 +298,8 @@ fn live_history_shared_continuations_keep_whole_commit_and_budget() -> FerrosGry
 		last_time: 100,
 	};
 	let mut page = AlignedPage::zeroed();
-	encode_header(header, &mut page)?;
-	assert_eq!(decode_header(&page)?, header);
+	encode_header(header, &mut page).assert_ok();
+	assert_eq!(decode_header(&page).assert_ok(), header);
 	let read = |number: crate::storage::page::PageNo, output: &mut AlignedPage| {
 		let index =
 			usize::try_from(number.get() - 1).map_err(|_error| invalid("fixture page index"))?;
@@ -280,18 +307,23 @@ fn live_history_shared_continuations_keep_whole_commit_and_budget() -> FerrosGry
 		output.as_bytes_mut().copy_from_slice(source.as_bytes());
 		Ok(())
 	};
-	let mut budget = CodecBudget::new(8 * 1024 * 1024, crate::storage::PAGE_SIZE)?;
+	let mut budget = CodecBudget::new(8 * 1024 * 1024, crate::storage::PAGE_SIZE).assert_ok();
 	let restored_bytes = decode_pages(
 		locator,
 		header.pages,
 		&mut |number, output| read(number, output),
 		&mut budget,
-	)?;
-	let LivePayload::Batch(restored) = decode_bounded(&restored_bytes, &mut budget)? else {
-		return Err(invalid("fixture batch kind"));
+	)
+	.assert_ok();
+	let LivePayload::Batch(restored) = decode_bounded(&restored_bytes, &mut budget).assert_ok()
+	else {
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture batch kind"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(restored, original);
-	let mut budget = CodecBudget::new(encoded.len() + 2 * crate::storage::PAGE_SIZE, 0)?;
+	let mut budget = CodecBudget::new(encoded.len() + 2 * crate::storage::PAGE_SIZE, 0).assert_ok();
 	let rejection = decode_pages(
 		locator,
 		header.pages,
@@ -300,16 +332,17 @@ fn live_history_shared_continuations_keep_whole_commit_and_budget() -> FerrosGry
 	)
 	.and_then(|bytes| decode_bounded(&bytes, &mut budget));
 	assert!(rejection.is_err(), "payload decode cannot reset the complete page admission");
-	Ok(())
 }
 
 /// Qualified paths and nested rows retain captured descriptors after schema
 /// changes.
 #[test]
-fn live_history_nested_qualified_path_and_numeric_representations() -> FerrosGrynnResult<()> {
-	let mut original = batch()?;
-	let left = occurrence(1, "historical-before-rename", AtomKind::Node)?;
-	let right = occurrence(2, "child-before-rename", AtomKind::Edge)?;
+fn live_history_nested_qualified_path_and_numeric_representations() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut original = batch().assert_ok();
+	let left = occurrence(1, "historical-before-rename", AtomKind::Node).assert_ok();
+	let right = occurrence(2, "child-before-rename", AtomKind::Edge).assert_ok();
 	let path = Path::new(
 		original.id().as_uuid(),
 		SnapshotId::new(44, 3),
@@ -343,23 +376,34 @@ fn live_history_nested_qualified_path_and_numeric_representations() -> FerrosGry
 			after: None,
 		},
 	];
-	let LivePayload::Batch(restored) = decode(&bytes(&original)?, 8 * 1024 * 1024)? else {
-		return Err(invalid("fixture batch kind"));
+	let LivePayload::Batch(restored) =
+		decode(&bytes(&original).assert_ok(), 8 * 1024 * 1024).assert_ok()
+	else {
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture batch kind"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(restored, original);
 	assert!(crate::values::runtime::same_value(
-		restored.events[0].after.as_ref().ok_or_else(|| invalid("fixture image"))?,
-		original.events[0].after.as_ref().ok_or_else(|| invalid("fixture image"))?
+		restored.events[0].after.as_ref().ok_or_else(|| invalid("fixture image")).assert_ok(),
+		original.events[0].after.as_ref().ok_or_else(|| invalid("fixture image")).assert_ok()
 	));
 	let Value::Object(row) =
-		restored.events[0].after.as_ref().ok_or_else(|| invalid("fixture row"))?
+		restored.events[0].after.as_ref().ok_or_else(|| invalid("fixture row")).assert_ok()
 	else {
-		return Err(invalid("fixture object"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture object"));
+			test_result.assert_ok();
+		};
 	};
 	assert!(matches!(row.get("int"), Some(Value::Number(Number::Int(1)))));
 	assert!(matches!(row.get("float"), Some(Value::Number(Number::Float(_)))));
 	let Some(Value::Path(path)) = row.get("path") else {
-		return Err(invalid("fixture path"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture path"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(path.steps()[0].atom().graph().name(), "historical-before-rename");
 	assert_eq!(
@@ -368,15 +412,16 @@ fn live_history_nested_qualified_path_and_numeric_representations() -> FerrosGry
 	);
 	assert_eq!(path.snapshot(), SnapshotId::new(44, 3));
 	assert!(matches!(path.cost(), Some(Number::Int(9_007_199_254_740_993))));
-	Ok(())
 }
 
 /// Every truncation and nonzero reserved header byte is rejected before rows
 /// escape.
 #[test]
-fn live_history_malformed_lengths_reserved_and_admission() -> FerrosGrynnResult<()> {
-	let original = batch()?;
-	let encoded = bytes(&original)?;
+fn live_history_malformed_lengths_reserved_and_admission() {
+	use crate::test_assertions::AssertResult as _;
+
+	let original = batch().assert_ok();
+	let encoded = bytes(&original).assert_ok();
 	for length in 0..encoded.len() {
 		assert!(decode(&encoded[..length], 8 * 1024 * 1024).is_err(), "prefix {length}");
 	}
@@ -410,13 +455,14 @@ fn live_history_malformed_lengths_reserved_and_admission() -> FerrosGrynnResult<
 	let mut malformed = encoded;
 	malformed.push(0);
 	assert!(decode(&malformed, 8 * 1024 * 1024).is_err());
-	Ok(())
 }
 
 /// Order, clocks and optional images are validated independently of encoding.
 #[test]
-fn live_history_rejects_invalid_net_order_and_clocks() -> FerrosGrynnResult<()> {
-	let mut original = batch()?;
+fn live_history_rejects_invalid_net_order_and_clocks() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut original = batch().assert_ok();
 	original.events[0].ordinal = 1;
 	assert!(bytes(&original).is_err());
 	original.events[0].ordinal = 0;
@@ -429,13 +475,14 @@ fn live_history_rejects_invalid_net_order_and_clocks() -> FerrosGrynnResult<()> 
 	original.bindings[0].value = original.versionstamp();
 	original.events[0].after = None;
 	assert!(bytes(&original).is_err());
-	Ok(())
 }
 
 /// Faults and unknown bounds remain explicit whole-commit control deliveries.
 #[test]
-fn live_history_control_gap_and_fault_roundtrip() -> FerrosGrynnResult<()> {
-	let original = batch()?;
+fn live_history_control_gap_and_fault_roundtrip() {
+	use crate::test_assertions::AssertResult as _;
+
+	let original = batch().assert_ok();
 	let gap = LiveGap {
 		id: original.id(),
 		reason: LiveGapReason::EvaluationFault,
@@ -447,7 +494,8 @@ fn live_history_control_gap_and_fault_roundtrip() -> FerrosGrynnResult<()> {
 		"query",
 		crate::gql_status::TextSpan::new(0, 5),
 	)
-	.map_err(|_error| invalid("fixture location"))?;
+	.map_err(|_error| invalid("fixture location"))
+	.assert_ok();
 	let cause = FerrosGrynnError::storage_decode_limit_exceeded(
 		"LIVE result bytes",
 		(1_u64 << 53) + 17,
@@ -474,20 +522,27 @@ fn live_history_control_gap_and_fault_roundtrip() -> FerrosGrynnResult<()> {
 		original.versionstamp().get(),
 		100,
 		64 * 1024,
-	)?;
+	)
+	.assert_ok();
 	let LivePayload::Fault {
 		diagnostic: original_diagnostic,
 		..
 	} = &payload
 	else {
-		return Err(invalid("fixture fault kind"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture fault kind"));
+			test_result.assert_ok();
+		};
 	};
 	let LivePayload::Fault {
 		diagnostic,
 		gap: restored,
-	} = decode(&encoded, 64 * 1024)?
+	} = decode(&encoded, 64 * 1024).assert_ok()
 	else {
-		return Err(invalid("fixture fault"));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(invalid("fixture fault"));
+			test_result.assert_ok();
+		};
 	};
 	assert_eq!(restored, gap);
 	assert_eq!(diagnostic.status().code().to_string(), "FG-G1F09");
@@ -496,6 +551,5 @@ fn live_history_control_gap_and_fault_roundtrip() -> FerrosGrynnResult<()> {
 		original_diagnostic.to_wire(),
 		"typed cause parameters and metadata survive replay exactly"
 	);
-	assert_eq!(inspect(&encoded, encoded.len() as u64)?.events, 0);
-	Ok(())
+	assert_eq!(inspect(&encoded, encoded.len() as u64).assert_ok().events, 0);
 }

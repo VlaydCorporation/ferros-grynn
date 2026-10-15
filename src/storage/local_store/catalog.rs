@@ -52,6 +52,7 @@ use crate::{
 	},
 };
 
+/// Encodes database catalog.
 pub(super) fn encode_database_catalog(
 	root: &DatabaseRoot,
 	atom_store: AtomStoreCatalogBinding,
@@ -324,7 +325,7 @@ pub(super) fn encode_database_catalog(
 
 	Ok(DatabaseCatalog {
 		bridges: root.bridges.physical,
-		event_outbox_segments: root.event_outbox_segments().as_ref().clone(),
+		event_outbox_segments: root.event_outbox_segments().to_vec(),
 		events: root.schema.events().map(|event| event.as_ref().clone()).collect(),
 		database_uuid: root.database_uuid,
 		committed_at_ns: root.committed_at_ns,
@@ -625,6 +626,7 @@ pub(super) fn decode_live_segments(
 	)
 }
 
+/// Encodes analyzer filter.
 fn encode_analyzer_filter(
 	filter: &AnalyzerFilter,
 	context: &mut EncodeContext,
@@ -660,10 +662,13 @@ fn encode_analyzer_filter(
 	})
 }
 
+/// Decodes schema.
 pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<SchemaCatalog> {
-	let mut schema = SchemaCatalog::default();
-	schema.next_schema_id = catalog.next_schema_id;
-	schema.next_graph_id = catalog.next_graph_id;
+	let mut schema = SchemaCatalog {
+		next_schema_id: catalog.next_schema_id,
+		next_graph_id: catalog.next_graph_id,
+		..Default::default()
+	};
 	for entry in &catalog.classes {
 		let fields = entry
 			.fields
@@ -773,6 +778,7 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 	Ok(schema)
 }
 
+/// Decodes catalog values.
 pub(super) fn decode_catalog_values(
 	catalog: &DatabaseCatalog,
 	dictionary: &PropertyDictionary,
@@ -875,6 +881,7 @@ pub(super) fn decode_catalog_values(
 	Ok(())
 }
 
+/// Decodes analyzer filter.
 fn decode_analyzer_filter(
 	filter: &AnalyzerFilterCatalogEntry,
 	context: &crate::values::storage::DecodeContext<'_>,
@@ -920,6 +927,7 @@ fn decode_analyzer_filter(
 	})
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

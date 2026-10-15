@@ -45,6 +45,7 @@ pub struct LiveSubscription {
 }
 
 impl std::fmt::Debug for LiveSubscription {
+	/// Formats `LiveSubscription` using the requested formatter.
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("LiveSubscription")
 			.field("id", &self.id())

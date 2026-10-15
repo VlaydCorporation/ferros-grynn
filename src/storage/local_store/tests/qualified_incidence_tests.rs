@@ -10,6 +10,8 @@ use crate::{
 
 /// Backend parity includes a recovered external connector and BUILD overwrite.
 fn reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::test_assertions::AssertCondition as _;
+
 	let directory = TestDirectory::new();
 	let options = LocalOptions {
 		io_mode: mode,
@@ -44,28 +46,33 @@ fn reopen(mode: IoMode) -> FerrosGrynnResult<()> {
 	let reopened = Datastore::open_local(&directory.0, options)?;
 	let mut remove = reopened.begin();
 	remove.detach_occurrence(child.id(), &"item:leaf".parse()?, false)?;
-	assert!(remove.commit().is_err());
+	(remove.commit().is_err()).assert_true();
 	let result = reopened.execute(
 		"BUILD GRAPH OVERWRITE <GRAPH> child FROM (MATCH (item:other AS p) IN GRAPH replacement \
 		 RETURN p) NODES p;",
 		&Object::new(),
 	)?;
-	assert!(result[0].result.is_err(), "{result:?}");
-	assert!(reopened.begin().membership(child.id(), &"item:leaf".parse()?)?.is_some());
-	assert!(reopened.begin().membership(child.id(), &"item:other".parse()?)?.is_none());
+	(result[0].result.is_err()).assert_true_with(|| format!("{result:?}"));
+	(reopened.begin().membership(child.id(), &"item:leaf".parse()?)?.is_some()).assert_true();
+	(reopened.begin().membership(child.id(), &"item:other".parse()?)?.is_none()).assert_true();
 	drop(reopened);
 	let recovered = Datastore::open_local(&directory.0, options)?;
-	assert!(recovered.begin().membership(parent.id(), &"link:connector".parse()?)?.is_some());
-	assert!(recovered.begin().membership(child.id(), &"item:leaf".parse()?)?.is_some());
+	(recovered.begin().membership(parent.id(), &"link:connector".parse()?)?.is_some())
+		.assert_true();
+	(recovered.begin().membership(child.id(), &"item:leaf".parse()?)?.is_some()).assert_true();
 	Ok(())
 }
 
+/// Verifies qualified incidence local sync reopen rejects dangling and
+/// overwrite alias.
 #[test]
 fn qualified_incidence_local_sync_reopen_rejects_dangling_and_overwrite_alias()
 -> FerrosGrynnResult<()> {
 	reopen(IoMode::Sync)
 }
 
+/// Verifies qualified incidence local native reopen rejects dangling and
+/// overwrite alias.
 #[cfg(feature = "native-async-io")]
 #[test]
 fn qualified_incidence_local_native_reopen_rejects_dangling_and_overwrite_alias()

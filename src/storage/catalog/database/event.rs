@@ -144,6 +144,7 @@ fn read_text(
 }
 
 #[cfg(test)]
+/// Regression tests for event behavior.
 mod tests {
 	use super::*;
 
@@ -157,44 +158,48 @@ mod tests {
 		Ok(event)
 	}
 
+	/// Verifies event descriptor golden and policy round trip.
 	#[test]
-	fn event_descriptor_golden_and_policy_round_trip() -> FerrosGrynnResult<()> {
-		let event = fixture()?;
+	fn event_descriptor_golden_and_policy_round_trip() {
+		use crate::test_assertions::AssertResult as _;
+
+		let event = fixture().assert_ok();
 		let mut bytes = Vec::new();
-		encode(&mut bytes, &event)?;
+		encode(&mut bytes, &event).assert_ok();
 		let expected = [
 			3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 16, 2, 0, 0, 0, 0, 0, 0, 0,
 			1, 0, 0, 0, b'a', 0, 4, 0, 0, 0, b't', b'r', b'u', b'e', 1, 0, 0, 0, b'1',
 		];
 		assert_eq!(bytes.as_slice(), expected);
 		let mut decoder = Decoder::new(&bytes);
-		let mut budget = CodecBudget::new(1024 * 1024, bytes.len())?;
-		assert_eq!(decode(&mut decoder, &mut budget)?, event);
-		decoder.finish()?;
-		Ok(())
+		let mut budget = CodecBudget::new(1024 * 1024, bytes.len()).assert_ok();
+		assert_eq!(decode(&mut decoder, &mut budget).assert_ok(), event);
+		decoder.finish().assert_ok();
 	}
 
+	/// Verifies event descriptor rejects unknown flags depth and lengths.
 	#[test]
-	fn event_descriptor_rejects_unknown_flags_depth_and_lengths() -> FerrosGrynnResult<()> {
+	fn event_descriptor_rejects_unknown_flags_depth_and_lengths() {
+		use crate::test_assertions::AssertResult as _;
+
 		let mut bytes = Vec::new();
-		encode(&mut bytes, &fixture()?)?;
+		encode(&mut bytes, &fixture().assert_ok()).assert_ok();
 		for (offset, value) in [(16, 2), (17, 2), (19, 17)] {
 			let mut invalid = bytes.clone();
 			invalid[offset] = value;
 			let mut decoder = Decoder::new(&invalid);
-			let mut budget = CodecBudget::new(1024 * 1024, invalid.len())?;
+			let mut budget = CodecBudget::new(1024 * 1024, invalid.len()).assert_ok();
 			assert!(decode(&mut decoder, &mut budget).is_err());
 		}
 		let mut oversized = bytes.clone();
 		oversized[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
 		let mut decoder = Decoder::new(&oversized);
-		let mut budget = CodecBudget::new(1024 * 1024, oversized.len())?;
+		let mut budget = CodecBudget::new(1024 * 1024, oversized.len()).assert_ok();
 		assert!(decode(&mut decoder, &mut budget).is_err());
 		for length in 0..bytes.len() {
 			let mut decoder = Decoder::new(&bytes[..length]);
-			let mut budget = CodecBudget::new(1024 * 1024, length)?;
+			let mut budget = CodecBudget::new(1024 * 1024, length).assert_ok();
 			assert!(decode(&mut decoder, &mut budget).is_err());
 		}
-		Ok(())
 	}
 }

@@ -68,243 +68,17 @@ struct Recipe<'analyzer, 'catalog> {
 /// Registration-only freezing remains separate from durable scope recipes.
 enum GraphScope {
 	/// A named graph binds its stable identity during analysis.
-	Static(crate::values::GraphRef),
+	Static(
+		/// A named graph binds its stable identity during analysis.
+		crate::values::GraphRef,
+	),
 	/// A root ordinary parameter is reified at registration execution.
 	Frozen,
 	/// Read-only scope evaluation follows the normal query pipeline.
-	Expression(LiveExpr),
-}
-
-#[cfg(test)]
-mod tests {
-	use std::collections::{BTreeMap, BTreeSet};
-
-	use super::{Analyzer, Recipe};
-	use crate::{
-		datastore::{BindingAdmission, ClassField, ClassSchema, Datastore},
-		gql::root_catalog::RootCatalog,
-		gql_status::{FerrosGrynnError, FerrosGrynnResult},
-		graph::AtomKind,
-		live::LiveBindingOptions,
-		syn::{ParserSettings, StatementKind, parse},
-		values::{Object, Type},
-	};
-
-	/// Runs the real converter with tighter scratch before ordinary analysis.
-	fn convert(store: &Datastore, source: &str, bytes: usize) -> FerrosGrynnResult<()> {
-		let root = store.inner.current_root();
-		let catalog = RootCatalog(&root);
-		let variables = Object::new();
-		let analyzer = Analyzer::new(source, &catalog, &variables, &BTreeSet::new());
-		let program = parse(source, ParserSettings::default())?;
-		let StatementKind::LiveSelect(statement) = &program.statements[0].kind else {
-			return Err(FerrosGrynnError::invalid_argument("LIVE recipe fixture missing"));
-		};
-		let options = LiveBindingOptions::default().with_budgets(bytes, 1_000_000)?;
-		let mut recipe = Recipe {
-			analyzer: &analyzer,
-			captures: BTreeMap::new(),
-			operand_slots: BTreeMap::new(),
-			budget: BindingAdmission::new(&options),
-			frozen_graphs: Vec::new(),
-		};
-		let _query = recipe.select(&statement.select, program.statements[0].span, 0)?;
-		Ok(())
-	}
-
-	/// Repeated rich types and long qualifier copies spend the shared cap.
-	#[test]
-	fn live_gql_recipe_admission_counts_types_aliases_and_record_keys() -> FerrosGrynnResult<()> {
-		let store = Datastore::in_memory();
-		let mut setup = store.begin();
-		let shape = Type::RecordShape(
-			(0..8).map(|index| (format!("field_{index:064}").into(), Type::Int)).collect(),
-		);
-		setup.define_class(ClassSchema::new("person", AtomKind::Node, [ClassField::new(
-			"details", shape,
-		)])?)?;
-		setup.commit()?;
-		assert!(convert(&store, "LIVE SELECT details FROM person;", 320 * 1024).is_ok());
-		let items = vec!["details"; 200].join(", ");
-		assert!(convert(&store, &format!("LIVE SELECT {items} FROM person;"), 320 * 1024).is_err());
-		let alias = "a".repeat(64 * 1024);
-		assert!(
-			convert(&store, &format!("LIVE SELECT * FROM person AS `{alias}`;"), 320 * 1024)
-				.is_err()
-		);
-		let large = "a".repeat(128 * 1024);
-		assert!(
-			convert(&store, &format!("LIVE SELECT * FROM person:'{large}';"), 320 * 1024).is_err()
-		);
-		Ok(())
-	}
-
-	/// Type-name parsing is admitted before lowercase/type recursion, including
-	/// inactive expressions and the highest supported generic nesting.
-	#[test]
-	fn live_recipe_cast_type_admission() -> FerrosGrynnResult<()> {
-		let store = Datastore::in_memory();
-		let mut setup = store.begin();
-		setup.define_class(ClassSchema::new("person", AtomKind::Node, [ClassField::new(
-			"age",
-			Type::Int,
-		)])?)?;
-		setup.commit()?;
-		for depth in [0, 1, 64] {
-			let target = format!("{}int{}", "option<".repeat(depth), ">".repeat(depth));
-			convert(
-				&store,
-				&format!("LIVE SELECT VALUE IF false THEN <{target}>age ELSE 0 END FROM person;"),
-				16 * 1024 * 1024,
-			)?;
-		}
-		let large = "a".repeat(128 * 1024);
-		assert!(
-			convert(&store, &format!("LIVE SELECT VALUE <{large}>age FROM person;"), 320 * 1024)
-				.is_err()
-		);
-		let target = format!("{}int{}", "option<".repeat(65), ">".repeat(65));
-		let error = convert(
-			&store,
-			&format!("LIVE SELECT VALUE <{target}>age FROM person;"),
-			16 * 1024 * 1024,
-		)
-		.err()
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("overdeep GQL cast admitted"))?;
-		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
-		Ok(())
-	}
-
-	/// Text preflight rejects oversized first-use PURE bodies without filling
-	/// the long-lived session cache, including SINCE/BUFFER expressions.
-	#[test]
-	fn live_gql_preflight_bounds_first_use_functions_and_options() -> FerrosGrynnResult<()> {
-		let store = Datastore::in_memory();
-		for result in store.execute(
-			"DEFINE CLASS person TYPE NODE; DEFINE PURE FUNCTION fn::age() -> int { RETURN 18; };",
-			&Object::new(),
-		)? {
-			result.result?;
-		}
-		let root = store.inner.current_root();
-		let catalog = RootCatalog(&root);
-		let control = crate::gql::ExecutionControl::new(
-			&crate::gql::QueryExecutionOptions {
-				barrier_memory_bytes: std::num::NonZeroUsize::new(1024 * 1024).ok_or_else(
-					|| FerrosGrynnError::invalid_argument("fixture compiler budget is zero"),
-				)?,
-				..crate::gql::QueryExecutionOptions::default()
-			},
-			None,
-		);
-		for source in [
-			"LIVE SELECT VALUE fn::age() FROM person;",
-			"LIVE SELECT * FROM person BUFFER fn::age();",
-		] {
-			let program = parse(source, ParserSettings::default())?;
-			let (logical, _) = super::super::analyze_statement_with_runtime(
-				&program.statements[0],
-				source,
-				&catalog,
-				&Object::new(),
-				&BTreeSet::new(),
-				&control,
-			)?;
-			assert_eq!(logical.statements.len(), 1);
-			if source.contains("VALUE") {
-				assert!(!control.function_cache().has_entries());
-			}
-		}
-		let mut setup = store.begin();
-		setup.define_function(crate::datastore::SchemaFunction::new(
-			"fn",
-			"large",
-			Vec::new(),
-			Type::Int,
-			crate::datastore::FunctionEffect::Pure,
-			false,
-			None,
-			format!("{{ /* {} */ RETURN 18; }}", "x".repeat(4096)),
-		)?)?;
-		setup.commit()?;
-		let root = store.inner.current_root();
-		let catalog = RootCatalog(&root);
-		for source in [
-			"LIVE SELECT VALUE fn::large() FROM person;",
-			"LIVE SELECT * FROM person BUFFER fn::large();",
-		] {
-			let program = parse(source, ParserSettings::default())?;
-			let error = super::super::analyze_statement_with_runtime(
-				&program.statements[0],
-				source,
-				&catalog,
-				&Object::new(),
-				&BTreeSet::new(),
-				&control,
-			)
-			.err()
-			.ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("unbounded textual compiler admitted")
-			})?;
-			assert!(error.to_string().contains("PURE compiler scratch"), "{error}");
-			assert_eq!(control.function_cache().named_dependency_count(), 1);
-		}
-		Ok(())
-	}
-
-	/// Separate source declarations retain separate frozen lexical slots.
-	#[test]
-	fn live_gql_frozen_scopes_keep_source_owners() -> FerrosGrynnResult<()> {
-		let store = Datastore::in_memory();
-		let mut setup = store.begin();
-		setup.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
-		let left = setup.define_graph("left", crate::graph::GraphKind::Graph)?;
-		let right = setup.define_graph("right", crate::graph::GraphKind::Graph)?;
-		setup.commit()?;
-		let root = store.inner.current_root();
-		let catalog = RootCatalog(&root);
-		let parameters = Object::from_iter([
-			("left", crate::values::Value::from(left)),
-			("right", crate::values::Value::from(right)),
-		]);
-		let source = "SELECT * FROM person IN GRAPH $left; SELECT * FROM person IN GRAPH $right;";
-		let analyzer = Analyzer::new(source, &catalog, &parameters, &BTreeSet::new());
-		let program = parse(source, ParserSettings::default())?;
-		let options = LiveBindingOptions::default();
-		let mut recipe = Recipe {
-			analyzer: &analyzer,
-			captures: BTreeMap::new(),
-			operand_slots: BTreeMap::new(),
-			budget: BindingAdmission::new(&options),
-			frozen_graphs: Vec::new(),
-		};
-		for (slot, statement) in program.statements.iter().enumerate() {
-			let StatementKind::Select(select) = &statement.kind else {
-				return Err(FerrosGrynnError::invalid_argument("source capture fixture missing"));
-			};
-			let slot = u32::try_from(slot).map_err(|_error| {
-				FerrosGrynnError::operation_overflow("source capture fixture slot")
-			})?;
-			assert!(matches!(
-				recipe.source(&select.source, statement.span, 0, slot)?,
-				crate::live::LiveSource::Class(_)
-			));
-			assert!(matches!(
-				recipe.source(&select.source, statement.span, 1, slot)?,
-				crate::live::LiveSource::GraphClassExpr { .. }
-			));
-		}
-		assert_eq!(recipe.frozen_graphs.len(), 2);
-		assert_eq!(recipe.frozen_graphs[0].source, 0);
-		assert_eq!(recipe.frozen_graphs[1].source, 1);
-		let (super::TypedExprKind::Slot(left), super::TypedExprKind::Slot(right)) =
-			(&recipe.frozen_graphs[0].graph.kind, &recipe.frozen_graphs[1].graph.kind)
-		else {
-			return Err(FerrosGrynnError::invalid_argument("frozen lexical slots were replaced"));
-		};
-		assert_ne!(left, right);
-		Ok(())
-	}
+	Expression(
+		/// Read-only scope evaluation follows the normal query pipeline.
+		LiveExpr,
+	),
 }
 
 impl Analyzer<'_> {
@@ -568,6 +342,7 @@ impl Recipe<'_, '_> {
 			None
 		};
 		let analyzer = Analyzer {
+			layout_shell_bytes: std::cell::Cell::new(0),
 			slot_reads,
 			source: self.analyzer.source,
 			catalog: self.analyzer.catalog,
@@ -589,12 +364,12 @@ impl Recipe<'_, '_> {
 		};
 		let checked = check(&analyzer)?;
 		for (id, _version) in cache.named_dependencies() {
-			if let Some(function) = self.analyzer.catalog.function(id)? {
-				if crate::syn::has_bridge_clause(function.body())? {
-					return Err(FerrosGrynnError::query_feature_not_supported(
-						"WITH BRIDGE function dependencies in durable LIVE recipes",
-					));
-				}
+			if let Some(function) = self.analyzer.catalog.function(id)?
+				&& crate::syn::has_bridge_clause(function.body())?
+			{
+				return Err(FerrosGrynnError::query_feature_not_supported(
+					"WITH BRIDGE function dependencies in durable LIVE recipes",
+				));
 			}
 		}
 		if let Some(reads) = &analyzer.slot_reads {
@@ -1418,5 +1193,272 @@ impl Recipe<'_, '_> {
 			LivePath::field(name)?
 		};
 		Ok(LiveExpr::Field(path))
+	}
+}
+
+#[cfg(test)]
+/// Regression tests for live behavior.
+mod tests {
+	use std::collections::{BTreeMap, BTreeSet};
+
+	use super::{Analyzer, Recipe};
+	use crate::{
+		datastore::{BindingAdmission, ClassField, ClassSchema, Datastore},
+		gql::root_catalog::RootCatalog,
+		gql_status::{FerrosGrynnError, FerrosGrynnResult},
+		graph::AtomKind,
+		live::LiveBindingOptions,
+		syn::{ParserSettings, StatementKind, parse},
+		values::{Object, Type},
+	};
+
+	/// Runs the real converter with tighter scratch before ordinary analysis.
+	fn convert(store: &Datastore, source: &str, bytes: usize) -> FerrosGrynnResult<()> {
+		let root = store.inner.current_root();
+		let catalog = RootCatalog(&root);
+		let variables = Object::new();
+		let analyzer = Analyzer::new(source, &catalog, &variables, &BTreeSet::new());
+		let program = parse(source, ParserSettings::default())?;
+		let StatementKind::LiveSelect(statement) = &program.statements[0].kind else {
+			return Err(FerrosGrynnError::invalid_argument("LIVE recipe fixture missing"));
+		};
+		let options = LiveBindingOptions::default().with_budgets(bytes, 1_000_000)?;
+		let mut recipe = Recipe {
+			analyzer: &analyzer,
+			captures: BTreeMap::new(),
+			operand_slots: BTreeMap::new(),
+			budget: BindingAdmission::new(&options),
+			frozen_graphs: Vec::new(),
+		};
+		let _query = recipe.select(&statement.select, program.statements[0].span, 0)?;
+		Ok(())
+	}
+
+	/// Repeated rich types and long qualifier copies spend the shared cap.
+	#[test]
+	fn live_gql_recipe_admission_counts_types_aliases_and_record_keys() {
+		use crate::test_assertions::AssertResult as _;
+
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		let shape = Type::RecordShape(
+			(0..8).map(|index| (format!("field_{index:064}").into(), Type::Int)).collect(),
+		);
+		setup
+			.define_class(
+				ClassSchema::new("person", AtomKind::Node, [ClassField::new("details", shape)])
+					.assert_ok(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
+		assert!(convert(&store, "LIVE SELECT details FROM person;", 320 * 1024).is_ok());
+		let items = vec!["details"; 200].join(", ");
+		assert!(convert(&store, &format!("LIVE SELECT {items} FROM person;"), 320 * 1024).is_err());
+		let alias = "a".repeat(64 * 1024);
+		assert!(
+			convert(&store, &format!("LIVE SELECT * FROM person AS `{alias}`;"), 320 * 1024)
+				.is_err()
+		);
+		let large = "a".repeat(128 * 1024);
+		assert!(
+			convert(&store, &format!("LIVE SELECT * FROM person:'{large}';"), 320 * 1024).is_err()
+		);
+	}
+
+	/// Type-name parsing is admitted before lowercase/type recursion, including
+	/// inactive expressions and the highest supported generic nesting.
+	#[test]
+	fn live_recipe_cast_type_admission() {
+		use crate::test_assertions::AssertResult as _;
+
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		setup
+			.define_class(
+				ClassSchema::new("person", AtomKind::Node, [ClassField::new("age", Type::Int)])
+					.assert_ok(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
+		for depth in [0, 1, 64] {
+			let target = format!("{}int{}", "option<".repeat(depth), ">".repeat(depth));
+			convert(
+				&store,
+				&format!("LIVE SELECT VALUE IF false THEN <{target}>age ELSE 0 END FROM person;"),
+				16 * 1024 * 1024,
+			)
+			.assert_ok();
+		}
+		let large = "a".repeat(128 * 1024);
+		assert!(
+			convert(&store, &format!("LIVE SELECT VALUE <{large}>age FROM person;"), 320 * 1024)
+				.is_err()
+		);
+		let target = format!("{}int{}", "option<".repeat(65), ">".repeat(65));
+		let error = convert(
+			&store,
+			&format!("LIVE SELECT VALUE <{target}>age FROM person;"),
+			16 * 1024 * 1024,
+		)
+		.err()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("overdeep GQL cast admitted"))
+		.assert_ok();
+		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
+	}
+
+	/// Text preflight rejects oversized first-use PURE bodies without filling
+	/// the long-lived session cache, including SINCE/BUFFER expressions.
+	#[test]
+	fn live_gql_preflight_bounds_first_use_functions_and_options() {
+		use crate::test_assertions::AssertResult as _;
+
+		let store = Datastore::in_memory();
+		for result in store
+			.execute(
+				"DEFINE CLASS person TYPE NODE; DEFINE PURE FUNCTION fn::age() -> int { RETURN \
+				 18; };",
+				&Object::new(),
+			)
+			.assert_ok()
+		{
+			result.result.assert_ok();
+		}
+		let root = store.inner.current_root();
+		let catalog = RootCatalog(&root);
+		let control = crate::gql::ExecutionControl::new(
+			&crate::gql::QueryExecutionOptions {
+				barrier_memory_bytes: std::num::NonZeroUsize::new(1024 * 1024)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("fixture compiler budget is zero")
+					})
+					.assert_ok(),
+				..crate::gql::QueryExecutionOptions::default()
+			},
+			None,
+		);
+		for source in [
+			"LIVE SELECT VALUE fn::age() FROM person;",
+			"LIVE SELECT * FROM person BUFFER fn::age();",
+		] {
+			let program = parse(source, ParserSettings::default()).assert_ok();
+			let (logical, _) = super::super::analyze_statement_with_runtime(
+				&program.statements[0],
+				source,
+				&catalog,
+				&Object::new(),
+				&BTreeSet::new(),
+				&control,
+			)
+			.assert_ok();
+			assert_eq!(logical.statements.len(), 1);
+			if source.contains("VALUE") {
+				assert!(!control.function_cache().has_entries());
+			}
+		}
+		let mut setup = store.begin();
+		setup
+			.define_function(
+				crate::datastore::SchemaFunction::new(
+					"fn",
+					"large",
+					Vec::new(),
+					Type::Int,
+					crate::datastore::FunctionEffect::Pure,
+					false,
+					None,
+					format!("{{ /* {} */ RETURN 18; }}", "x".repeat(4096)),
+				)
+				.assert_ok(),
+			)
+			.assert_ok();
+		setup.commit().assert_ok();
+		let root = store.inner.current_root();
+		let catalog = RootCatalog(&root);
+		for source in [
+			"LIVE SELECT VALUE fn::large() FROM person;",
+			"LIVE SELECT * FROM person BUFFER fn::large();",
+		] {
+			let program = parse(source, ParserSettings::default()).assert_ok();
+			let error = super::super::analyze_statement_with_runtime(
+				&program.statements[0],
+				source,
+				&catalog,
+				&Object::new(),
+				&BTreeSet::new(),
+				&control,
+			)
+			.err()
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("unbounded textual compiler admitted")
+			})
+			.assert_ok();
+			assert!(error.to_string().contains("PURE compiler scratch"), "{error}");
+			assert_eq!(control.function_cache().named_dependency_count(), 1);
+		}
+	}
+
+	/// Separate source declarations retain separate frozen lexical slots.
+	#[test]
+	fn live_gql_frozen_scopes_keep_source_owners() {
+		use crate::test_assertions::AssertResult as _;
+
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		setup.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+		let left = setup.define_graph("left", crate::graph::GraphKind::Graph).assert_ok();
+		let right = setup.define_graph("right", crate::graph::GraphKind::Graph).assert_ok();
+		setup.commit().assert_ok();
+		let root = store.inner.current_root();
+		let catalog = RootCatalog(&root);
+		let parameters = Object::from_iter([
+			("left", crate::values::Value::from(left)),
+			("right", crate::values::Value::from(right)),
+		]);
+		let source = "SELECT * FROM person IN GRAPH $left; SELECT * FROM person IN GRAPH $right;";
+		let analyzer = Analyzer::new(source, &catalog, &parameters, &BTreeSet::new());
+		let program = parse(source, ParserSettings::default()).assert_ok();
+		let options = LiveBindingOptions::default();
+		let mut recipe = Recipe {
+			analyzer: &analyzer,
+			captures: BTreeMap::new(),
+			operand_slots: BTreeMap::new(),
+			budget: BindingAdmission::new(&options),
+			frozen_graphs: Vec::new(),
+		};
+		for (slot, statement) in program.statements.iter().enumerate() {
+			let StatementKind::Select(select) = &statement.kind else {
+				return {
+					let test_result: FerrosGrynnResult<()> =
+						Err(FerrosGrynnError::invalid_argument("source capture fixture missing"));
+					test_result.assert_ok();
+				};
+			};
+			let slot = u32::try_from(slot)
+				.map_err(|_error| {
+					FerrosGrynnError::operation_overflow("source capture fixture slot")
+				})
+				.assert_ok();
+			assert!(matches!(
+				recipe.source(&select.source, statement.span, 0, slot).assert_ok(),
+				crate::live::LiveSource::Class(_)
+			));
+			assert!(matches!(
+				recipe.source(&select.source, statement.span, 1, slot).assert_ok(),
+				crate::live::LiveSource::GraphClassExpr { .. }
+			));
+		}
+		assert_eq!(recipe.frozen_graphs.len(), 2);
+		assert_eq!(recipe.frozen_graphs[0].source, 0);
+		assert_eq!(recipe.frozen_graphs[1].source, 1);
+		let (super::TypedExprKind::Slot(left), super::TypedExprKind::Slot(right)) =
+			(&recipe.frozen_graphs[0].graph.kind, &recipe.frozen_graphs[1].graph.kind)
+		else {
+			return {
+				let test_result: FerrosGrynnResult<()> =
+					Err(FerrosGrynnError::invalid_argument("frozen lexical slots were replaced"));
+				test_result.assert_ok();
+			};
+		};
+		assert_ne!(left, right);
 	}
 }

@@ -6,7 +6,10 @@ use super::*;
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RowSelector<'a> {
 	/// Existing primary class union keeps its scalar ordinal CASE.
-	Class(usize),
+	Class(
+		/// Existing primary class union keeps its scalar ordinal CASE.
+		usize,
+	),
 	/// Root JOIN families distinguish every declared class and missing LEFT
 	/// slot.
 	Joined {
@@ -704,6 +707,7 @@ fn incompatible() -> FerrosGrynnError {
 }
 
 #[cfg(test)]
+/// Regression tests for aggregate union behavior.
 mod tests {
 	use super::*;
 	use crate::{datastore::Datastore, gql::QueryExecutionOptions};
@@ -711,7 +715,9 @@ mod tests {
 	/// Missing LEFT states stay distinct; one aggregate reduces selected row
 	/// arguments instead of selecting among already reduced groups.
 	#[test]
-	fn live_join_row_selector_preserves_none_and_aggregate_domain() -> FerrosGrynnResult<()> {
+	fn live_join_row_selector_preserves_none_and_aggregate_domain() {
+		use crate::test_assertions::AssertResult as _;
+
 		let store = Datastore::in_memory();
 		let root = store.inner.current_root();
 		let control = ExecutionControl::new(&QueryExecutionOptions::default(), None);
@@ -730,17 +736,18 @@ mod tests {
 			columns: &columns,
 			labels: &labels,
 		};
-		let selected = row_expression_selected(&read, &variants, selector)?;
+		let selected = row_expression_selected(&read, &variants, selector).assert_ok();
 		let rows = labels
 			.iter()
 			.map(|label| {
 				Row::new(label.iter().map(|value| value.map_or(Value::None, Value::from)).collect())
 			})
 			.collect::<Vec<_>>();
-		let snapshot = read.snapshot()?;
+		let snapshot = read.snapshot().assert_ok();
 		for (row, value) in rows.iter().zip(&values) {
 			assert_eq!(
-				eval_select_expr(&read, snapshot, &selected, row, None, &[], "", &control)?,
+				eval_select_expr(&read, snapshot, &selected, row, None, &[], "", &control)
+					.assert_ok(),
 				match &value.kind {
 					TypedExprKind::Constant(value) => value.clone(),
 					_ => Value::None,
@@ -760,7 +767,8 @@ mod tests {
 			})
 			.collect::<Vec<_>>();
 		let sum =
-			merge_expression_selected(&read, &sums.iter().collect::<Vec<_>>(), selector, &[], &[])?;
+			merge_expression_selected(&read, &sums.iter().collect::<Vec<_>>(), selector, &[], &[])
+				.assert_ok();
 		assert!(matches!(&sum.kind, TypedExprKind::Aggregate { argument: Some(argument), .. }
 			if matches!(argument.kind, TypedExprKind::Case { .. })));
 		let row = rows[0].clone();
@@ -769,7 +777,8 @@ mod tests {
 			_account: BarrierAccount::new(4096),
 		};
 		assert_eq!(
-			eval_select_expr(&read, snapshot, &sum, &row, Some(&group), &[], "", &control)?,
+			eval_select_expr(&read, snapshot, &sum, &row, Some(&group), &[], "", &control)
+				.assert_ok(),
 			Value::from(30)
 		);
 		let bad_labels = vec![vec![Some(0)]];
@@ -780,7 +789,7 @@ mod tests {
 			})
 			.is_err()
 		);
-		let ordinal = row_expression(&read, &variants, 0)?;
+		let ordinal = row_expression(&read, &variants, 0).assert_ok();
 		assert_eq!(
 			eval_select_expr(
 				&read,
@@ -791,9 +800,9 @@ mod tests {
 				&[],
 				"",
 				&control
-			)?,
+			)
+			.assert_ok(),
 			Value::from(20)
 		);
-		Ok(())
 	}
 }

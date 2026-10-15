@@ -49,16 +49,24 @@ fn require<T>(result: FerrosGrynnResult<T>) -> T {
 
 /// Keeps the local directory until every datastore handle has been released.
 struct Fixture {
+	/// Datastore retained by the fixture or operation.
 	store: Option<Datastore>,
+	/// Directory retaining the local files used by the scenario.
 	directory: Option<PathBuf>,
+	/// Stable record identities seeded for the scenario.
 	records: Vec<RecordId>,
+	/// Interned property-name identifier used for value lookup.
 	key: PropertyKeyId,
+	/// Changefeed identity observed by this scenario.
 	feed: ChangefeedId,
+	/// Earliest version from which the fixture requests change delivery.
 	since: Versionstamp,
+	/// Payload retained for the operation or its expected result.
 	value: i64,
 }
 
 impl Drop for Fixture {
+	/// Runs cleanup for this `Fixture` before its fields are released.
 	fn drop(&mut self) {
 		drop(self.store.take());
 		if let Some(directory) = self.directory.take() {

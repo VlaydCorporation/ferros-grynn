@@ -15,7 +15,10 @@ const MAX_EVENT_SOURCE_BYTES: usize = 64 * 1024;
 /// Stable identity of one event definition from the common schema clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct EventId(SchemaId);
+pub struct EventId(
+	/// Schema-namespace identity assigned to this event definition.
+	SchemaId,
+);
 
 impl EventId {
 	/// Creates an identity, rejecting the reserved zero and maximum values.
@@ -44,12 +47,14 @@ impl EventId {
 }
 
 impl From<EventId> for SchemaId {
+	/// Converts `EventId` into `SchemaId`.
 	fn from(value: EventId) -> Self {
 		value.0
 	}
 }
 
 impl Display for EventId {
+	/// Formats `EventId` using the requested formatter.
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
 		Display::fmt(&self.get(), f)
 	}
@@ -60,9 +65,15 @@ impl Display for EventId {
 #[non_exhaustive]
 pub enum EventTarget {
 	/// Database-global class records.
-	Class(ClassId),
+	Class(
+		/// Database-global class records.
+		ClassId,
+	),
 	/// Qualified occurrences and their effective values.
-	Graph(GraphId),
+	Graph(
+		/// Qualified occurrences and their effective values.
+		GraphId,
+	),
 }
 
 /// Checked retry and causal-depth policy of an asynchronous event.
@@ -75,6 +86,7 @@ pub struct EventAsyncOptions {
 }
 
 impl Default for EventAsyncOptions {
+	/// Constructs the default initial state of `EventAsyncOptions`.
 	fn default() -> Self {
 		Self {
 			retries: 0,
@@ -118,7 +130,11 @@ pub enum EventExecution {
 	#[default]
 	Sync,
 	/// Enqueue atomically with the mutation and execute in a fresh transaction.
-	Async(EventAsyncOptions),
+	Async(
+		/// Enqueue atomically with the mutation and execute in a fresh
+		/// transaction.
+		EventAsyncOptions,
+	),
 }
 
 /// Owned source definition; executable typed IR is compiled independently.
@@ -251,28 +267,35 @@ impl EventDefinition {
 }
 
 #[cfg(test)]
+/// Regression tests for event behavior.
 mod tests {
 	use super::*;
 
+	/// Verifies event policy checks reserved identities and depth.
 	#[test]
-	fn event_policy_checks_reserved_identities_and_depth() -> FerrosGrynnResult<()> {
+	fn event_policy_checks_reserved_identities_and_depth() {
+		use crate::test_assertions::AssertResult as _;
+
 		assert!(EventId::new(0).is_none());
 		assert!(EventId::new(u32::MAX).is_none());
 		assert_eq!(EventId::new(1).map(EventId::get), Some(1));
 		assert_eq!(EventAsyncOptions::default().max_depth(), 3);
 		assert_eq!(EventAsyncOptions::default().retries(), 0);
-		assert_eq!(EventAsyncOptions::new(255, 0)?.retries(), 255);
-		assert_eq!(EventAsyncOptions::new(0, 16)?.max_depth(), 16);
+		assert_eq!(EventAsyncOptions::new(255, 0).assert_ok().retries(), 255);
+		assert_eq!(EventAsyncOptions::new(0, 16).assert_ok().max_depth(), 16);
 		assert!(EventAsyncOptions::new(0, 17).is_err());
-		Ok(())
 	}
 
+	/// Verifies event source is owned and bounded.
 	#[test]
-	fn event_source_is_owned_and_bounded() -> FerrosGrynnResult<()> {
+	fn event_source_is_owned_and_bounded() {
+		use crate::test_assertions::AssertResult as _;
+
 		let graph = GraphId::new(1)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture graph identity"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture graph identity"))
+			.assert_ok();
 		let target = EventTarget::Graph(graph);
-		let definition = EventDefinition::new("audit", target, "true", "{ RETURN 1; }")?;
+		let definition = EventDefinition::new("audit", target, "true", "{ RETURN 1; }").assert_ok();
 		assert_eq!(definition.id(), None);
 		assert_eq!(definition.execution(), EventExecution::Sync);
 		assert_eq!(definition.target(), target);
@@ -280,8 +303,7 @@ mod tests {
 		assert!(EventDefinition::new("audit", target, "", "1").is_err());
 		assert!(EventDefinition::new("audit", target, "true", "\0").is_err());
 		assert!(EventDefinition::new("audit", target, "true", "x".repeat(65_537)).is_err());
-		let longest = EventDefinition::new("audit", target, "true", "x".repeat(65_536))?;
+		let longest = EventDefinition::new("audit", target, "true", "x".repeat(65_536)).assert_ok();
 		assert_eq!(longest.then().len(), 65_536);
-		Ok(())
 	}
 }

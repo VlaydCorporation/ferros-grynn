@@ -43,35 +43,7 @@ fn single(mut response: IndexedResults) -> FerrosGrynnResult<sdk::Value> {
 
 /// Client-only adapter; identity and table correspondences remain owned
 /// metadata.
-///
-/// ```no_run
-/// # #[cfg(feature = "bridge-surreal-mem")]
-/// # async fn example() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
-/// use ferros_grynn::{
-/// 	bridge::{BridgeData, FerrosBridge, SurrealQueryBridgeExt},
-/// 	datastore::Datastore,
-/// };
-/// let client =
-/// 	surrealdb::Surreal::new::<surrealdb::engine::local::Mem>(()).await.map_err(|error| {
-/// 		ferros_grynn::gql_status::FerrosGrynnError::bridge_operation_error(
-/// 			"example client failed",
-/// 		)
-/// 		.with_technical_source(error)
-/// 	})?;
-/// let mut result = client
-/// 	.query("RETURN $bridge")
-/// 	.use_bridge(
-/// 		FerrosBridge::new(Datastore::in_memory()),
-/// 		BridgeData::InternalQuery("RETURN [none, null, 7]", None),
-/// 	)
-/// 	.await?;
-/// let value: surrealdb::types::Value = result.take(0).map_err(|error| {
-/// 	ferros_grynn::gql_status::FerrosGrynnError::bridge_operation_error("example result failed")
-/// 		.with_technical_source(error)
-/// })?;
-/// # Ok(()) }
-/// # fn main() {}
-/// ```
+#[doc = include_str!("../../../docs/rustdoc/bridge-surreal-example-01.md")]
 pub struct SurrealBridge<C: Connection> {
 	/// Runtime-only dedicated native session.
 	client: Surreal<C>,
@@ -262,14 +234,18 @@ impl<C: Connection> SurrealBridge<C> {
 	}
 }
 impl<C: Connection> Bridge for SurrealBridge<C> {
+	/// Returns database for `SurrealBridge<C>`.
 	fn database(&self) -> Option<BridgeDatabaseRef> {
 		Some(self.database.reference())
 	}
 
+	/// Returns capabilities for `SurrealBridge<C>`.
 	fn capabilities(&self) -> BridgeCapabilities {
 		BridgeCapabilities::FULL
 	}
 
+	/// Dispatches queries, record reads or relation mirroring through the
+	/// configured SurrealDB client.
 	fn execute(&self, operation: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_> {
 		Box::pin(async move { self.operation(operation, &context).await })
 	}
@@ -277,15 +253,21 @@ impl<C: Connection> Bridge for SurrealBridge<C> {
 
 /// Dropping an interrupted operation schedules rollback of its open
 /// transaction.
-struct RemoteTransaction<C: Connection>(Option<surrealdb::method::Transaction<C>>);
+struct RemoteTransaction<C: Connection>(
+	/// Dropping an interrupted operation schedules rollback of its open
+	/// transaction.
+	Option<surrealdb::method::Transaction<C>>,
+);
 impl<C: Connection> Drop for RemoteTransaction<C> {
+	/// Runs cleanup for this `RemoteTransaction<C>` before its fields are
+	/// released.
 	fn drop(&mut self) {
-		if let Some(transaction) = self.0.take() {
-			if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-				let _rollback = runtime.spawn(async move {
-					let _result = transaction.cancel().await;
-				});
-			}
+		if let Some(transaction) = self.0.take()
+			&& let Ok(runtime) = tokio::runtime::Handle::try_current()
+		{
+			let _rollback = runtime.spawn(async move {
+				let _result = transaction.cancel().await;
+			});
 		}
 	}
 }
@@ -323,7 +305,6 @@ fn verify_relation(
 pub trait SurrealQueryBridgeExt<'q, C: Connection> {
 	/// Adds a read-only FG source while preserving the native query and
 	/// bindings.
-	#[must_use]
 	fn use_bridge<B: Bridge + 'static>(
 		self,
 		adapter: B,
@@ -331,6 +312,8 @@ pub trait SurrealQueryBridgeExt<'q, C: Connection> {
 	) -> SurrealBridgedQuery<'q, C>;
 }
 impl<'q, C: Connection> SurrealQueryBridgeExt<'q, C> for Query<'q, C> {
+	/// Wraps this native query and registers its first read-only Ferros-Grynn
+	/// source.
 	fn use_bridge<B: Bridge + 'static>(
 		self,
 		adapter: B,
@@ -360,31 +343,30 @@ pub struct SurrealBridgedQuery<'q, C: Connection> {
 impl<'q, C: Connection> SurrealBridgedQuery<'q, C> {
 	/// Preserves ordinary native binding behavior; bridge bindings are applied
 	/// last.
-	#[must_use]
-	pub fn bind(mut self, variables: impl surrealdb::method::IntoVariables) -> Self {
+	pub fn bind<VariablesArg: surrealdb::method::IntoVariables>(
+		mut self,
+		variables: VariablesArg,
+	) -> Self {
 		self.query = self.query.bind(variables);
 		self
 	}
 
 	/// Appends native statements through the original query builder.
-	#[must_use]
-	pub fn query(mut self, source: impl Into<std::borrow::Cow<'q, str>>) -> Self {
+	pub fn query<SourceArg: Into<std::borrow::Cow<'q, str>>>(mut self, source: SourceArg) -> Self {
 		self.query = self.query.query(source);
 		self
 	}
 
 	/// Supplies FG source and shared conversion budgets.
-	#[must_use]
 	pub fn options(mut self, options: QueryExecutionOptions) -> Self {
 		self.options = options;
 		self
 	}
 
 	/// Adds another InternalQuery source and rejects external sources.
-	#[must_use]
 	pub fn use_bridge<B: Bridge + 'static>(mut self, adapter: B, data: BridgeData<'_>) -> Self {
 		match super::query::SourceBinding::new(Arc::new(adapter), data) {
-			Ok(source) if source.internal && source.adapter.capabilities().internal_queries => {
+			Ok(source) if source.internal && source.adapter.capabilities().internal_queries() => {
 				self.sources.push(source);
 			}
 			Ok(_) => {
@@ -427,7 +409,7 @@ impl<'q, C: Connection> SurrealBridgedQuery<'q, C> {
 				.and_then(|timeout| std::time::Instant::now().checked_add(timeout)),
 		};
 		context.options.cancellation = Some(cancellation);
-		context.options.bridge_memory = Some(Arc::new(parking_lot::Mutex::new(
+		context.options.context.bridge_memory = Some(Arc::new(parking_lot::Mutex::new(
 			crate::gql::BarrierAccount::new(context.options.barrier_memory_bytes.get()),
 		)));
 		let mut bindings = Object::new();
@@ -451,6 +433,7 @@ impl<'q, C: Connection> IntoFuture for SurrealBridgedQuery<'q, C> {
 	type IntoFuture = Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'q>>;
 	type Output = FerrosGrynnResult<IndexedResults>;
 
+	/// Converts this value into future for `SurrealBridgedQuery<'q, C>`.
 	fn into_future(self) -> Self::IntoFuture {
 		Box::pin(self.execute())
 	}

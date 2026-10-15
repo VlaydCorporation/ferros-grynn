@@ -4,9 +4,8 @@ use futures::lock::Mutex;
 use sysinfo::{Pid, System};
 
 /// Detected total system memory in bytes, cached at first access.
-/// Falls back to cgroup limits when running inside a container, and
-/// uses a conservative 1 GiB default when `/proc` is inaccessible
-/// (e.g. systemd `ProcSubset=pid` hardening).
+/// Prefers a positive cgroup limit when available. If the host-memory
+/// observation returns zero, uses a conservative 1 GiB default.
 pub(crate) static TOTAL_SYSTEM_MEMORY: LazyLock<u64> = LazyLock::new(|| {
 	// Load the system attributes
 	let mut system = System::new();
@@ -37,6 +36,7 @@ pub static ENVIRONMENT: LazyLock<Mutex<Environment>> =
 pub static INFORMATION: LazyLock<Mutex<Information>> =
 	LazyLock::new(|| Mutex::new(Information::default()));
 
+/// Returns refresh for this module.
 pub async fn refresh() {
 	// Get the environment
 	let mut environment = ENVIRONMENT.lock().await;
@@ -45,7 +45,7 @@ pub async fn refresh() {
 	let mut information = INFORMATION.lock().await;
 	// Update the cached information metrics
 	information.cpu_usage = environment.cpu_usage();
-	information.memory_allocated = crate::memory::ALLOC.memory_allocated();
+	information.memory_allocated = crate::memory::allocated_bytes();
 	information.memory_usage = environment.memory_usage();
 	information.load_average = environment.load_average();
 	information.physical_cores = environment.physical_cores();
@@ -55,21 +55,30 @@ pub async fn refresh() {
 /// Cached system utilisation metrics information
 #[derive(Default)]
 pub struct Information {
+	/// Worker parallelism currently available to the process.
 	pub available_parallelism: usize,
+	/// Observed process CPU usage.
 	pub cpu_usage: f32,
+	/// Observed short-, medium- and long-window host load averages.
 	pub load_average: [f64; 3],
+	/// Allocated-memory estimate reported by the project allocator accounting.
 	pub memory_allocated: usize,
+	/// Observed process memory usage.
 	pub memory_usage: u64,
+	/// Detected physical CPU core count.
 	pub physical_cores: usize,
 }
 
 /// An environment for fetching system utilization
 pub struct Environment {
+	/// Host and process observer used to refresh environment measurements.
 	sys: System,
+	/// Process identifier selected for environment observations.
 	pid: Pid,
 }
 
 impl Default for Environment {
+	/// Constructs the default initial state of `Environment`.
 	fn default() -> Self {
 		Self {
 			sys: System::new_all(),

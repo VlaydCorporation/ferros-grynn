@@ -34,6 +34,7 @@ use crate::{
 /// Physical files that can remain reachable while the new root is published.
 #[derive(Default)]
 pub(super) struct IndexReusePlan {
+	/// Indexes associated with this index reuse plan.
 	pub(super) indexes: BTreeMap<IndexId, RetainedIndex>,
 	/// Graph snapshot files are retained whole and never receive row deltas.
 	pub(super) graph_artifacts: BTreeMap<IndexId, (PhysicalIndexBinding, FileCatalogEntry)>,
@@ -93,6 +94,7 @@ impl IndexReusePlan {
 		Ok(())
 	}
 
+	/// Returns the skipped builds result.
 	pub(super) fn skipped_builds(&self) -> BTreeSet<IndexId> {
 		self.indexes.keys().copied().collect()
 	}
@@ -100,21 +102,34 @@ impl IndexReusePlan {
 
 /// One immutable base and its exact current replacement generation.
 pub(super) struct RetainedIndex {
+	/// Kind associated with this retained index.
 	pub(super) kind: ClassIndexKind,
+	/// Scope associated with this retained index.
 	pub(super) scope: IndexScope,
+	/// Base associated with this retained index.
 	pub(super) base: PhysicalIndexBinding,
+	/// Base entry associated with this retained index.
 	pub(super) base_entry: FileCatalogEntry,
+	/// Delta associated with this retained index.
 	pub(super) delta: RetainedDelta,
 }
 
 /// Delta publication selected by the reuse planner.
 pub(super) enum RetainedDelta {
+	/// None case of retained delta.
 	None,
+	/// Existing case of retained delta.
 	Existing {
+		/// Binding associated with this retained delta.
 		binding: PhysicalIndexBinding,
+		/// Entry associated with this retained delta.
 		entry: FileCatalogEntry,
 	},
-	Replacement(Vec<AlignedPage>),
+	/// Replacement case of retained delta.
+	Replacement(
+		/// Replacement case of retained delta.
+		Vec<AlignedPage>,
+	),
 }
 
 impl LocalStore {
@@ -189,7 +204,7 @@ impl LocalStore {
 				let Some(binding) = old.physical else {
 					continue;
 				};
-				let Some(base_entry) = file_entry(&files, old.scope, binding)?.cloned() else {
+				let Some(base_entry) = file_entry(&files, old.scope, binding).cloned() else {
 					continue;
 				};
 				let Ok(Some(decoded)) = self.physical_index(&snapshot, index_id) else {
@@ -238,7 +253,7 @@ impl LocalStore {
 				let delta = match delta {
 					PreparedDelta::Unchanged => match old.delta {
 						Some(delta) => {
-							let Some(entry) = file_entry(&files, old.scope, delta)?.cloned() else {
+							let Some(entry) = file_entry(&files, old.scope, delta).cloned() else {
 								continue;
 							};
 							RetainedDelta::Existing {
@@ -263,9 +278,15 @@ impl LocalStore {
 	}
 }
 
+/// Prepared delta alternatives.
 enum PreparedDelta {
+	/// Unchanged case of prepared delta.
 	Unchanged,
-	Replacement(Vec<AlignedPage>),
+	/// Replacement case of prepared delta.
+	Replacement(
+		/// Replacement case of prepared delta.
+		Vec<AlignedPage>,
+	),
 }
 
 /// Retains the base while the bounded delta replaces every changed identity.
@@ -292,6 +313,7 @@ fn prepare_geometry_delta(
 	}
 	Ok(Some(PreparedDelta::Replacement(build_geometry_delta(base.spec, next.commit_ts, records)?)))
 }
+/// Prepares fulltext delta.
 fn prepare_fulltext_delta(
 	previous: &DatabaseRoot,
 	next: &DatabaseRoot,
@@ -373,6 +395,7 @@ fn prepare_fulltext_delta(
 	Ok(Some(PreparedDelta::Replacement(pages)))
 }
 
+/// Prepares vector delta.
 fn prepare_vector_delta(
 	previous: &DatabaseRoot,
 	next: &DatabaseRoot,
@@ -428,6 +451,7 @@ fn prepare_vector_delta(
 	Ok(Some(PreparedDelta::Replacement(pages)))
 }
 
+/// Returns the fulltext row result.
 fn fulltext_row(
 	root: &DatabaseRoot,
 	record: &RecordId,
@@ -455,6 +479,7 @@ fn fulltext_row(
 	Ok(Some((atom, tokens)))
 }
 
+/// Returns the vector row result.
 fn vector_row(
 	root: &DatabaseRoot,
 	record: &RecordId,
@@ -473,6 +498,7 @@ fn vector_row(
 	Ok(Some((atom, vector)))
 }
 
+/// Returns the scoped value result.
 fn scoped_value<'a>(
 	root: &'a DatabaseRoot,
 	record: &RecordId,
@@ -511,24 +537,27 @@ fn scoped_value<'a>(
 	}
 }
 
+/// Returns the file entry result.
 fn file_entry(
 	files: &FileCatalog,
 	scope: IndexScope,
 	binding: PhysicalIndexBinding,
-) -> FerrosGrynnResult<Option<&FileCatalogEntry>> {
+) -> Option<&FileCatalogEntry> {
 	let space = match scope {
 		IndexScope::Base => crate::datastore::DataSpaceId::Database,
 		IndexScope::Effective {
 			graph,
 		} => crate::datastore::DataSpaceId::Graph(graph),
 	};
-	Ok(files.files.iter().find(|entry| entry.space_id == space && entry.file_id == binding.file_id))
+	files.files.iter().find(|entry| entry.space_id == space && entry.file_id == binding.file_id)
 }
 
+/// Rebuilds threshold.
 fn rebuild_threshold(population: usize) -> usize {
 	(population / 1_000).clamp(1, 4_096)
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }

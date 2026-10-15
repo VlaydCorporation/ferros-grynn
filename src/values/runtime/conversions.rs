@@ -30,15 +30,18 @@ use super::{
 use crate::gql_status::FerrosGrynnError;
 
 impl From<bool> for Value {
+	/// Converts `bool` into `Value`.
 	fn from(value: bool) -> Self {
 		Self::Bool(value)
 	}
 }
 
+/// Expands the impl number value declarations used by this module.
 macro_rules! impl_number_value {
 	($($type:ty),* $(,)?) => {
 		$(
 			impl From<$type> for Value {
+				/// Converts the source payload into its corresponding value variant.
 				fn from(value: $type) -> Self {
 					Self::Number(Number::from(value))
 				}
@@ -64,39 +67,46 @@ impl_number_value!(
 );
 
 impl From<Number> for Value {
+	/// Converts `Number` into `Value`.
 	fn from(value: Number) -> Self {
 		Self::Number(value)
 	}
 }
 
 impl From<Text> for Value {
+	/// Converts `Text` into `Value`.
 	fn from(value: Text) -> Self {
 		Self::String(value)
 	}
 }
 
 impl From<String> for Value {
+	/// Converts `String` into `Value`.
 	fn from(value: String) -> Self {
 		Self::String(Text::from(value))
 	}
 }
 
 impl From<&str> for Value {
+	/// Converts `&str` into `Value`.
 	fn from(value: &str) -> Self {
 		Self::String(Text::from(value))
 	}
 }
 
 impl From<char> for Value {
+	/// Converts `char` into `Value`.
 	fn from(value: char) -> Self {
 		Self::String(Text::from(value))
 	}
 }
 
+/// Expands the impl value variant declarations used by this module.
 macro_rules! impl_value_variant {
 	($($type:ty => $variant:ident),* $(,)?) => {
 		$(
 			impl From<$type> for Value {
+				/// Converts the source payload into its corresponding value variant.
 				fn from(value: $type) -> Self {
 					Self::$variant(value)
 				}
@@ -121,63 +131,74 @@ impl_value_variant!(
 );
 
 impl From<Vec<Value>> for Value {
+	/// Converts `Vec<Value>` into `Value`.
 	fn from(value: Vec<Value>) -> Self {
 		Self::Array(Array::new(value))
 	}
 }
 
 impl From<Closure> for Value {
+	/// Converts `Closure` into `Value`.
 	fn from(value: Closure) -> Self {
 		Self::Closure(Box::new(value))
 	}
 }
 
 impl From<RecordId> for Value {
+	/// Converts `RecordId` into `Value`.
 	fn from(value: RecordId) -> Self {
 		Self::Record(Box::new(value))
 	}
 }
 
 impl From<ErrorValue> for Value {
+	/// Converts `ErrorValue` into `Value`.
 	fn from(value: ErrorValue) -> Self {
 		Self::Error(Box::new(value))
 	}
 }
 
 impl From<QueryCursor> for Value {
+	/// Converts `QueryCursor` into `Value`.
 	fn from(value: QueryCursor) -> Self {
 		Self::Cursor(value)
 	}
 }
 
 impl From<GraphRef> for Value {
+	/// Converts `GraphRef` into `Value`.
 	fn from(value: GraphRef) -> Self {
 		Self::GraphRef(Box::new(value))
 	}
 }
 
 impl From<AtomRef> for Value {
+	/// Converts `AtomRef` into `Value`.
 	fn from(value: AtomRef) -> Self {
 		Self::Atom(Box::new(value))
 	}
 }
 
 impl From<Path> for Value {
+	/// Converts `Path` into `Value`.
 	fn from(value: Path) -> Self {
 		Self::Path(Box::new(value))
 	}
 }
 
 impl From<MaterializedGraph> for Value {
+	/// Converts `MaterializedGraph` into `Value`.
 	fn from(value: MaterializedGraph) -> Self {
 		Self::Graph(Box::new(value))
 	}
 }
 
+/// Expands the impl graph value declarations used by this module.
 macro_rules! impl_graph_value {
 	($($type:ty),* $(,)?) => {
 		$(
 			impl From<$type> for Value {
+				/// Converts the source payload into its corresponding value variant.
 				fn from(value: $type) -> Self {
 					Self::from(MaterializedGraph::from(value))
 				}
@@ -197,6 +218,7 @@ impl_graph_value!(
 	graph::Subgraph<Frozen>,
 );
 
+/// Returns the value conversion error result.
 fn value_conversion_error(value: &Value, target: &'static str) -> FerrosGrynnError {
 	FerrosGrynnError::conversion_error(value.kind().name(), target)
 }
@@ -204,6 +226,7 @@ fn value_conversion_error(value: &Value, target: &'static str) -> FerrosGrynnErr
 impl TryFrom<Value> for bool {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `bool` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Bool(value) => Ok(value),
@@ -215,6 +238,7 @@ impl TryFrom<Value> for bool {
 impl TryFrom<Value> for Number {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `Number` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Number(value) => Ok(value),
@@ -223,12 +247,14 @@ impl TryFrom<Value> for Number {
 	}
 }
 
+/// Expands the try number from value declarations used by this module.
 macro_rules! try_number_from_value {
 	($($type:ty),* $(,)?) => {
 		$(
 			impl TryFrom<Value> for $type {
 				type Error = FerrosGrynnError;
 
+				/// Checks the source variant and converts its payload to the requested type.
 				fn try_from(value: Value) -> Result<Self, Self::Error> {
 					match value {
 						Value::Number(value) => Self::try_from(value),
@@ -261,6 +287,7 @@ try_number_from_value!(
 impl TryFrom<Value> for Text {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `Text` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::String(value) => Ok(value),
@@ -272,17 +299,20 @@ impl TryFrom<Value> for Text {
 impl TryFrom<Value> for String {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `String` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		Text::try_from(value).map(Text::into_string)
 	}
 }
 
+/// Expands the try value variant declarations used by this module.
 macro_rules! try_value_variant {
 	($($type:ty => $variant:ident),* $(,)?) => {
 		$(
 			impl TryFrom<Value> for $type {
 				type Error = FerrosGrynnError;
 
+				/// Checks the source variant and converts its payload to the requested type.
 				fn try_from(value: Value) -> Result<Self, Self::Error> {
 					match value {
 						Value::$variant(value) => Ok(value),
@@ -312,6 +342,7 @@ try_value_variant!(
 impl TryFrom<Value> for Closure {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `Closure` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Closure(value) => Ok(*value),
@@ -323,6 +354,7 @@ impl TryFrom<Value> for Closure {
 impl TryFrom<Value> for RecordId {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `RecordId` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Record(value) => Ok(*value),
@@ -332,6 +364,7 @@ impl TryFrom<Value> for RecordId {
 }
 
 impl From<AtomOccurrenceRef> for Value {
+	/// Converts `AtomOccurrenceRef` into `Value`.
 	fn from(value: AtomOccurrenceRef) -> Self {
 		Self::AtomOccurrence(Box::new(value))
 	}
@@ -340,6 +373,7 @@ impl From<AtomOccurrenceRef> for Value {
 impl TryFrom<Value> for GraphRef {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `GraphRef` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::GraphRef(value) => Ok(*value),
@@ -351,6 +385,7 @@ impl TryFrom<Value> for GraphRef {
 impl TryFrom<Value> for AtomRef {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `AtomRef` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Atom(value) => Ok(*value),
@@ -362,6 +397,8 @@ impl TryFrom<Value> for AtomRef {
 impl TryFrom<Value> for AtomOccurrenceRef {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `AtomOccurrenceRef` after validating the
+	/// conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::AtomOccurrence(value) => Ok(*value),
@@ -373,6 +410,7 @@ impl TryFrom<Value> for AtomOccurrenceRef {
 impl TryFrom<Value> for Path {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `Path` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Path(value) => Ok(*value),
@@ -384,6 +422,8 @@ impl TryFrom<Value> for Path {
 impl TryFrom<Value> for MaterializedGraph {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `MaterializedGraph` after validating the
+	/// conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Graph(value) => Ok(*value),
@@ -395,6 +435,7 @@ impl TryFrom<Value> for MaterializedGraph {
 impl TryFrom<Value> for Graph<Frozen> {
 	type Error = FerrosGrynnError;
 
+	/// Converts `Value` into `Graph<Frozen>` after validating the conversion.
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match MaterializedGraph::try_from(value)? {
 			MaterializedGraph::Graph(value) => Ok(value),
@@ -403,12 +444,14 @@ impl TryFrom<Value> for Graph<Frozen> {
 	}
 }
 
+/// Expands the try graph family from value declarations used by this module.
 macro_rules! try_graph_family_from_value {
 	($($type:ty),* $(,)?) => {
 		$(
 			impl TryFrom<Value> for $type {
 				type Error = FerrosGrynnError;
 
+				/// Checks the source variant and converts its payload to the requested type.
 				fn try_from(value: Value) -> Result<Self, Self::Error> {
 					Self::try_from(MaterializedGraph::try_from(value)?)
 				}

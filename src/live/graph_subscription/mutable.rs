@@ -237,7 +237,10 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveGraphSubscription<Mutable,
 	/// # Errors
 	/// Returns key-space exhaustion or the existing subscription resource
 	/// limit.
-	pub fn intern_property(&mut self, name: impl Into<Text>) -> FerrosGrynnResult<PropertyKeyId> {
+	pub fn intern_property<NameArg: Into<Text>>(
+		&mut self,
+		name: NameArg,
+	) -> FerrosGrynnResult<PropertyKeyId> {
 		let name = name.into();
 		if let Some(key) = self.property_key(name.as_str()) {
 			return Ok(key);
@@ -587,10 +590,9 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveGraphSubscription<Mutable,
 			.flush
 			.as_ref()
 			.is_some_and(|flush| batch.versionstamp() >= flush.checkpoint.versionstamp())
+			&& let Some(event) = self.apply_pending_flush()?
 		{
-			if let Some(event) = self.apply_pending_flush()? {
-				return Ok(event);
-			}
+			return Ok(event);
 		}
 		if batch.versionstamp() <= self.revision {
 			self.unconfirmed = Some(delivery.token().clone());
@@ -751,9 +753,9 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveGraphSubscription<Mutable,
 	/// # Errors
 	/// Callback/validator failure preserves the former local state and
 	/// conflict.
-	pub fn rebase(
+	pub fn rebase<MergeArg: FnOnce(&mut G, &LiveGraphConflict) -> FerrosGrynnResult<()>>(
 		&mut self,
-		merge: impl FnOnce(&mut G, &LiveGraphConflict) -> FerrosGrynnResult<()>,
+		merge: MergeArg,
 	) -> FerrosGrynnResult<LiveGraphNext> {
 		self.ensure_open()?;
 		let pending = self
@@ -764,6 +766,8 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveGraphSubscription<Mutable,
 			pending.conflict.incoming.after(),
 			pending.conflict.remote_revision(),
 		)?;
+		// Merge into a detached candidate so a failing callback cannot
+		// partially overwrite local state.
 		merge(&mut candidate, &pending.conflict)?;
 		let working = LiveGraph::new_mutable(candidate);
 		let budget = self.budget()?;
@@ -792,6 +796,7 @@ impl<G: LiveFamily<State = Mutable, Mutable = G>> LiveGraphSubscription<Mutable,
 }
 
 #[cfg(test)]
+/// Regression tests for mutable behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -799,6 +804,7 @@ mod tests {
 		live::LiveGraphAtomId,
 	};
 
+	/// Verifies structural conflict keeps resource errors as errors.
 	#[test]
 	fn structural_conflict_keeps_resource_errors_as_errors() {
 		assert!(!structural_conflict(&FerrosGrynnError::traversal_resource_limit_exceeded(
@@ -807,8 +813,11 @@ mod tests {
 		assert!(structural_conflict(&FerrosGrynnError::graph_constraint_violation("dag", "cycle")));
 	}
 
+	/// Verifies qualified conflict search is bounded and checks scope changes.
 	#[test]
-	fn qualified_conflict_search_is_bounded_and_checks_scope_changes() -> FerrosGrynnResult<()> {
+	fn qualified_conflict_search_is_bounded_and_checks_scope_changes() {
+		use crate::test_assertions::AssertResult as _;
+
 		let scope = LiveGraphScopeId::Root;
 		let targets = (0..20_000)
 			.map(|id| {
@@ -817,22 +826,23 @@ mod tests {
 					atom: AtomRef::new(AtomKind::Node, format!("node:{id}").parse()?),
 				}))
 			})
-			.collect::<FerrosGrynnResult<std::collections::BTreeSet<_>>>()?
+			.collect::<FerrosGrynnResult<std::collections::BTreeSet<_>>>()
+			.assert_ok()
 			.into_iter()
 			.collect::<Vec<_>>();
 		let missing = LiveGraphTarget::Atom(LiveGraphAtomId {
 			scope: scope.clone(),
-			atom: AtomRef::new(AtomKind::Node, "other:missing".parse()?),
+			atom: AtomRef::new(AtomKind::Node, "other:missing".parse().assert_ok()),
 		});
 		let mut work = 0;
 		let mut admit = |_, steps| {
 			work += steps;
 			Ok(())
 		};
-		assert!(!overlaps(&missing, &targets, &mut admit)?);
-		assert!(overlaps(&targets[10_000], &targets, &mut admit)?);
-		assert!(overlaps(&LiveGraphTarget::Graph(scope.clone()), &targets, &mut admit)?);
-		assert!(overlaps(&missing, &[LiveGraphTarget::Graph(scope)], &mut admit)?);
+		assert!(!overlaps(&missing, &targets, &mut admit).assert_ok());
+		assert!(overlaps(&targets[10_000], &targets, &mut admit).assert_ok());
+		assert!(overlaps(&LiveGraphTarget::Graph(scope.clone()), &targets, &mut admit).assert_ok());
+		assert!(overlaps(&missing, &[LiveGraphTarget::Graph(scope)], &mut admit).assert_ok());
 		assert!(work < 128);
 		assert!(
 			overlaps(&missing, &targets, &mut |_, _| Err(
@@ -840,6 +850,5 @@ mod tests {
 			))
 			.is_err()
 		);
-		Ok(())
 	}
 }

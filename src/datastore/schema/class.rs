@@ -22,13 +22,21 @@ pub enum ClassSchemaMode {
 /// Versioned schema and index definitions for one `RecordId` namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassSchema {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(crate) id: Option<ClassId>,
+	/// Version associated with this class schema.
 	pub(crate) version: SchemaVersion,
+	/// Name associated with this class schema.
 	pub(crate) name: Text,
+	/// Kind associated with this class schema.
 	pub(crate) kind: AtomKind,
+	/// Mode associated with this class schema.
 	pub(crate) mode: ClassSchemaMode,
+	/// Fields associated with this class schema.
 	pub(crate) fields: Vec<ClassField>,
+	/// Indexes associated with this class schema.
 	pub(crate) indexes: Vec<ClassIndex>,
+	/// Published at associated with this class schema.
 	pub(crate) published_at: u64,
 }
 
@@ -255,28 +263,34 @@ impl ClassSchema {
 }
 
 #[cfg(test)]
+/// Regression tests for class behavior.
 mod tests {
 	use super::{ClassSchema, ClassSchemaMode};
+	#[cfg(test)]
+	use crate::test_assertions::AssertOption as _;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::{
 		datastore::{ClassField, ClassIndex, ClassIndexKind, IndexScope},
 		values::{AtomKind, Type},
 	};
 
+	/// Verifies class requires kind and explicit index scope.
 	#[test]
 	fn class_requires_kind_and_explicit_index_scope() {
 		let index =
 			ClassIndex::new("by_email", ClassIndexKind::Unique, IndexScope::Base, ["email"])
-				.unwrap();
+				.assert_ok();
 		let class =
 			ClassSchema::new("person", AtomKind::Node, [ClassField::new("email", Type::String)])
-				.unwrap()
+				.assert_ok()
 				.with_schema_mode(ClassSchemaMode::Schemafull)
 				.with_index(index)
-				.unwrap();
+				.assert_ok();
 
 		assert_eq!(class.name(), "person");
 		assert_eq!(class.kind(), AtomKind::Node);
 		assert_eq!(class.schema_mode(), ClassSchemaMode::Schemafull);
-		assert_eq!(class.indexes().next().unwrap().scope(), IndexScope::Base);
+		assert_eq!(class.indexes().next().assert_some().scope(), IndexScope::Base);
 	}
 }

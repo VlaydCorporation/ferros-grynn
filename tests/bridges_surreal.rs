@@ -1,6 +1,11 @@
+#![cfg(test)]
+
 //! Public embedded-client consumer and runtime gates for Stage 30.
 
 #![cfg(feature = "bridge-surreal")]
+/// Assertions shared with the root unit-test harness.
+#[path = "common/assertions.rs"]
+pub mod test_assertions;
 
 use std::sync::{
 	Arc,
@@ -31,34 +36,47 @@ use ferros_grynn::{
 };
 use surrealdb::{Connection, IndexedResults, Surreal, types as sdk};
 
+/// Reports an SDK fixture error and retains it as a technical source.
 fn external(error: surrealdb::Error) -> FerrosGrynnError {
 	eprintln!("SDK fixture error: {error}");
 	FerrosGrynnError::bridge_operation_error("SDK integration failed").with_technical_source(error)
 }
+/// Extracts the only checked native statement result.
 fn single(mut response: IndexedResults) -> FerrosGrynnResult<sdk::Value> {
-	assert_eq!(response.num_statements(), 1);
+	use crate::test_assertions::AssertComparison as _;
+
+	(&response.num_statements(), &1_usize).assert_equal();
 	response = response.check().map_err(external)?;
 	response.take::<sdk::Value>(0).map_err(external)
 }
+/// Creates a current-thread Tokio runtime with its drivers enabled.
 fn runtime() -> FerrosGrynnResult<tokio::runtime::Runtime> {
 	tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| {
 		FerrosGrynnError::bridge_operation_error("test runtime failed").with_technical_source(error)
 	})
 }
 
+/// Bridge wrapper injecting one unknown commit outcome before forwarding
+/// ordinary requests.
 struct UnknownCommit<C: Connection> {
+	/// Underlying value or owner wrapped by this adapter.
 	inner: Arc<SurrealBridge<C>>,
+	/// One-shot flag controlling the injected test failure.
 	once: AtomicBool,
 }
 impl<C: Connection> Bridge for UnknownCommit<C> {
+	/// Returns database for `UnknownCommit<C>`.
 	fn database(&self) -> Option<BridgeDatabaseRef> {
 		self.inner.database()
 	}
 
+	/// Returns capabilities for `UnknownCommit<C>`.
 	fn capabilities(&self) -> BridgeCapabilities {
 		BridgeCapabilities::FULL
 	}
 
+	/// Forwards requests and reports one unknown outcome after successful
+	/// mirroring.
 	fn execute(&self, operation: BridgeOperation, context: BridgeContext) -> BridgeFuture<'_> {
 		let mirror = matches!(operation, BridgeOperation::Mirror(_));
 		Box::pin(async move {
@@ -73,6 +91,7 @@ impl<C: Connection> Bridge for UnknownCommit<C> {
 	}
 }
 
+/// Exercises both bridge directions, batched records and mirror recovery.
 async fn embedded<C: Connection>(client: Surreal<C>) -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
 	let mut tx = store.begin();
@@ -167,16 +186,16 @@ async fn embedded<C: Connection>(client: Surreal<C>) -> FerrosGrynnResult<()> {
 		.check()
 		.map_err(external)?;
 	let mut tx = store.begin();
-	tx.register_bridge_mapping(BridgeMappingSubject::Atom(record), BridgeEntityRef {
-		database: reference,
-		record: "profile:a".parse()?,
-	})?;
+	tx.register_bridge_mapping(
+		BridgeMappingSubject::Atom(record),
+		BridgeEntityRef::new(reference, "profile:a".parse()?),
+	)?;
 	tx.commit()?;
 	let mut tx = store.begin();
-	tx.register_bridge_mapping(BridgeMappingSubject::Atom(other), BridgeEntityRef {
-		database: reference,
-		record: "profile:b".parse()?,
-	})?;
+	tx.register_bridge_mapping(
+		BridgeMappingSubject::Atom(other),
+		BridgeEntityRef::new(reference, "profile:b".parse()?),
+	)?;
 	tx.commit()?;
 	store.attach_bridge(reference, UnknownCommit {
 		inner: bridge,
@@ -234,16 +253,17 @@ async fn embedded<C: Connection>(client: Surreal<C>) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Verifies bridge surreal mem both directions.
 #[cfg(feature = "bridge-surreal-mem")]
 #[test]
 fn bridge_surreal_mem_both_directions() -> FerrosGrynnResult<()> {
 	let result = runtime()?.block_on(async {
 		embedded(Surreal::new::<surrealdb::engine::local::Mem>(()).await.map_err(external)?).await
 	});
-	if let Err(error) = &result {
-		if let Some(source) = error.technical_source() {
-			eprintln!("native fixture failure: {source}");
-		}
+	if let Err(error) = &result
+		&& let Some(source) = error.technical_source()
+	{
+		eprintln!("native fixture failure: {source}");
 	}
 	result
 }
@@ -291,6 +311,7 @@ async fn wait_native_close(directory: &std::path::Path) -> FerrosGrynnResult<()>
 	}
 }
 
+/// Verifies bridge surreal rocksdb both directions and reopen.
 #[cfg(feature = "bridge-surreal-rocksdb")]
 #[test]
 fn bridge_surreal_rocksdb_both_directions_and_reopen() -> FerrosGrynnResult<()> {

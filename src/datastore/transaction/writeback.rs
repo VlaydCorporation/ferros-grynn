@@ -20,31 +20,65 @@ use crate::{
 	values::{Number, PropertyKeyId, PropertyMap, RecordId, Text, Value},
 };
 
+/// Prepared node rows, edge rows and removals for one graph writeback.
+type DesiredGraphRows = (Vec<DesiredNode>, Vec<DesiredEdge>, Vec<(AtomKind, RecordId)>);
+
+/// Desired node state.
 struct DesiredNode {
+	/// Local associated with this desired node.
 	local: AtomId,
+	/// Record associated with this desired node.
 	record: RecordId,
+	/// Label associated with this desired node.
 	label: Option<Text>,
+	/// Properties associated with this desired node.
 	properties: PropertyMap,
+	/// Nested graph associated with this desired node.
 	nested_graph: Option<GraphId>,
 }
 
+/// Desired edge state.
 struct DesiredEdge {
+	/// Local associated with this desired edge.
 	local: AtomId,
+	/// Record associated with this desired edge.
 	record: RecordId,
+	/// Label associated with this desired edge.
 	label: Option<Text>,
+	/// Properties associated with this desired edge.
 	properties: PropertyMap,
+	/// Topology associated with this desired edge.
 	topology: EdgeTopology,
+	/// Weight associated with this desired edge.
 	weight: Option<Number>,
+	/// Transition graph associated with this desired edge.
 	transition_graph: Option<GraphId>,
 }
 
+/// Overlay action alternatives.
 enum OverlayAction {
-	Set(PropertyKeyId, Value),
-	Hide(PropertyKeyId),
-	Reset(PropertyKeyId),
+	/// Set case of overlay action.
+	Set(
+		/// Interned property-name identifier used to address the selected
+		/// property.
+		PropertyKeyId,
+		/// Set case of overlay action.
+		Value,
+	),
+	/// Hide case of overlay action.
+	Hide(
+		/// Hide case of overlay action.
+		PropertyKeyId,
+	),
+	/// Reset case of overlay action.
+	Reset(
+		/// Reset case of overlay action.
+		PropertyKeyId,
+	),
 }
 
 impl<Reader: GraphRead> GraphWriteBack<Reader> for Transaction {
+	/// Performs the flush operation for `Transaction`.
 	fn flush(
 		&mut self,
 		graph: &Reader,
@@ -56,6 +90,7 @@ impl<Reader: GraphRead> GraphWriteBack<Reader> for Transaction {
 }
 
 impl Transaction {
+	/// Flushes materialized.
 	fn flush_materialized<Reader: GraphRead>(
 		&mut self,
 		graph: &Reader,
@@ -99,9 +134,11 @@ impl Transaction {
 			let mutation_start = self.mutations.len();
 			self.note_dml_change_target(&node.record, Some(reference.id()))?;
 			self.set_occurrence_label(reference.id(), &node.record, node.label.clone())?;
-			self.replace_occurrence_state(reference.id(), &node.record, OccurrenceState::Node {
-				nested_graph: node.nested_graph,
-			})?;
+			self.replace_occurrence_state(
+				reference.id(),
+				&node.record,
+				OccurrenceState::node(node.nested_graph),
+			)?;
 			self.write_effective_properties(reference.id(), &node.record, &node.properties)?;
 			if self.mutations.len() == mutation_start {
 				self.mark_change_noops(intent_start);
@@ -114,11 +151,11 @@ impl Transaction {
 			resolve_topology_locals(self, reference.id(), origin, &edge.topology, &mut locals)?;
 			let topology = remap_topology(&edge.topology, &locals)?;
 			self.set_occurrence_label(reference.id(), &edge.record, edge.label.clone())?;
-			self.replace_occurrence_state(reference.id(), &edge.record, OccurrenceState::Edge {
-				topology,
-				weight: edge.weight,
-				transition_graph: edge.transition_graph,
-			})?;
+			self.replace_occurrence_state(
+				reference.id(),
+				&edge.record,
+				OccurrenceState::edge(topology, edge.weight, edge.transition_graph),
+			)?;
 			self.write_effective_properties(reference.id(), &edge.record, &edge.properties)?;
 			if self.mutations.len() == mutation_start {
 				self.mark_change_noops(intent_start);
@@ -127,6 +164,7 @@ impl Transaction {
 		self.validate_graph_family(reference)
 	}
 
+	/// Ensures writeback atom.
 	fn ensure_writeback_atom(
 		&mut self,
 		record: &RecordId,
@@ -152,6 +190,7 @@ impl Transaction {
 		})
 	}
 
+	/// Ensures writeback node.
 	fn ensure_writeback_node(
 		&mut self,
 		graph: GraphId,
@@ -166,6 +205,7 @@ impl Transaction {
 		}
 	}
 
+	/// Ensures writeback edge.
 	fn ensure_writeback_edge(
 		&mut self,
 		graph: GraphId,
@@ -187,6 +227,7 @@ impl Transaction {
 		}
 	}
 
+	/// Detaches removed.
 	fn detach_removed(
 		&mut self,
 		graph: GraphId,
@@ -207,6 +248,7 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Writes effective properties.
 	fn write_effective_properties(
 		&mut self,
 		graph: GraphId,
@@ -257,11 +299,12 @@ impl Transaction {
 	}
 }
 
+/// Collects delta.
 fn collect_delta<Reader: GraphRead>(
 	graph: &Reader,
 	origin: &MaterializationOrigin,
 	dirty: &[DirtyTarget],
-) -> FerrosGrynnResult<(Vec<DesiredNode>, Vec<DesiredEdge>, Vec<(AtomKind, RecordId)>)> {
+) -> FerrosGrynnResult<DesiredGraphRows> {
 	let mut nodes = Vec::new();
 	let mut edges = Vec::new();
 	let mut removed = Vec::new();
@@ -302,6 +345,7 @@ fn collect_delta<Reader: GraphRead>(
 	Ok((nodes, edges, removed))
 }
 
+/// Returns the checked record result.
 fn checked_record(
 	origin: &MaterializationOrigin,
 	local: AtomId,
@@ -319,6 +363,7 @@ fn checked_record(
 	Ok(record)
 }
 
+/// Resolves topology locals.
 fn resolve_topology_locals(
 	transaction: &Transaction,
 	graph: GraphId,
@@ -347,6 +392,7 @@ fn resolve_topology_locals(
 	Ok(())
 }
 
+/// Returns the overlay action result.
 fn overlay_action(
 	key: PropertyKeyId,
 	base: Option<&Value>,
@@ -366,6 +412,7 @@ fn overlay_action(
 	}
 }
 
+/// Returns the graph identity result.
 fn graph_identity(graph: GraphId) -> crate::values::Uuid {
 	uuid::Uuid::from_u128(u128::from(graph.get())).into()
 }

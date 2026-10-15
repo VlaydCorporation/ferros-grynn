@@ -7,16 +7,23 @@ use crate::{
 	values::{Number, Text, Value},
 };
 
+/// Configured max analyzer input scalars value.
 const MAX_ANALYZER_INPUT_SCALARS: usize = 1_000_000;
+/// Configured max analyzer term scalars value.
 const MAX_ANALYZER_TERM_SCALARS: usize = 4_096;
+/// Configured max analyzer term bytes value.
 const MAX_ANALYZER_TERM_BYTES: usize = 8 * 1_024;
+/// Configured max analyzer tokens value.
 const MAX_ANALYZER_TOKENS: usize = 1_000_000;
 
 /// One final analyzer token and the half-open scalar span of its source text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AnalyzedToken {
+pub struct AnalyzedToken {
+	/// Term associated with this analyzed token.
 	pub(crate) term: Text,
+	/// Start associated with this analyzed token.
 	pub(crate) start: u32,
+	/// End associated with this analyzed token.
 	pub(crate) end: u32,
 }
 
@@ -26,7 +33,7 @@ pub(crate) struct AnalyzedToken {
 ///
 /// Returns an error when the analyzer uses a UDF or a configured resource
 /// limit is exceeded.
-pub(crate) fn analyze_builtin(
+pub fn analyze_builtin(
 	analyzer: &SchemaAnalyzer,
 	input: &str,
 ) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
@@ -66,7 +73,7 @@ pub(crate) fn analyze_builtin_bounded(
 ///
 /// Returns an error for an invalid function result, scalar span, term, or
 /// resource limit.
-pub(crate) fn analyze_function_result(
+pub fn analyze_function_result(
 	analyzer: &SchemaAnalyzer,
 	input: &str,
 	result: &Value,
@@ -146,6 +153,7 @@ pub(crate) fn analyze_function_result_bounded(
 	apply_filters(analyzer, tokens, admit)
 }
 
+/// Returns the tokenize result.
 fn tokenize(
 	input: &str,
 	tokenizers: impl ExactSizeIterator<Item = AnalyzerTokenizer>,
@@ -160,7 +168,8 @@ fn tokenize(
 		return Ok(vec![AnalyzedToken {
 			term: Text::from(input),
 			start: 0,
-			end: u32::try_from(scalar_count).map_err(|_| analyzer_limit("source span"))?,
+			end: u32::try_from(scalar_count)
+				.map_err(|_conversion_error| analyzer_limit("source span"))?,
 		}]);
 	}
 
@@ -193,6 +202,7 @@ fn tokenize(
 	Ok(tokens)
 }
 
+/// Flushes token.
 fn flush_token(
 	input: &str,
 	chars: &[(usize, char)],
@@ -212,20 +222,28 @@ fn flush_token(
 	check_token_count(tokens.len().saturating_add(1))?;
 	tokens.push(AnalyzedToken {
 		term: Text::from(term),
-		start: u32::try_from(start_scalar).map_err(|_| analyzer_limit("source span"))?,
-		end: u32::try_from(end_scalar).map_err(|_| analyzer_limit("source span"))?,
+		start: u32::try_from(start_scalar)
+			.map_err(|_conversion_error| analyzer_limit("source span"))?,
+		end: u32::try_from(end_scalar)
+			.map_err(|_conversion_error| analyzer_limit("source span"))?,
 	});
 	Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Scalar class alternatives.
 enum ScalarClass {
+	/// Whitespace case of scalar class.
 	Whitespace,
+	/// Letter case of scalar class.
 	Letter,
+	/// Number case of scalar class.
 	Number,
+	/// Punctuation case of scalar class.
 	Punctuation,
 }
 
+/// Returns the scalar class result.
 fn scalar_class(value: char) -> ScalarClass {
 	if value.is_whitespace() {
 		ScalarClass::Whitespace
@@ -238,10 +256,12 @@ fn scalar_class(value: char) -> ScalarClass {
 	}
 }
 
+/// Returns whether this value is punctuation.
 fn is_punctuation(value: char) -> bool {
 	!value.is_whitespace() && !value.is_alphanumeric()
 }
 
+/// Applies filters.
 fn apply_filters(
 	analyzer: &SchemaAnalyzer,
 	mut tokens: Vec<AnalyzedToken>,
@@ -304,6 +324,7 @@ fn apply_filters(
 	Ok(tokens)
 }
 
+/// Returns the map terms result.
 fn map_terms(
 	tokens: Vec<AnalyzedToken>,
 	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
@@ -333,6 +354,7 @@ fn map_terms(
 	Ok(output)
 }
 
+/// Returns the ngrams result.
 fn ngrams(
 	tokens: Vec<AnalyzedToken>,
 	minimum: usize,
@@ -385,6 +407,7 @@ fn ngrams(
 	Ok(output)
 }
 
+/// Returns the stemmer algorithm result.
 const fn stemmer_algorithm(language: AnalyzerLanguage) -> Algorithm {
 	match language {
 		AnalyzerLanguage::Arabic => Algorithm::Arabic,
@@ -408,6 +431,7 @@ const fn stemmer_algorithm(language: AnalyzerLanguage) -> Algorithm {
 	}
 }
 
+/// Returns the bounded scalar count result.
 fn bounded_scalar_count(input: &str) -> FerrosGrynnResult<usize> {
 	let count = input.chars().count();
 	if count > MAX_ANALYZER_INPUT_SCALARS {
@@ -416,6 +440,7 @@ fn bounded_scalar_count(input: &str) -> FerrosGrynnResult<usize> {
 	Ok(count)
 }
 
+/// Checks term.
 fn check_term(term: &str) -> FerrosGrynnResult<()> {
 	if term.len() > MAX_ANALYZER_TERM_BYTES || term.chars().count() > MAX_ANALYZER_TERM_SCALARS {
 		return Err(analyzer_limit("term"));
@@ -423,6 +448,7 @@ fn check_term(term: &str) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Checks token count.
 fn check_token_count(count: usize) -> FerrosGrynnResult<()> {
 	if count > MAX_ANALYZER_TOKENS {
 		return Err(analyzer_limit("token"));
@@ -430,10 +456,12 @@ fn check_token_count(count: usize) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Returns the analyzer limit result.
 fn analyzer_limit(resource: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("analyzer {resource} limit exceeded"))
 }
 
+/// Returns the token offset result.
 fn token_offset(value: Option<&Value>, field: &str) -> FerrosGrynnResult<u32> {
 	value
 		.and_then(Value::as_number)
@@ -447,7 +475,12 @@ fn token_offset(value: Option<&Value>, field: &str) -> FerrosGrynnResult<u32> {
 }
 
 #[cfg(test)]
+/// Regression tests for text analyzer behavior.
 mod tests {
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
+
+	/// Verifies bounded filters admit mapper and ngram expansion before copy.
 	#[test]
 	fn bounded_filters_admit_mapper_and_ngram_expansion_before_copy() {
 		use std::{cell::Cell, collections::BTreeMap};
@@ -477,9 +510,9 @@ mod tests {
 		let mapper =
 			BTreeMap::from([(Text::from("x"), Some(Text::from("y".repeat(4 * 1024 * 1024))))]);
 		let mapper =
-			SchemaAnalyzer::new("mapper_budget", [], [AnalyzerFilter::Mapper(mapper)]).unwrap();
+			SchemaAnalyzer::new("mapper_budget", [], [AnalyzerFilter::Mapper(mapper)]).assert_ok();
 		assert_eq!(
-			analyze_builtin_bounded(&mapper, "x", &admit).unwrap_err().status().code().to_string(),
+			analyze_builtin_bounded(&mapper, "x", &admit).assert_err().status().code().to_string(),
 			"FG-54F13"
 		);
 		bytes.set(0);
@@ -488,10 +521,10 @@ mod tests {
 			min: 1,
 			max: 1000,
 		}])
-		.unwrap();
+		.assert_ok();
 		assert_eq!(
 			analyze_builtin_bounded(&grams, &"a".repeat(1000), &admit)
-				.unwrap_err()
+				.assert_err()
 				.status()
 				.code()
 				.to_string(),
@@ -503,10 +536,10 @@ mod tests {
 			min: 1,
 			max: 2,
 		}])
-		.unwrap();
+		.assert_ok();
 		assert_eq!(
-			analyze_builtin_bounded(&small, "ab", &admit).unwrap(),
-			super::analyze_builtin(&small, "ab").unwrap()
+			analyze_builtin_bounded(&small, "ab", &admit).assert_ok(),
+			super::analyze_builtin(&small, "ab").assert_ok()
 		);
 	}
 
@@ -518,14 +551,15 @@ mod tests {
 		values::{Array, Object, Text, Value},
 	};
 
+	/// Verifies combines boundaries and preserves source spans through filters.
 	#[test]
 	fn combines_boundaries_and_preserves_source_spans_through_filters() {
 		let analyzer =
 			SchemaAnalyzer::new("words", [AnalyzerTokenizer::Camel, AnalyzerTokenizer::Punct], [
 				AnalyzerFilter::Lowercase,
 			])
-			.unwrap();
-		let tokens = analyze_builtin(&analyzer, "RustGraph!").unwrap();
+			.assert_ok();
+		let tokens = analyze_builtin(&analyzer, "RustGraph!").assert_ok();
 		assert_eq!(
 			tokens
 				.iter()
@@ -535,13 +569,14 @@ mod tests {
 		);
 	}
 
+	/// Verifies blank is the only implicit whitespace boundary.
 	#[test]
 	fn blank_is_the_only_implicit_whitespace_boundary() {
-		let camel = SchemaAnalyzer::new("camel", [AnalyzerTokenizer::Camel], []).unwrap();
-		let blank = SchemaAnalyzer::new("blank", [AnalyzerTokenizer::Blank], []).unwrap();
+		let camel = SchemaAnalyzer::new("camel", [AnalyzerTokenizer::Camel], []).assert_ok();
+		let blank = SchemaAnalyzer::new("blank", [AnalyzerTokenizer::Blank], []).assert_ok();
 		assert_eq!(
 			analyze_builtin(&camel, "lower wordsHere")
-				.unwrap()
+				.assert_ok()
 				.into_iter()
 				.map(|token| token.term)
 				.collect::<Vec<_>>(),
@@ -549,7 +584,7 @@ mod tests {
 		);
 		assert_eq!(
 			analyze_builtin(&blank, "lower wordsHere")
-				.unwrap()
+				.assert_ok()
 				.into_iter()
 				.map(|token| token.term)
 				.collect::<Vec<_>>(),
@@ -557,6 +592,7 @@ mod tests {
 		);
 	}
 
+	/// Verifies applies ordered unicode ngram and mapper filters.
 	#[test]
 	fn applies_ordered_unicode_ngram_and_mapper_filters() {
 		let mut mapper = BTreeMap::new();
@@ -570,17 +606,18 @@ mod tests {
 			},
 			AnalyzerFilter::Mapper(mapper),
 		])
-		.unwrap();
-		let tokens = analyze_builtin(&analyzer, "\u{FB03}eld").unwrap();
+		.assert_ok();
+		let tokens = analyze_builtin(&analyzer, "\u{FB03}eld").assert_ok();
 		assert_eq!(tokens.len(), 1);
 		assert_eq!(tokens[0].term, "ligature");
 		assert_eq!((tokens[0].start, tokens[0].end), (0, 4));
 	}
 
+	/// Verifies normalizes nfc and runs every snowball language.
 	#[test]
 	fn normalizes_nfc_and_runs_every_snowball_language() {
-		let nfc = SchemaAnalyzer::new("nfc", [], [AnalyzerFilter::Nfc]).unwrap();
-		let tokens = analyze_builtin(&nfc, "e\u{301}").unwrap();
+		let nfc = SchemaAnalyzer::new("nfc", [], [AnalyzerFilter::Nfc]).assert_ok();
+		let tokens = analyze_builtin(&nfc, "e\u{301}").assert_ok();
 		assert_eq!(tokens[0].term, "é");
 		assert_eq!((tokens[0].start, tokens[0].end), (0, 2));
 
@@ -605,19 +642,20 @@ mod tests {
 			(AnalyzerLanguage::Turkish, "evler"),
 		] {
 			let analyzer =
-				SchemaAnalyzer::new("stem", [], [AnalyzerFilter::Snowball(language)]).unwrap();
-			let tokens = analyze_builtin(&analyzer, term).unwrap();
+				SchemaAnalyzer::new("stem", [], [AnalyzerFilter::Snowball(language)]).assert_ok();
+			let tokens = analyze_builtin(&analyzer, term).assert_ok();
 			assert_eq!(tokens.len(), 1);
 			assert!(!tokens[0].term.is_empty());
 			assert_eq!((tokens[0].start, tokens[0].end), (0, term.chars().count() as u32));
 		}
 	}
 
+	/// Verifies validates function token shape and scalar ranges.
 	#[test]
 	fn validates_function_token_shape_and_scalar_ranges() {
-		let mut analyzer = SchemaAnalyzer::new("udf", [], []).unwrap();
+		let mut analyzer = SchemaAnalyzer::new("udf", [], []).assert_ok();
 		analyzer.function = Some((
-			crate::datastore::schema::FunctionId::new(7).unwrap(),
+			crate::datastore::schema::FunctionId::new(7).assert_some(),
 			crate::datastore::schema::SchemaVersion::INITIAL,
 		));
 		let token = Object::from_iter([
@@ -626,7 +664,7 @@ mod tests {
 			("end", Value::from(4_i64)),
 		]);
 		let result = Value::Array(Array::new(vec![Value::Object(token)]));
-		let tokens = analyze_function_result(&analyzer, "граф!", &result).unwrap();
+		let tokens = analyze_function_result(&analyzer, "граф!", &result).assert_ok();
 		assert_eq!(tokens[0].term, "граф");
 		assert_eq!((tokens[0].start, tokens[0].end), (0, 4));
 
@@ -655,11 +693,12 @@ mod tests {
 		}
 	}
 
+	/// Verifies covers class ascii uppercase ngrams and mapper drop.
 	#[test]
 	fn covers_class_ascii_uppercase_ngrams_and_mapper_drop() {
-		let class = SchemaAnalyzer::new("class", [AnalyzerTokenizer::Class], []).unwrap();
+		let class = SchemaAnalyzer::new("class", [AnalyzerTokenizer::Class], []).assert_ok();
 		let terms = analyze_builtin(&class, "abc123!Ж")
-			.unwrap()
+			.assert_ok()
 			.into_iter()
 			.map(|token| token.term)
 			.collect::<Vec<_>>();
@@ -669,8 +708,8 @@ mod tests {
 			AnalyzerFilter::Ascii,
 			AnalyzerFilter::Uppercase,
 		])
-		.unwrap();
-		let tokens = analyze_builtin(&ascii_upper, "Crème").unwrap();
+		.assert_ok();
+		let tokens = analyze_builtin(&ascii_upper, "Crème").assert_ok();
 		assert_eq!(tokens[0].term, "CREME");
 		assert_eq!((tokens[0].start, tokens[0].end), (0, 5));
 
@@ -678,8 +717,8 @@ mod tests {
 			min: 2,
 			max: 2,
 		}])
-		.unwrap();
-		let tokens = analyze_builtin(&ngram, "rust").unwrap();
+		.assert_ok();
+		let tokens = analyze_builtin(&ngram, "rust").assert_ok();
 		assert_eq!(tokens.iter().map(|token| token.term.as_str()).collect::<Vec<_>>(), vec![
 			"ru", "us", "st"
 		],);
@@ -692,8 +731,8 @@ mod tests {
 			SchemaAnalyzer::new("mapper", [AnalyzerTokenizer::Blank], [AnalyzerFilter::Mapper(
 				mapper,
 			)])
-			.unwrap();
-		let tokens = analyze_builtin(&mapper, "drop keep").unwrap();
+			.assert_ok();
+		let tokens = analyze_builtin(&mapper, "drop keep").assert_ok();
 		assert_eq!(tokens.len(), 1);
 		assert_eq!(tokens[0].term, "kept");
 		assert_eq!((tokens[0].start, tokens[0].end), (5, 9));

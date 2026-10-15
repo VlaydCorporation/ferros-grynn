@@ -22,6 +22,7 @@ pub struct MaintenanceOptions {
 }
 
 impl Default for MaintenanceOptions {
+	/// Constructs the default initial state of `MaintenanceOptions`.
 	fn default() -> Self {
 		Self {
 			max_memory_bytes: NonZeroUsize::new(256 * 1024 * 1024).unwrap_or(NonZeroUsize::MIN),
@@ -64,6 +65,7 @@ pub struct CheckpointPolicy {
 }
 
 impl Default for CheckpointPolicy {
+	/// Constructs the default initial state of `CheckpointPolicy`.
 	fn default() -> Self {
 		Self {
 			unbackfilled_page_percent: DEFAULT_CHECKPOINT_DIRTY_PERCENT,
@@ -91,6 +93,7 @@ pub struct LocalOptions {
 }
 
 impl Default for LocalOptions {
+	/// Constructs the default initial state of `LocalOptions`.
 	fn default() -> Self {
 		Self {
 			io_mode: IoMode::Sync,
@@ -103,16 +106,21 @@ impl Default for LocalOptions {
 	}
 }
 
+/// Snapshot-lifetime, write-set and maintenance limits for an in-memory
+/// datastore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct InMemoryOptions {
+	/// Maximum lifetime accepted for a retained transaction snapshot.
 	pub max_snapshot_age: Duration,
+	/// Maximum admitted memory for one transaction write set.
 	pub max_write_set_bytes: usize,
 	/// Resource limits for maintenance and import builders.
 	pub maintenance: MaintenanceOptions,
 }
 
 impl Default for InMemoryOptions {
+	/// Constructs the default initial state of `InMemoryOptions`.
 	fn default() -> Self {
 		Self {
 			max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
@@ -127,42 +135,60 @@ impl Default for InMemoryOptions {
 #[non_exhaustive]
 pub enum DatastoreOptions {
 	/// Volatile in-process storage.
-	InMemory(InMemoryOptions),
+	InMemory(
+		/// Volatile in-process storage.
+		InMemoryOptions,
+	),
 	/// Exclusively owned local disk storage.
-	Local(LocalOptions),
+	Local(
+		/// Exclusively owned local disk storage.
+		LocalOptions,
+	),
 }
 
 impl Default for DatastoreOptions {
+	/// Constructs the default initial state of `DatastoreOptions`.
 	fn default() -> Self {
 		Self::InMemory(InMemoryOptions::default())
 	}
 }
 
+/// Transaction isolation contract requested by a datastore client.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IsolationLevel {
+	/// Read data committed at each permitted transaction observation point.
 	ReadCommitted,
+	/// Read from one retained snapshot with write-conflict validation.
 	Snapshot,
+	/// Apply serializable transaction validation in addition to snapshot reads.
 	#[default]
 	Serializable,
 }
 
+/// Whether a transaction may modify the database or only read it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransactionAccess {
+	/// Permit writes in addition to reads.
 	#[default]
 	ReadWrite,
+	/// Reject operations that would mutate the database.
 	ReadOnly,
 }
 
+/// Isolation and access settings selected when beginning a transaction.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TransactionOptions {
+	/// Isolation contract applied when the transaction begins.
 	pub isolation: IsolationLevel,
+	/// Requested access mode or explicit query access-path selection.
 	pub access: TransactionAccess,
 }
 
 impl TransactionOptions {
+	/// Constructs `TransactionOptions` from the supplied initial state.
 	pub fn new(isolation: IsolationLevel, access: TransactionAccess) -> Self {
 		Self {
 			isolation,

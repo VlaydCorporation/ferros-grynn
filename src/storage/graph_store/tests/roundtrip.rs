@@ -3,6 +3,8 @@ use std::{error::Error, sync::Arc};
 use rapidhash::RapidHashSet;
 
 use super::support::{CombinedLayout, Fixture, TestDirectory};
+#[cfg(test)]
+use crate::test_assertions::{AssertOption as _, AssertResult as _};
 use crate::{
 	datastore::DatabaseRoot,
 	storage::{
@@ -41,41 +43,48 @@ use crate::{
 /// AtomStore, graph space, and both membership directions share one commit
 /// boundary.
 #[test]
-fn one_wal_transaction_publishes_atom_store_graph_and_memberships() -> Result<(), Box<dyn Error>> {
-	let directory = TestDirectory::new()?;
-	let fixture = Fixture::build()?;
-	let (atom, graph, reverse) = fixture.images()?;
-	let empty_database = fixture.empty_database()?;
+fn one_wal_transaction_publishes_atom_store_graph_and_memberships() {
+	use crate::test_assertions::AssertResult as _;
+
+	let directory = TestDirectory::new().assert_ok();
+	let fixture = Fixture::build().assert_ok();
+	let (atom, graph, reverse) = fixture.images().assert_ok();
+	let empty_database = fixture.empty_database().assert_ok();
 	let empty_atom = build_durable_atom_store_image(
 		&empty_database.atoms,
 		&empty_database.schema,
 		&empty_database.dictionary,
-	)?;
+	)
+	.assert_ok();
 	let mut empty_context =
-		value_context(&empty_database.schema, empty_database.dictionary.as_ref().clone())?;
+		value_context(&empty_database.schema, empty_database.dictionary.as_ref().clone())
+			.assert_ok();
 	let empty_graph =
-		build_durable_graph_image(&empty_database, fixture.graph_id, &mut empty_context)?;
-	let empty_reverse = build_reverse_membership_image(&empty_database)?;
+		build_durable_graph_image(&empty_database, fixture.graph_id, &mut empty_context)
+			.assert_ok();
+	let empty_reverse = build_reverse_membership_image(&empty_database).assert_ok();
 	let layout = CombinedLayout::create(
 		directory.as_path(),
 		fixture.graph_id,
 		&empty_atom,
 		&empty_graph,
 		&empty_reverse,
-	)?;
+	)
+	.assert_ok();
 	let registry = FileRegistry::open(
 		layout.catalog.registrations(directory.as_path()),
 		DirectFileOpenMode::Synchronous,
 		&RapidHashSet::default(),
-	)?;
+	)
+	.assert_ok();
 	let wal_path = directory.as_path().join("wal");
-	let wal = FrameWal::create_new(&wal_path)?;
+	let wal = FrameWal::create_new(&wal_path).assert_ok();
 	let before = wal.snapshot();
 
-	let mut aborted = wal.begin_tx()?;
-	stage_durable_atom_store_image(&mut aborted, layout.atoms, &atom)?;
-	stage_durable_graph_image(&mut aborted, layout.graph, &graph)?;
-	stage_reverse_membership_image(&mut aborted, layout.reverse, &reverse)?;
+	let mut aborted = wal.begin_tx().assert_ok();
+	stage_durable_atom_store_image(&mut aborted, layout.atoms, &atom).assert_ok();
+	stage_durable_graph_image(&mut aborted, layout.graph, &graph).assert_ok();
+	stage_reverse_membership_image(&mut aborted, layout.reverse, &reverse).assert_ok();
 	drop(aborted);
 	let old = open_snapshot(
 		&wal,
@@ -88,15 +97,16 @@ fn one_wal_transaction_publishes_atom_store_graph_and_memberships() -> Result<()
 		layout.reverse,
 		&fixture,
 		graph.arena.clone(),
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(old.atoms.atoms().count(), 0);
-	assert_eq!(old.graph(fixture.graph_id).unwrap().occurrences().count(), 0);
+	assert_eq!(old.graph(fixture.graph_id).assert_some().occurrences().count(), 0);
 
-	let mut tx = wal.begin_tx()?;
-	stage_durable_atom_store_image(&mut tx, layout.atoms, &atom)?;
-	stage_durable_graph_image(&mut tx, layout.graph, &graph)?;
-	stage_reverse_membership_image(&mut tx, layout.reverse, &reverse)?;
-	wal.commit_tx(tx)?;
+	let mut tx = wal.begin_tx().assert_ok();
+	stage_durable_atom_store_image(&mut tx, layout.atoms, &atom).assert_ok();
+	stage_durable_graph_image(&mut tx, layout.graph, &graph).assert_ok();
+	stage_reverse_membership_image(&mut tx, layout.reverse, &reverse).assert_ok();
+	wal.commit_tx(tx).assert_ok();
 	let opened = open_snapshot(
 		&wal,
 		&registry,
@@ -108,11 +118,12 @@ fn one_wal_transaction_publishes_atom_store_graph_and_memberships() -> Result<()
 		layout.reverse,
 		&fixture,
 		graph.arena.clone(),
-	)?;
+	)
+	.assert_ok();
 	assert_opened(&opened, &fixture);
 
 	drop(wal);
-	let recovered = FrameWal::open(&wal_path)?;
+	let recovered = FrameWal::open(&wal_path).assert_ok();
 	let reopened = open_snapshot(
 		&recovered,
 		&registry,
@@ -124,9 +135,9 @@ fn one_wal_transaction_publishes_atom_store_graph_and_memberships() -> Result<()
 		layout.reverse,
 		&fixture,
 		graph.arena,
-	)?;
+	)
+	.assert_ok();
 	assert_opened(&reopened, &fixture);
-	Ok(())
 }
 
 /// One checkpoint backfills all data spaces before publishing both metadata
@@ -217,6 +228,7 @@ fn checkpoint_recovers_atom_and_graph_spaces_from_authorized_cow() -> Result<(),
 	Ok(())
 }
 
+/// Opens snapshot for this module.
 #[allow(
 	clippy::too_many_arguments,
 	reason = "the integration helper mirrors the durable trust boundary"
@@ -274,27 +286,28 @@ fn open_snapshot(
 	Ok(database)
 }
 
+/// Returns assert opened for this module.
 fn assert_opened(opened: &DatabaseRoot, fixture: &Fixture) {
 	assert_eq!(opened.atoms.atoms().count(), fixture.database.atoms.atoms().count());
 	assert_eq!(
-		opened.graph(fixture.graph_id).unwrap().occurrences().count(),
-		fixture.database.graph(fixture.graph_id).unwrap().occurrences().count()
+		opened.graph(fixture.graph_id).assert_some().occurrences().count(),
+		fixture.database.graph(fixture.graph_id).assert_some().occurrences().count()
 	);
 	assert_eq!(opened.membership(fixture.graph_id, fixture.left), Some(fixture.left_local));
-	let class = opened.atom(fixture.left).unwrap().class_id();
+	let class = opened.atom(fixture.left).assert_some().class_id();
 	assert_eq!(
 		opened.indexes.graph_class(fixture.graph_id, class),
 		fixture.database.indexes.graph_class(fixture.graph_id, class)
 	);
-	assert_eq!(opened.statistics.graph(fixture.graph_id).unwrap().node_count, 2);
+	assert_eq!(opened.statistics.graph(fixture.graph_id).assert_some().node_count, 2);
 	assert_eq!(
 		opened
 			.effective_property(
 				fixture.graph_id,
 				fixture.left_local,
-				opened.dictionary.get("name").unwrap(),
+				opened.dictionary.get("name").assert_some(),
 			)
-			.unwrap(),
+			.assert_ok(),
 		Some(&crate::values::Value::from("private"))
 	);
 }

@@ -32,6 +32,7 @@ mod type_codec;
 mod validate;
 
 #[cfg(test)]
+/// Regression tests for database behavior.
 mod tests;
 
 use crate::{
@@ -60,89 +61,145 @@ use crate::{
 /// One ordered analyzer filter in the durable catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) enum AnalyzerFilterCatalogEntry {
+	/// Nfc case of analyzer filter catalog entry.
 	Nfc,
+	/// Nfkc case of analyzer filter catalog entry.
 	Nfkc,
+	/// Ascii case of analyzer filter catalog entry.
 	Ascii,
+	/// Lowercase case of analyzer filter catalog entry.
 	Lowercase,
+	/// Uppercase case of analyzer filter catalog entry.
 	Uppercase,
+	/// Edge ngram case of analyzer filter catalog entry.
 	EdgeNgram {
+		/// Min associated with this analyzer filter catalog entry.
 		min: u16,
+		/// Max associated with this analyzer filter catalog entry.
 		max: u16,
 	},
+	/// Ngram case of analyzer filter catalog entry.
 	Ngram {
+		/// Min associated with this analyzer filter catalog entry.
 		min: u16,
+		/// Max associated with this analyzer filter catalog entry.
 		max: u16,
 	},
-	Snowball(crate::datastore::AnalyzerLanguage),
+	/// Snowball case of analyzer filter catalog entry.
+	Snowball(
+		/// Snowball case of analyzer filter catalog entry.
+		crate::datastore::AnalyzerLanguage,
+	),
 	/// Canonical `StorageValue::Object` bytes.
-	Mapper(Vec<u8>),
+	Mapper(
+		/// Canonical `StorageValue::Object` bytes.
+		Vec<u8>,
+	),
 }
 
 /// One durable text-analyzer definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct AnalyzerCatalogEntry {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: AnalyzerId,
+	/// Version associated with this analyzer catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Published at associated with this analyzer catalog entry.
 	pub(in crate::storage) published_at: u64,
+	/// Name associated with this analyzer catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Tokenizers associated with this analyzer catalog entry.
 	pub(in crate::storage) tokenizers: std::collections::BTreeSet<AnalyzerTokenizer>,
+	/// Filters associated with this analyzer catalog entry.
 	pub(in crate::storage) filters: Vec<AnalyzerFilterCatalogEntry>,
+	/// Function associated with this analyzer catalog entry.
 	pub(in crate::storage) function: Option<(FunctionId, SchemaVersion)>,
+	/// Comment associated with this analyzer catalog entry.
 	pub(in crate::storage) comment: Option<Text>,
 }
 
 /// Exact physical root of one immutable index generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) struct PhysicalIndexBinding {
+	/// File id associated with this physical index binding.
 	pub(in crate::storage) file_id: DataFileId,
+	/// Root associated with this physical index binding.
 	pub(in crate::storage) root: PageNo,
 }
 
 /// Database-global AtomStore generation and its non-singleton roots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) struct AtomStoreCatalogBinding {
+	/// Generation identifying this version of the data.
 	pub(in crate::storage) generation: u64,
+	/// Primary associated with this atom store catalog binding.
 	pub(in crate::storage) primary: PhysicalIndexBinding,
+	/// Reverse membership associated with this atom store catalog binding.
 	pub(in crate::storage) reverse_membership: PhysicalIndexBinding,
 }
 
 /// One versioned field belonging to a class definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct ClassFieldCatalogEntry {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: SchemaId,
+	/// Version associated with this class field catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Name associated with this class field catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Value type associated with this class field catalog entry.
 	pub(in crate::storage) value_type: Type,
+	/// Property key associated with this class field catalog entry.
 	pub(in crate::storage) property_key: PropertyKeyId,
 }
 
 /// One versioned base or effective class-index definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct ClassIndexCatalogEntry {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: IndexId,
+	/// Version associated with this class index catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Name associated with this class index catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Kind associated with this class index catalog entry.
 	pub(in crate::storage) kind: ClassIndexKind,
+	/// State associated with this class index catalog entry.
 	pub(in crate::storage) state: ClassIndexState,
+	/// Maintenance associated with this class index catalog entry.
 	pub(in crate::storage) maintenance: IndexMaintenanceMode,
+	/// Build revision associated with this class index catalog entry.
 	pub(in crate::storage) build_revision: u64,
+	/// Scope associated with this class index catalog entry.
 	pub(in crate::storage) scope: IndexScope,
+	/// Fields associated with this class index catalog entry.
 	pub(in crate::storage) fields: Vec<PropertyKeyId>,
+	/// Options associated with this class index catalog entry.
 	pub(in crate::storage) options: ClassIndexOptions,
+	/// Physical associated with this class index catalog entry.
 	pub(in crate::storage) physical: Option<PhysicalIndexBinding>,
+	/// Delta associated with this class index catalog entry.
 	pub(in crate::storage) delta: Option<PhysicalIndexBinding>,
 }
 
 /// One durable `RecordId` namespace definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct ClassCatalogEntry {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: ClassId,
+	/// Version associated with this class catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Published at associated with this class catalog entry.
 	pub(in crate::storage) published_at: u64,
+	/// Name associated with this class catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Kind associated with this class catalog entry.
 	pub(in crate::storage) kind: AtomKind,
+	/// Mode associated with this class catalog entry.
 	pub(in crate::storage) mode: ClassSchemaMode,
+	/// Fields associated with this class catalog entry.
 	pub(in crate::storage) fields: Vec<ClassFieldCatalogEntry>,
+	/// Indexes associated with this class catalog entry.
 	pub(in crate::storage) indexes: Vec<ClassIndexCatalogEntry>,
 }
 
@@ -152,18 +209,29 @@ pub(in crate::storage) struct GraphCatalogEntry {
 	/// Durable incidence dependency revision; unrelated COW/checkpoint does not
 	/// change it.
 	pub(in crate::storage) tensor_revision: u64,
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: GraphId,
+	/// Version associated with this graph catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Published at associated with this graph catalog entry.
 	pub(in crate::storage) published_at: u64,
+	/// Generation identifying this version of the data.
 	pub(in crate::storage) generation: u64,
+	/// Name associated with this graph catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Kind associated with this graph catalog entry.
 	pub(in crate::storage) kind: GraphKind,
+	/// Storage mode associated with this graph catalog entry.
 	pub(in crate::storage) storage_mode: GraphStorageMode,
+	/// Topology constraints associated with this graph catalog entry.
 	pub(in crate::storage) topology_constraints: GraphTopologyConstraints,
+	/// Label index associated with this graph catalog entry.
 	pub(in crate::storage) label_index: (IndexId, SchemaVersion),
+	/// Adjacency index associated with this graph catalog entry.
 	pub(in crate::storage) adjacency_index: (IndexId, SchemaVersion),
 	/// Optional engine capability and its snapshot-exact synchronous side-file.
 	pub(in crate::storage) edge_endpoint_index: Option<(IndexId, SchemaVersion)>,
+	/// Edge endpoint associated with this graph catalog entry.
 	pub(in crate::storage) edge_endpoint: Option<PhysicalIndexBinding>,
 	/// User snapshot definitions in stable identity order.
 	pub(in crate::storage) indexes: Vec<GraphIndex>,
@@ -171,52 +239,79 @@ pub(in crate::storage) struct GraphCatalogEntry {
 	/// definitions.
 	pub(in crate::storage) index_bindings:
 		std::collections::BTreeMap<IndexId, PhysicalIndexBinding>,
+	/// Membership associated with this graph catalog entry.
 	pub(in crate::storage) membership: PhysicalIndexBinding,
+	/// Owner root associated with this graph catalog entry.
 	pub(in crate::storage) owner_root: Option<GraphId>,
+	/// Root associated with this graph catalog entry.
 	pub(in crate::storage) root: Option<Vec<u8>>,
+	/// Properties associated with this graph catalog entry.
 	pub(in crate::storage) properties: Vec<GraphPropertyCatalogEntry>,
+	/// Arena associated with this graph catalog entry.
 	pub(in crate::storage) arena: GraphArenaBindings,
 }
 
 /// One catalog-owned graph property encoded through the canonical value codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct GraphPropertyCatalogEntry {
+	/// Key associated with this graph property catalog entry.
 	pub(in crate::storage) key: PropertyKeyId,
+	/// Value associated with this graph property catalog entry.
 	pub(in crate::storage) value: Vec<u8>,
 }
 
 /// One encoded global parameter; value bytes use the canonical value codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct ParameterCatalogEntry {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: SchemaId,
+	/// Version associated with this parameter catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Published at associated with this parameter catalog entry.
 	pub(in crate::storage) published_at: u64,
+	/// Name associated with this parameter catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Value associated with this parameter catalog entry.
 	pub(in crate::storage) value: Vec<u8>,
+	/// Comment associated with this parameter catalog entry.
 	pub(in crate::storage) comment: Option<Text>,
 }
 
 /// One parameter in a durable named-function signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct FunctionParameterCatalogEntry {
+	/// Name associated with this function parameter catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Value type associated with this function parameter catalog entry.
 	pub(in crate::storage) value_type: Type,
 }
 
 /// One durable named-function overload. The body is persisted as UTF-8 source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct FunctionCatalogEntry {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(in crate::storage) id: FunctionId,
+	/// Version associated with this function catalog entry.
 	pub(in crate::storage) version: SchemaVersion,
+	/// Published at associated with this function catalog entry.
 	pub(in crate::storage) published_at: u64,
+	/// Namespace associated with this function catalog entry.
 	pub(in crate::storage) namespace: Text,
+	/// Name associated with this function catalog entry.
 	pub(in crate::storage) name: Text,
+	/// Parameters associated with this function catalog entry.
 	pub(in crate::storage) parameters: Vec<FunctionParameterCatalogEntry>,
+	/// Result associated with this function catalog entry.
 	pub(in crate::storage) result: Type,
+	/// Effect associated with this function catalog entry.
 	pub(in crate::storage) effect: FunctionEffect,
+	/// Cost associated with this function catalog entry.
 	pub(in crate::storage) cost: bool,
+	/// Max depth associated with this function catalog entry.
 	pub(in crate::storage) max_depth: Option<u8>,
+	/// Body associated with this function catalog entry.
 	pub(in crate::storage) body: Text,
+	/// Comment associated with this function catalog entry.
 	pub(in crate::storage) comment: Option<Text>,
 }
 
@@ -243,14 +338,23 @@ pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) live_bindings: Vec<LiveBindingCatalogEntry>,
 	/// Private result history is not exposed by user SHOW CHANGES.
 	pub(in crate::storage) live_history: Vec<LiveHistoryCatalogEntry>,
+	/// Next graph id associated with this database catalog.
 	pub(in crate::storage) next_graph_id: u64,
+	/// Next schema id associated with this database catalog.
 	pub(in crate::storage) next_schema_id: u64,
+	/// Time zones associated with this database catalog.
 	pub(in crate::storage) time_zones: Vec<Text>,
+	/// Atom store associated with this database catalog.
 	pub(in crate::storage) atom_store: AtomStoreCatalogBinding,
+	/// Classes associated with this database catalog.
 	pub(in crate::storage) classes: Vec<ClassCatalogEntry>,
+	/// Graphs associated with this database catalog.
 	pub(in crate::storage) graphs: Vec<GraphCatalogEntry>,
+	/// Parameters associated with this database catalog.
 	pub(in crate::storage) parameters: Vec<ParameterCatalogEntry>,
+	/// Functions associated with this database catalog.
 	pub(in crate::storage) functions: Vec<FunctionCatalogEntry>,
+	/// Analyzers associated with this database catalog.
 	pub(in crate::storage) analyzers: Vec<AnalyzerCatalogEntry>,
 }
 

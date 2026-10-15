@@ -40,21 +40,30 @@ use crate::{
 	},
 };
 
+/// Configured max hash collision candidates value.
 const MAX_HASH_COLLISION_CANDIDATES: usize = 4096;
 
+/// Group state.
 struct Group<V> {
+	/// Vector hash associated with this group.
 	vector_hash: u64,
+	/// Vector associated with this group.
 	vector: V,
+	/// Postings associated with this group.
 	postings: Vec<crate::values::storage::DiskAtomRef>,
 }
 
 #[derive(Clone, Copy)]
+/// Build candidate state.
 struct BuildCandidate {
+	/// Distance associated with this build candidate.
 	distance: f64,
+	/// Ordinal associated with this build candidate.
 	ordinal: u32,
 }
 
 impl PartialEq for BuildCandidate {
+	/// Compares this `BuildCandidate` with another value for equality.
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
@@ -63,18 +72,22 @@ impl PartialEq for BuildCandidate {
 impl Eq for BuildCandidate {}
 
 impl PartialOrd for BuildCandidate {
+	/// Compares this `BuildCandidate` with another value when they are ordered.
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for BuildCandidate {
+	/// Compares this `BuildCandidate` with another value using its ordering
+	/// contract.
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.distance.total_cmp(&other.distance).then_with(|| self.ordinal.cmp(&other.ordinal))
 	}
 }
 
 /// Builds one deterministic immutable HNSW or DiskANN generation.
+#[cfg(test)]
 pub(in crate::storage) fn build_vector_index<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	documents: Vec<VectorDocument<V>>,
@@ -111,6 +124,8 @@ pub(in crate::storage) fn build_vector_graph_with_distance<V: Borrow<Vector>>(
 	build_graph_with_hasher_and_distance(spec, documents, rapidhash_v3, distance_function)
 }
 
+/// Builds with hasher.
+#[cfg(test)]
 fn build_with_hasher<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	documents: Vec<VectorDocument<V>>,
@@ -124,6 +139,7 @@ fn build_with_hasher<V: Borrow<Vector>>(
 	build_with_hasher_and_distance(spec, documents, hash, &mut unavailable)
 }
 
+/// Builds with hasher and distance.
 fn build_with_hasher_and_distance<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	documents: Vec<VectorDocument<V>>,
@@ -140,6 +156,7 @@ fn build_with_hasher_and_distance<V: Borrow<Vector>>(
 	encode_vector_index(spec, entrypoint, &nodes)
 }
 
+/// Builds graph with hasher and distance.
 fn build_graph_with_hasher_and_distance<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	mut documents: Vec<VectorDocument<V>>,
@@ -178,6 +195,7 @@ fn build_graph_with_hasher_and_distance<V: Borrow<Vector>>(
 	Ok((entrypoint, nodes))
 }
 
+/// Returns the enforce hnsw build budget result.
 fn enforce_hnsw_build_budget<V>(
 	spec: VectorBuildSpec,
 	documents: &[VectorDocument<V>],
@@ -192,6 +210,7 @@ fn enforce_hnsw_build_budget<V>(
 	Ok(())
 }
 
+/// Returns the estimated hnsw build bytes result.
 fn estimated_hnsw_build_bytes<V>(
 	spec: VectorBuildSpec,
 	documents: &[VectorDocument<V>],
@@ -279,14 +298,17 @@ fn estimated_hnsw_build_bytes<V>(
 	.try_fold(0_usize, |total, bytes| checked_add(total, bytes, "HNSW build estimate"))
 }
 
+/// Returns the checked add result.
 fn checked_add(left: usize, right: usize, context: &str) -> FerrosGrynnResult<usize> {
 	left.checked_add(right).ok_or_else(|| invalid(format!("{context} exceeds usize")))
 }
 
+/// Returns the checked mul result.
 fn checked_mul(left: usize, right: usize, context: &str) -> FerrosGrynnResult<usize> {
 	left.checked_mul(right).ok_or_else(|| invalid(format!("{context} exceeds usize")))
 }
 
+/// Returns the group documents result.
 fn group_documents<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	documents: Vec<VectorDocument<V>>,
@@ -344,6 +366,7 @@ fn group_documents<V: Borrow<Vector>>(
 	Ok(groups)
 }
 
+/// Builds adjacency.
 fn build_adjacency<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &mut [VectorNode<V>],
@@ -366,6 +389,7 @@ fn build_adjacency<V: Borrow<Vector>>(
 	}
 }
 
+/// Builds hnsw adjacency.
 fn build_hnsw_adjacency<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &mut [VectorNode<V>],
@@ -376,9 +400,8 @@ fn build_hnsw_adjacency<V: Borrow<Vector>>(
 		&Vector,
 	) -> FerrosGrynnResult<f64>,
 ) -> FerrosGrynnResult<u32> {
-	let options = match spec.options {
-		crate::datastore::ClassIndexOptions::Hnsw(options) => options,
-		_ => return Err(invalid("HNSW builder received another index kind")),
+	let crate::datastore::ClassIndexOptions::Hnsw(options) = spec.options else {
+		return Err(invalid("HNSW builder received another index kind"));
 	};
 	let mut entrypoint = 0_usize;
 	let mut highest_level = nodes[0]
@@ -447,6 +470,7 @@ fn build_hnsw_adjacency<V: Borrow<Vector>>(
 	u32::try_from(entrypoint).map_err(|_error| invalid("HNSW entrypoint exceeds u32"))
 }
 
+/// Returns the greedy hnsw level result.
 fn greedy_hnsw_level<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -500,6 +524,7 @@ fn greedy_hnsw_level<V: Borrow<Vector>>(
 	}
 }
 
+/// Returns the search hnsw level result.
 fn search_hnsw_level<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -575,6 +600,7 @@ fn search_hnsw_level<V: Borrow<Vector>>(
 	Ok(nearest.into_iter().collect())
 }
 
+/// Returns the rank hnsw candidates result.
 fn rank_hnsw_candidates<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -609,6 +635,7 @@ fn rank_hnsw_candidates<V: Borrow<Vector>>(
 	Ok(ranked)
 }
 
+/// Returns the select hnsw neighbors result.
 fn select_hnsw_neighbors<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -663,6 +690,7 @@ fn select_hnsw_neighbors<V: Borrow<Vector>>(
 	Ok(selected)
 }
 
+/// Builds diskann adjacency.
 fn build_diskann_adjacency<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &mut [VectorNode<V>],
@@ -673,9 +701,8 @@ fn build_diskann_adjacency<V: Borrow<Vector>>(
 		&Vector,
 	) -> FerrosGrynnResult<f64>,
 ) -> FerrosGrynnResult<u32> {
-	let options = match spec.options {
-		crate::datastore::ClassIndexOptions::DiskAnn(options) => options,
-		_ => return Err(invalid("DiskANN builder received another index kind")),
+	let crate::datastore::ClassIndexOptions::DiskAnn(options) = spec.options else {
+		return Err(invalid("DiskANN builder received another index kind"));
 	};
 	let degree = usize::from(options.degree().get()).min(nodes.len().saturating_sub(1));
 	let degree_with_slack = ((degree as f32) * GRAPH_SLACK_FACTOR).floor() as usize;
@@ -731,6 +758,7 @@ fn build_diskann_adjacency<V: Borrow<Vector>>(
 	u32::try_from(entrypoint).map_err(|_error| invalid("DiskANN entrypoint exceeds u32"))
 }
 
+/// Returns the diskann entrypoint result.
 fn diskann_entrypoint<V>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -749,6 +777,7 @@ fn diskann_entrypoint<V>(
 		.ok_or_else(|| invalid("non-empty DiskANN has no entrypoint"))
 }
 
+/// Returns the seed diskann neighbors result.
 fn seed_diskann_neighbors(
 	spec: VectorBuildSpec,
 	count: usize,
@@ -797,6 +826,7 @@ fn seed_diskann_neighbors(
 	clippy::too_many_arguments,
 	reason = "the DiskANN refinement loop keeps its build inputs explicit"
 )]
+/// Returns the refine diskann node result.
 fn refine_diskann_node<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &mut [VectorNode<V>],
@@ -855,6 +885,7 @@ fn refine_diskann_node<V: Borrow<Vector>>(
 	Ok(())
 }
 
+/// Returns the search diskann graph result.
 fn search_diskann_graph<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -905,6 +936,7 @@ fn search_diskann_graph<V: Borrow<Vector>>(
 	Ok(queue.iter().map(|candidate| *candidate.id()).collect())
 }
 
+/// Returns the distance f32 result.
 fn distance_f32<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -933,6 +965,7 @@ fn distance_f32<V: Borrow<Vector>>(
 	clippy::too_many_arguments,
 	reason = "the pruning kernel keeps its immutable build inputs explicit"
 )]
+/// Returns the robust prune neighbors result.
 fn robust_prune_neighbors<V: Borrow<Vector>>(
 	spec: VectorBuildSpec,
 	nodes: &[VectorNode<V>],
@@ -993,7 +1026,7 @@ fn robust_prune_neighbors<V: Borrow<Vector>>(
 				selected.push(*candidate);
 			}
 		}
-		if current_alpha == alpha {
+		if current_alpha.partial_cmp(&alpha) == Some(std::cmp::Ordering::Equal) {
 			break;
 		}
 		current_alpha = (current_alpha * alpha.min(1.2)).min(alpha);
@@ -1011,6 +1044,7 @@ fn robust_prune_neighbors<V: Borrow<Vector>>(
 	Ok(selected)
 }
 
+/// Returns the diskann prune kind result.
 fn diskann_prune_kind(distance: VectorDistance) -> FerrosGrynnResult<PruneKind> {
 	let metric = match distance {
 		VectorDistance::Euclidean => Metric::L2,
@@ -1022,6 +1056,7 @@ fn diskann_prune_kind(distance: VectorDistance) -> FerrosGrynnResult<PruneKind> 
 	Ok(PruneKind::from_metric(metric))
 }
 
+/// Builds distance.
 fn build_distance(
 	spec: VectorBuildSpec,
 	left: &Vector,
@@ -1046,19 +1081,22 @@ fn build_distance(
 		}
 		return Ok(distance);
 	}
-	if spec.algorithm()? == VectorAlgorithm::DiskAnn {
-		if let Some(value) = diskann_vector_distance(left, right, spec.distance()?)? {
-			return Ok(value);
-		}
+	if spec.algorithm()? == VectorAlgorithm::DiskAnn
+		&& let Some(value) = diskann_vector_distance(left, right, spec.distance()?)?
+	{
+		return Ok(value);
 	}
 	exact_vector_distance(left, right, spec.distance()?)
 }
 
+/// Returns the diskann vector distance result.
 fn diskann_vector_distance(
 	left: &Vector,
 	right: &Vector,
 	distance: VectorDistance,
 ) -> FerrosGrynnResult<Option<f64>> {
+	/// Dispatches supported vector distances to DiskANN kernels for one scalar
+	/// element type.
 	macro_rules! evaluate {
 		($kind:ty, $left:expr, $right:expr) => {{
 			let value = match distance {
@@ -1106,6 +1144,7 @@ fn diskann_vector_distance(
 	}
 }
 
+/// Returns the normalized f32 distance result.
 fn normalized_f32_distance(
 	left: impl ExactSizeIterator<Item = f32>,
 	right: impl ExactSizeIterator<Item = f32>,
@@ -1129,11 +1168,13 @@ fn normalized_f32_distance(
 	Ok(f64::from(1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())))
 }
 
+/// Returns the invalid result.
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]
+/// Regression tests for build behavior.
 mod tests {
 	use std::{collections::BTreeSet, num::NonZeroU16};
 
@@ -1149,6 +1190,8 @@ mod tests {
 		search_hnsw_level,
 		select_hnsw_neighbors,
 	};
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 	use crate::{
 		datastore::{
 			ClassId,
@@ -1173,14 +1216,15 @@ mod tests {
 		values::{PropertyKeyId, Vector, VectorKind, storage::DiskAtomRef},
 	};
 
+	/// Verifies hnsw build budget rejects the same input below its estimate.
 	#[test]
 	fn hnsw_build_budget_rejects_the_same_input_below_its_estimate() {
 		let options = HnswIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
 		)
-		.unwrap();
+		.assert_ok();
 		let spec = spec(ClassIndexOptions::Hnsw(options));
 		let documents = vec![
 			VectorDocument {
@@ -1192,20 +1236,21 @@ mod tests {
 				vector: Vector::from(vec![1.0_f32, 0.0]),
 			},
 		];
-		let estimate = estimated_hnsw_build_bytes(spec, &documents).unwrap();
+		let estimate = estimated_hnsw_build_bytes(spec, &documents).assert_ok();
 
 		assert!(enforce_hnsw_build_budget(spec, &documents, estimate).is_ok());
 		assert!(enforce_hnsw_build_budget(spec, &documents, estimate - 1).is_err());
 	}
 
+	/// Verifies hnsw build keeps nearest candidates from multiple entrypoints.
 	#[test]
 	fn hnsw_build_keeps_nearest_candidates_from_multiple_entrypoints() {
 		let options = HnswIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(1).unwrap(),
+			NonZeroU16::new(1).assert_some(),
 			VectorDistance::Euclidean,
 		)
-		.unwrap();
+		.assert_ok();
 		let build_spec = spec(ClassIndexOptions::Hnsw(options));
 		let nodes = vec![
 			VectorNode {
@@ -1240,7 +1285,7 @@ mod tests {
 		};
 
 		let actual = search_hnsw_level(build_spec, &nodes, 3, [0, 2], 0, 2, &mut unavailable)
-			.unwrap()
+			.assert_ok()
 			.into_iter()
 			.map(|candidate| candidate.ordinal)
 			.collect::<BTreeSet<_>>();
@@ -1248,13 +1293,17 @@ mod tests {
 		assert_eq!(actual, BTreeSet::from([1, 2]));
 	}
 
+	/// Verifies hnsw neighbor selection keeps diverse and pruned connections.
 	#[test]
-	fn hnsw_neighbor_selection_keeps_diverse_and_pruned_connections()
-	-> crate::gql_status::FerrosGrynnResult<()> {
-		let dimensions =
-			NonZeroU16::new(2).ok_or_else(|| invalid("HNSW diversity test dimension is zero"))?;
+	fn hnsw_neighbor_selection_keeps_diverse_and_pruned_connections() {
+		use crate::test_assertions::AssertResult as _;
+
+		let dimensions = NonZeroU16::new(2)
+			.ok_or_else(|| invalid("HNSW diversity test dimension is zero"))
+			.assert_ok();
 		let options =
-			HnswIndexOptions::defaults(VectorKind::F32, dimensions, VectorDistance::Euclidean)?;
+			HnswIndexOptions::defaults(VectorKind::F32, dimensions, VectorDistance::Euclidean)
+				.assert_ok();
 		let build_spec = spec(ClassIndexOptions::Hnsw(options));
 		let nodes = vec![
 			VectorNode {
@@ -1288,23 +1337,26 @@ mod tests {
 			))
 		};
 
-		let ranked = rank_hnsw_candidates(build_spec, &nodes, 3, [0, 1, 2], &mut unavailable)?;
-		let selected = select_hnsw_neighbors(build_spec, &nodes, ranked, 2, &mut unavailable)?;
+		let ranked =
+			rank_hnsw_candidates(build_spec, &nodes, 3, [0, 1, 2], &mut unavailable).assert_ok();
+		let selected =
+			select_hnsw_neighbors(build_spec, &nodes, ranked, 2, &mut unavailable).assert_ok();
 
 		assert_eq!(selected, vec![0, 2]);
-		Ok(())
 	}
 
+	/// Returns atom for this module.
 	fn atom(slot: u64) -> DiskAtomRef {
-		DiskAtomRef::from_parts(AtomKind::Node, slot).unwrap()
+		DiskAtomRef::from_parts(AtomKind::Node, slot).assert_ok()
 	}
 
+	/// Returns spec for this module.
 	fn spec(options: ClassIndexOptions) -> VectorBuildSpec {
 		VectorBuildSpec {
-			index: IndexId::new(7).unwrap(),
+			index: IndexId::new(7).assert_some(),
 			index_version: SchemaVersion::INITIAL,
 			scope: IndexScope::Base,
-			class: ClassId::new(3).unwrap(),
+			class: ClassId::new(3).assert_some(),
 			field: PropertyKeyId::new(2),
 			options,
 			build_revision: 11,
@@ -1312,14 +1364,15 @@ mod tests {
 		}
 	}
 
+	/// Verifies hnsw bytes are deterministic and round trip.
 	#[test]
 	fn hnsw_bytes_are_deterministic_and_round_trip() {
 		let options = HnswIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
 		)
-		.unwrap();
+		.assert_ok();
 		let documents = || {
 			vec![
 				VectorDocument {
@@ -1336,26 +1389,28 @@ mod tests {
 				},
 			]
 		};
-		let left = build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).unwrap();
+		let left =
+			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).assert_ok();
 		let right =
-			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).unwrap();
+			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).assert_ok();
 		assert_eq!(
 			left.pages.iter().map(|page| page.as_bytes()).collect::<Vec<_>>(),
 			right.pages.iter().map(|page| page.as_bytes()).collect::<Vec<_>>(),
 		);
-		let decoded = decode_vector_index(&left.pages).unwrap();
+		let decoded = decode_vector_index(&left.pages).assert_ok();
 		assert_eq!(decoded.nodes.len(), 3);
 		assert!(decoded.entrypoint.is_some());
 	}
 
+	/// Verifies graph builder keeps borrowed vector payloads.
 	#[test]
 	fn graph_builder_keeps_borrowed_vector_payloads() {
 		let options = HnswIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
 		)
-		.unwrap();
+		.assert_ok();
 		let source = [Vector::from(vec![0.0_f32, 1.0]), Vector::from(vec![1.0_f32, 0.0])];
 		let documents = vec![
 			VectorDocument {
@@ -1377,21 +1432,22 @@ mod tests {
 			documents,
 			&mut unavailable,
 		)
-		.unwrap();
+		.assert_ok();
 
-		assert!(std::ptr::eq(nodes[0].vector, &source[0]));
-		assert!(std::ptr::eq(nodes[1].vector, &source[1]));
+		assert!(std::ptr::eq(nodes[0].vector, &raw const source[0]));
+		assert!(std::ptr::eq(nodes[1].vector, &raw const source[1]));
 	}
 
+	/// Verifies hashed vector compares full bytes under forced collisions.
 	#[test]
 	fn hashed_vector_compares_full_bytes_under_forced_collisions() {
 		let options = DiskAnnIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
 			true,
 		)
-		.unwrap();
+		.assert_ok();
 		let documents = vec![
 			VectorDocument {
 				atom: atom(1),
@@ -1408,23 +1464,24 @@ mod tests {
 		];
 		let built =
 			build_with_hasher(spec(ClassIndexOptions::DiskAnn(options)), documents, |_bytes| 0)
-				.unwrap();
-		let decoded = decode_vector_index(&built.pages).unwrap();
+				.assert_ok();
+		let decoded = decode_vector_index(&built.pages).assert_ok();
 		assert_eq!(decoded.nodes.len(), 2);
 		assert_eq!(decoded.nodes[0].postings, vec![atom(1), atom(3)]);
 		assert_eq!(decoded.nodes[1].postings, vec![atom(2)]);
 	}
 
+	/// Verifies hashed vector changes lookup not diskann graph.
 	#[test]
 	fn hashed_vector_changes_lookup_not_diskann_graph() {
 		let build = |hashed_vector| {
 			let options = DiskAnnIndexOptions::defaults(
 				VectorKind::F32,
-				NonZeroU16::new(2).unwrap(),
+				NonZeroU16::new(2).assert_some(),
 				VectorDistance::Euclidean,
 				hashed_vector,
 			)
-			.unwrap();
+			.assert_ok();
 			let documents = vec![
 				VectorDocument {
 					atom: atom(1),
@@ -1439,9 +1496,9 @@ mod tests {
 					vector: Vector::from(vec![1.0_f32, 2.0]),
 				},
 			];
-			let built =
-				build_vector_index(spec(ClassIndexOptions::DiskAnn(options)), documents).unwrap();
-			decode_vector_index(&built.pages).unwrap()
+			let built = build_vector_index(spec(ClassIndexOptions::DiskAnn(options)), documents)
+				.assert_ok();
+			decode_vector_index(&built.pages).assert_ok()
 		};
 		let plain = build(false);
 		let hashed = build(true);
@@ -1450,14 +1507,15 @@ mod tests {
 		assert_eq!(plain.nodes, hashed.nodes);
 	}
 
+	/// Verifies vector codec rejects checksum and resealed header corruption.
 	#[test]
 	fn vector_codec_rejects_checksum_and_resealed_header_corruption() {
 		let options = HnswIndexOptions::defaults(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
 		)
-		.unwrap();
+		.assert_ok();
 		let documents = || {
 			vec![VectorDocument {
 				atom: atom(1),
@@ -1466,32 +1524,33 @@ mod tests {
 		};
 
 		let mut checksum =
-			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).unwrap();
+			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).assert_ok();
 		checksum.pages[0].as_bytes_mut()[47] = 1;
 		assert!(decode_vector_index(&checksum.pages).is_err());
 
 		let mut reserved =
-			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).unwrap();
+			build_vector_index(spec(ClassIndexOptions::Hnsw(options)), documents()).assert_ok();
 		reserved.pages[0].as_bytes_mut()[47] = 1;
-		reserved.pages[0].seal().unwrap();
+		reserved.pages[0].seal().assert_ok();
 		assert!(decode_vector_index(&reserved.pages).is_err());
 	}
 
+	/// Verifies hnsw build stays below an all pairs distance scan.
 	#[test]
 	fn hnsw_build_stays_below_an_all_pairs_distance_scan() {
 		let count = 512_u16;
 		let distance = VectorDistance::Custom {
-			function: FunctionId::new(17).unwrap(),
+			function: FunctionId::new(17).assert_some(),
 			version: SchemaVersion::INITIAL,
 		};
 		let options = HnswIndexOptions::new(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			distance,
-			NonZeroU16::new(4).unwrap(),
-			NonZeroU16::new(16).unwrap(),
+			NonZeroU16::new(4).assert_some(),
+			NonZeroU16::new(16).assert_some(),
 		)
-		.unwrap();
+		.assert_ok();
 		let documents = (0..count)
 			.map(|ordinal| {
 				let value = f32::from(ordinal);
@@ -1521,9 +1580,9 @@ mod tests {
 			documents,
 			&mut custom,
 		)
-		.unwrap();
+		.assert_ok();
 		let count = usize::from(count);
-		let all_pairs = count.checked_mul(count - 1).unwrap() / 2;
+		let all_pairs = count.checked_mul(count - 1).assert_some() / 2;
 		assert!(
 			evaluations < all_pairs,
 			"HNSW evaluated {evaluations} distances for {count} nodes"
@@ -1540,19 +1599,20 @@ mod tests {
 		}));
 	}
 
+	/// Verifies diskann build is degree bounded and reachable from entrypoint.
 	#[test]
 	fn diskann_build_is_degree_bounded_and_reachable_from_entrypoint() {
 		let count = 128_u16;
 		let options = DiskAnnIndexOptions::new(
 			VectorKind::F32,
-			NonZeroU16::new(2).unwrap(),
+			NonZeroU16::new(2).assert_some(),
 			VectorDistance::Euclidean,
-			NonZeroU16::new(8).unwrap(),
-			NonZeroU16::new(16).unwrap(),
+			NonZeroU16::new(8).assert_some(),
+			NonZeroU16::new(16).assert_some(),
 			1.2,
 			false,
 		)
-		.unwrap();
+		.assert_ok();
 		let documents = (0..count)
 			.map(|ordinal| {
 				let angle = f32::from(ordinal) / f32::from(count) * std::f32::consts::TAU;
@@ -1572,20 +1632,21 @@ mod tests {
 			documents,
 			&mut unavailable,
 		)
-		.unwrap();
+		.assert_ok();
 		assert!(nodes.iter().all(|node| node.neighbors[0].len() <= 8));
-		let mut pending = vec![entrypoint.unwrap()];
+		let mut pending = vec![entrypoint.assert_some()];
 		let mut visited = BTreeSet::new();
 		while let Some(ordinal) = pending.pop() {
 			if !visited.insert(ordinal) {
 				continue;
 			}
-			let index = usize::try_from(ordinal).unwrap();
+			let index = usize::try_from(ordinal).assert_ok();
 			pending.extend(nodes[index].neighbors[0].iter().copied());
 		}
 		assert_eq!(visited.len(), nodes.len());
 	}
 
+	/// Verifies hnsw recall across search breadths.
 	#[test]
 	#[ignore = "configurable HNSW recall probe for the Stage-23 performance gate"]
 	fn hnsw_recall_across_search_breadths() -> crate::gql_status::FerrosGrynnResult<()> {
@@ -1729,6 +1790,7 @@ mod tests {
 		Ok(())
 	}
 
+	/// Verifies default ann recall at ten meets the exact oracle.
 	#[test]
 	fn default_ann_recall_at_ten_meets_the_exact_oracle() {
 		let source = (0_u16..128)
@@ -1739,17 +1801,17 @@ mod tests {
 							+ u32::from(dimension) * 151
 							+ u32::from(ordinal) * u32::from(dimension) * 19)
 							% 997;
-						f32::from(u16::try_from(mixed).unwrap()) / 997.0
+						f32::from(u16::try_from(mixed).assert_ok()) / 997.0
 					})
 					.collect::<Vec<_>>();
 				(atom(u64::from(ordinal) + 1), Vector::from(vector))
 			})
 			.collect::<Vec<_>>();
-		let dimensions = NonZeroU16::new(16).unwrap();
+		let dimensions = NonZeroU16::new(16).assert_some();
 		let options = [
 			ClassIndexOptions::Hnsw(
 				HnswIndexOptions::defaults(VectorKind::F32, dimensions, VectorDistance::Euclidean)
-					.unwrap(),
+					.assert_ok(),
 			),
 			ClassIndexOptions::DiskAnn(
 				DiskAnnIndexOptions::defaults(
@@ -1758,7 +1820,7 @@ mod tests {
 					VectorDistance::Euclidean,
 					false,
 				)
-				.unwrap(),
+				.assert_ok(),
 			),
 		];
 		for options in options {
@@ -1769,8 +1831,8 @@ mod tests {
 					vector: vector.clone(),
 				})
 				.collect();
-			let built = build_vector_index(spec(options), documents).unwrap();
-			let index = decode_vector_index(&built.pages).unwrap();
+			let built = build_vector_index(spec(options), documents).assert_ok();
+			let index = decode_vector_index(&built.pages).assert_ok();
 			let mut matched = 0_usize;
 			let mut expected_total = 0_usize;
 			for query_ordinal in [0_usize, 37, 79, 127] {
@@ -1780,7 +1842,7 @@ mod tests {
 					.map(|(atom, vector)| {
 						(
 							exact_vector_distance(query, vector, VectorDistance::Euclidean)
-								.unwrap(),
+								.assert_ok(),
 							*atom,
 						)
 					})
@@ -1800,7 +1862,7 @@ mod tests {
 				};
 				let actual =
 					search_vector_index_with_distance(&index, query, 10, 64, &mut unavailable)
-						.unwrap()
+						.assert_ok()
 						.into_iter()
 						.map(|hit| hit.atom)
 						.collect::<BTreeSet<_>>();
@@ -1814,11 +1876,14 @@ mod tests {
 		}
 	}
 
+	/// Verifies normalized distance streams components without materializing
+	/// copies.
 	#[test]
 	fn normalized_distance_streams_components_without_materializing_copies() {
-		let same = normalized_f32_distance([3.0, 4.0].into_iter(), [6.0, 8.0].into_iter()).unwrap();
+		let same =
+			normalized_f32_distance([3.0, 4.0].into_iter(), [6.0, 8.0].into_iter()).assert_ok();
 		let orthogonal =
-			normalized_f32_distance([1.0, 0.0].into_iter(), [0.0, 1.0].into_iter()).unwrap();
+			normalized_f32_distance([1.0, 0.0].into_iter(), [0.0, 1.0].into_iter()).assert_ok();
 		assert!(same.abs() <= f64::from(f32::EPSILON));
 		assert!((orthogonal - 1.0).abs() <= f64::from(f32::EPSILON));
 		assert!(normalized_f32_distance([1.0].into_iter(), [1.0, 2.0].into_iter()).is_err());

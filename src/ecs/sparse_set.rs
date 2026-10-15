@@ -3,15 +3,20 @@ use crate::{
 	values::runtime::graph::{AtomId, AtomKind},
 };
 
+/// Number of sparse atom slots addressed by one lazily allocated sparse page.
 pub const SPARSE_PAGE_LEN: usize = 4096;
+/// Configured vacant value.
 const VACANT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Default)]
+/// Sparse pages state.
 struct SparsePages {
+	/// Pages associated with this sparse pages.
 	pages: Vec<Option<Box<[u32]>>>,
 }
 
 impl SparsePages {
+	/// Returns sparse pages.
 	fn get(&self, slot: u64) -> Option<u32> {
 		let page = usize::try_from(slot / SPARSE_PAGE_LEN as u64).ok()?;
 		let offset = slot as usize % SPARSE_PAGE_LEN;
@@ -19,6 +24,7 @@ impl SparsePages {
 		(value != VACANT).then_some(value)
 	}
 
+	/// Sets sparse pages.
 	fn set(&mut self, slot: u64, dense: Option<u32>) -> FerrosGrynnResult<()> {
 		let page = usize::try_from(slot / SPARSE_PAGE_LEN as u64)
 			.map_err(|_err| FerrosGrynnError::graph_capacity_exceeded("ECS sparse index"))?;
@@ -32,6 +38,7 @@ impl SparsePages {
 		Ok(())
 	}
 
+	/// Returns the allocated pages result.
 	fn allocated_pages(&self) -> usize {
 		self.pages.iter().filter(|page| page.is_some()).count()
 	}
@@ -44,13 +51,18 @@ impl SparsePages {
 /// generation.
 #[derive(Debug, Clone)]
 pub struct SparseSet<T> {
+	/// Node sparse associated with this sparse set.
 	node_sparse: SparsePages,
+	/// Edge sparse associated with this sparse set.
 	edge_sparse: SparsePages,
+	/// Dense atoms associated with this sparse set.
 	dense_atoms: Vec<AtomId>,
+	/// Dense components associated with this sparse set.
 	dense_components: Vec<T>,
 }
 
 impl<T> SparseSet<T> {
+	/// Constructs `SparseSet<T>` from the supplied initial state.
 	pub fn new() -> Self {
 		Self {
 			node_sparse: SparsePages::default(),
@@ -60,6 +72,7 @@ impl<T> SparseSet<T> {
 		}
 	}
 
+	/// Creates an empty collection with the requested initial capacity.
 	pub fn with_capacity(dense_capacity: usize) -> Self {
 		let mut result = Self::new();
 		result.dense_atoms.reserve(dense_capacity);
@@ -67,17 +80,27 @@ impl<T> SparseSet<T> {
 		result
 	}
 
+	/// Returns the logical element count of this `SparseSet<T>`.
 	pub const fn len(&self) -> usize {
 		self.dense_components.len()
 	}
 
+	/// Reports whether this `SparseSet<T>` contains no logical elements.
 	pub const fn is_empty(&self) -> bool {
 		self.dense_components.is_empty()
 	}
 
+	/// Inserts a key and value using the collection's replacement rules.
+	///
+	/// # Errors
+	///
+	/// Returns `graph_capacity_exceeded` diagnostics and propagates failures
+	/// from called operations.
 	pub fn insert(&mut self, id: AtomId, component: T) -> FerrosGrynnResult<Option<T>> {
 		let pages = self.pages(id)?;
 		if let Some(index) = pages.get(id.slot()).map(|index| index as usize) {
+			// A reused slot replaces its old generation in place; lookups still
+			// compare the full AtomId.
 			debug_assert!(index < self.dense_atoms.len());
 			self.dense_atoms[index] = id;
 			return Ok(Some(std::mem::replace(&mut self.dense_components[index], component)));
@@ -91,6 +114,7 @@ impl<T> SparseSet<T> {
 		Ok(None)
 	}
 
+	/// Removes the requested entry and returns it when present.
 	pub fn remove(&mut self, id: AtomId) -> Option<T> {
 		let index = self.dense_index(id)?;
 		let last = self.dense_components.len() - 1;
@@ -105,39 +129,48 @@ impl<T> SparseSet<T> {
 		Some(removed)
 	}
 
+	/// Looks up the requested entry without modifying the collection.
 	pub fn get(&self, id: AtomId) -> Option<&T> {
 		self.dense_index(id).map(|index| &self.dense_components[index])
 	}
 
+	/// Borrows the requested entry mutably when it exists.
 	pub fn get_mut(&mut self, id: AtomId) -> Option<&mut T> {
 		let index = self.dense_index(id)?;
 		Some(&mut self.dense_components[index])
 	}
 
+	/// Reports whether the contains condition holds for `SparseSet<T>`.
 	pub fn contains(&self, id: AtomId) -> bool {
 		self.dense_index(id).is_some()
 	}
 
+	/// Borrows the stored dense atoms of this `SparseSet<T>`.
 	pub fn atoms(&self) -> &[AtomId] {
 		&self.dense_atoms
 	}
 
+	/// Borrows the stored dense components of this `SparseSet<T>`.
 	pub fn components(&self) -> &[T] {
 		&self.dense_components
 	}
 
+	/// Borrows the stored dense components of this `SparseSet<T>`.
 	pub fn components_mut(&mut self) -> &mut [T] {
 		&mut self.dense_components
 	}
 
+	/// Borrows the elements of this `SparseSet<T>` for iteration.
 	pub fn iter(&self) -> impl ExactSizeIterator<Item = (AtomId, &T)> {
 		self.dense_atoms.iter().copied().zip(&self.dense_components)
 	}
 
+	/// Borrows the elements of this `SparseSet<T>` for mutable iteration.
 	pub fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (AtomId, &mut T)> {
 		self.dense_atoms.iter().copied().zip(&mut self.dense_components)
 	}
 
+	/// Removes all logical elements from the collection.
 	pub fn clear(&mut self) {
 		self.node_sparse = SparsePages::default();
 		self.edge_sparse = SparsePages::default();
@@ -145,6 +178,7 @@ impl<T> SparseSet<T> {
 		self.dense_components.clear();
 	}
 
+	/// Returns retain for `SparseSet<T>`.
 	pub fn retain<Pred: FnMut(AtomId, &mut T) -> bool>(&mut self, mut predicate: Pred) {
 		let mut index = 0;
 		while index < self.len() {
@@ -152,25 +186,31 @@ impl<T> SparseSet<T> {
 			if predicate(id, &mut self.dense_components[index]) {
 				index += 1;
 			} else {
+				// Revisit this index because swap_remove moves an untested
+				// component into it.
 				self.remove(id);
 			}
 		}
 	}
 
+	/// Returns allocated sparse pages for `SparseSet<T>`.
 	pub fn allocated_sparse_pages(&self) -> usize {
 		self.node_sparse.allocated_pages() + self.edge_sparse.allocated_pages()
 	}
 
+	/// Returns the dense index result.
 	pub(crate) fn dense_index(&self, id: AtomId) -> Option<usize> {
 		let index = self.pages(id).ok()?.get(id.slot())? as usize;
 		(self.dense_atoms.get(index) == Some(&id)).then_some(index)
 	}
 
+	/// Returns the occupant result.
 	pub(crate) fn occupant(&self, id: AtomId) -> Option<AtomId> {
 		let index = self.pages(id).ok()?.get(id.slot())? as usize;
 		self.dense_atoms.get(index).copied()
 	}
 
+	/// Returns the pages result.
 	fn pages(&self, id: AtomId) -> FerrosGrynnResult<&SparsePages> {
 		match id.kind() {
 			Some(AtomKind::Node) => Ok(&self.node_sparse),
@@ -179,6 +219,7 @@ impl<T> SparseSet<T> {
 		}
 	}
 
+	/// Returns the pages mut result.
 	fn pages_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut SparsePages> {
 		match id.kind() {
 			Some(AtomKind::Node) => Ok(&mut self.node_sparse),
@@ -189,20 +230,26 @@ impl<T> SparseSet<T> {
 }
 
 impl<T> Default for SparseSet<T> {
+	/// Constructs the default initial state of `SparseSet<T>`.
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
+/// Returns the invalid atom result.
 fn invalid_atom(id: AtomId) -> FerrosGrynnError {
 	FerrosGrynnError::atom_does_not_exist("atom", id.to_string())
 }
 
 #[cfg(test)]
+/// Regression tests for sparse set behavior.
 mod tests {
 	use super::{SPARSE_PAGE_LEN, SparseSet};
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::values::runtime::graph::AtomId;
 
+	/// Returns atom for this module.
 	fn atom(slot: u64, generation: u32, edge: bool) -> AtomId {
 		let kind = if edge {
 			1_u64 << 40
@@ -212,38 +259,42 @@ mod tests {
 		AtomId::from_raw((u64::from(generation) << 41) | kind | slot)
 	}
 
+	/// Verifies uses separate lazy pages for node and edge slots.
 	#[test]
 	fn uses_separate_lazy_pages_for_node_and_edge_slots() {
 		let mut set = SparseSet::new();
 		let node = atom(SPARSE_PAGE_LEN as u64 + 7, 0, false);
 		let edge = atom(SPARSE_PAGE_LEN as u64 + 7, 0, true);
 
-		set.insert(node, "node").unwrap();
-		set.insert(edge, "edge").unwrap();
+		set.insert(node, "node").assert_ok();
+		set.insert(edge, "edge").assert_ok();
 		assert_eq!(set.get(node), Some(&"node"));
 		assert_eq!(set.get(edge), Some(&"edge"));
 		assert_eq!(set.allocated_sparse_pages(), 2);
 	}
 
+	/// Verifies stale generation cannot observe or remove current component.
 	#[test]
 	fn stale_generation_cannot_observe_or_remove_current_component() {
 		let old = atom(17, 2, false);
 		let current = atom(17, 3, false);
 		let mut set = SparseSet::new();
 
-		set.insert(old, 10).unwrap();
-		assert_eq!(set.insert(current, 20).unwrap(), Some(10));
+		set.insert(old, 10).assert_ok();
+		assert_eq!(set.insert(current, 20).assert_ok(), Some(10));
 		assert_eq!(set.get(old), None);
 		assert_eq!(set.get(current), Some(&20));
 		assert_eq!(set.remove(old), None);
 		assert_eq!(set.remove(current), Some(20));
 	}
 
+	/// Verifies swap remove repairs sparse index and retain visits moved
+	/// values.
 	#[test]
 	fn swap_remove_repairs_sparse_index_and_retain_visits_moved_values() {
 		let mut set = SparseSet::new();
 		for slot in 0..8 {
-			set.insert(atom(slot, 0, false), slot).unwrap();
+			set.insert(atom(slot, 0, false), slot).assert_ok();
 		}
 		assert_eq!(set.remove(atom(2, 0, false)), Some(2));
 		assert_eq!(set.get(atom(7, 0, false)), Some(&7));
@@ -254,9 +305,10 @@ mod tests {
 		assert_eq!(values, [0, 4, 6]);
 	}
 
+	/// Verifies rejects null atom.
 	#[test]
 	fn rejects_null_atom() {
-		let error = SparseSet::<u8>::new().insert(AtomId::NULL, 1).unwrap_err();
+		let error = SparseSet::<u8>::new().insert(AtomId::NULL, 1).assert_err();
 		assert_eq!(error.status().code().to_string(), "FG-G1F01");
 	}
 }

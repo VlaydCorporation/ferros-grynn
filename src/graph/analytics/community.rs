@@ -335,10 +335,10 @@ fn label_relation(
 ///
 /// # Errors
 /// Rejects weights, invalid limits, overflow, cancellation or nonconvergence.
-pub fn label_propagation(
+pub fn label_propagation<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: LabelPropagationOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<CommunityResult<LabelPropagationOptions>> {
 	if options.max_sweeps == 0 {
 		return Err(invalid("label propagation sweep limit must be positive"));
@@ -452,14 +452,15 @@ fn positive_gain(
 	node: usize,
 	old: usize,
 	new: usize,
-	before: MoveScore,
-	after: MoveScore,
+	score_change: (MoveScore, MoveScore),
 	resolution: f64,
 	exact_scratch: &mut bool,
 	control: &mut Control<'_>,
 ) -> FerrosGrynnResult<bool> {
+	let (before, after) = score_change;
+
 	control.work(32)?;
-	if level.integer && resolution == 1.0 {
+	if level.integer && resolution.partial_cmp(&1.0) == Some(std::cmp::Ordering::Equal) {
 		let internal = integer_strength(after.incident)?
 			.checked_sub(integer_strength(before.incident)?)
 			.ok_or_else(overflow)?;
@@ -611,18 +612,17 @@ fn local_moves(
 					node,
 					old,
 					usize::MAX,
-					old_score,
-					singleton,
+					(old_score, singleton),
 					options.resolution,
 					&mut exact_scratch,
 					control,
 				)? {
-				// ponytail: singleton search is linear only for potentially
+				// shortcut: singleton search is linear only for potentially
 				// profitable splits; index vacant groups if
 				// measured split-heavy workloads need it.
-				for candidate in 0..n {
+				for (candidate, &population) in count.iter().enumerate().take(n) {
 					control.step()?;
-					if count[candidate] == 0 {
+					if population == 0 {
 						votes.add(candidate, 0.0, control)?;
 						break;
 					}
@@ -649,14 +649,15 @@ fn local_moves(
 					node,
 					old,
 					*candidate,
-					old_score,
-					score,
+					(old_score, score),
 					options.resolution,
 					&mut exact_scratch,
 					control,
 				)? && (best == old
 					|| score.point > best_score.point
-					|| (score.point == best_score.point && *candidate < best))
+					|| (score.point.partial_cmp(&best_score.point)
+						== Some(std::cmp::Ordering::Equal)
+						&& *candidate < best))
 				{
 					best = *candidate;
 					best_score = score;
@@ -688,10 +689,10 @@ fn local_moves(
 /// # Errors
 /// Rejects incompatible orientation, weights, numeric/resource limits or
 /// nonconvergence; no incomplete community assignment is returned.
-pub fn louvain(
+pub fn louvain<CheckArg: FnMut() -> FerrosGrynnResult<()>>(
 	projection: &TensorProjection,
 	options: LouvainOptions,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	check: &mut CheckArg,
 ) -> FerrosGrynnResult<CommunityResult<LouvainOptions>> {
 	if !options.resolution.is_finite()
 		|| options.resolution <= 0.0

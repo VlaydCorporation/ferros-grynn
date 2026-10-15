@@ -1,3 +1,7 @@
+#[cfg(test)]
+use crate::test_assertions::AssertOption as _;
+#[cfg(test)]
+use crate::test_assertions::AssertResult as _;
 use crate::{
 	datastore::{ClassSchema, Datastore, Transaction},
 	gql::QueryExecutionOptions,
@@ -13,18 +17,19 @@ use crate::{
 	values::{Number, Object, RecordId, Text, Value},
 };
 
+/// Returns matching ids for this module.
 fn matching_ids(transaction: &mut Transaction, source: &str, column: &str) -> Vec<RecordId> {
-	let results = transaction.execute(source, &Object::new()).unwrap();
-	let rows = results[0].result.as_ref().unwrap().value().as_array().unwrap();
+	let results = transaction.execute(source, &Object::new()).assert_ok();
+	let rows = results[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	let mut ids = rows
 		.iter()
 		.map(|row| {
 			row.as_object()
-				.unwrap()
+				.assert_some()
 				.get(column)
-				.unwrap()
+				.assert_some()
 				.as_atom_occurrence()
-				.unwrap()
+				.assert_some()
 				.atom()
 				.id()
 				.clone()
@@ -34,25 +39,28 @@ fn matching_ids(transaction: &mut Transaction, source: &str, column: &str) -> Ve
 	ids
 }
 
+/// Verifies match routes exact class label and intersection without legacy
+/// syntax.
 #[test]
 fn match_routes_exact_class_label_and_intersection_without_legacy_syntax() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("device", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("friendship", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("social", GraphKind::Graph).unwrap();
-	let alice = "person:alice".parse::<RecordId>().unwrap();
-	let bob = "person:bob".parse::<RecordId>().unwrap();
-	let router = "device:router".parse::<RecordId>().unwrap();
-	let friendship = "friendship:shared".parse::<RecordId>().unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("device", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("friendship", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("social", GraphKind::Graph).assert_ok();
+	let alice = "person:alice".parse::<RecordId>().assert_ok();
+	let bob = "person:bob".parse::<RecordId>().assert_ok();
+	let router = "device:router".parse::<RecordId>().assert_ok();
+	let friendship = "friendship:shared".parse::<RecordId>().assert_ok();
 	for record in [&alice, &bob, &router, &friendship] {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
 	let alice_local =
-		seed.attach_node(graph.id(), &alice, Some(Text::from("Employee")), None).unwrap();
-	let bob_local = seed.attach_node(graph.id(), &bob, Some(Text::from("Visitor")), None).unwrap();
-	seed.attach_node(graph.id(), &router, Some(Text::from("Employee")), None).unwrap();
+		seed.attach_node(graph.id(), &alice, Some(Text::from("Employee")), None).assert_ok();
+	let bob_local =
+		seed.attach_node(graph.id(), &bob, Some(Text::from("Visitor")), None).assert_ok();
+	seed.attach_node(graph.id(), &router, Some(Text::from("Employee")), None).assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&friendship,
@@ -61,13 +69,13 @@ fn match_routes_exact_class_label_and_intersection_without_legacy_syntax() {
 		None,
 		None,
 	)
-	.unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	assert_eq!(
 		matching_ids(&mut transaction, "MATCH (person:alice AS n) IN GRAPH social RETURN n", "n",),
-		[alice.clone()]
+		std::slice::from_ref(&alice)
 	);
 	assert!(
 		matching_ids(
@@ -95,7 +103,7 @@ fn match_routes_exact_class_label_and_intersection_without_legacy_syntax() {
 			"MATCH (person AS n LABEL Employee) IN GRAPH social RETURN n",
 			"n",
 		),
-		[alice.clone()]
+		std::slice::from_ref(&alice)
 	);
 	assert!(
 		matching_ids(
@@ -117,27 +125,28 @@ fn match_routes_exact_class_label_and_intersection_without_legacy_syntax() {
 
 	let legacy = transaction
 		.execute("MATCH (person AS n) FROM social RETURN n", &Object::new())
-		.unwrap_err();
+		.assert_err();
 	assert_eq!(legacy.status().code().to_string(), "FG-42001");
 }
 
+/// Verifies match shortest uses bfs dijkstra and path functions.
 #[test]
 fn match_shortest_uses_bfs_dijkstra_and_path_functions() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("routes", GraphKind::Graph).unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("routes", GraphKind::Graph).assert_ok();
 	let nodes = ["person:a", "person:b", "person:c", "person:d"]
-		.map(|value| value.parse::<RecordId>().unwrap());
+		.map(|value| value.parse::<RecordId>().assert_ok());
 	let edges = ["link:direct", "link:ab", "link:bd", "link:ac", "link:cd"]
-		.map(|value| value.parse::<RecordId>().unwrap());
+		.map(|value| value.parse::<RecordId>().assert_ok());
 	for record in nodes.iter().chain(&edges) {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
 	let local = nodes
 		.iter()
-		.map(|record| seed.attach_node(graph.id(), record, None, None).unwrap())
+		.map(|record| seed.attach_node(graph.id(), record, None, None).assert_ok())
 		.collect::<Vec<_>>();
 	for (record, source, target, weight) in [
 		(&edges[0], local[0], local[3], 10_i64),
@@ -154,9 +163,9 @@ fn match_shortest_uses_bfs_dijkstra_and_path_functions() {
 			Some(Number::Int(weight)),
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
-	seed.commit().unwrap();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	let query = |transaction: &mut Transaction, objective: &str| {
@@ -167,52 +176,54 @@ fn match_shortest_uses_bfs_dijkstra_and_path_functions() {
 		);
 		transaction
 			.execute(&source, &Object::new())
-			.unwrap()
+			.assert_ok()
 			.remove(0)
 			.result
-			.unwrap()
+			.assert_ok()
 			.value()
 			.clone()
 	};
 	let unweighted = query(&mut transaction, "SHORTEST");
-	let unweighted = unweighted.as_array().unwrap().get(0).unwrap().as_object().unwrap();
+	let unweighted =
+		unweighted.as_array().assert_some().get(0).assert_some().as_object().assert_some();
 	assert_eq!(unweighted.get("length"), Some(&Value::from(1_i64)));
 	assert_eq!(unweighted.get("cost"), Some(&Value::from(1_i64)));
-	assert_eq!(unweighted.get("atoms").and_then(Value::as_array).unwrap().len(), 3);
+	assert_eq!(unweighted.get("atoms").and_then(Value::as_array).assert_some().len(), 3);
 
 	let weighted = query(&mut transaction, "WEIGHTED SHORTEST");
-	let weighted = weighted.as_array().unwrap().get(0).unwrap().as_object().unwrap();
+	let weighted = weighted.as_array().assert_some().get(0).assert_some().as_object().assert_some();
 	assert_eq!(weighted.get("length"), Some(&Value::from(2_i64)));
 	assert_eq!(weighted.get("cost"), Some(&Value::from(2_i64)));
-	let atoms = weighted.get("atoms").and_then(Value::as_array).unwrap();
+	let atoms = weighted.get("atoms").and_then(Value::as_array).assert_some();
 	assert_eq!(atoms.len(), 5);
 	assert_eq!(
-		atoms.get(2).unwrap().as_atom_occurrence().unwrap().atom().id(),
+		atoms.get(2).assert_some().as_atom_occurrence().assert_some().atom().id(),
 		&nodes[1],
 		"equal-cost paths use public occurrence identity as the canonical tie-break"
 	);
 	let all = query(&mut transaction, "ALL WEIGHTED SHORTEST");
-	let all = all.as_array().unwrap();
+	let all = all.as_array().assert_some();
 	assert_eq!(all.len(), 2);
 	for row in all.iter() {
-		let row = row.as_object().unwrap();
+		let row = row.as_object().assert_some();
 		assert_eq!(row.get("length"), Some(&Value::from(2_i64)));
 		assert_eq!(row.get("cost"), Some(&Value::from(2_i64)));
 	}
 	let all_hop = query(&mut transaction, "ALL SHORTEST");
-	assert_eq!(all_hop.as_array().unwrap().len(), 1);
+	assert_eq!(all_hop.as_array().assert_some().len(), 1);
 	let traversed = transaction
 		.execute(
 			"TRAVERSE FROM [person:a,person:a] IN GRAPH @routes |> \
 			 tv::allWeightedShortestPaths(person:d);",
 			&Object::new(),
 		)
-		.unwrap();
-	let traversed = traversed[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let traversed = traversed[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(traversed.len(), 4);
 	assert!(traversed.iter().all(|value| matches!(value, Value::Path(_))));
 }
 
+/// Verifies graph first match executes hyper and within relations.
 #[test]
 fn graph_first_match_executes_hyper_and_within_relations() {
 	let store = Datastore::in_memory();
@@ -223,22 +234,22 @@ fn graph_first_match_executes_hyper_and_within_relations() {
 		("module", AtomKind::Node),
 		("meeting", AtomKind::Edge),
 	] {
-		seed.define_class(ClassSchema::new(class, kind, []).unwrap()).unwrap();
+		seed.define_class(ClassSchema::new(class, kind, []).assert_ok()).assert_ok();
 	}
-	let knowledge = seed.define_graph("knowledge", GraphKind::Hypergraph).unwrap();
-	let child = seed.define_graph("child", GraphKind::Graph).unwrap();
-	let meta = seed.define_graph("meta", GraphKind::Metagraph).unwrap();
-	let alice = "person:alice".parse::<RecordId>().unwrap();
-	let bob = "person:bob".parse::<RecordId>().unwrap();
-	let doc = "document:spec".parse::<RecordId>().unwrap();
-	let module = "module:root".parse::<RecordId>().unwrap();
-	let meeting = "meeting:review".parse::<RecordId>().unwrap();
+	let knowledge = seed.define_graph("knowledge", GraphKind::Hypergraph).assert_ok();
+	let child = seed.define_graph("child", GraphKind::Graph).assert_ok();
+	let meta = seed.define_graph("meta", GraphKind::Metagraph).assert_ok();
+	let alice = "person:alice".parse::<RecordId>().assert_ok();
+	let bob = "person:bob".parse::<RecordId>().assert_ok();
+	let doc = "document:spec".parse::<RecordId>().assert_ok();
+	let module = "module:root".parse::<RecordId>().assert_ok();
+	let meeting = "meeting:review".parse::<RecordId>().assert_ok();
 	for record in [&alice, &bob, &doc, &module, &meeting] {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
-	let alice_local = seed.attach_node(knowledge.id(), &alice, None, None).unwrap();
-	let bob_local = seed.attach_node(knowledge.id(), &bob, None, None).unwrap();
-	let doc_local = seed.attach_node(knowledge.id(), &doc, None, None).unwrap();
+	let alice_local = seed.attach_node(knowledge.id(), &alice, None, None).assert_ok();
+	let bob_local = seed.attach_node(knowledge.id(), &bob, None, None).assert_ok();
+	let doc_local = seed.attach_node(knowledge.id(), &doc, None, None).assert_ok();
 	seed.attach_edge(
 		knowledge.id(),
 		&meeting,
@@ -247,10 +258,10 @@ fn graph_first_match_executes_hyper_and_within_relations() {
 		None,
 		None,
 	)
-	.unwrap();
-	seed.attach_node(child.id(), &doc, None, None).unwrap();
-	seed.attach_node(meta.id(), &module, None, Some(child.id())).unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.attach_node(child.id(), &doc, None, None).assert_ok();
+	seed.attach_node(meta.id(), &module, None, Some(child.id())).assert_ok();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	let hyper = transaction
@@ -259,8 +270,8 @@ fn graph_first_match_executes_hyper_and_within_relations() {
 			 GRAPH knowledge RETURN p, d",
 			&Object::new(),
 		)
-		.unwrap();
-	let rows = hyper[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let rows = hyper[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(rows.len(), 2);
 
 	let within = transaction
@@ -268,32 +279,39 @@ fn graph_first_match_executes_hyper_and_within_relations() {
 			"MATCH (document AS d) WITHIN <(module AS m)> IN GRAPH meta RETURN d, m",
 			&Object::new(),
 		)
-		.unwrap();
-	let rows = within[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let rows = within[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(rows.len(), 1);
-	let row = rows.get(0).unwrap().as_object().unwrap();
-	assert_eq!(row.get("d").unwrap().as_atom_occurrence().unwrap().graph().id(), child.id());
-	assert_eq!(row.get("m").unwrap().as_atom_occurrence().unwrap().graph().id(), meta.id());
+	let row = rows.get(0).assert_some().as_object().assert_some();
+	assert_eq!(
+		row.get("d").assert_some().as_atom_occurrence().assert_some().graph().id(),
+		child.id()
+	);
+	assert_eq!(
+		row.get("m").assert_some().as_atom_occurrence().assert_some().graph().id(),
+		meta.id()
+	);
 }
 
+/// Verifies atomwalk supports vertex edge and edge edge incidence.
 #[test]
 fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
-	let graph = seed.define_graph("atomwalk", GraphKind::Graph).unwrap();
-	let a = "person:a".parse::<RecordId>().unwrap();
-	let b = "person:b".parse::<RecordId>().unwrap();
-	let target = "relation:target".parse::<RecordId>().unwrap();
-	let vertex_edge = "relation:ve".parse::<RecordId>().unwrap();
-	let edge_vertex = "relation:ev".parse::<RecordId>().unwrap();
-	let edge_edge = "relation:ee".parse::<RecordId>().unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("atomwalk", GraphKind::Graph).assert_ok();
+	let a = "person:a".parse::<RecordId>().assert_ok();
+	let b = "person:b".parse::<RecordId>().assert_ok();
+	let target = "relation:target".parse::<RecordId>().assert_ok();
+	let vertex_edge = "relation:ve".parse::<RecordId>().assert_ok();
+	let edge_vertex = "relation:ev".parse::<RecordId>().assert_ok();
+	let edge_edge = "relation:ee".parse::<RecordId>().assert_ok();
 	for record in [&a, &b, &target, &vertex_edge, &edge_vertex, &edge_edge] {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
-	let a_local = seed.attach_node(graph.id(), &a, None, None).unwrap();
-	let b_local = seed.attach_node(graph.id(), &b, None, None).unwrap();
+	let a_local = seed.attach_node(graph.id(), &a, None, None).assert_ok();
+	let b_local = seed.attach_node(graph.id(), &b, None, None).assert_ok();
 	let target_local = seed
 		.attach_edge(
 			graph.id(),
@@ -303,7 +321,7 @@ fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 			None,
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	let vertex_edge_local = seed
 		.attach_edge(
 			graph.id(),
@@ -313,7 +331,7 @@ fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 			None,
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&edge_vertex,
@@ -322,7 +340,7 @@ fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 		None,
 		None,
 	)
-	.unwrap();
+	.assert_ok();
 	seed.attach_edge(
 		graph.id(),
 		&edge_edge,
@@ -331,8 +349,8 @@ fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 		None,
 		None,
 	)
-	.unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	for query in [
@@ -345,12 +363,14 @@ fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 		"MATCH ATOM path=<(person:a)>~[relation*1..2 ALL SHORTEST]~><[relation:target]> IN GRAPH \
 		 atomwalk RETURN path",
 	] {
-		let result = transaction.execute(query, &Object::new()).unwrap();
-		let rows = result[0].result.as_ref().unwrap().value().as_array().unwrap();
+		let result = transaction.execute(query, &Object::new()).assert_ok();
+		let rows = result[0].result.as_ref().assert_ok().value().as_array().assert_some();
 		assert_eq!(rows.len(), 1, "{query}");
 	}
 }
 
+/// Verifies nested match preserves scopes for fixed variable and shortest
+/// paths.
 #[test]
 fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 	let store = Datastore::in_memory();
@@ -361,22 +381,22 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 		("bridge", AtomKind::Edge),
 		("meeting", AtomKind::Edge),
 	] {
-		seed.define_class(ClassSchema::new(class, kind, []).unwrap()).unwrap();
+		seed.define_class(ClassSchema::new(class, kind, []).assert_ok()).assert_ok();
 	}
-	let child = seed.define_graph("nested_docs", GraphKind::Graph).unwrap();
-	let meta = seed.define_graph("nested_meta", GraphKind::Metagraph).unwrap();
-	let module = "module:root".parse::<RecordId>().unwrap();
-	let document = "document:spec".parse::<RecordId>().unwrap();
-	let appendix = "document:appendix".parse::<RecordId>().unwrap();
-	let bridge = "bridge:contains".parse::<RecordId>().unwrap();
-	let meeting = "meeting:review".parse::<RecordId>().unwrap();
+	let child = seed.define_graph("nested_docs", GraphKind::Graph).assert_ok();
+	let meta = seed.define_graph("nested_meta", GraphKind::Metagraph).assert_ok();
+	let module = "module:root".parse::<RecordId>().assert_ok();
+	let document = "document:spec".parse::<RecordId>().assert_ok();
+	let appendix = "document:appendix".parse::<RecordId>().assert_ok();
+	let bridge = "bridge:contains".parse::<RecordId>().assert_ok();
+	let meeting = "meeting:review".parse::<RecordId>().assert_ok();
 	for record in [&module, &document, &appendix, &bridge, &meeting] {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
-	let child_document = seed.attach_node(child.id(), &document, None, None).unwrap();
-	let child_appendix = seed.attach_node(child.id(), &appendix, None, None).unwrap();
-	let owner = seed.attach_node(meta.id(), &module, None, Some(child.id())).unwrap();
-	let nested = QualifiedAtomId::new([owner], child_document).unwrap();
+	let child_document = seed.attach_node(child.id(), &document, None, None).assert_ok();
+	let child_appendix = seed.attach_node(child.id(), &appendix, None, None).assert_ok();
+	let owner = seed.attach_node(meta.id(), &module, None, Some(child.id())).assert_ok();
+	let nested = QualifiedAtomId::new([owner], child_document).assert_ok();
 	seed.attach_edge(
 		meta.id(),
 		&bridge,
@@ -385,9 +405,9 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 		Some(Number::Int(3)),
 		None,
 	)
-	.unwrap();
-	let nested_document = QualifiedAtomId::new([owner], child_document).unwrap();
-	let nested_appendix = QualifiedAtomId::new([owner], child_appendix).unwrap();
+	.assert_ok();
+	let nested_document = QualifiedAtomId::new([owner], child_document).assert_ok();
+	let nested_appendix = QualifiedAtomId::new([owner], child_appendix).assert_ok();
 	seed.attach_edge(
 		meta.id(),
 		&meeting,
@@ -399,8 +419,8 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 		None,
 		None,
 	)
-	.unwrap();
-	seed.commit().unwrap();
+	.assert_ok();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	let fixed = transaction
@@ -409,11 +429,14 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 			 nested_meta RETURN m, e, d, graph::inner(m) AS inner",
 			&Object::new(),
 		)
-		.unwrap();
-	let fixed = fixed[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let fixed = fixed[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(fixed.len(), 1);
-	let fixed = fixed.get(0).unwrap().as_object().unwrap();
-	assert_eq!(fixed.get("d").unwrap().as_atom_occurrence().unwrap().graph().id(), child.id());
+	let fixed = fixed.get(0).assert_some().as_object().assert_some();
+	assert_eq!(
+		fixed.get("d").assert_some().as_atom_occurrence().assert_some().graph().id(),
+		child.id()
+	);
 	assert_eq!(fixed.get("inner"), Some(&Value::GraphRef(Box::new(child.clone()))));
 
 	let reverse = transaction
@@ -423,8 +446,8 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 			 GRAPH nested_meta RETURN back",
 			&Object::new(),
 		)
-		.unwrap();
-	assert_eq!(reverse[0].result.as_ref().unwrap().value().as_array().unwrap().len(), 1);
+		.assert_ok();
+	assert_eq!(reverse[0].result.as_ref().assert_ok().value().as_array().assert_some().len(), 1);
 
 	let variable = transaction
 		.execute(
@@ -433,14 +456,17 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 			 path::atoms(path) AS atoms",
 			&Object::new(),
 		)
-		.unwrap();
-	let variable = variable[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let variable = variable[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(variable.len(), 1);
-	let variable = variable.get(0).unwrap().as_object().unwrap();
+	let variable = variable.get(0).assert_some().as_object().assert_some();
 	assert_eq!(variable.get("length"), Some(&Value::from(2_i64)));
-	let atoms = variable.get("atoms").and_then(Value::as_array).unwrap();
-	assert_eq!(atoms.get(2).unwrap().as_atom_occurrence().unwrap().graph().id(), child.id());
-	let path = variable.get("path").and_then(Value::as_path).unwrap();
+	let atoms = variable.get("atoms").and_then(Value::as_array).assert_some();
+	assert_eq!(
+		atoms.get(2).assert_some().as_atom_occurrence().assert_some().graph().id(),
+		child.id()
+	);
+	let path = variable.get("path").and_then(Value::as_path).assert_some();
 	assert_eq!(path.steps()[1].direction(), PathDirection::Forward);
 	assert_eq!(path.steps()[1].role(), EndpointRole::Target);
 	assert_eq!(path.steps()[2].direction(), PathDirection::Reverse);
@@ -452,11 +478,11 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 			 d) IN GRAPH nested_meta RETURN path::cost(path) AS cost",
 			&Object::new(),
 		)
-		.unwrap();
-	let shortest = shortest[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let shortest = shortest[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(shortest.len(), 1);
 	assert_eq!(
-		shortest.get(0).unwrap().as_object().unwrap().get("cost"),
+		shortest.get(0).assert_some().as_object().assert_some().get("cost"),
 		Some(&Value::from(3_i64))
 	);
 	let all = transaction
@@ -465,8 +491,8 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 			 GRAPH nested_meta RETURN path::cost(path) AS cost",
 			&Object::new(),
 		)
-		.unwrap();
-	assert_eq!(all[0].result.as_ref().unwrap().value().as_array().unwrap(), shortest);
+		.assert_ok();
+	assert_eq!(all[0].result.as_ref().assert_ok().value().as_array().assert_some(), shortest);
 
 	let hyper = transaction
 		.execute(
@@ -474,8 +500,8 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 			 GRAPH nested_meta RETURN d",
 			&Object::new(),
 		)
-		.unwrap();
-	let hyper = hyper[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let hyper = hyper[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(hyper.len(), 2);
 	assert!(hyper.iter().all(|row| {
 		row.as_object()
@@ -485,24 +511,26 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 	}));
 }
 
+/// Verifies match optional distinct modes and expansion budget follow the
+/// clause contract.
 #[test]
 fn match_optional_distinct_modes_and_expansion_budget_follow_the_clause_contract() {
 	let store = Datastore::in_memory();
 	let mut seed = store.begin();
-	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
-	seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
-	let modes = seed.define_graph("modes", GraphKind::Graph).unwrap();
-	let parallel = seed.define_graph("parallel", GraphKind::Graph).unwrap();
-	let a = "person:a".parse::<RecordId>().unwrap();
-	let b = "person:b".parse::<RecordId>().unwrap();
-	let loop_edge = "link:loop".parse::<RecordId>().unwrap();
-	let first = "link:first".parse::<RecordId>().unwrap();
-	let second = "link:second".parse::<RecordId>().unwrap();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let modes = seed.define_graph("modes", GraphKind::Graph).assert_ok();
+	let parallel = seed.define_graph("parallel", GraphKind::Graph).assert_ok();
+	let a = "person:a".parse::<RecordId>().assert_ok();
+	let b = "person:b".parse::<RecordId>().assert_ok();
+	let loop_edge = "link:loop".parse::<RecordId>().assert_ok();
+	let first = "link:first".parse::<RecordId>().assert_ok();
+	let second = "link:second".parse::<RecordId>().assert_ok();
 	for record in [&a, &b, &loop_edge, &first, &second] {
-		seed.create_atom(record.clone(), Default::default()).unwrap();
+		seed.create_atom(record.clone(), crate::values::PropertyMap::default()).assert_ok();
 	}
-	let modes_a = seed.attach_node(modes.id(), &a, None, None).unwrap();
-	let modes_b = seed.attach_node(modes.id(), &b, None, None).unwrap();
+	let modes_a = seed.attach_node(modes.id(), &a, None, None).assert_ok();
+	let modes_b = seed.attach_node(modes.id(), &b, None, None).assert_ok();
 	seed.attach_edge(
 		modes.id(),
 		&loop_edge,
@@ -511,9 +539,9 @@ fn match_optional_distinct_modes_and_expansion_budget_follow_the_clause_contract
 		None,
 		None,
 	)
-	.unwrap();
-	let parallel_a = seed.attach_node(parallel.id(), &a, None, None).unwrap();
-	let parallel_b = seed.attach_node(parallel.id(), &b, None, None).unwrap();
+	.assert_ok();
+	let parallel_a = seed.attach_node(parallel.id(), &a, None, None).assert_ok();
+	let parallel_b = seed.attach_node(parallel.id(), &b, None, None).assert_ok();
 	for edge in [&first, &second] {
 		seed.attach_edge(
 			parallel.id(),
@@ -523,26 +551,29 @@ fn match_optional_distinct_modes_and_expansion_budget_follow_the_clause_contract
 			None,
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 	}
-	seed.commit().unwrap();
+	seed.commit().assert_ok();
 
 	let mut transaction = store.begin();
 	let optional = transaction
 		.execute("OPTIONAL MATCH (person:missing AS p) IN GRAPH modes RETURN p", &Object::new())
-		.unwrap();
-	let optional = optional[0].result.as_ref().unwrap().value().as_array().unwrap();
+		.assert_ok();
+	let optional = optional[0].result.as_ref().assert_ok().value().as_array().assert_some();
 	assert_eq!(optional.len(), 1);
-	assert_eq!(optional.get(0).unwrap().as_object().unwrap().get("p"), Some(&Value::None),);
+	assert_eq!(
+		optional.get(0).assert_some().as_object().assert_some().get("p"),
+		Some(&Value::None),
+	);
 
 	let count = |transaction: &mut Transaction, query: &str| {
-		transaction.execute(query, &Object::new()).unwrap()[0]
+		transaction.execute(query, &Object::new()).assert_ok()[0]
 			.result
 			.as_ref()
-			.unwrap()
+			.assert_ok()
 			.value()
 			.as_array()
-			.unwrap()
+			.assert_some()
 			.len()
 	};
 	for (mode, expected) in [("WALK", 1), ("TRAIL", 0), ("ACYCLIC", 0), ("SIMPLE", 1)] {
@@ -586,6 +617,6 @@ fn match_optional_distinct_modes_and_expansion_budget_follow_the_clause_contract
 			&Object::new(),
 			options,
 		)
-		.unwrap();
-	assert_eq!(results[0].result.as_ref().unwrap_err().status().code().to_string(), "FG-54F11",);
+		.assert_ok();
+	assert_eq!(results[0].result.as_ref().assert_err().status().code().to_string(), "FG-54F11",);
 }

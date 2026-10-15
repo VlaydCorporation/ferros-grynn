@@ -17,12 +17,16 @@ const MAX_GENERATION: u32 = (1 << 23) - 1;
 /// One slot namespace shared by database-global nodes and edges.
 #[derive(Debug, Clone, Default)]
 struct GlobalSlotAllocator {
+	/// Generations associated with this global slot allocator.
 	generations: Vec<u32>,
+	/// Occupied associated with this global slot allocator.
 	occupied: Vec<bool>,
+	/// Free associated with this global slot allocator.
 	free: Vec<u64>,
 }
 
 impl GlobalSlotAllocator {
+	/// Returns the alloc result.
 	fn alloc(&mut self, kind: AtomKind) -> FerrosGrynnResult<GlobalAtomId> {
 		let slot = match self.free.pop() {
 			Some(slot) => slot,
@@ -41,6 +45,7 @@ impl GlobalSlotAllocator {
 		AtomId::from_parts(kind, slot, self.generations[index]).map(GlobalAtomId)
 	}
 
+	/// Restores global slot allocator.
 	fn restore(&mut self, id: GlobalAtomId) -> FerrosGrynnResult<()> {
 		let index = usize::try_from(id.slot())
 			.map_err(|_error| FerrosGrynnError::graph_capacity_exceeded("global atom store"))?;
@@ -60,6 +65,7 @@ impl GlobalSlotAllocator {
 		Ok(())
 	}
 
+	/// Restores free.
 	fn restore_free(&mut self, slot: u64, generation: u32) -> FerrosGrynnResult<()> {
 		let index = usize::try_from(slot)
 			.map_err(|_error| FerrosGrynnError::graph_capacity_exceeded("global atom store"))?;
@@ -81,6 +87,7 @@ impl GlobalSlotAllocator {
 		Ok(())
 	}
 
+	/// Returns the free result.
 	fn free(&mut self, id: GlobalAtomId) -> FerrosGrynnResult<()> {
 		let index = usize::try_from(id.slot())
 			.map_err(|_error| FerrosGrynnError::graph_capacity_exceeded("global atom store"))?;
@@ -97,6 +104,7 @@ impl GlobalSlotAllocator {
 		Ok(())
 	}
 
+	/// Extends through.
 	fn extend_through(&mut self, index: usize) -> FerrosGrynnResult<()> {
 		while self.generations.len() <= index {
 			let slot = u64::try_from(self.generations.len())
@@ -108,10 +116,12 @@ impl GlobalSlotAllocator {
 		Ok(())
 	}
 
+	/// Returns the capacity result.
 	const fn capacity(&self) -> usize {
 		self.generations.len()
 	}
 
+	/// Returns the generation result.
 	fn generation(&self, slot: usize) -> Option<u32> {
 		self.generations.get(slot).copied()
 	}
@@ -120,7 +130,10 @@ impl GlobalSlotAllocator {
 /// Generation-aware address of one database-global atom.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(crate) struct GlobalAtomId(AtomId);
+pub struct GlobalAtomId(
+	/// Atom identity addressed by this form.
+	AtomId,
+);
 
 impl GlobalAtomId {
 	/// Restores an address from its durable packed representation.
@@ -161,39 +174,49 @@ impl GlobalAtomId {
 }
 
 impl Debug for GlobalAtomId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		formatter.debug_tuple("GlobalAtomId").field(&self.0).finish()
+	/// Formats `GlobalAtomId` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("GlobalAtomId").field(&self.0).finish()
 	}
 }
 
 impl Display for GlobalAtomId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.0, formatter)
+	/// Formats `GlobalAtomId` using the requested formatter.
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.0, f)
 	}
 }
 
 /// Database-global identity, class, and base properties of one atom.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BaseAtom {
+pub struct BaseAtom {
+	/// Identifier used to locate this value within its owning subsystem.
 	id: GlobalAtomId,
+	/// Stable record identifier of the associated atom.
 	record_id: RecordId,
+	/// Identifier of the schema class.
 	class_id: ClassId,
+	/// Properties associated with this base atom.
 	properties: PropertyMap,
 }
 
 impl BaseAtom {
+	/// Returns the id result.
 	pub(crate) const fn id(&self) -> GlobalAtomId {
 		self.id
 	}
 
+	/// Records id.
 	pub(crate) const fn record_id(&self) -> &RecordId {
 		&self.record_id
 	}
 
+	/// Returns the class id result.
 	pub(crate) const fn class_id(&self) -> ClassId {
 		self.class_id
 	}
 
+	/// Returns the kind result.
 	pub(crate) fn kind(&self) -> AtomKind {
 		match self.id.kind() {
 			Some(kind) => kind,
@@ -201,10 +224,12 @@ impl BaseAtom {
 		}
 	}
 
+	/// Returns the properties result.
 	pub(crate) const fn properties(&self) -> &PropertyMap {
 		&self.properties
 	}
 
+	/// Returns the properties mut result.
 	pub(crate) fn properties_mut(&mut self) -> &mut PropertyMap {
 		&mut self.properties
 	}
@@ -212,14 +237,19 @@ impl BaseAtom {
 
 /// Database-global atom registry and exact reverse graph memberships.
 #[derive(Debug, Clone)]
-pub(crate) struct AtomStoreRoot {
+pub struct AtomStoreRoot {
+	/// Allocator associated with this atom store root.
 	allocator: GlobalSlotAllocator,
+	/// Primary associated with this atom store root.
 	primary: BTreeMap<RecordId, GlobalAtomId>,
+	/// Atoms associated with this atom store root.
 	atoms: BTreeMap<GlobalAtomId, Arc<BaseAtom>>,
+	/// Memberships associated with this atom store root.
 	memberships: BTreeMap<GlobalAtomId, BTreeMap<GraphId, AtomId>>,
 }
 
 impl Default for AtomStoreRoot {
+	/// Constructs the default initial state of `AtomStoreRoot`.
 	fn default() -> Self {
 		Self {
 			allocator: GlobalSlotAllocator::default(),
@@ -231,6 +261,7 @@ impl Default for AtomStoreRoot {
 }
 
 impl AtomStoreRoot {
+	/// Inserts atom store root.
 	pub(crate) fn insert(
 		&mut self,
 		class: &ClassSchema,
@@ -259,6 +290,7 @@ impl AtomStoreRoot {
 		Ok(id)
 	}
 
+	/// Inserts at.
 	pub(crate) fn insert_at(
 		&mut self,
 		id: GlobalAtomId,
@@ -285,6 +317,7 @@ impl AtomStoreRoot {
 		Ok(())
 	}
 
+	/// Inserts record.
 	fn insert_record(
 		&mut self,
 		id: GlobalAtomId,
@@ -304,18 +337,22 @@ impl AtomStoreRoot {
 		);
 	}
 
+	/// Resolves atom store root.
 	pub(crate) fn resolve(&self, record_id: &RecordId) -> Option<GlobalAtomId> {
 		self.primary.get(record_id).copied()
 	}
 
+	/// Returns the atom result.
 	pub(crate) fn atom(&self, id: GlobalAtomId) -> Option<&BaseAtom> {
 		self.atoms.get(&id).filter(|atom| atom.id == id).map(Arc::as_ref)
 	}
 
+	/// Returns the atom arc result.
 	pub(crate) fn atom_arc(&self, id: GlobalAtomId) -> Option<Arc<BaseAtom>> {
 		self.atoms.get(&id).filter(|atom| atom.id == id).cloned()
 	}
 
+	/// Returns the atom mut result.
 	pub(crate) fn atom_mut(&mut self, id: GlobalAtomId) -> Option<&mut BaseAtom> {
 		let atom = self.atoms.get_mut(&id)?;
 		if atom.id != id {
@@ -324,6 +361,7 @@ impl AtomStoreRoot {
 		Some(Arc::make_mut(atom))
 	}
 
+	/// Removes atom store root.
 	pub(crate) fn remove(&mut self, id: GlobalAtomId) -> FerrosGrynnResult<BaseAtom> {
 		if self.memberships.get(&id).is_some_and(|memberships| !memberships.is_empty()) {
 			return Err(FerrosGrynnError::graph_constraint_violation(
@@ -351,18 +389,22 @@ impl AtomStoreRoot {
 		Ok(Arc::try_unwrap(atom).unwrap_or_else(|atom| atom.as_ref().clone()))
 	}
 
+	/// Returns the atoms result.
 	pub(crate) fn atoms(&self) -> impl ExactSizeIterator<Item = &BaseAtom> {
 		self.atoms.values().map(Arc::as_ref)
 	}
 
+	/// Returns the slot capacity result.
 	pub(crate) const fn slot_capacity(&self) -> usize {
 		self.allocator.capacity()
 	}
 
+	/// Returns the slot generation result.
 	pub(crate) fn slot_generation(&self, slot: usize) -> Option<u32> {
 		self.allocator.generation(slot)
 	}
 
+	/// Restores free slot.
 	pub(crate) fn restore_free_slot(
 		&mut self,
 		slot: u64,
@@ -371,10 +413,12 @@ impl AtomStoreRoot {
 		self.allocator.restore_free(slot, generation)
 	}
 
+	/// Returns the memberships result.
 	pub(crate) fn memberships(&self, id: GlobalAtomId) -> Option<&BTreeMap<GraphId, AtomId>> {
 		self.memberships.get(&id)
 	}
 
+	/// Performs the add membership operation.
 	pub(crate) fn add_membership(&mut self, global: GlobalAtomId, graph: GraphId, local: AtomId) {
 		self.memberships.entry(global).or_default().insert(graph, local);
 	}
@@ -402,6 +446,7 @@ impl AtomStoreRoot {
 		Ok(())
 	}
 
+	/// Removes membership.
 	pub(crate) fn remove_membership(&mut self, global: GlobalAtomId, graph: GraphId) {
 		let Some(memberships) = self.memberships.get_mut(&global) else {
 			return;
@@ -414,30 +459,34 @@ impl AtomStoreRoot {
 }
 
 #[cfg(test)]
+/// Regression tests for atom store behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::values::RecordIdPart;
 
+	/// Verifies reused slot rejects the stale global atom id.
 	#[test]
 	fn reused_slot_rejects_the_stale_global_atom_id() {
-		let mut class = ClassSchema::new("person", AtomKind::Node, []).unwrap();
+		let mut class = ClassSchema::new("person", AtomKind::Node, []).assert_ok();
 		class.id = ClassId::new(1);
 		let mut store = AtomStoreRoot::default();
 		let first = store
 			.insert(
 				&class,
-				RecordId::new("person", RecordIdPart::String("first".into())).unwrap(),
+				RecordId::new("person", RecordIdPart::String("first".into())).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
-		store.remove(first).unwrap();
+			.assert_ok();
+		store.remove(first).assert_ok();
 		let second = store
 			.insert(
 				&class,
-				RecordId::new("person", RecordIdPart::String("second".into())).unwrap(),
+				RecordId::new("person", RecordIdPart::String("second".into())).assert_ok(),
 				PropertyMap::new(),
 			)
-			.unwrap();
+			.assert_ok();
 
 		assert_eq!(first.slot(), second.slot());
 		assert_ne!(first.generation(), second.generation());

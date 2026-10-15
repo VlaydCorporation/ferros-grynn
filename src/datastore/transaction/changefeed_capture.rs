@@ -510,6 +510,7 @@ pub(super) fn admit_history_publication(
 }
 
 #[cfg(test)]
+/// Regression tests for changefeed capture behavior.
 mod tests {
 	use super::*;
 	use crate::{
@@ -551,21 +552,27 @@ mod tests {
 		.with_full(true))
 	}
 
+	/// Verifies changefeed final full policy captures earlier dml and exact
+	/// noops.
 	#[test]
-	fn changefeed_final_full_policy_captures_earlier_dml_and_exact_noops() -> FerrosGrynnResult<()>
-	{
-		let (store, record, class, _graph, key) = fixture()?;
+	fn changefeed_final_full_policy_captures_earlier_dml_and_exact_noops() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, class, _graph, key) = fixture().assert_ok();
 		let mut tx = store.begin();
-		tx.set_base_property(&record, key, Value::from(2))?;
-		let feed = tx.configure_changefeed(ChangefeedSource::Class(class), full_config()?)?;
-		tx.set_base_property(&record, key, Value::from(3))?;
-		tx.remove_base_property(&record, PropertyKeyId::new(99))?;
-		let stamp = tx.commit()?.commit_ts();
+		tx.set_base_property(&record, key, Value::from(2)).assert_ok();
+		let feed = tx
+			.configure_changefeed(ChangefeedSource::Class(class), full_config().assert_ok())
+			.assert_ok();
+		tx.set_base_property(&record, key, Value::from(3)).assert_ok();
+		tx.remove_base_property(&record, PropertyKeyId::new(99)).assert_ok();
+		let stamp = tx.commit().assert_ok().commit_ts();
 		let root = store.inner.current_root();
 		let group = root
 			.change_history()
 			.get(&(feed, stamp))
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture history is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture history is absent"))
+			.assert_ok();
 		assert_eq!(group.net.entries().len(), 1);
 		let entry = &group.net.entries()[0];
 		assert_eq!(
@@ -579,7 +586,8 @@ mod tests {
 		let full = group
 			.full
 			.as_ref()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture FULL history is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture FULL history is absent"))
+			.assert_ok();
 		assert_eq!(full.entries().len(), 3);
 		for (ordinal, entry) in full.entries().iter().enumerate() {
 			assert_eq!(entry.ordinal(), ordinal as u64);
@@ -591,70 +599,81 @@ mod tests {
 			root.committed_at_ns
 		);
 		let mut restore = store.begin();
-		restore.set_base_property(&record, key, Value::from(4))?;
-		restore.set_base_property(&record, key, Value::from(3))?;
-		let restored_stamp = restore.commit()?.commit_ts();
+		restore.set_base_property(&record, key, Value::from(4)).assert_ok();
+		restore.set_base_property(&record, key, Value::from(3)).assert_ok();
+		let restored_stamp = restore.commit().assert_ok().commit_ts();
 		let latest = store.inner.current_root();
-		let restored = latest.change_history().get(&(feed, restored_stamp)).ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("fixture restore history is absent")
-		})?;
+		let restored = latest
+			.change_history()
+			.get(&(feed, restored_stamp))
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture restore history is absent"))
+			.assert_ok();
 		assert!(restored.net.entries().is_empty());
 		assert_eq!(restored.full.as_ref().map(|full| full.entries().len()), Some(2));
-		Ok(())
 	}
 
+	/// Verifies changefeed noop only full commits validate and advance clock.
 	#[test]
-	fn changefeed_noop_only_full_commits_validate_and_advance_clock() -> FerrosGrynnResult<()> {
-		let (store, record, class, graph, key) = fixture()?;
+	fn changefeed_noop_only_full_commits_validate_and_advance_clock() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, class, graph, key) = fixture().assert_ok();
 		let source = ChangefeedSource::Graph(graph);
 		let mut configure = store.begin();
-		let feed = configure.configure_changefeed(source, full_config()?)?;
-		configure.commit()?;
+		let feed = configure.configure_changefeed(source, full_config().assert_ok()).assert_ok();
+		configure.commit().assert_ok();
 		let before = store.inner.current_root().commit_ts;
 		let mut tx = store.begin();
-		tx.reset_property(graph, &record, key)?;
-		let stamp = tx.commit()?.commit_ts();
+		tx.reset_property(graph, &record, key).assert_ok();
+		let stamp = tx.commit().assert_ok().commit_ts();
 		assert_eq!(stamp, before + 1);
 		let root = store.inner.current_root();
 		let group = root
 			.change_history()
 			.get(&(feed, stamp))
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture no-op history is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture no-op history is absent"))
+			.assert_ok();
 		assert!(group.net.entries().is_empty());
 		assert_eq!(group.full.as_ref().map(|full| full.entries().len()), Some(1));
 		let mut noop = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Snapshot,
 			TransactionAccess::ReadWrite,
 		));
-		noop.reset_property(graph, &record, key)?;
+		noop.reset_property(graph, &record, key).assert_ok();
 		let mut writer = store.begin();
-		writer.set_base_property(&record, key, Value::from(9))?;
-		writer.commit()?;
+		writer.set_base_property(&record, key, Value::from(9)).assert_ok();
+		writer.commit().assert_ok();
 		assert!(noop.commit().is_err());
 		let mut class_noop = store.begin();
-		class_noop.remove_base_property(&record, PropertyKeyId::new(99))?;
+		class_noop.remove_base_property(&record, PropertyKeyId::new(99)).assert_ok();
 		let before = store.inner.current_root().commit_ts;
-		assert_eq!(class_noop.commit()?.commit_ts(), before);
+		assert_eq!(class_noop.commit().assert_ok().commit_ts(), before);
 		let mut enable = store.begin();
-		enable.configure_changefeed(ChangefeedSource::Class(class), full_config()?)?;
-		enable.commit()?;
-		Ok(())
+		enable
+			.configure_changefeed(ChangefeedSource::Class(class), full_config().assert_ok())
+			.assert_ok();
+		enable.commit().assert_ok();
 	}
 
+	/// Verifies changefeed net uses storage numeric tags and suppresses masked
+	/// fanout.
 	#[test]
-	fn changefeed_net_uses_storage_numeric_tags_and_suppresses_masked_fanout()
-	-> FerrosGrynnResult<()> {
-		let (store, record, class, graph, key) = fixture()?;
+	fn changefeed_net_uses_storage_numeric_tags_and_suppresses_masked_fanout() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, class, graph, key) = fixture().assert_ok();
 		let mut configure = store.begin();
-		let class_feed =
-			configure.configure_changefeed(ChangefeedSource::Class(class), full_config()?)?;
-		let graph_feed =
-			configure.configure_changefeed(ChangefeedSource::Graph(graph), full_config()?)?;
-		configure.hide_property(graph, &record, key)?;
-		configure.commit()?;
+		let class_feed = configure
+			.configure_changefeed(ChangefeedSource::Class(class), full_config().assert_ok())
+			.assert_ok();
+		let graph_feed = configure
+			.configure_changefeed(ChangefeedSource::Graph(graph), full_config().assert_ok())
+			.assert_ok();
+		configure.hide_property(graph, &record, key).assert_ok();
+		configure.commit().assert_ok();
 		let mut tx = store.begin();
-		tx.set_base_property(&record, key, Value::Number(Number::Float(1.0)))?;
-		let stamp = tx.commit()?.commit_ts();
+		tx.set_base_property(&record, key, Value::Number(Number::Float(1.0))).assert_ok();
+		let stamp = tx.commit().assert_ok().commit_ts();
 		let root = store.inner.current_root();
 		assert_eq!(
 			root.change_history().get(&(class_feed, stamp)).map(|group| group.net.entries().len()),
@@ -662,139 +681,165 @@ mod tests {
 		);
 		assert!(!root.change_history().contains_key(&(graph_feed, stamp)));
 		let mut overlay = store.begin();
-		overlay.set_overlay(graph, &record, key, Value::from(7))?;
-		let stamp = overlay.commit()?.commit_ts();
+		overlay.set_overlay(graph, &record, key, Value::from(7)).assert_ok();
+		let stamp = overlay.commit().assert_ok().commit_ts();
 		let root = store.inner.current_root();
-		let group = root.change_history().get(&(graph_feed, stamp)).ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("fixture overlay history is absent")
-		})?;
+		let group = root
+			.change_history()
+			.get(&(graph_feed, stamp))
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture overlay history is absent"))
+			.assert_ok();
 		let after = group.net.entries()[0]
 			.after()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture overlay image is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture overlay image is absent"))
+			.assert_ok();
 		assert_eq!(after.properties().get("value"), Some(&Value::from(7)));
 		assert_eq!(
 			after.overlays().get("value"),
 			Some(&crate::changefeed::ChangeOverlay::Value(Value::from(7)))
 		);
-		Ok(())
 	}
 
+	/// Verifies changefeed drop and recreate identity do not capture foreign
+	/// slots.
 	#[test]
-	fn changefeed_drop_and_recreate_identity_do_not_capture_foreign_slots() -> FerrosGrynnResult<()>
-	{
-		let (store, _record, class, _graph, key) = fixture()?;
+	fn changefeed_drop_and_recreate_identity_do_not_capture_foreign_slots() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, class, _graph, key) = fixture().assert_ok();
 		let mut configure = store.begin();
-		let feed =
-			configure.configure_changefeed(ChangefeedSource::Class(class), full_config()?)?;
-		configure.commit()?;
-		let left_record = "item:left".parse::<RecordId>()?;
-		let right_record = "item:right".parse::<RecordId>()?;
+		let feed = configure
+			.configure_changefeed(ChangefeedSource::Class(class), full_config().assert_ok())
+			.assert_ok();
+		configure.commit().assert_ok();
+		let left_record = "item:left".parse::<RecordId>().assert_ok();
+		let right_record = "item:right".parse::<RecordId>().assert_ok();
 		let mut left = store.begin();
 		let mut right = store.begin();
-		left.create_atom(left_record.clone(), PropertyMap::new())?;
-		right.create_atom(right_record, PropertyMap::new())?;
-		right.commit()?;
-		let stamp = left.commit()?.commit_ts();
-		let root = store.inner.current_root();
-		let group = root.change_history().get(&(feed, stamp)).ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("fixture rebased history is absent")
-		})?;
-		assert!(group.net.entries()[0].before().is_none());
-		let mut recreate = store.begin();
-		recreate.delete_atom(&left_record)?;
-		let mut properties = PropertyMap::new();
-		properties.insert(key, 8);
-		recreate.create_atom(left_record.clone(), properties)?;
-		let stamp = recreate.commit()?.commit_ts();
-		let root = store.inner.current_root();
-		let group = root.change_history().get(&(feed, stamp)).ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("fixture recreated history is absent")
-		})?;
-		assert_eq!(group.net.entries().len(), 1);
-		assert!(group.net.entries()[0].before().is_some());
-		assert!(group.net.entries()[0].after().is_some());
-		let mut drop = store.begin();
-		drop.set_base_property(&left_record, key, Value::from(9))?;
-		drop.drop_changefeed(ChangefeedSource::Class(class))?;
-		let stamp = drop.commit()?.commit_ts();
+		left.create_atom(left_record.clone(), PropertyMap::new()).assert_ok();
+		right.create_atom(right_record, PropertyMap::new()).assert_ok();
+		right.commit().assert_ok();
+		let stamp = left.commit().assert_ok().commit_ts();
 		let root = store.inner.current_root();
 		let group = root
 			.change_history()
 			.get(&(feed, stamp))
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture DROP gap is absent"))?;
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture rebased history is absent"))
+			.assert_ok();
+		assert!(group.net.entries()[0].before().is_none());
+		let mut recreate = store.begin();
+		recreate.delete_atom(&left_record).assert_ok();
+		let mut properties = PropertyMap::new();
+		properties.insert(key, 8);
+		recreate.create_atom(left_record.clone(), properties).assert_ok();
+		let stamp = recreate.commit().assert_ok().commit_ts();
+		let root = store.inner.current_root();
+		let group = root
+			.change_history()
+			.get(&(feed, stamp))
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("fixture recreated history is absent")
+			})
+			.assert_ok();
+		assert_eq!(group.net.entries().len(), 1);
+		assert!(group.net.entries()[0].before().is_some());
+		assert!(group.net.entries()[0].after().is_some());
+		let mut drop = store.begin();
+		drop.set_base_property(&left_record, key, Value::from(9)).assert_ok();
+		drop.drop_changefeed(ChangefeedSource::Class(class)).assert_ok();
+		let stamp = drop.commit().assert_ok().commit_ts();
+		let root = store.inner.current_root();
+		let group = root
+			.change_history()
+			.get(&(feed, stamp))
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture DROP gap is absent"))
+			.assert_ok();
 		assert_eq!(
 			group.gap.as_ref().map(ChangefeedGap::reason),
 			Some(ChangefeedGapReason::SourceDropped)
 		);
 		assert!(group.net.entries().is_empty());
-		Ok(())
 	}
 
+	/// Verifies changefeed mixed update validates each full noop target.
 	#[test]
-	fn changefeed_mixed_update_validates_each_full_noop_target() -> FerrosGrynnResult<()> {
-		let (store, _record, class, _graph, key) = fixture()?;
-		let second = "item:b".parse::<RecordId>()?;
+	fn changefeed_mixed_update_validates_each_full_noop_target() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, class, _graph, key) = fixture().assert_ok();
+		let second = "item:b".parse::<RecordId>().assert_ok();
 		let mut setup = store.begin();
 		let mut properties = PropertyMap::new();
 		properties.insert(key, 2);
-		setup.create_atom(second.clone(), properties)?;
-		setup.configure_changefeed(ChangefeedSource::Class(class), full_config()?)?;
-		setup.commit()?;
+		setup.create_atom(second.clone(), properties).assert_ok();
+		setup
+			.configure_changefeed(ChangefeedSource::Class(class), full_config().assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut mixed = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Snapshot,
 			TransactionAccess::ReadWrite,
 		));
-		for outcome in
-			mixed.execute("UPDATE item SET value = 2 RETURN NONE", &crate::values::Object::new())?
+		for outcome in mixed
+			.execute("UPDATE item SET value = 2 RETURN NONE", &crate::values::Object::new())
+			.assert_ok()
 		{
-			let _result = outcome.result?;
+			let _result = outcome.result.assert_ok();
 		}
 		assert!(mixed.change_journal.intents.iter().any(|intent| intent.noop));
 		assert!(
 			mixed.change_journal.operations.iter().any(|operation| !operation.mutations.is_empty())
 		);
 		let mut writer = store.begin();
-		writer.set_base_property(&second, key, Value::from(3))?;
-		writer.commit()?;
+		writer.set_base_property(&second, key, Value::from(3)).assert_ok();
+		writer.commit().assert_ok();
 		assert!(mixed.commit().is_err());
-		Ok(())
 	}
 
+	/// Verifies changefeed unrelated deleted noop and final retirement do not
+	/// reject writes.
 	#[test]
-	fn changefeed_unrelated_deleted_noop_and_final_retirement_do_not_reject_writes()
-	-> FerrosGrynnResult<()> {
-		let (store, record, _class, graph, key) = fixture()?;
+	fn changefeed_unrelated_deleted_noop_and_final_retirement_do_not_reject_writes() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, _class, graph, key) = fixture().assert_ok();
 		let mut setup = store.begin();
-		let other = setup.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
-		let second = "other:b".parse::<RecordId>()?;
-		setup.create_atom(second.clone(), PropertyMap::new())?;
-		setup.configure_changefeed(ChangefeedSource::Class(other), full_config()?)?;
-		setup.commit()?;
+		let other = setup
+			.define_class(ClassSchema::new("other", AtomKind::Node, []).assert_ok())
+			.assert_ok();
+		let second = "other:b".parse::<RecordId>().assert_ok();
+		setup.create_atom(second.clone(), PropertyMap::new()).assert_ok();
+		setup
+			.configure_changefeed(ChangefeedSource::Class(other), full_config().assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut tx = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Snapshot,
 			TransactionAccess::ReadWrite,
 		));
-		tx.remove_base_property(&record, PropertyKeyId::new(99))?;
-		tx.set_base_property(&second, key, Value::from(3))?;
+		tx.remove_base_property(&record, PropertyKeyId::new(99)).assert_ok();
+		tx.set_base_property(&second, key, Value::from(3)).assert_ok();
 		let mut writer = store.begin();
-		writer.delete_atom_cascade(&record, true)?;
-		writer.commit()?;
-		tx.commit()?;
+		writer.delete_atom_cascade(&record, true).assert_ok();
+		writer.commit().assert_ok();
+		tx.commit().assert_ok();
 		let mut restore = store.begin();
-		restore.create_atom(record.clone(), PropertyMap::new())?;
-		restore.attach_node(graph, &record, None, None)?;
-		let feed = restore.configure_changefeed(ChangefeedSource::Graph(graph), full_config()?)?;
-		restore.commit()?;
+		restore.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		restore.attach_node(graph, &record, None, None).assert_ok();
+		let feed = restore
+			.configure_changefeed(ChangefeedSource::Graph(graph), full_config().assert_ok())
+			.assert_ok();
+		restore.commit().assert_ok();
 		let mut retired = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Snapshot,
 			TransactionAccess::ReadWrite,
 		));
-		retired.reset_property(graph, &record, key)?;
-		retired.remove_graph("scope")?;
+		retired.reset_property(graph, &record, key).assert_ok();
+		retired.remove_graph("scope").assert_ok();
 		let mut writer = store.begin();
-		writer.set_base_property(&record, key, Value::from(4))?;
-		writer.commit()?;
-		let stamp = retired.commit()?.commit_ts();
+		writer.set_base_property(&record, key, Value::from(4)).assert_ok();
+		writer.commit().assert_ok();
+		let stamp = retired.commit().assert_ok().commit_ts();
 		assert_eq!(
 			store
 				.inner
@@ -805,24 +850,29 @@ mod tests {
 				.map(ChangefeedGap::reason),
 			Some(ChangefeedGapReason::SourceDropped)
 		);
-		Ok(())
 	}
 
+	/// Verifies changefeed publication admits retained epoch cow before copy.
 	#[test]
-	fn changefeed_publication_admits_retained_epoch_cow_before_copy() -> FerrosGrynnResult<()> {
-		let (store, _record, class, _graph, _key) = fixture()?;
+	fn changefeed_publication_admits_retained_epoch_cow_before_copy() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, _record, class, _graph, _key) = fixture().assert_ok();
 		let mut setup = store.begin();
-		let feed = setup.configure_changefeed(ChangefeedSource::Class(class), full_config()?)?;
-		setup.commit()?;
+		let feed = setup
+			.configure_changefeed(ChangefeedSource::Class(class), full_config().assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut root = (*store.inner.current_root()).clone();
 		let definition = Arc::make_mut(
 			Arc::make_mut(root.changefeeds_mut())
 				.definitions
 				.get_mut(&feed)
-				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture feed is absent"))?,
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture feed is absent"))
+				.assert_ok(),
 		);
 		for stamp in 10..110 {
-			definition.set_capture_epoch(stamp, Some(full_config()?))?;
+			definition.set_capture_epoch(stamp, Some(full_config().assert_ok())).assert_ok();
 		}
 		let old = root.clone();
 		let mut budget = CaptureBudget {
@@ -831,18 +881,22 @@ mod tests {
 		};
 		assert!(admit_history_publication(&root, feed, &mut budget).is_err());
 		assert!(Arc::ptr_eq(old.changefeeds(), root.changefeeds()));
-		Ok(())
 	}
 
+	/// Verifies changefeed mixed writeback validates unchanged full targets.
 	#[test]
-	fn changefeed_mixed_writeback_validates_unchanged_full_targets() -> FerrosGrynnResult<()> {
-		let (store, record, _class, graph, _key) = fixture()?;
-		let second = "item:b".parse::<RecordId>()?;
+	fn changefeed_mixed_writeback_validates_unchanged_full_targets() {
+		use crate::test_assertions::AssertResult as _;
+
+		let (store, record, _class, graph, _key) = fixture().assert_ok();
+		let second = "item:b".parse::<RecordId>().assert_ok();
 		let mut setup = store.begin();
-		setup.create_atom(second.clone(), PropertyMap::new())?;
-		setup.attach_node(graph, &second, None, None)?;
-		setup.configure_changefeed(ChangefeedSource::Graph(graph), full_config()?)?;
-		setup.commit()?;
+		setup.create_atom(second.clone(), PropertyMap::new()).assert_ok();
+		setup.attach_node(graph, &second, None, None).assert_ok();
+		setup
+			.configure_changefeed(ChangefeedSource::Graph(graph), full_config().assert_ok())
+			.assert_ok();
+		setup.commit().assert_ok();
 		let mut tx = store.begin_with(TransactionOptions::new(
 			IsolationLevel::Snapshot,
 			TransactionAccess::ReadWrite,
@@ -851,31 +905,36 @@ mod tests {
 			.working
 			.schema
 			.graph(graph)
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture graph is absent"))?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture graph is absent"))
+			.assert_ok()
 			.reference()
 			.clone();
 		let materialized = crate::graph::query_to_memory::<
 			crate::graph::Graph<crate::graph::Frozen>,
 			_,
-		>(&reference.read(&tx)?)?;
+		>(&reference.read(&tx).assert_ok())
+		.assert_ok();
 		let first_local = crate::graph::GraphRead::atom_id(
 			&materialized,
-			&crate::graph::AtomRef::new(AtomKind::Node, record.clone()),
-		)?
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture first node is absent"))?;
+			&crate::graph::AtomRef::new(AtomKind::Node, record),
+		)
+		.assert_ok()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture first node is absent"))
+		.assert_ok();
 		let second_local = crate::graph::GraphRead::atom_id(
 			&materialized,
 			&crate::graph::AtomRef::new(AtomKind::Node, second.clone()),
-		)?
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture second node is absent"))?;
+		)
+		.assert_ok()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture second node is absent"))
+		.assert_ok();
 		let mut materialized = materialized.thaw();
-		materialized.set_node_label(first_local, Some("changed".into()))?;
-		materialized.set_node_label(second_local, None)?;
-		materialized.flush(&mut tx)?;
+		materialized.set_node_label(first_local, Some("changed".into())).assert_ok();
+		materialized.set_node_label(second_local, None).assert_ok();
+		materialized.flush(&mut tx).assert_ok();
 		let mut writer = store.begin();
-		writer.set_occurrence_label(graph, &second, Some("concurrent".into()))?;
-		writer.commit()?;
+		writer.set_occurrence_label(graph, &second, Some("concurrent".into())).assert_ok();
+		writer.commit().assert_ok();
 		assert!(tx.commit().is_err());
-		Ok(())
 	}
 }

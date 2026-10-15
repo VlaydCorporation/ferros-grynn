@@ -5,6 +5,7 @@ use ferros_grynn::{
 
 use crate::support::{create_person, execute, people, record, value};
 
+/// Verifies sdk scalar index matches scan after update delete and rollback.
 #[test]
 fn sdk_scalar_index_matches_scan_after_update_delete_and_rollback() {
 	let db = database();
@@ -40,6 +41,8 @@ fn sdk_scalar_index_matches_scan_after_update_delete_and_rollback() {
 	});
 }
 
+/// Verifies sdk unique index rejects duplicate values without losing valid
+/// writes.
 #[test]
 fn sdk_unique_index_rejects_duplicate_values_without_losing_valid_writes() {
 	let db = database();
@@ -67,6 +70,7 @@ fn sdk_unique_index_rejects_duplicate_values_without_losing_valid_writes() {
 	});
 }
 
+/// Verifies effective scalar index tracks overlay reset and detach.
 #[test]
 fn effective_scalar_index_tracks_overlay_reset_and_detach() {
 	let db = database();
@@ -104,6 +108,7 @@ fn effective_scalar_index_tracks_overlay_reset_and_detach() {
 	});
 }
 
+/// Verifies deferred index requires rebuild and count remains exact.
 #[test]
 fn deferred_index_requires_rebuild_and_count_remains_exact() {
 	let db = database();

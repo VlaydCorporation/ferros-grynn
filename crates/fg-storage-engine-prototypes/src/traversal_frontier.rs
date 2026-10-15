@@ -18,16 +18,27 @@ use ferros_grynn::{
 
 use crate::harness::{MeasurementTimer, process_memory_snapshot};
 
+/// Traversal query that materializes the outgoing frontier's `id` values.
 const QUERY: &str = "TRAVERSE FROM $source IN GRAPH $graph |> tv::out() |> tv::values('id');";
+/// Explain query used to inspect the outgoing traversal's physical read route.
 const EXPLAIN: &str =
 	"EXPLAIN ANALYZE FORMAT JSON TRAVERSE FROM $source IN GRAPH $graph |> tv::out();";
+/// Number of outgoing targets placed in the sparse frontier fixture.
 const FRONTIER_WIDTH: usize = 4;
+/// Filler node and edge slots inserted between consecutive frontier targets.
 const SLOT_GAP: usize = 102;
+/// Queries grouped into one timed sample unless overridden by the probe
+/// environment.
 const DEFAULT_QUERIES_PER_SAMPLE: usize = 64;
 
-struct TestDirectory(PathBuf);
+/// Temporary directory owner used to keep test files alive for their scenario.
+struct TestDirectory(
+	/// Path retained for the lifetime of the temporary directory owner.
+	PathBuf,
+);
 
 impl TestDirectory {
+	/// Constructs `TestDirectory` from the supplied initial state.
 	fn new() -> Self {
 		Self(
 			std::env::temp_dir()
@@ -37,33 +48,51 @@ impl TestDirectory {
 }
 
 impl Drop for TestDirectory {
+	/// Runs cleanup for this `TestDirectory` before its fields are released.
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Seeded local graph and expected result retained for traversal-frontier
+/// measurements.
 struct Fixture {
+	/// Directory retaining the local files used by the scenario.
 	directory: TestDirectory,
+	/// Owned graph reference identifying the operation scope.
 	graph: GraphRef,
+	/// Stable record identity of the atom from which traversal begins.
 	source: RecordId,
+	/// Expected result used to validate the fixture before accepting a
+	/// measurement.
 	expected: Value,
 }
 
+/// Wall time, CPU time and process-memory observations from one measured run.
 #[derive(Clone, Copy)]
 struct Sample {
+	/// Elapsed wall-clock duration of the measured run.
 	wall_time: Duration,
+	/// Process CPU duration consumed during the measured run.
 	cpu_time: Duration,
+	/// Change in resident process memory, measured in bytes.
 	rss_delta_bytes: i64,
+	/// Change in process page-fault count during the measured run.
 	page_fault_delta: u32,
 }
 
+/// Transport selected for a traversal-frontier measurement.
 #[derive(Clone, Copy)]
 enum Candidate {
+	/// Validated synchronous Direct I/O traversal candidate.
 	Sync,
+	/// Traversal candidate requesting the optional native asynchronous
+	/// transport.
 	IoRing,
 }
 
 impl Candidate {
+	/// Returns name for `Candidate`.
 	const fn name(self) -> &'static str {
 		match self {
 			Self::Sync => "sync_direct",
@@ -71,6 +100,7 @@ impl Candidate {
 		}
 	}
 
+	/// Returns mode for `Candidate`.
 	const fn mode(self) -> IoMode {
 		match self {
 			Self::Sync => IoMode::Sync,
@@ -112,6 +142,8 @@ fn storage_engine_prototype_traversal_frontier_probe() -> Result<(), Box<dyn Err
 	let mut ioring_samples = Vec::with_capacity(repetitions);
 
 	for repetition in 0..repetitions {
+		// Alternate paired order so one transport does not always run after the
+		// other.
 		let order = if repetition % 2 == 0 {
 			[Candidate::Sync, Candidate::IoRing]
 		} else {
@@ -178,6 +210,7 @@ fn storage_engine_prototype_traversal_frontier_probe() -> Result<(), Box<dyn Err
 	Ok(())
 }
 
+/// Builds the build fixture used by nearby scenarios.
 fn build_fixture() -> Result<Fixture, Box<dyn Error>> {
 	let directory = TestDirectory::new();
 	let store = Datastore::create_local(&directory.0, local_options(IoMode::Sync))?;
@@ -254,6 +287,7 @@ fn build_fixture() -> Result<Fixture, Box<dyn Error>> {
 	})
 }
 
+/// Returns measure for this module.
 fn measure(
 	fixture: &Fixture,
 	candidate: Candidate,
@@ -294,13 +328,18 @@ fn measure(
 	})
 }
 
+/// Aggregated latency and CPU observations for a measurement candidate.
 #[derive(Clone, Copy)]
 struct Summary {
+	/// Median wall-clock duration of the candidate, in nanoseconds.
 	wall_median_ns: u128,
+	/// Ninety-ninth-percentile wall-clock duration, in nanoseconds.
 	wall_p99_ns: u128,
+	/// Combined process CPU duration of the samples, in nanoseconds.
 	cpu_total_ns: u128,
 }
 
+/// Returns summarize for this module.
 fn summarize(samples: &[Sample]) -> Summary {
 	let mut wall = samples.iter().map(|sample| sample.wall_time.as_nanos()).collect::<Vec<_>>();
 	wall.sort_unstable();
@@ -311,6 +350,7 @@ fn summarize(samples: &[Sample]) -> Summary {
 	}
 }
 
+/// Returns gate decision for this module.
 fn gate_decision(sync: Summary, ioring: Summary) -> &'static str {
 	let throughput_gate =
 		ioring.wall_median_ns.saturating_mul(100) <= sync.wall_median_ns.saturating_mul(80);
@@ -323,6 +363,7 @@ fn gate_decision(sync: Summary, ioring: Summary) -> &'static str {
 	}
 }
 
+/// Returns signed delta for this module.
 fn signed_delta(after: u64, before: u64) -> i64 {
 	if after >= before {
 		i64::try_from(after - before).unwrap_or(i64::MAX)
@@ -331,14 +372,21 @@ fn signed_delta(after: u64, before: u64) -> i64 {
 	}
 }
 
+/// Differences in page-read counters observed during a measured traversal.
 struct TransportMetrics {
+	/// Read-window counter observed during the traversal measurement.
 	windows: i64,
+	/// Page count observed through the resident read path.
 	resident_pages: i64,
+	/// Page count observed through the wal read path.
 	wal_pages: i64,
+	/// Page count observed through the sync read path.
 	sync_pages: i64,
+	/// Page count observed through the ioring read path.
 	ioring_pages: i64,
 }
 
+/// Returns transport metrics for this module.
 fn transport_metrics(
 	fixture: &Fixture,
 	candidate: Candidate,
@@ -361,6 +409,7 @@ fn transport_metrics(
 	})
 }
 
+/// Returns integer for this module.
 fn integer(values: &Object, field: &str) -> Result<i64, Box<dyn Error>> {
 	values
 		.get(field)
@@ -369,6 +418,7 @@ fn integer(values: &Object, field: &str) -> Result<i64, Box<dyn Error>> {
 		.ok_or_else(|| format!("EXPLAIN metric {field} is not an integer").into())
 }
 
+/// Returns variables for this module.
 fn variables(fixture: &Fixture) -> Object {
 	let mut variables = Object::new();
 	variables.insert("graph", Value::GraphRef(Box::new(fixture.graph.clone())));
@@ -376,6 +426,7 @@ fn variables(fixture: &Fixture) -> Object {
 	variables
 }
 
+/// Returns local options for this module.
 fn local_options(mode: IoMode) -> LocalOptions {
 	let mut options = LocalOptions::default();
 	options.io_mode = mode;
@@ -383,6 +434,7 @@ fn local_options(mode: IoMode) -> LocalOptions {
 	options
 }
 
+/// Returns artifact file for this module.
 fn artifact_file() -> Result<PathBuf, Box<dyn Error>> {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"))
 		.join("..")

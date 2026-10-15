@@ -1,5 +1,4 @@
 use std::{
-	error::Error,
 	fs::{self, OpenOptions},
 	io::{self, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
@@ -25,94 +24,114 @@ use crate::{
 	values::{AtomRef, PropertyKeyId, RecordIdPart, Value},
 };
 
+/// Process-local suffix counter that separates temporary atom-store-image test
+/// directories.
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-struct TestDirectory(PathBuf);
+/// Temporary directory owner used to keep test files alive for their scenario.
+struct TestDirectory(
+	/// Path retained for the lifetime of the temporary directory owner.
+	PathBuf,
+);
 
 impl TestDirectory {
+	/// Constructs `TestDirectory` from the supplied initial state.
 	fn new() -> io::Result<Self> {
 		let suffix = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
 		let name = format!(".ferros-grynn-atom-store-{}-{suffix}", std::process::id());
 		Ok(Self(std::env::current_dir()?.join(name)))
 	}
 
+	/// Borrows the wrapped path representation.
 	fn as_path(&self) -> &Path {
 		&self.0
 	}
 }
 
 impl Drop for TestDirectory {
+	/// Runs cleanup for this `TestDirectory` before its fields are released.
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.0));
 	}
 }
 
+/// Verifies atom store image round trips global ids primary and properties.
 #[test]
-fn atom_store_image_round_trips_global_ids_primary_and_properties() -> FerrosGrynnResult<()> {
-	let mut root = DatabaseRoot::default();
-	let person = install_class(&mut root, 1, "person", AtomKind::Node)?;
-	let relation = install_class(&mut root, 2, "relation", AtomKind::Edge)?;
-	let name = Arc::make_mut(&mut root.dictionary).intern("name")?;
-	let link = Arc::make_mut(&mut root.dictionary).intern("link")?;
+fn atom_store_image_round_trips_global_ids_primary_and_properties() {
+	use crate::test_assertions::AssertResult as _;
 
-	let first_record = crate::values::RecordId::new("person", RecordIdPart::Int(1))?;
+	let mut root = DatabaseRoot::default();
+	let person = install_class(&mut root, 1, "person", AtomKind::Node).assert_ok();
+	let relation = install_class(&mut root, 2, "relation", AtomKind::Edge).assert_ok();
+	let name = Arc::make_mut(&mut root.dictionary).intern("name").assert_ok();
+	let link = Arc::make_mut(&mut root.dictionary).intern("link").assert_ok();
+
+	let first_record = crate::values::RecordId::new("person", RecordIdPart::Int(1)).assert_ok();
 	let mut first_properties = PropertyMap::new();
 	first_properties.insert(name, "Ada");
-	let first = root.insert_atom(&person, first_record.clone(), first_properties)?;
+	let first = root.insert_atom(&person, first_record.clone(), first_properties).assert_ok();
 
-	let edge_record = crate::values::RecordId::new("relation", RecordIdPart::Int(9))?;
+	let edge_record = crate::values::RecordId::new("relation", RecordIdPart::Int(9)).assert_ok();
 	let edge = GlobalAtomId::from_raw(
-		AtomId::from_parts(AtomKind::Edge, ATOM_SLOTS_PER_PAGE + 1, 7)?.raw(),
+		AtomId::from_parts(AtomKind::Edge, ATOM_SLOTS_PER_PAGE + 1, 7).assert_ok().raw(),
 	);
 	let mut edge_properties = PropertyMap::new();
 	edge_properties.insert(link, Value::from(AtomRef::new(AtomKind::Node, first_record)));
 	edge_properties.insert(PropertyKeyId::new(2), Value::from("x".repeat(MAX_INLINE_BYTES + 1)));
-	root.insert_atom_at(edge, &relation, edge_record, edge_properties)?;
-	Arc::make_mut(&mut root.atoms).restore_free_slot(ATOM_SLOTS_PER_PAGE, 4)?;
+	root.insert_atom_at(edge, &relation, edge_record, edge_properties).assert_ok();
+	Arc::make_mut(&mut root.atoms).restore_free_slot(ATOM_SLOTS_PER_PAGE, 4).assert_ok();
 
 	let capacity = root.atoms.slot_capacity();
 	let mut dictionary = root.dictionary.as_ref().clone();
 	let image =
-		build_atom_store_image(&root.atoms, &root.schema, &mut dictionary, PageLsn::new(19))?;
+		build_atom_store_image(&root.atoms, &root.schema, &mut dictionary, PageLsn::new(19))
+			.assert_ok();
 	assert_eq!(image.atoms_hot.len(), 2);
-	let reopened = open_atom_store_image(image, capacity, &root.schema, &dictionary)?;
+	let mut reopened =
+		open_atom_store_image(image, capacity, &root.schema, &dictionary).assert_ok();
 	assert_eq!(reopened.atoms().collect::<Vec<_>>(), root.atoms.atoms().collect::<Vec<_>>());
-	assert_eq!(reopened.resolve(&"person:1".parse()?), Some(first));
+	assert_eq!(reopened.resolve(&"person:1".parse().assert_ok()), Some(first));
 
-	let next = reopened.clone().insert(&person, "person:2".parse()?, PropertyMap::new())?;
+	let next =
+		reopened.insert(&person, "person:2".parse().assert_ok(), PropertyMap::new()).assert_ok();
 	assert_eq!((next.slot(), next.generation()), (ATOM_SLOTS_PER_PAGE, 4));
-	Ok(())
 }
 
+/// Verifies durable commit preserves snapshots and recovers wal frames.
 #[test]
-fn durable_commit_preserves_snapshots_and_recovers_wal_frames() -> Result<(), Box<dyn Error>> {
-	let directory = TestDirectory::new()?;
+fn durable_commit_preserves_snapshots_and_recovers_wal_frames() {
+	use crate::test_assertions::AssertResult as _;
+
+	let directory = TestDirectory::new().assert_ok();
 	let mut root = DatabaseRoot::default();
-	let person = install_class(&mut root, 1, "person", AtomKind::Node)?;
-	let name = Arc::make_mut(&mut root.dictionary).intern("name")?;
+	let person = install_class(&mut root, 1, "person", AtomKind::Node).assert_ok();
+	let name = Arc::make_mut(&mut root.dictionary).intern("name").assert_ok();
 	let mut properties = PropertyMap::new();
 	properties.insert(name, "Ada");
-	let record: crate::values::RecordId = "person:1".parse()?;
-	let atom = root.insert_atom(&person, record.clone(), properties)?;
-	let image = build_durable_atom_store_image(&root.atoms, &root.schema, &root.dictionary)?;
+	let record: crate::values::RecordId = "person:1".parse().assert_ok();
+	let atom = root.insert_atom(&person, record.clone(), properties).assert_ok();
+	let image =
+		build_durable_atom_store_image(&root.atoms, &root.schema, &root.dictionary).assert_ok();
 
 	let empty = build_durable_atom_store_image(
 		&AtomStoreRoot::default(),
 		&SchemaCatalog::default(),
 		&PropertyDictionary::new(),
-	)?;
-	let (catalog, files) = create_layout(directory.as_path(), &empty)?;
+	)
+	.assert_ok();
+	let (catalog, files) = create_layout(directory.as_path(), &empty).assert_ok();
 	let registry = FileRegistry::open(
 		catalog.registrations(directory.as_path()),
 		DirectFileOpenMode::Synchronous,
 		&RapidHashSet::default(),
-	)?;
+	)
+	.assert_ok();
 	let wal_path = directory.as_path().join("wal");
-	let wal = FrameWal::create_new(&wal_path)?;
+	let wal = FrameWal::create_new(&wal_path).assert_ok();
 	let before = wal.snapshot();
 
-	let mut aborted = wal.begin_tx()?;
-	stage_durable_atom_store_image(&mut aborted, files, &image)?;
+	let mut aborted = wal.begin_tx().assert_ok();
+	stage_durable_atom_store_image(&mut aborted, files, &image).assert_ok();
 	drop(aborted);
 	let (uncommitted, dictionary, _) = open_durable_atom_store_image(
 		&wal,
@@ -122,14 +141,15 @@ fn durable_commit_preserves_snapshots_and_recovers_wal_frames() -> Result<(), Bo
 		AtomStoreCheckpointAuthority::EMPTY,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(uncommitted.atoms().count(), 0);
 	assert!(dictionary.is_empty());
 
-	let mut tx = wal.begin_tx()?;
-	stage_durable_atom_store_image(&mut tx, files, &image)?;
-	stage_durable_atom_store_image(&mut tx, files, &image)?;
-	let outcome = wal.commit_tx(tx)?;
+	let mut tx = wal.begin_tx().assert_ok();
+	stage_durable_atom_store_image(&mut tx, files, &image).assert_ok();
+	stage_durable_atom_store_image(&mut tx, files, &image).assert_ok();
+	let outcome = wal.commit_tx(tx).assert_ok();
 	let (old, old_dictionary, _) = open_durable_atom_store_image(
 		&wal,
 		&registry,
@@ -138,11 +158,16 @@ fn durable_commit_preserves_snapshots_and_recovers_wal_frames() -> Result<(), Bo
 		AtomStoreCheckpointAuthority::EMPTY,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(old.atoms().count(), 0);
 	assert!(old_dictionary.is_empty());
 
-	corrupt_byte(registry.resolve_file(DataSpaceId::Database, files.superblock)?.path(), 80)?;
+	corrupt_byte(
+		registry.resolve_file(DataSpaceId::Database, files.superblock).assert_ok().path(),
+		80,
+	)
+	.assert_ok();
 	let (opened, dictionary, metadata) = open_durable_atom_store_image(
 		&wal,
 		&registry,
@@ -151,10 +176,11 @@ fn durable_commit_preserves_snapshots_and_recovers_wal_frames() -> Result<(), Bo
 		AtomStoreCheckpointAuthority::EMPTY,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(opened.resolve(&record), Some(atom));
 	assert_eq!(dictionary.get("name"), Some(name));
-	assert_eq!(metadata.live_count()?, 1);
+	assert_eq!(metadata.live_count().assert_ok(), 1);
 	assert_eq!(
 		wal.recovery_frames()
 			.iter()
@@ -163,19 +189,22 @@ fn durable_commit_preserves_snapshots_and_recovers_wal_frames() -> Result<(), Bo
 		1
 	);
 
-	let mut unchanged = wal.begin_tx()?;
+	let mut unchanged = wal.begin_tx().assert_ok();
 	let mut ignored_lsn = metadata;
 	ignored_lsn.page_lsn = PageLsn::new(u64::MAX);
-	assert!(!stage_atom_store_superblock_if_changed(
-		&mut unchanged,
-		files.superblock,
-		metadata,
-		ignored_lsn,
-	)?);
-	assert_eq!(wal.commit_tx(unchanged)?.commit_lsn(), outcome.commit_lsn());
+	assert!(
+		!stage_atom_store_superblock_if_changed(
+			&mut unchanged,
+			files.superblock,
+			metadata,
+			ignored_lsn,
+		)
+		.assert_ok()
+	);
+	assert_eq!(wal.commit_tx(unchanged).assert_ok().commit_lsn(), outcome.commit_lsn());
 
 	drop(wal);
-	let reopened_wal = FrameWal::open(&wal_path)?;
+	let reopened_wal = FrameWal::open(&wal_path).assert_ok();
 	let (reopened, reopened_dictionary, reopened_metadata) = open_durable_atom_store_image(
 		&reopened_wal,
 		&registry,
@@ -184,54 +213,63 @@ fn durable_commit_preserves_snapshots_and_recovers_wal_frames() -> Result<(), Bo
 		AtomStoreCheckpointAuthority::EMPTY,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(reopened.resolve(&record), Some(atom));
 	assert_eq!(reopened_dictionary.get("name"), Some(name));
-	assert_eq!(reopened_metadata.live_count()?, 1);
-	Ok(())
+	assert_eq!(reopened_metadata.live_count().assert_ok(), 1);
 }
 
+/// Verifies checkpoint backfills data and recovers only authorized cow
+/// candidates.
 #[test]
-fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
--> Result<(), Box<dyn Error>> {
-	let directory = TestDirectory::new()?;
+fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates() {
+	use crate::test_assertions::AssertResult as _;
+
+	let directory = TestDirectory::new().assert_ok();
 	let mut root = DatabaseRoot::default();
-	let person = install_class(&mut root, 1, "person", AtomKind::Node)?;
-	let name = Arc::make_mut(&mut root.dictionary).intern("name")?;
+	let person = install_class(&mut root, 1, "person", AtomKind::Node).assert_ok();
+	let name = Arc::make_mut(&mut root.dictionary).intern("name").assert_ok();
 	let mut properties = PropertyMap::new();
 	properties.insert(name, "Grace");
-	let record: crate::values::RecordId = "person:2".parse()?;
-	let atom = root.insert_atom(&person, record.clone(), properties)?;
-	let image = build_durable_atom_store_image(&root.atoms, &root.schema, &root.dictionary)?;
+	let record: crate::values::RecordId = "person:2".parse().assert_ok();
+	let atom = root.insert_atom(&person, record.clone(), properties).assert_ok();
+	let image =
+		build_durable_atom_store_image(&root.atoms, &root.schema, &root.dictionary).assert_ok();
 	let empty = build_durable_atom_store_image(
 		&AtomStoreRoot::default(),
 		&SchemaCatalog::default(),
 		&PropertyDictionary::new(),
-	)?;
-	let (catalog, files) = create_layout(directory.as_path(), &empty)?;
+	)
+	.assert_ok();
+	let (catalog, files) = create_layout(directory.as_path(), &empty).assert_ok();
 	let registry = FileRegistry::open(
 		catalog.registrations(directory.as_path()),
 		DirectFileOpenMode::Synchronous,
 		&RapidHashSet::default(),
-	)?;
+	)
+	.assert_ok();
 	let wal_path = directory.as_path().join("wal");
-	let wal = FrameWal::create_new(&wal_path)?;
-	let mut tx = wal.begin_tx()?;
-	stage_durable_atom_store_image(&mut tx, files, &image)?;
-	let outcome = wal.commit_tx(tx)?;
+	let wal = FrameWal::create_new(&wal_path).assert_ok();
+	let mut tx = wal.begin_tx().assert_ok();
+	stage_durable_atom_store_image(&mut tx, files, &image).assert_ok();
+	let outcome = wal.commit_tx(tx).assert_ok();
 
-	let ticket = wal.begin_checkpoint(outcome.commit_lsn(), CheckpointGeneration::ZERO)?;
-	let logical = backfill_atom_store_checkpoint(&wal, &registry, files, &ticket)?
-		.ok_or_else(|| io::Error::other("checkpoint omitted the AtomStore superblock"))?;
-	let checkpoint = wal.finish_checkpoint(ticket)?;
+	let ticket = wal.begin_checkpoint(outcome.commit_lsn(), CheckpointGeneration::ZERO).assert_ok();
+	let logical = backfill_atom_store_checkpoint(&wal, &registry, files, &ticket)
+		.assert_ok()
+		.ok_or_else(|| io::Error::other("checkpoint omitted the AtomStore superblock"))
+		.assert_ok();
+	let checkpoint = wal.finish_checkpoint(ticket).assert_ok();
 	let authority = AtomStoreCheckpointAuthority {
 		generation: checkpoint.generation(),
 		backfilled_lsn: checkpoint.target(),
 		checkpoint_record_lsn: checkpoint.checkpoint_record_lsn(),
 	};
-	let checkpointed = write_atom_store_checkpoint_page(&registry, files, logical, authority)?;
+	let checkpointed =
+		write_atom_store_checkpoint_page(&registry, files, logical, authority).assert_ok();
 	assert_eq!(checkpointed.page_lsn, logical.page_lsn);
-	wal.publish_checkpoint(&checkpoint)?;
+	wal.publish_checkpoint(&checkpoint).assert_ok();
 	let clocks = checkpoint.clocks();
 	let seed = RecoverySeed::new(
 		checkpoint.generation(),
@@ -245,7 +283,7 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 	);
 	drop(wal);
 
-	let reopened_wal = FrameWal::open_with_seed(&wal_path, seed)?;
+	let reopened_wal = FrameWal::open_with_seed(&wal_path, seed).assert_ok();
 	let (opened, dictionary, metadata) = open_durable_atom_store_image(
 		&reopened_wal,
 		&registry,
@@ -254,7 +292,8 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		authority,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(opened.resolve(&record), Some(atom));
 	assert_eq!(dictionary.get("name"), Some(name));
 	assert_eq!(metadata, checkpointed);
@@ -264,7 +303,8 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		backfilled_lsn: authority.backfilled_lsn,
 		checkpoint_record_lsn: Lsn::new(authority.checkpoint_record_lsn.get() + 1),
 	};
-	let ahead = write_atom_store_checkpoint_page(&registry, files, logical, next_authority)?;
+	let ahead =
+		write_atom_store_checkpoint_page(&registry, files, logical, next_authority).assert_ok();
 	let (_, _, selected_previous) = open_durable_atom_store_image(
 		&reopened_wal,
 		&registry,
@@ -273,7 +313,8 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		authority,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(selected_previous, checkpointed);
 
 	let third_authority = AtomStoreCheckpointAuthority {
@@ -281,14 +322,17 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		backfilled_lsn: next_authority.backfilled_lsn,
 		checkpoint_record_lsn: Lsn::new(next_authority.checkpoint_record_lsn.get() + 1),
 	};
-	let temporary =
-		temporary_path(registry.resolve_file(DataSpaceId::Database, files.superblock)?.path());
-	let staged_temporary = logical.at_checkpoint(
-		third_authority.generation,
-		third_authority.backfilled_lsn,
-		third_authority.checkpoint_record_lsn,
-	)?;
-	write_direct_pages(&temporary, &[staged_temporary.encode()?])?;
+	let temporary = temporary_path(
+		registry.resolve_file(DataSpaceId::Database, files.superblock).assert_ok().path(),
+	);
+	let staged_temporary = logical
+		.at_checkpoint(
+			third_authority.generation,
+			third_authority.backfilled_lsn,
+			third_authority.checkpoint_record_lsn,
+		)
+		.assert_ok();
+	write_direct_pages(&temporary, &[staged_temporary.encode().assert_ok()]).assert_ok();
 	let (_, _, ignored_temporary) = open_durable_atom_store_image(
 		&reopened_wal,
 		&registry,
@@ -297,13 +341,17 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		third_authority,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(ignored_temporary, ahead);
 
-	let superblock_path =
-		registry.resolve_file(DataSpaceId::Database, files.superblock)?.path().to_path_buf();
+	let superblock_path = registry
+		.resolve_file(DataSpaceId::Database, files.superblock)
+		.assert_ok()
+		.path()
+		.to_path_buf();
 	assert!(previous_path(&superblock_path).exists());
-	corrupt_byte(&superblock_path, 88)?;
+	corrupt_byte(&superblock_path, 88).assert_ok();
 	let (_, _, recovered_previous) = open_durable_atom_store_image(
 		&reopened_wal,
 		&registry,
@@ -312,21 +360,25 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		next_authority,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(recovered_previous, checkpointed);
 
-	let next_record: crate::values::RecordId = "person:3".parse()?;
-	let next_atom = root.insert_atom(&person, next_record.clone(), PropertyMap::new())?;
+	let next_record: crate::values::RecordId = "person:3".parse().assert_ok();
+	let next_atom = root.insert_atom(&person, next_record.clone(), PropertyMap::new()).assert_ok();
 	let mut next_image =
-		build_durable_atom_store_image(&root.atoms, &root.schema, &root.dictionary)?;
-	next_image.superblock = next_image.superblock.at_checkpoint(
-		authority.generation,
-		authority.backfilled_lsn,
-		authority.checkpoint_record_lsn,
-	)?;
-	let mut post_checkpoint_tx = reopened_wal.begin_tx()?;
-	stage_durable_atom_store_image(&mut post_checkpoint_tx, files, &next_image)?;
-	reopened_wal.commit_tx(post_checkpoint_tx)?;
+		build_durable_atom_store_image(&root.atoms, &root.schema, &root.dictionary).assert_ok();
+	next_image.superblock = next_image
+		.superblock
+		.at_checkpoint(
+			authority.generation,
+			authority.backfilled_lsn,
+			authority.checkpoint_record_lsn,
+		)
+		.assert_ok();
+	let mut post_checkpoint_tx = reopened_wal.begin_tx().assert_ok();
+	stage_durable_atom_store_image(&mut post_checkpoint_tx, files, &next_image).assert_ok();
+	reopened_wal.commit_tx(post_checkpoint_tx).assert_ok();
 	let (post_checkpoint, _, post_checkpoint_metadata) = open_durable_atom_store_image(
 		&reopened_wal,
 		&registry,
@@ -335,12 +387,13 @@ fn checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates()
 		authority,
 		files,
 		&root.schema,
-	)?;
+	)
+	.assert_ok();
 	assert_eq!(post_checkpoint.resolve(&next_record), Some(next_atom));
 	assert!(post_checkpoint_metadata.page_lsn.get() > authority.backfilled_lsn.get());
-	Ok(())
 }
 
+/// Returns install class for this module.
 fn install_class(
 	root: &mut DatabaseRoot,
 	id: u32,
@@ -353,6 +406,7 @@ fn install_class(
 	root.schema.class(name).ok_or_else(|| invalid("installed test class is absent"))
 }
 
+/// Creates layout for this module.
 fn create_layout(
 	root: &Path,
 	empty: &DurableAtomStoreImage,
@@ -421,6 +475,7 @@ fn create_layout(
 	Ok((catalog, files))
 }
 
+/// Returns catalog entry for this module.
 fn catalog_entry(
 	file_id: DataFileId,
 	role: DataFileRole,
@@ -436,10 +491,12 @@ fn catalog_entry(
 	})
 }
 
+/// Returns data file id for this module.
 fn data_file_id(instance: u64, kind: DataFileKind) -> FerrosGrynnResult<DataFileId> {
 	DataFileId::new(instance, kind).ok_or_else(|| invalid("test data-file identity is invalid"))
 }
 
+/// Writes direct pages for this module.
 fn write_direct_pages(path: &Path, pages: &[AlignedPage]) -> FerrosGrynnResult<()> {
 	let parent = path.parent().ok_or_else(|| invalid("test data file has no parent"))?;
 	fs::create_dir_all(parent).map_err(|source| {
@@ -453,6 +510,7 @@ fn write_direct_pages(path: &Path, pages: &[AlignedPage]) -> FerrosGrynnResult<(
 	file.sync_data()
 }
 
+/// Returns corrupt byte for this module.
 fn corrupt_byte(path: &Path, offset: u64) -> io::Result<()> {
 	let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 	file.seek(SeekFrom::Start(offset))?;

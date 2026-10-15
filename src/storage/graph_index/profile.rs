@@ -341,21 +341,23 @@ impl KeyWorkload {
 /// durability.
 #[test]
 #[ignore = "stage-10 paired builder performance and retained-output diagnostic"]
-fn stage10_streaming_index_profile() -> Result<(), Box<dyn Error>> {
-	let items = environment_usize("FG_IMPORT_BUILDER_ITEMS", 50_000)?;
-	let directory = ProfileDirectory::create()?;
-	let records = build_records(directory.path(), items)?;
+fn stage10_streaming_index_profile() {
+	use crate::test_assertions::AssertResult as _;
+
+	let items = environment_usize("FG_IMPORT_BUILDER_ITEMS", 50_000).assert_ok();
+	let directory = ProfileDirectory::create().assert_ok();
+	let records = build_records(directory.path(), items).assert_ok();
 
 	let buffered_warmup = directory.path().join("buffered-warmup.fgidx");
 	let streaming_warmup = directory.path().join("streaming-warmup.fgidx");
-	let buffered = run_buffered(&records, &buffered_warmup)?;
-	let streaming = run_streaming(&records, directory.path(), &streaming_warmup)?;
+	let buffered = run_buffered(&records, &buffered_warmup).assert_ok();
+	let streaming = run_streaming(&records, directory.path(), &streaming_warmup).assert_ok();
 	assert_eq!(
-		scan_file(&buffered_warmup, buffered.root)?,
-		scan_file(&streaming_warmup, streaming.root)?
+		scan_file(&buffered_warmup, buffered.root).assert_ok(),
+		scan_file(&streaming_warmup, streaming.root).assert_ok()
 	);
-	fs::remove_file(buffered_warmup)?;
-	fs::remove_file(streaming_warmup)?;
+	fs::remove_file(buffered_warmup).assert_ok();
+	fs::remove_file(streaming_warmup).assert_ok();
 
 	let mut buffered_samples = Vec::with_capacity(PROFILE_RUNS);
 	let mut streaming_samples = Vec::with_capacity(PROFILE_RUNS);
@@ -364,18 +366,18 @@ fn stage10_streaming_index_profile() -> Result<(), Box<dyn Error>> {
 		let streaming_path = directory.path().join(format!("streaming-{run}.fgidx"));
 		let (buffered, streaming) = if run % 2 == 0 {
 			(
-				run_buffered(&records, &buffered_path)?,
-				run_streaming(&records, directory.path(), &streaming_path)?,
+				run_buffered(&records, &buffered_path).assert_ok(),
+				run_streaming(&records, directory.path(), &streaming_path).assert_ok(),
 			)
 		} else {
-			let streaming = run_streaming(&records, directory.path(), &streaming_path)?;
-			let buffered = run_buffered(&records, &buffered_path)?;
+			let streaming = run_streaming(&records, directory.path(), &streaming_path).assert_ok();
+			let buffered = run_buffered(&records, &buffered_path).assert_ok();
 			(buffered, streaming)
 		};
 		buffered_samples.push(buffered.elapsed);
 		streaming_samples.push(streaming.elapsed);
-		fs::remove_file(buffered_path)?;
-		fs::remove_file(streaming_path)?;
+		fs::remove_file(buffered_path).assert_ok();
+		fs::remove_file(streaming_path).assert_ok();
 	}
 
 	let buffered_ns = median_nanos(&mut buffered_samples);
@@ -386,13 +388,12 @@ fn stage10_streaming_index_profile() -> Result<(), Box<dyn Error>> {
 		.saturating_mul(u128::try_from(PAGE_SIZE).unwrap_or(u128::MAX));
 	let row = format!(
 		"{},{items},{},{},{buffered_ns},{streaming_ns},{ratio_ppm},{retained_output_bytes}",
-		SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+		SystemTime::now().duration_since(UNIX_EPOCH).assert_ok().as_millis(),
 		buffered.page_count,
 		streaming.page_count,
 	);
-	write_csv(&row)?;
+	write_csv(&row).assert_ok();
 	println!("FG_IMPORT_BUILDER,{row}");
-	Ok(())
 }
 
 /// Decodes a generated standard index so different valid page layouts are

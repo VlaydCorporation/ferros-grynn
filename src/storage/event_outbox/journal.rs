@@ -312,15 +312,15 @@ pub(in crate::storage) fn decode(
 				version,
 				target,
 				state,
+				attempts,
 				retries,
 				depth,
 				ceiling,
-				attempts,
+				due_at_ns,
 				accepted_at,
 				updated_at,
 				created_at_ns,
 				updated_at_ns,
-				due_at_ns,
 				diagnostic,
 				payload,
 			}),
@@ -373,59 +373,76 @@ fn decode_state(tag: u8) -> FerrosGrynnResult<EventInvocationState> {
 }
 
 #[cfg(test)]
+/// Regression tests for journal behavior.
 mod tests {
 	use super::*;
 	use crate::datastore::{EventAsyncOptions, EventCause, EventDefinition, EventExecution};
 
+	/// Verifies event journal rejects unreachable queue and terminal overflow.
 	#[test]
-	fn event_journal_rejects_unreachable_queue_and_terminal_overflow() -> FerrosGrynnResult<()> {
-		let mut definition =
-			EventDefinition::new("a", EventTarget::Class(ClassId::from_storage(1)?), "true", "1")?
-				.with_execution(EventExecution::Async(EventAsyncOptions::default()));
-		definition.id = Some(EventId::from_storage(2)?);
+	fn event_journal_rejects_unreachable_queue_and_terminal_overflow() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut definition = EventDefinition::new(
+			"a",
+			EventTarget::Class(ClassId::from_storage(1).assert_ok()),
+			"true",
+			"1",
+		)
+		.assert_ok()
+		.with_execution(EventExecution::Async(EventAsyncOptions::default()));
+		definition.id = Some(EventId::from_storage(2).assert_ok());
 		let invocation = EventInvocation::queued(
 			&definition,
-			EventCause::next(None, definition.execution())?,
+			EventCause::next(None, definition.execution()).assert_ok(),
 			Arc::from([1_u8]),
 			5,
-		)?;
+		)
+		.assert_ok();
 		let mut root = EventOutbox::default();
-		root.enqueue(Arc::new(invocation), 1)?;
-		let id =
-			*root.invocations.keys().next().ok_or_else(|| invalid("fixture identity absent"))?;
+		root.enqueue(Arc::new(invocation), 1).assert_ok();
+		let id = *root
+			.invocations
+			.keys()
+			.next()
+			.ok_or_else(|| invalid("fixture identity absent"))
+			.assert_ok();
 		let mut impossible = root.clone();
 		Arc::make_mut(
 			impossible
 				.invocations
 				.get_mut(&id)
-				.ok_or_else(|| invalid("fixture invocation absent"))?,
+				.ok_or_else(|| invalid("fixture invocation absent"))
+				.assert_ok(),
 		)
 		.attempts = 1;
-		let bytes = encode(None, &impossible, 1, &mut CodecBudget::new(1 << 20, 0)?)?;
+		let bytes =
+			encode(None, &impossible, 1, &mut CodecBudget::new(1 << 20, 0).assert_ok()).assert_ok();
 		assert!(
 			decode(
 				&bytes,
 				&mut EventOutbox::default(),
 				1,
-				&mut CodecBudget::new(1 << 20, bytes.len())?
+				&mut CodecBudget::new(1 << 20, bytes.len()).assert_ok()
 			)
 			.is_err()
 		);
-		root.transition(id, 0, EventInvocationState::Running, 5, None, 2)?;
-		root.transition(id, 1, EventInvocationState::Completed, 5, None, 3)?;
+		root.transition(id, 0, EventInvocationState::Running, 5, None, 2).assert_ok();
+		root.transition(id, 1, EventInvocationState::Completed, 5, None, 3).assert_ok();
 		let terminal = root.invocations[&id].as_ref().clone();
 		for index in 1..=10_001_u128 {
 			let mut terminal = terminal.clone();
 			terminal.id = JobId::from_uuid(uuid::Uuid::from_u128(index).into());
 			root.invocations.insert(terminal.id, Arc::new(terminal));
 		}
-		let bytes = encode(None, &root, 3, &mut CodecBudget::new(64 << 20, 0)?)?;
+		let bytes =
+			encode(None, &root, 3, &mut CodecBudget::new(64 << 20, 0).assert_ok()).assert_ok();
 		assert!(
 			decode(
 				&bytes,
 				&mut EventOutbox::default(),
 				3,
-				&mut CodecBudget::new(64 << 20, bytes.len())?
+				&mut CodecBudget::new(64 << 20, bytes.len()).assert_ok()
 			)
 			.is_err()
 		);
@@ -436,51 +453,77 @@ mod tests {
 			terminal.diagnostic = Some("a".repeat(4096).into());
 			root.invocations.insert(terminal.id, Arc::new(terminal));
 		}
-		let bytes = encode(None, &root, 3, &mut CodecBudget::new(128 << 20, 0)?)?;
+		let bytes =
+			encode(None, &root, 3, &mut CodecBudget::new(128 << 20, 0).assert_ok()).assert_ok();
 		assert!(
 			decode(
 				&bytes,
 				&mut EventOutbox::default(),
 				3,
-				&mut CodecBudget::new(128 << 20, bytes.len())?
+				&mut CodecBudget::new(128 << 20, bytes.len()).assert_ok()
 			)
 			.is_err()
 		);
-		Ok(())
 	}
 
+	/// Verifies event journal checkpoint attempt and completion are atomic.
 	#[test]
-	fn event_journal_checkpoint_attempt_and_completion_are_atomic() -> FerrosGrynnResult<()> {
-		let mut definition =
-			EventDefinition::new("a", EventTarget::Class(ClassId::from_storage(1)?), "true", "1")?
-				.with_execution(EventExecution::Async(EventAsyncOptions::default()));
-		definition.id = Some(EventId::from_storage(2)?);
+	fn event_journal_checkpoint_attempt_and_completion_are_atomic() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut definition = EventDefinition::new(
+			"a",
+			EventTarget::Class(ClassId::from_storage(1).assert_ok()),
+			"true",
+			"1",
+		)
+		.assert_ok()
+		.with_execution(EventExecution::Async(EventAsyncOptions::default()));
+		definition.id = Some(EventId::from_storage(2).assert_ok());
 		let mut invocation = EventInvocation::queued(
 			&definition,
-			EventCause::next(None, definition.execution())?,
+			EventCause::next(None, definition.execution()).assert_ok(),
 			Arc::from([1_u8, 2, 3]),
 			5,
-		)?;
+		)
+		.assert_ok();
 		invocation.id = JobId::from_uuid(uuid::Uuid::from_u128(1).into());
 		let id = invocation.id;
 		let mut queued = EventOutbox::default();
-		queued.enqueue(Arc::new(invocation), 1)?;
-		let mut budget = CodecBudget::new(1 << 20, 0)?;
-		let checkpoint = encode(None, &queued, 1, &mut budget)?;
+		queued.enqueue(Arc::new(invocation), 1).assert_ok();
+		let mut budget = CodecBudget::new(1 << 20, 0).assert_ok();
+		let checkpoint = encode(None, &queued, 1, &mut budget).assert_ok();
 		assert_eq!(&checkpoint[..8], b"FGEO\x01\x00\x01\x00");
 		let mut recovered = EventOutbox::default();
-		decode(&checkpoint, &mut recovered, 1, &mut CodecBudget::new(1 << 20, checkpoint.len())?)?;
+		decode(
+			&checkpoint,
+			&mut recovered,
+			1,
+			&mut CodecBudget::new(1 << 20, checkpoint.len()).assert_ok(),
+		)
+		.assert_ok();
 		assert_eq!(recovered, queued);
 		let mut running = queued.clone();
-		running.transition(id, 0, EventInvocationState::Running, 5, None, 2)?;
-		let delta = encode(Some(&queued), &running, 2, &mut CodecBudget::new(1 << 20, 0)?)?;
+		running.transition(id, 0, EventInvocationState::Running, 5, None, 2).assert_ok();
+		let delta =
+			encode(Some(&queued), &running, 2, &mut CodecBudget::new(1 << 20, 0).assert_ok())
+				.assert_ok();
 		assert!(delta.len() < checkpoint.len());
-		decode(&delta, &mut recovered, 2, &mut CodecBudget::new(1 << 20, delta.len())?)?;
+		decode(&delta, &mut recovered, 2, &mut CodecBudget::new(1 << 20, delta.len()).assert_ok())
+			.assert_ok();
 		assert_eq!(recovered, running);
 		let mut completed = running.clone();
-		completed.transition(id, 1, EventInvocationState::Completed, 0, None, 3)?;
-		let marker = encode(Some(&running), &completed, 3, &mut CodecBudget::new(1 << 20, 0)?)?;
-		decode(&marker, &mut recovered, 3, &mut CodecBudget::new(1 << 20, marker.len())?)?;
+		completed.transition(id, 1, EventInvocationState::Completed, 0, None, 3).assert_ok();
+		let marker =
+			encode(Some(&running), &completed, 3, &mut CodecBudget::new(1 << 20, 0).assert_ok())
+				.assert_ok();
+		decode(
+			&marker,
+			&mut recovered,
+			3,
+			&mut CodecBudget::new(1 << 20, marker.len()).assert_ok(),
+		)
+		.assert_ok();
 		assert_eq!(recovered, completed);
 		assert_eq!(recovered.pending_count, 0);
 		assert!(
@@ -492,7 +535,7 @@ mod tests {
 				&marker,
 				&mut recovered.clone(),
 				3,
-				&mut CodecBudget::new(1 << 20, marker.len())?
+				&mut CodecBudget::new(1 << 20, marker.len()).assert_ok()
 			)
 			.is_err()
 		);
@@ -502,11 +545,10 @@ mod tests {
 					&checkpoint[..length],
 					&mut EventOutbox::default(),
 					1,
-					&mut CodecBudget::new(1 << 20, length)?
+					&mut CodecBudget::new(1 << 20, length).assert_ok()
 				)
 				.is_err()
 			);
 		}
-		Ok(())
 	}
 }

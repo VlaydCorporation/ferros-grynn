@@ -61,7 +61,7 @@ struct CentralityArc {
 /// Enumerates vertex-acyclic projected paths without prefix dominance pruning.
 /// Rounded costs may merge unequal prefixes, so a predecessor DAG is unsound.
 /// Work and scratch ceilings are checked before allocation and expansion.
-// ponytail: non-Int costs require bounded path enumeration; certify safe
+// shortcut: non-Int costs require bounded path enumeration; certify safe
 // arithmetic domains when measured workloads need a faster path.
 pub(super) fn full_state_scores(
 	projection: &TensorProjection,

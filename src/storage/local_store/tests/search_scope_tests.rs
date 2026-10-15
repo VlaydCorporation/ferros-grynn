@@ -1,34 +1,42 @@
 use super::*;
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
+/// Verifies effective search indexes match scan after local reopen.
 #[test]
-fn effective_search_indexes_match_scan_after_local_reopen() -> FerrosGrynnResult<()> {
+fn effective_search_indexes_match_scan_after_local_reopen() {
+	use crate::test_assertions::AssertResult as _;
+
 	let directory = TestDirectory::new();
 	let options = LocalOptions::default();
-	let store = Datastore::create_local(&directory.0, options)?;
-	let setup = store.execute(
-		"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE GRAPH research; DEFINE \
-		 CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; \
-		 DEFINE FIELD embedding ON CLASS document TYPE vector<f32>; CREATE document:a SET title = \
-		 'base first', embedding = $a; CREATE document:b SET title = 'base second', embedding = \
-		 $b; ATTACH document:a TO GRAPH research; ATTACH document:b TO GRAPH research; DEFINE \
-		 INDEX title_effective ON CLASS document FIELDS title FULLTEXT ANALYZER words HIGHLIGHTS \
-		 SCOPE EFFECTIVE IN GRAPH research; DEFINE INDEX hnsw_effective ON CLASS document FIELDS \
-		 embedding HNSW DIMENSION 2 TYPE F32 DIST EUCLIDEAN EFC 16 M 4 SCOPE EFFECTIVE IN GRAPH \
-		 research; DEFINE INDEX disk_effective ON CLASS document FIELDS embedding DISKANN \
-		 DIMENSION 2 TYPE F32 DIST EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE EFFECTIVE IN \
-		 GRAPH research; UPDATE document:b IN GRAPH research SET title = 'overlay target', \
-		 embedding = $overlay;",
-		&Object::from_iter([
-			("a", Value::Vector(Vector::F32(vec![10.0, 0.0]))),
-			("b", Value::Vector(Vector::F32(vec![20.0, 0.0]))),
-			("overlay", Value::Vector(Vector::F32(vec![0.0, 0.0]))),
-		]),
-	)?;
+	let store = Datastore::create_local(&directory.0, options).assert_ok();
+	let setup = store
+		.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE GRAPH research; \
+			 DEFINE CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document \
+			 TYPE string; DEFINE FIELD embedding ON CLASS document TYPE vector<f32>; CREATE \
+			 document:a SET title = 'base first', embedding = $a; CREATE document:b SET title = \
+			 'base second', embedding = $b; ATTACH document:a TO GRAPH research; ATTACH \
+			 document:b TO GRAPH research; DEFINE INDEX title_effective ON CLASS document FIELDS \
+			 title FULLTEXT ANALYZER words HIGHLIGHTS SCOPE EFFECTIVE IN GRAPH research; DEFINE \
+			 INDEX hnsw_effective ON CLASS document FIELDS embedding HNSW DIMENSION 2 TYPE F32 \
+			 DIST EUCLIDEAN EFC 16 M 4 SCOPE EFFECTIVE IN GRAPH research; DEFINE INDEX \
+			 disk_effective ON CLASS document FIELDS embedding DISKANN DIMENSION 2 TYPE F32 DIST \
+			 EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE EFFECTIVE IN GRAPH research; UPDATE \
+			 document:b IN GRAPH research SET title = 'overlay target', embedding = $overlay;",
+			&Object::from_iter([
+				("a", Value::Vector(Vector::F32(vec![10.0, 0.0]))),
+				("b", Value::Vector(Vector::F32(vec![20.0, 0.0]))),
+				("overlay", Value::Vector(Vector::F32(vec![0.0, 0.0]))),
+			]),
+		)
+		.assert_ok();
 	if setup.iter().any(|result| result.result.is_err()) {
-		return Err(FerrosGrynnError::invalid_argument(
-			"effective search-index fixture setup failed",
-		));
+		return {
+			let test_result: FerrosGrynnResult<()> = Err(FerrosGrynnError::invalid_argument(
+				"effective search-index fixture setup failed",
+			));
+			test_result.assert_ok();
+		};
 	}
 	let parameters = Object::from_iter([("query", Value::Vector(Vector::F32(vec![0.0, 0.0])))]);
 	let queries = [
@@ -54,29 +62,31 @@ fn effective_search_indexes_match_scan_after_local_reopen() -> FerrosGrynnResult
 	let expected = queries
 		.iter()
 		.map(|(_, scan)| query_value(&store, scan, &parameters))
-		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		.collect::<FerrosGrynnResult<Vec<_>>>()
+		.assert_ok();
 	let expected_id = Value::Array(
 		vec![Value::from(
 			"document:b"
 				.parse::<RecordId>()
-				.map_err(|error| FerrosGrynnError::invalid_argument(error.to_string()))?,
+				.map_err(|error| FerrosGrynnError::invalid_argument(error.to_string()))
+				.assert_ok(),
 		)]
 		.into(),
 	);
 	for ((forced, _), expected) in queries.iter().zip(&expected) {
 		assert_eq!(expected, &expected_id);
-		assert_eq!(&query_value(&store, forced, &parameters)?, expected);
+		assert_eq!(&query_value(&store, forced, &parameters).assert_ok(), expected);
 	}
-	assert!(store.checkpoint(CheckpointMode::Restart)?);
+	assert!(store.checkpoint(CheckpointMode::Restart).assert_ok());
 	drop(store);
 
-	let reopened = Datastore::open_local(&directory.0, options)?;
+	let reopened = Datastore::open_local(&directory.0, options).assert_ok();
 	for ((forced, _), expected) in queries.iter().zip(&expected) {
-		assert_eq!(&query_value(&reopened, forced, &parameters)?, expected);
+		assert_eq!(&query_value(&reopened, forced, &parameters).assert_ok(), expected);
 	}
-	Ok(())
 }
 
+/// Returns query value for this module.
 fn query_value(store: &Datastore, query: &str, parameters: &Object) -> FerrosGrynnResult<Value> {
 	store
 		.execute(query, parameters)?

@@ -1,13 +1,17 @@
 //! Hybrid physical-read engine assembled from measured resident and I/O paths.
 //!
-//! Point reads use the R8 resident arena, contiguous scans bypass admission via
-//! validated scatter/prefetch, and known sparse windows may use frame-oriented
-//! IoRing. The hidden prototype API exposes measurement hooks only and never
-//! selects production behavior.
+//! Point reads use the R8 resident arena, and known sparse windows may use
+//! frame-oriented IoRing. The hidden prototype API also exposes bounded
+//! scatter/prefetch and resolved-page experiments without selecting production
+//! behavior.
 
-use std::{num::NonZeroUsize, ptr::NonNull, sync::Arc};
+#[cfg(feature = "storage-engine-prototype-api")]
+use std::ptr::NonNull;
+use std::{num::NonZeroUsize, sync::Arc};
 
-use parking_lot::{Mutex, RwLock};
+#[cfg(windows)]
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rapidhash::{HashMapExt, RapidHashMap};
 
 #[cfg(all(windows, feature = "native-async-io"))]
@@ -18,32 +22,30 @@ use super::{
 	page_cache::{PageCacheKey, PageCacheVersion},
 	types::DataFileId,
 };
-#[cfg(windows)]
+#[cfg(all(
+	windows,
+	any(feature = "native-async-io", feature = "storage-engine-prototype-api")
+))]
 use super::{direct_io::DirectFile, page::PageNo};
-use crate::{
-	datastore::DataSpaceId,
-	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-};
+#[cfg(any(
+	feature = "storage-engine-prototype-api",
+	all(windows, feature = "native-async-io")
+))]
+use crate::gql_status::FerrosGrynnError;
+use crate::{datastore::DataSpaceId, gql_status::FerrosGrynnResult};
 
 mod arena;
 mod route;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "storage-engine-prototype-api"))]
 mod windows_scatter;
 
+pub use arena::{AtomicArenaBufferPool, AtomicPageGuard, SourceBoundLocator};
 #[cfg(feature = "storage-engine-prototype-api")]
-pub use arena::AtomicBatchReservation;
-pub use arena::{
-	AtomicArenaBufferPool,
-	AtomicEpochPage,
-	AtomicPageGuard,
-	ResolvedFrameHandle,
-	SourceBoundLocator,
-};
+pub use arena::{AtomicBatchReservation, AtomicEpochPage, ResolvedFrameHandle};
 #[cfg(feature = "storage-engine-prototype-api")]
-pub use route::{MAX_IORING_QUEUE_DEPTH, PREFETCH_DEPTH};
+pub use route::{MAX_IORING_QUEUE_DEPTH, MAX_SCATTER_PAGES, PREFETCH_DEPTH};
 pub use route::{
 	MAX_READ_SCOPE_OPERATIONS,
-	MAX_SCATTER_PAGES,
 	ReadIntent,
 	ReadRoute,
 	ReadWindow,
@@ -53,7 +55,7 @@ pub use route::{
 	sparse_transient_pages,
 	transient_pages,
 };
-#[cfg(windows)]
+#[cfg(all(windows, feature = "storage-engine-prototype-api"))]
 pub use windows_scatter::ScatterPrefetchCursor;
 #[cfg(all(windows, feature = "storage-engine-prototype-api"))]
 pub use windows_scatter::ValidatedScatterExtent;
@@ -66,9 +68,11 @@ struct TransientArena {
 	scatter_extent_pages: usize,
 	/// Pages available to one sparse IoRing batch.
 	sparse_pages: usize,
-	/// One Windows scatter pipeline may run at a time until measured otherwise.
+	/// Retained serialization state for the prototype scatter pipeline.
+	/// Keep the field in core builds as well; only its measurement consumers
+	/// are feature-gated.
 	#[cfg(windows)]
-	scatter_lane: Mutex<()>,
+	_scatter_lane: Mutex<()>,
 	/// Lazily created frame-oriented ring serialized for one bounded batch.
 	#[cfg(all(windows, feature = "native-async-io"))]
 	io_ring: Mutex<Option<WindowsIoRing>>,
@@ -83,7 +87,7 @@ impl TransientArena {
 			scatter_extent_pages: scatter_extent_pages(capacity),
 			sparse_pages: sparse_transient_pages(capacity),
 			#[cfg(windows)]
-			scatter_lane: Mutex::new(()),
+			_scatter_lane: Mutex::new(()),
 			#[cfg(all(windows, feature = "native-async-io"))]
 			io_ring: Mutex::new(None),
 		}
@@ -94,7 +98,7 @@ impl TransientArena {
 #[cfg(all(windows, feature = "native-async-io"))]
 pub struct SparseReadBatch {
 	/// Requested physical page numbers in caller order.
-	page_numbers: Vec<PageNo>,
+	_page_numbers: Vec<PageNo>,
 	/// Corresponding validated pages in caller order.
 	pages: Vec<AlignedPage>,
 }
@@ -102,18 +106,21 @@ pub struct SparseReadBatch {
 #[cfg(all(windows, feature = "native-async-io"))]
 impl SparseReadBatch {
 	/// Returns the number of completed pages.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub const fn len(&self) -> usize {
 		self.pages.len()
 	}
 
 	/// Returns whether the completed window is empty.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub const fn is_empty(&self) -> bool {
 		self.pages.is_empty()
 	}
 
 	/// Returns the physical page number at the caller's position.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn page_no(&self, index: usize) -> Option<PageNo> {
-		self.page_numbers.get(index).copied()
+		self._page_numbers.get(index).copied()
 	}
 
 	/// Returns all validated pages in caller order, including duplicates.
@@ -132,6 +139,7 @@ struct SourceIdentity {
 	file_id: DataFileId,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl SourceIdentity {
 	/// Extracts source identity from an exact cache key.
 	const fn from_key(key: PageCacheKey) -> Self {
@@ -145,8 +153,12 @@ impl SourceIdentity {
 
 /// Exact immutable epoch of a physical page source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SourceEpoch(PageCacheVersion);
+struct SourceEpoch(
+	/// Exact immutable epoch of a physical page source.
+	PageCacheVersion,
+);
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl SourceEpoch {
 	/// Extracts the source epoch from an exact cache key.
 	const fn from_key(key: PageCacheKey) -> Self {
@@ -163,6 +175,7 @@ struct SourceState {
 	epoch: SourceEpoch,
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl SourceState {
 	/// Extracts exact source state from a resident cache key.
 	const fn from_key(key: PageCacheKey) -> Self {
@@ -193,6 +206,7 @@ impl SourceRegistry {
 	}
 
 	/// Returns or creates one exact home-source locator.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	fn home_locator(
 		&self,
 		arena: &AtomicArenaBufferPool,
@@ -205,7 +219,8 @@ impl SourceRegistry {
 				"WAL-exact pages use a bounded cursor-local resolved table",
 			));
 		}
-		if let Some(locator) = self.home.read().get(&state).cloned() {
+		let locator = self.home.read().get(&state).cloned();
+		if let Some(locator) = locator {
 			return validate_source_page_count(locator, page_count);
 		}
 		let candidate = Arc::new(SourceBoundLocator::new(arena, first_key, page_count)?);
@@ -215,6 +230,7 @@ impl SourceRegistry {
 	}
 
 	/// Retires older home epochs while active scopes retain their own `Arc`.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	fn retire_home_versions(&self, current: SourceState) -> usize {
 		let mut removed = 0;
 		self.home.write().retain(|state, _| {
@@ -232,6 +248,7 @@ impl SourceRegistry {
 }
 
 /// Validates that all users agree on one source's physical page range.
+#[cfg(feature = "storage-engine-prototype-api")]
 fn validate_source_page_count(
 	locator: Arc<SourceBoundLocator>,
 	page_count: NonZeroUsize,
@@ -281,11 +298,6 @@ impl HybridReadEngine {
 		self.arena.clear_resident()
 	}
 
-	/// Returns the resident capacity through the page-manager cache contract.
-	pub(super) const fn capacity(&self) -> usize {
-		self.resident_capacity()
-	}
-
 	/// Returns the bounded cache-bypassing frame budget.
 	pub const fn transient_capacity(&self) -> usize {
 		self.transient.capacity
@@ -328,6 +340,7 @@ impl HybridReadEngine {
 	/// error. Once the worker submits I/O, errors are never retried through a
 	/// different transport.
 	#[cfg(windows)]
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn scatter_cursor(
 		&self,
 		file: Arc<DirectFile>,
@@ -345,7 +358,7 @@ impl HybridReadEngine {
 			first_page,
 			page_count,
 			self.transient.scatter_extent_pages,
-			self.transient.scatter_lane.lock(),
+			self.transient._scatter_lane.lock(),
 		)
 	}
 
@@ -391,12 +404,16 @@ impl HybridReadEngine {
 			page.validate(*page_no)?;
 		}
 		Ok(SparseReadBatch {
-			page_numbers: reads.iter().map(|(_, page_no)| *page_no).collect(),
+			_page_numbers: reads.iter().map(|(_, page_no)| *page_no).collect(),
 			pages,
 		})
 	}
 
 	/// Returns a validated pinned page, loading an exact-version miss once.
+	///
+	/// # Errors
+	///
+	/// Returns page-validation, cache-admission or loader errors.
 	pub fn get_or_load<Loader>(
 		&self,
 		key: PageCacheKey,
@@ -409,6 +426,10 @@ impl HybridReadEngine {
 	}
 
 	/// Probes the exact-version resident directory without starting I/O.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the resident page cannot be pinned or validated.
 	pub fn get_if_resident(
 		&self,
 		key: PageCacheKey,
@@ -417,11 +438,18 @@ impl HybridReadEngine {
 	}
 
 	/// Resolves one exact resident version for repeated scoped access.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn resolve(&self, key: PageCacheKey) -> Option<ResolvedFrameHandle> {
 		self.arena.resolve(key)
 	}
 
 	/// Returns the lazy locator for one exact home-file epoch.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the source identity or locator admission is
+	/// invalid.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn home_locator(
 		&self,
 		first_key: PageCacheKey,
@@ -433,6 +461,12 @@ impl HybridReadEngine {
 	/// Removes registry ownership of older home epochs for the same source.
 	///
 	/// Existing scopes remain valid because they own the retired locator.
+	///
+	/// # Errors
+	///
+	/// Returns an error when `current_key` does not identify a home-file
+	/// version.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn retire_home_versions(&self, current_key: PageCacheKey) -> FerrosGrynnResult<usize> {
 		let current = SourceState::from_key(current_key);
 		if !current.is_home() {
@@ -454,6 +488,12 @@ impl HybridReadEngine {
 	}
 
 	/// Opens one bounded cursor read epoch.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the read-epoch registry cannot admit another
+	/// scope.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn read_scope(&self) -> FerrosGrynnResult<ReadScope<'_>> {
 		ReadScope::new(&self.arena)
 	}
@@ -481,6 +521,7 @@ impl HybridReadEngine {
 }
 
 /// Cursor-owned read epoch for at most 256 page operations from one source.
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct ReadScope<'engine> {
 	/// Arena used to rotate epochs without changing engines.
 	arena: &'engine AtomicArenaBufferPool,
@@ -493,6 +534,7 @@ pub struct ReadScope<'engine> {
 }
 
 /// Reusable compact translation from logical page order to arena frames.
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct ResolvedPageTable {
 	/// Arena that produced every handle in this table.
 	arena_id: u64,
@@ -507,6 +549,7 @@ pub struct ResolvedPageTable {
 }
 
 /// Borrowed view over a reusable exact-version page table.
+#[cfg(feature = "storage-engine-prototype-api")]
 pub struct ResolvedPageWindow<'scope, 'engine> {
 	/// Live epoch preventing the validated frames from being reused.
 	_epoch: &'scope arena::AtomicReadEpoch<'engine>,
@@ -514,6 +557,7 @@ pub struct ResolvedPageWindow<'scope, 'engine> {
 	pages: &'scope [NonNull<AlignedPage>],
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl ResolvedPageWindow<'_, '_> {
 	/// Returns the number of pages available in caller order.
 	pub const fn len(&self) -> usize {
@@ -535,6 +579,7 @@ impl ResolvedPageWindow<'_, '_> {
 	}
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl ResolvedPageTable {
 	/// Replaces the cursor-owned order while retaining both allocations.
 	fn replace(
@@ -569,6 +614,7 @@ impl ResolvedPageTable {
 	}
 }
 
+#[cfg(feature = "storage-engine-prototype-api")]
 impl<'engine> ReadScope<'engine> {
 	/// Enters the first bounded epoch.
 	fn new(arena: &'engine AtomicArenaBufferPool) -> FerrosGrynnResult<Self> {
@@ -774,6 +820,7 @@ impl<'engine> ReadScope<'engine> {
 }
 
 /// Checks the universal read-window operation bound.
+#[cfg(feature = "storage-engine-prototype-api")]
 fn validate_window<T>(items: &[T]) -> FerrosGrynnResult<()> {
 	if items.len() > MAX_READ_SCOPE_OPERATIONS {
 		Err(FerrosGrynnError::storage_io_failure(
@@ -785,6 +832,7 @@ fn validate_window<T>(items: &[T]) -> FerrosGrynnResult<()> {
 }
 
 /// Validates the arena, source epoch, and universal table bound.
+#[cfg(feature = "storage-engine-prototype-api")]
 fn validate_resolved_handles(
 	arena: &AtomicArenaBufferPool,
 	handles: &[ResolvedFrameHandle],

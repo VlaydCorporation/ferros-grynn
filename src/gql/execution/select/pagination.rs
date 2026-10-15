@@ -6,6 +6,7 @@ use super::*;
 	clippy::too_many_arguments,
 	reason = "pagination needs the complete analyzed query identity and statement runtime"
 )]
+/// Returns the page output result.
 pub(super) fn page_output(
 	output: SortedRecords,
 	start: usize,
@@ -80,6 +81,7 @@ pub(super) fn page_output(
 	}
 }
 
+/// Returns whether the should retain spool condition holds.
 fn should_retain_spool(
 	plan: &LogicalSelect,
 	limit: Option<usize>,
@@ -89,6 +91,7 @@ fn should_retain_spool(
 	returned != 0 && returned != total && limit.is_some() && !plan.order.is_empty() && !plan.only
 }
 
+/// Returns the select limit result.
 pub(super) fn select_limit(
 	plan: &LogicalSelect,
 	slots: &[Value],
@@ -146,23 +149,38 @@ pub(in crate::gql::execution) fn check_select_cardinality(
 	Ok(())
 }
 
+/// Output row state.
 pub(super) struct OutputRow {
+	/// Value associated with this output row.
 	pub(super) value: Value,
+	/// Keys associated with this output row.
 	pub(super) keys: Vec<Value>,
+	/// Stable associated with this output row.
 	pub(super) stable: Vec<Value>,
+	/// Sequence associated with this output row.
 	pub(super) sequence: Vec<Value>,
+	/// Ordinal associated with this output row.
 	pub(super) ordinal: usize,
 }
 
+/// Output collector alternatives.
 pub(super) enum OutputCollector {
-	Memory(Vec<CursorRecord>),
+	/// Memory case of output collector.
+	Memory(
+		/// Memory case of output collector.
+		Vec<CursorRecord>,
+	),
+	/// Sorter case of output collector.
 	Sorter {
+		/// Sorter associated with this output collector.
 		sorter: QuerySorter,
+		/// Preserve input order associated with this output collector.
 		preserve_input_order: bool,
 	},
 }
 
 impl OutputCollector {
+	/// Creates a new `OutputCollector` value.
 	pub(super) fn new<Read: QueryRead>(
 		read: &Read,
 		snapshot: Snapshot,
@@ -195,11 +213,12 @@ impl OutputCollector {
 				fields,
 				control.barrier_account(),
 				plan.tempfiles,
-			)?,
+			),
 			preserve_input_order: plan.order.is_empty() && !control.deterministic(),
 		})
 	}
 
+	/// Pushes output collector.
 	pub(super) fn push(&mut self, mut row: OutputRow) -> FerrosGrynnResult<()> {
 		match self {
 			Self::Memory(records) => {
@@ -221,6 +240,7 @@ impl OutputCollector {
 		}
 	}
 
+	/// Finishes output collector.
 	pub(super) fn finish(self) -> FerrosGrynnResult<SortedRecords> {
 		match self {
 			Self::Memory(records) => Ok(SortedRecords::Memory {
@@ -266,6 +286,7 @@ impl OutputCollector {
 	}
 }
 
+/// Returns the output record result.
 pub(super) fn output_record(row: OutputRow) -> CursorRecord {
 	CursorRecord {
 		value: row.value,
@@ -276,6 +297,7 @@ pub(super) fn output_record(row: OutputRow) -> CursorRecord {
 	}
 }
 
+/// Sorts fields.
 fn sort_fields(plan: &LogicalSelect) -> Vec<SortField> {
 	if plan.order.is_empty() {
 		return vec![SortField {
@@ -292,6 +314,7 @@ fn sort_fields(plan: &LogicalSelect) -> Vec<SortField> {
 		.collect()
 }
 
+/// Returns the output after anchor result.
 pub(super) fn output_after_anchor(
 	output: SortedRecords,
 	anchor: &CursorAnchor,

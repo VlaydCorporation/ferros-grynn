@@ -106,42 +106,53 @@ struct EventSourceCatalog<'read> {
 }
 
 impl QueryCatalog for EventSourceCatalog<'_> {
+	/// Admits analysis for `EventSourceCatalog<'_>`.
 	fn admit_analysis(&self, bytes: usize, work: u64) -> FerrosGrynnResult<()> {
 		self.current.admit_analysis(bytes, work)
 	}
 
+	/// Returns lexical binding type for `EventSourceCatalog<'_>`.
 	fn lexical_binding_type(&self, name: &str) -> Option<&Type> {
 		self.current.lexical_binding_type(name)
 	}
 
+	/// Reports whether the lexical binding is reactive condition holds for
+	/// `EventSourceCatalog<'_>`.
 	fn lexical_binding_is_reactive(&self, name: &str) -> bool {
 		self.current.lexical_binding_is_reactive(name)
 	}
 
+	/// Returns schema epoch for `EventSourceCatalog<'_>`.
 	fn schema_epoch(&self) -> u64 {
 		self.current.schema_epoch()
 	}
 
+	/// Returns schema for `EventSourceCatalog<'_>`.
 	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema> {
 		self.current.schema(class)
 	}
 
+	/// Returns class definition for `EventSourceCatalog<'_>`.
 	fn class_definition(&self, class: &str) -> FerrosGrynnResult<Arc<ClassSchema>> {
 		self.current.class_definition(class)
 	}
 
+	/// Returns schema mode for `EventSourceCatalog<'_>`.
 	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<ClassSchemaMode> {
 		self.current.schema_mode(class)
 	}
 
+	/// Returns class kind for `EventSourceCatalog<'_>`.
 	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind> {
 		self.current.class_kind(class)
 	}
 
+	/// Returns graph for `EventSourceCatalog<'_>`.
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef> {
 		self.graph_if_exists(name)?.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))
 	}
 
+	/// Returns graph if exists for `EventSourceCatalog<'_>`.
 	fn graph_if_exists(&self, name: &str) -> FerrosGrynnResult<Option<GraphRef>> {
 		if let Some(graph) = self.current.graph_if_exists(name)? {
 			return Ok(Some(graph));
@@ -155,6 +166,7 @@ impl QueryCatalog for EventSourceCatalog<'_> {
 		Ok(Some(graph.reference().clone()))
 	}
 
+	/// Returns functions for `EventSourceCatalog<'_>`.
 	fn functions(
 		&self,
 		namespace: &str,
@@ -176,6 +188,7 @@ impl QueryCatalog for EventSourceCatalog<'_> {
 		Ok(functions.iter().filter(matches).cloned().collect())
 	}
 
+	/// Returns function for `EventSourceCatalog<'_>`.
 	fn function(&self, id: FunctionId) -> FerrosGrynnResult<Option<Arc<SchemaFunction>>> {
 		match self.functions {
 			Some(functions) => Ok(functions.iter().find(|source| source.id() == Some(id)).cloned()),
@@ -183,10 +196,12 @@ impl QueryCatalog for EventSourceCatalog<'_> {
 		}
 	}
 
+	/// Returns analyzer for `EventSourceCatalog<'_>`.
 	fn analyzer(&self, name: &str) -> FerrosGrynnResult<Option<Arc<SchemaAnalyzer>>> {
 		self.current.analyzer(name)
 	}
 
+	/// Returns analyzer by id for `EventSourceCatalog<'_>`.
 	fn analyzer_by_id(&self, id: AnalyzerId) -> FerrosGrynnResult<Option<Arc<SchemaAnalyzer>>> {
 		self.current.analyzer_by_id(id)
 	}

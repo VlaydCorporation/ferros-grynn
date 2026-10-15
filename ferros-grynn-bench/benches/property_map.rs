@@ -11,57 +11,98 @@ use ferros_grynn::values::{PropertyKeyId, PropertyMap, Value};
 use rapidhash::{HashMapExt, RapidHashMap};
 use smallvec::SmallVec;
 
+/// Property counts covering empty, small and larger property-map
+/// representations.
 const SIZES: [usize; 8] = [0, 1, 4, 8, 9, 16, 32, 128];
+/// Inline entry capacity of the benchmark's comparison representations.
 const INLINE_PROPERTIES: usize = 8;
 
 type Entry = (PropertyKeyId, Value);
 type InlineRepr = SmallVec<Entry, INLINE_PROPERTIES>;
 type HeapRepr = RapidHashMap<PropertyKeyId, Value>;
 
+/// Inline or heap-backed entries used by the boxed property-map benchmark.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum BoxedEnumRepr {
-	Inline(InlineRepr),
-	Heap(HeapRepr),
+	/// Entries retained in the inline representation.
+	Inline(
+		/// Entries retained in the inline representation.
+		InlineRepr,
+	),
+	/// Entries retained in the heap-backed representation.
+	Heap(
+		/// Entries retained in the heap-backed representation.
+		HeapRepr,
+	),
 }
 
+/// Benchmark property map that boxes its inline-or-heap representation.
 #[derive(Default, Clone)]
 struct BoxedEnumPropertyMap {
+	/// Selected inline or heap-backed property-map representation.
 	repr: Option<Box<BoxedEnumRepr>>,
 }
 
+/// Inline or heap-backed entries stored directly by a benchmark property map.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum DirectHybridRepr {
-	Inline(InlineRepr),
-	Heap(HeapRepr),
+	/// Entries retained in the inline representation.
+	Inline(
+		/// Entries retained in the inline representation.
+		InlineRepr,
+	),
+	/// Entries retained in the heap-backed representation.
+	Heap(
+		/// Entries retained in the heap-backed representation.
+		HeapRepr,
+	),
 }
 
 impl Default for DirectHybridRepr {
+	/// Constructs the default initial state of `DirectHybridRepr`.
 	fn default() -> Self {
 		Self::Inline(InlineRepr::new())
 	}
 }
 
+/// Benchmark property map with an inline-or-heap representation stored
+/// directly.
 #[derive(Default, Clone)]
 struct DirectHybridPropertyMap {
+	/// Selected inline or heap-backed property-map representation.
 	repr: DirectHybridRepr,
 }
 
+/// Benchmark property map maintaining entries in property-key order.
 #[derive(Default, Clone)]
 struct SortedVecPropertyMap {
+	/// Owned entries retained for keyed lookup or iteration.
 	entries: Vec<Entry>,
 }
 
+/// Iterator over the selected representation of the boxed benchmark property
+/// map.
 enum BoxedEnumIter<'a> {
+	/// No entries are present.
 	Empty,
-	Inline(SliceIter<'a, Entry>),
-	Heap(HashIter<'a, PropertyKeyId, Value>),
+	/// Entries retained in the inline representation.
+	Inline(
+		/// Entries retained in the inline representation.
+		SliceIter<'a, Entry>,
+	),
+	/// Entries retained in the heap-backed representation.
+	Heap(
+		/// Entries retained in the heap-backed representation.
+		HashIter<'a, PropertyKeyId, Value>,
+	),
 }
 
 impl<'a> Iterator for BoxedEnumIter<'a> {
 	type Item = (PropertyKeyId, &'a Value);
 
+	/// Advances this `BoxedEnumIter<'a>` and returns its next element, if any.
 	fn next(&mut self) -> Option<Self::Item> {
 		match self {
 			Self::Empty => None,
@@ -72,6 +113,7 @@ impl<'a> Iterator for BoxedEnumIter<'a> {
 }
 
 impl BoxedEnumPropertyMap {
+	/// Inserts a key and value using the collection's replacement rules.
 	fn insert(&mut self, key: PropertyKeyId, value: Value) {
 		let Some(repr) = self.repr.as_mut() else {
 			let mut values = InlineRepr::new();
@@ -106,6 +148,7 @@ impl BoxedEnumPropertyMap {
 		**repr = BoxedEnumRepr::Heap(heap);
 	}
 
+	/// Looks up the requested entry without modifying the collection.
 	fn get(&self, key: PropertyKeyId) -> Option<&Value> {
 		match self.repr.as_deref() {
 			None => None,
@@ -117,6 +160,7 @@ impl BoxedEnumPropertyMap {
 		}
 	}
 
+	/// Borrows the elements of this `BoxedEnumPropertyMap` for iteration.
 	fn iter(&self) -> BoxedEnumIter<'_> {
 		match self.repr.as_deref() {
 			None => BoxedEnumIter::Empty,
@@ -127,6 +171,7 @@ impl BoxedEnumPropertyMap {
 }
 
 impl DirectHybridPropertyMap {
+	/// Inserts a key and value using the collection's replacement rules.
 	fn insert(&mut self, key: PropertyKeyId, value: Value) {
 		let spill = match &mut self.repr {
 			DirectHybridRepr::Inline(values) => {
@@ -154,6 +199,7 @@ impl DirectHybridPropertyMap {
 		self.repr = DirectHybridRepr::Heap(heap);
 	}
 
+	/// Looks up the requested entry without modifying the collection.
 	fn get(&self, key: PropertyKeyId) -> Option<&Value> {
 		match &self.repr {
 			DirectHybridRepr::Inline(values) => values
@@ -164,6 +210,7 @@ impl DirectHybridPropertyMap {
 		}
 	}
 
+	/// Borrows the elements of this `DirectHybridPropertyMap` for iteration.
 	fn iter(&self) -> BoxedEnumIter<'_> {
 		match &self.repr {
 			DirectHybridRepr::Inline(values) => BoxedEnumIter::Inline(values.iter()),
@@ -172,9 +219,12 @@ impl DirectHybridPropertyMap {
 	}
 }
 
+/// Implements sorted insertion and borrowed lookup for benchmark property-map
+/// candidates.
 macro_rules! impl_sorted_map {
 	($map:ty) => {
 		impl $map {
+			/// Replaces an existing property or inserts it at its sorted key position.
 			fn insert(&mut self, key: PropertyKeyId, value: Value) {
 				match self.entries.binary_search_by_key(&key, |(key, _)| *key) {
 					Ok(index) => self.entries[index].1 = value,
@@ -182,6 +232,7 @@ macro_rules! impl_sorted_map {
 				}
 			}
 
+			/// Finds a borrowed property value by binary search over the sorted keys.
 			fn get(&self, key: PropertyKeyId) -> Option<&Value> {
 				self.entries
 					.binary_search_by_key(&key, |(key, _)| *key)
@@ -189,6 +240,7 @@ macro_rules! impl_sorted_map {
 					.map(|index| &self.entries[index].1)
 			}
 
+			/// Iterates borrowed property entries in ascending key order.
 			fn iter(&self) -> SliceIter<'_, Entry> {
 				self.entries.iter()
 			}
@@ -197,14 +249,17 @@ macro_rules! impl_sorted_map {
 }
 
 impl_sorted_map!(SortedVecPropertyMap);
+/// Returns value for this module.
 fn value(index: usize) -> Value {
 	Value::from(index as i64)
 }
 
+/// Returns property map for this module.
 fn property_map(size: usize) -> PropertyMap {
 	(0..size).map(|index| (PropertyKeyId::new(index as u32), value(index))).collect()
 }
 
+/// Returns boxed enum map for this module.
 fn boxed_enum_map(size: usize) -> BoxedEnumPropertyMap {
 	let mut result = BoxedEnumPropertyMap::default();
 	for index in 0..size {
@@ -213,6 +268,7 @@ fn boxed_enum_map(size: usize) -> BoxedEnumPropertyMap {
 	result
 }
 
+/// Returns direct hybrid map for this module.
 fn direct_hybrid_map(size: usize) -> DirectHybridPropertyMap {
 	let mut result = DirectHybridPropertyMap::default();
 	for index in 0..size {
@@ -221,6 +277,7 @@ fn direct_hybrid_map(size: usize) -> DirectHybridPropertyMap {
 	result
 }
 
+/// Returns sorted vec map for this module.
 fn sorted_vec_map(size: usize) -> SortedVecPropertyMap {
 	let mut result = SortedVecPropertyMap::default();
 	for index in 0..size {
@@ -229,14 +286,17 @@ fn sorted_vec_map(size: usize) -> SortedVecPropertyMap {
 	result
 }
 
+/// Returns btree map for this module.
 fn btree_map(size: usize) -> BTreeMap<PropertyKeyId, Value> {
 	(0..size).map(|index| (PropertyKeyId::new(index as u32), value(index))).collect()
 }
 
+/// Returns rapid map for this module.
 fn rapid_map(size: usize) -> RapidHashMap<PropertyKeyId, Value> {
 	(0..size).map(|index| (PropertyKeyId::new(index as u32), value(index))).collect()
 }
 
+/// Measures build with the benchmark harness.
 fn bench_build(c: &mut Criterion) {
 	print_layout();
 	let mut group = c.benchmark_group("property_map/build");
@@ -267,6 +327,7 @@ fn bench_build(c: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures lookup with the benchmark harness.
 fn bench_lookup(c: &mut Criterion) {
 	let mut group = c.benchmark_group("property_map/lookup");
 
@@ -305,6 +366,7 @@ fn bench_lookup(c: &mut Criterion) {
 	group.finish();
 }
 
+/// Measures iterate and clone with the benchmark harness.
 fn bench_iterate_and_clone(c: &mut Criterion) {
 	let mut iterate = c.benchmark_group("property_map/iterate");
 	for size in SIZES {
@@ -392,6 +454,7 @@ fn bench_iterate_and_clone(c: &mut Criterion) {
 	clone.finish();
 }
 
+/// Returns print layout for this module.
 fn print_layout() {
 	println!(
 		"PropertyMap layout: production={} B, Value={} B, old inline allocation={} B, hash \

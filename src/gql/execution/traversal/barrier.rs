@@ -8,23 +8,36 @@ use crate::gql::{
 	spill::{QuerySorter, RecordStream, SortField},
 };
 
+/// Reports whether the value is barrier for this module.
 pub(super) const fn is_barrier(kind: TraverseStepKind) -> bool {
 	kind.is_barrier()
 }
 
+/// Traversal barrier output retained in memory or streamed from sorted records.
 pub(super) enum BarrierCursor {
+	/// Traversers retained in an admitted in-memory queue.
 	Buffered {
+		/// Traversers buffered until the barrier can produce output.
 		values: VecDeque<Traverser>,
+		/// Memory admission retained for the lifetime of the buffered values.
 		account: BarrierAccount,
 	},
-	Records(RecordStream),
+	/// Sorted records streamed from the external record sorter.
+	Records(
+		/// Sorted records streamed from the external record sorter.
+		RecordStream,
+	),
+	/// Grouped records streamed with one retained lookahead record.
 	Groups {
+		/// Upstream stream polled by this adapter.
 		stream: RecordStream,
+		/// Lookahead record retained while detecting the next group boundary.
 		pending: Option<CursorRecord>,
 	},
 }
 
 impl BarrierCursor {
+	/// Advances this `BarrierCursor` and returns its next element, if any.
 	pub(super) fn next<Read: QueryRead>(
 		&mut self,
 		machine: &mut TraversalMachine<'_, Read>,
@@ -52,6 +65,7 @@ impl BarrierCursor {
 }
 
 impl<Read: QueryRead> TraversalMachine<'_, Read> {
+	/// Prepares barrier for `TraversalMachine<'_, Read>`.
 	pub(super) fn prepare_barrier(
 		&mut self,
 		upstream: usize,
@@ -86,6 +100,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		}
 	}
 
+	/// Returns sorted records for `TraversalMachine<'_, Read>`.
 	fn sorted_records(
 		&mut self,
 		upstream: usize,
@@ -95,6 +110,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		self.sorted_stream(upstream, step, purpose).map(BarrierCursor::Records)
 	}
 
+	/// Returns sorted stream for `TraversalMachine<'_, Read>`.
 	fn sorted_stream(
 		&mut self,
 		upstream: usize,
@@ -115,7 +131,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			}],
 			self.control.barrier_account(),
 			false,
-		)?;
+		);
 		let mut ordinal = 0_usize;
 		while let Some(traverser) = self.pull(upstream)? {
 			self.control.check()?;
@@ -154,6 +170,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		sorter.finish()?.into_stream()
 	}
 
+	/// Returns deduplicated records for `TraversalMachine<'_, Read>`.
 	fn deduplicated_records(
 		&mut self,
 		upstream: usize,
@@ -173,7 +190,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			}],
 			self.control.barrier_account(),
 			false,
-		)?;
+		);
 		let mut ordinal = 0_usize;
 		while let Some(traverser) = self.pull(upstream)? {
 			let key = if step.kind == TraverseStepKind::DeduplicateBy {
@@ -195,7 +212,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			}],
 			self.control.barrier_account(),
 			false,
-		)?;
+		);
 		let mut stream = keyed.finish()?.into_stream()?;
 		let mut previous = None::<Value>;
 		while let Some(mut record) = stream.next()? {
@@ -212,6 +229,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		encounter.finish()?.into_stream().map(BarrierCursor::Records)
 	}
 
+	/// Returns fold for `TraversalMachine<'_, Read>`.
 	fn fold(&mut self, upstream: usize) -> FerrosGrynnResult<Value> {
 		let mut account = self.control.barrier_account();
 		let mut values = Vec::new();
@@ -235,6 +253,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		Ok(Value::Array(values.into()))
 	}
 
+	/// Returns count for `TraversalMachine<'_, Read>`.
 	fn count(&mut self, upstream: usize) -> FerrosGrynnResult<Value> {
 		let mut count = 0_u64;
 		while let Some(traverser) = self.pull(upstream)? {
@@ -247,6 +266,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			.map_err(|_error| FerrosGrynnError::operation_overflow("tv::count"))
 	}
 
+	/// Returns aggregate stream for `TraversalMachine<'_, Read>`.
 	fn aggregate_stream(
 		&mut self,
 		upstream: usize,
@@ -306,6 +326,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		}
 	}
 
+	/// Returns algorithm barrier for `TraversalMachine<'_, Read>`.
 	fn algorithm_barrier(
 		&mut self,
 		upstream: usize,
@@ -329,6 +350,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		buffered_values(values, self.control)
 	}
 
+	/// Returns traverser record for `TraversalMachine<'_, Read>`.
 	fn traverser_record(
 		&self,
 		traverser: Traverser,
@@ -362,6 +384,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		})
 	}
 
+	/// Returns traverser from record for `TraversalMachine<'_, Read>`.
 	fn traverser_from_record(&mut self, record: CursorRecord) -> FerrosGrynnResult<Traverser> {
 		let Value::Array(values) = record.value else {
 			return Err(FerrosGrynnError::invalid_storage_file(
@@ -431,12 +454,16 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	}
 }
 
+/// Whether a traversal sort is preparing ordered output or grouped aggregation.
 #[derive(Clone, Copy)]
 enum SortPurpose {
+	/// Sort traversal output by its ordering keys.
 	Order,
+	/// Sort traversal output so equal group keys become adjacent.
 	Group,
 }
 
+/// Yields the next group for this module.
 fn next_group<Read: QueryRead>(
 	machine: &mut TraversalMachine<'_, Read>,
 	stream: &mut RecordStream,
@@ -491,6 +518,7 @@ fn next_group<Read: QueryRead>(
 	Ok(Some(Traverser::new(Value::Object(value))))
 }
 
+/// Returns buffered value for this module.
 fn buffered_value(value: Value, control: &ExecutionControl) -> FerrosGrynnResult<BarrierCursor> {
 	let mut account = control.barrier_account();
 	let traverser = Traverser::new(value);
@@ -576,6 +604,7 @@ fn buffered_values(
 	})
 }
 
+/// Returns spill u32 for this module.
 fn spill_u32(value: Option<Value>, field: &str) -> FerrosGrynnResult<u32> {
 	value
 		.and_then(|value| value.as_number().and_then(|number| i64::try_from(number).ok()))
@@ -586,15 +615,19 @@ fn spill_u32(value: Option<Value>, field: &str) -> FerrosGrynnResult<u32> {
 }
 
 #[cfg(test)]
+/// Regression tests for barrier behavior.
 mod tests {
 	use std::num::NonZeroUsize;
 
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::{AssertOption as _, AssertResult as _};
 
+	/// Verifies capacity is admitted before growth including old allocation.
 	#[test]
 	fn capacity_is_admitted_before_growth_including_old_allocation() {
 		let options = crate::gql::QueryExecutionOptions {
-			barrier_memory_bytes: NonZeroUsize::new(64).unwrap(),
+			barrier_memory_bytes: NonZeroUsize::new(64).assert_some(),
 			..Default::default()
 		};
 		let control = ExecutionControl::new(&options, None);
@@ -603,7 +636,7 @@ mod tests {
 		assert!(reserve_slot(&mut traversers, &mut account, &control).is_err());
 		assert_eq!(traversers.capacity(), 0);
 		let mut values = Vec::<u64>::new();
-		reserve_slot(&mut values, &mut account, &control).unwrap();
+		reserve_slot(&mut values, &mut account, &control).assert_ok();
 		values.extend([0, 1, 2, 3]);
 		assert!(reserve_slot(&mut values, &mut account, &control).is_err());
 		assert_eq!(values.capacity(), 4);

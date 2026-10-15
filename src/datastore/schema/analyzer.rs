@@ -9,7 +9,10 @@ use crate::{
 /// Stable identity of one durable text analyzer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct AnalyzerId(SchemaId);
+pub struct AnalyzerId(
+	/// Schema-namespace identity assigned to this analyzer definition.
+	SchemaId,
+);
 
 impl AnalyzerId {
 	/// Creates an analyzer identity from its durable representation.
@@ -25,10 +28,12 @@ impl AnalyzerId {
 		self.0.get()
 	}
 
+	/// Creates from schema id.
 	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
 		Self(value)
 	}
 
+	/// Creates from storage.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("analyzer identity is reserved"))
@@ -36,14 +41,16 @@ impl AnalyzerId {
 }
 
 impl From<AnalyzerId> for SchemaId {
+	/// Converts `AnalyzerId` into `SchemaId`.
 	fn from(value: AnalyzerId) -> Self {
 		value.0
 	}
 }
 
 impl std::fmt::Display for AnalyzerId {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		std::fmt::Display::fmt(&self.get(), formatter)
+	/// Formats `AnalyzerId` using the requested formatter.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		std::fmt::Display::fmt(&self.get(), f)
 	}
 }
 
@@ -132,21 +139,35 @@ pub enum AnalyzerFilter {
 		max: u16,
 	},
 	/// Snowball stemming for one fixed language.
-	Snowball(AnalyzerLanguage),
+	Snowball(
+		/// Snowball stemming for one fixed language.
+		AnalyzerLanguage,
+	),
 	/// Inline exact term replacements; `None` removes a term.
-	Mapper(BTreeMap<Text, Option<Text>>),
+	Mapper(
+		/// Inline exact term replacements; `None` removes a term.
+		BTreeMap<Text, Option<Text>>,
+	),
 }
 
 /// Immutable durable definition of one named analyzer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaAnalyzer {
+	/// Identifier used to locate this value within its owning subsystem.
 	pub(crate) id: Option<AnalyzerId>,
+	/// Version associated with this schema analyzer.
 	pub(crate) version: SchemaVersion,
+	/// Published at associated with this schema analyzer.
 	pub(crate) published_at: u64,
+	/// Name associated with this schema analyzer.
 	pub(crate) name: Text,
+	/// Tokenizers associated with this schema analyzer.
 	pub(crate) tokenizers: BTreeSet<AnalyzerTokenizer>,
+	/// Filters associated with this schema analyzer.
 	pub(crate) filters: Vec<AnalyzerFilter>,
+	/// Function associated with this schema analyzer.
 	pub(crate) function: Option<(FunctionId, SchemaVersion)>,
+	/// Comment associated with this schema analyzer.
 	pub(crate) comment: Option<Text>,
 }
 
@@ -251,6 +272,7 @@ impl SchemaAnalyzer {
 	}
 }
 
+/// Validates name.
 fn validate_name(name: &Text) -> FerrosGrynnResult<()> {
 	if name.is_empty() || name.as_str().contains('\0') {
 		return Err(FerrosGrynnError::invalid_argument(
@@ -260,6 +282,7 @@ fn validate_name(name: &Text) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
+/// Validates filter.
 fn validate_filter(filter: &AnalyzerFilter) -> FerrosGrynnResult<()> {
 	match filter {
 		AnalyzerFilter::EdgeNgram {
@@ -290,12 +313,16 @@ fn validate_filter(filter: &AnalyzerFilter) -> FerrosGrynnResult<()> {
 }
 
 #[cfg(test)]
+/// Regression tests for analyzer behavior.
 mod tests {
 	use std::collections::BTreeMap;
 
 	use super::{AnalyzerFilter, AnalyzerTokenizer, SchemaAnalyzer};
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 	use crate::values::Text;
 
+	/// Verifies canonicalizes tokenizer set but preserves filter order.
 	#[test]
 	fn canonicalizes_tokenizer_set_but_preserves_filter_order() {
 		let analyzer = SchemaAnalyzer::new(
@@ -303,7 +330,7 @@ mod tests {
 			[AnalyzerTokenizer::Punct, AnalyzerTokenizer::Blank, AnalyzerTokenizer::Punct],
 			[AnalyzerFilter::Lowercase, AnalyzerFilter::Nfc],
 		)
-		.unwrap();
+		.assert_ok();
 		assert_eq!(analyzer.tokenizers().collect::<Vec<_>>(), vec![
 			AnalyzerTokenizer::Blank,
 			AnalyzerTokenizer::Punct
@@ -314,6 +341,7 @@ mod tests {
 		]);
 	}
 
+	/// Verifies rejects invalid ngrams and mapper terms.
 	#[test]
 	fn rejects_invalid_ngrams_and_mapper_terms() {
 		assert!(

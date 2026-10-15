@@ -20,11 +20,20 @@ pub enum ReachabilityAlgorithm {
 	/// Exact intervals, restricted to tree families.
 	TreeCover,
 	/// Negative filter with one through thirty-two interval dimensions.
-	Grail(u8),
+	Grail(
+		/// Negative filter with one through thirty-two interval dimensions.
+		u8,
+	),
 	/// Exact/approximate interval cover with one through 255 ranges.
-	Ferrari(u8),
+	Ferrari(
+		/// Exact/approximate interval cover with one through 255 ranges.
+		u8,
+	),
 	/// Negative Bloom filter with 64 through 4096 bits, divisible by eight.
-	Bfl(u16),
+	Bfl(
+		/// Negative Bloom filter with 64 through 4096 bits, divisible by eight.
+		u16,
+	),
 	/// Exact chain matrix; requires an explicit artifact budget.
 	ChainCover,
 	/// Performs exact traversal without a materialized artifact.
@@ -40,9 +49,15 @@ pub enum NeighbourhoodAlgorithm {
 	/// Distinct members at each radius.
 	Exact,
 	/// HyperLogLog with the supplied register precision, default twelve.
-	Sketch(u8),
+	Sketch(
+		/// HyperLogLog with the supplied register precision, default twelve.
+		u8,
+	),
 	/// Exact cached neighbourhoods for the supplied number of landmarks.
-	Landmark(u16),
+	Landmark(
+		/// Exact cached neighbourhoods for the supplied number of landmarks.
+		u16,
+	),
 	/// Performs exact traversal without a materialized artifact.
 	OnDemand,
 }
@@ -52,7 +67,10 @@ pub enum NeighbourhoodAlgorithm {
 #[non_exhaustive]
 pub enum PathIndexAlgorithm {
 	/// Directed ALT distances for one through 256 deterministic landmarks.
-	LandmarkSssp(u16),
+	LandmarkSssp(
+		/// Directed ALT distances for one through 256 deterministic landmarks.
+		u16,
+	),
 	/// Exact bindings for bounded, parameter-free patterns.
 	PatternCache,
 	/// Executes the existing exact shortest-path or pattern pipeline.
@@ -217,33 +235,7 @@ impl GraphIndex {
 	/// Returns invalid name, scope, format or zero-budget errors.
 	///
 	/// # Examples
-	/// ```
-	/// use ferros_grynn::{
-	/// 	datastore::{Datastore, GraphIndex, MaintenanceOptions, TensorCacheFormat},
-	/// 	graph::{
-	/// 		GraphKind,
-	/// 		tensor::{TensorOptions, TensorScope},
-	/// 	},
-	/// };
-	/// # fn main() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
-	/// let store = Datastore::in_memory();
-	/// let mut tx = store.begin();
-	/// let graph = tx.define_graph("example", GraphKind::Graph)?;
-	/// let id = tx.define_graph_index(
-	/// 	"example",
-	/// 	GraphIndex::new_tensor("incidence", TensorScope::Local, TensorCacheFormat::Auto, 1 << 20)?,
-	/// )?;
-	/// tx.commit()?;
-	/// store.rebuild_graph_index(graph.id(), id, MaintenanceOptions::default())?;
-	/// let mut read = store.begin();
-	/// let tensor = read.endpoint_tensor_using_index(&graph, TensorOptions::default(), id)?;
-	/// assert_eq!(tensor.shape(), (0, 0, 2));
-	/// assert!(read.graph_index("example", "incidence")?.is_some());
-	/// read.remove_graph_index("example", "incidence")?;
-	/// read.commit()?;
-	/// # Ok(())
-	/// # }
-	/// ```
+	#[doc = include_str!("../../../docs/rustdoc/datastore-schema-graph_index-example-01.md")]
 	pub fn new_tensor<IntoText: Into<Text>>(
 		name: IntoText,
 		scope: TensorScope,
@@ -279,9 +271,9 @@ impl GraphIndex {
 	/// # Errors
 	/// Returns an invalid-argument error for invalid labels or more than 1024
 	/// labels.
-	pub fn with_edge_labels<IntoText: Into<Text>>(
+	pub fn with_edge_labels<IntoText: Into<Text>, LabelsArg: IntoIterator<Item = IntoText>>(
 		mut self,
-		labels: impl IntoIterator<Item = IntoText>,
+		labels: LabelsArg,
 	) -> FerrosGrynnResult<Self> {
 		for label in labels {
 			let label = label.into();
@@ -712,9 +704,13 @@ fn append_text(bytes: &mut Vec<u8>, text: &Text) -> FerrosGrynnResult<()> {
 }
 
 #[cfg(test)]
+/// Regression tests for graph index behavior.
 mod tests {
 	use super::*;
+	#[cfg(test)]
+	use crate::test_assertions::AssertResult as _;
 
+	/// Verifies graph definition bounds and fingerprints.
 	#[test]
 	fn graph_definition_bounds_and_fingerprints() {
 		let reach = |algorithm, budget| {
@@ -731,20 +727,20 @@ mod tests {
 		assert!(reach(ReachabilityAlgorithm::Bfl(159), None).is_err());
 		assert!(reach(ReachabilityAlgorithm::ChainCover, None).is_err());
 		assert!(reach(ReachabilityAlgorithm::Auto, None).is_err());
-		let base = reach(ReachabilityAlgorithm::Grail(2), None).unwrap();
+		let base = reach(ReachabilityAlgorithm::Grail(2), None).assert_ok();
 		assert_eq!(base.state(), ClassIndexState::Stale);
 		assert_eq!(base.mode(), TraversalSemantics::Node);
 		assert_ne!(
-			base.fingerprint().unwrap(),
-			base.clone().with_mode(TraversalSemantics::Atom).fingerprint().unwrap()
+			base.fingerprint().assert_ok(),
+			base.clone().with_mode(TraversalSemantics::Atom).fingerprint().assert_ok()
 		);
 		assert_ne!(
-			base.fingerprint().unwrap(),
-			base.clone().with_direction(TraversalDirection::Both).fingerprint().unwrap()
+			base.fingerprint().assert_ok(),
+			base.clone().with_direction(TraversalDirection::Both).fingerprint().assert_ok()
 		);
 		assert_eq!(
-			base.clone().with_edge_labels(["b", "a"]).unwrap().fingerprint().unwrap(),
-			base.with_edge_labels(["a", "b", "a"]).unwrap().fingerprint().unwrap()
+			base.clone().with_edge_labels(["b", "a"]).assert_ok().fingerprint().assert_ok(),
+			base.with_edge_labels(["a", "b", "a"]).assert_ok().fingerprint().assert_ok()
 		);
 		assert!(
 			GraphIndex::new(
@@ -765,7 +761,7 @@ mod tests {
 			},
 			None,
 		)
-		.unwrap();
+		.assert_ok();
 		assert!(automatic.is_on_demand());
 		assert_eq!(automatic.state(), ClassIndexState::Ready);
 	}

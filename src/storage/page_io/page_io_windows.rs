@@ -31,13 +31,9 @@ use windows::Win32::{
 	},
 };
 
-use super::{
-	AlignedPage,
-	FerrosGrynnError,
-	FerrosGrynnResult,
-	FilePageExtent,
-	WINDOWS_IORING_QUEUE_DEPTH,
-};
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+use super::FilePageExtent;
+use super::{AlignedPage, FerrosGrynnError, FerrosGrynnResult, WINDOWS_IORING_QUEUE_DEPTH};
 use crate::storage::page::PAGE_SIZE;
 
 /// Infinite wait accepted by `SubmitIoRing`.
@@ -90,6 +86,7 @@ impl<'a> FrameRead<'a> {
 	/// # Errors
 	///
 	/// Returns a page-header or checksum error.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn validate(&self) -> FerrosGrynnResult<crate::storage::page::PageHeader> {
 		self.frame.validate(self.page_no)
 	}
@@ -178,6 +175,12 @@ unsafe impl Send for WindowsIoRing {}
 impl WindowsIoRing {
 	/// Queries IoRing, checks required operations, and creates one bounded
 	/// queue.
+	///
+	/// # Errors
+	///
+	/// Returns `IoModeUnavailable` if querying or creating IoRing fails,
+	/// Windows reports no usable queue capacity, or read or write operations
+	/// are unsupported.
 	pub fn new() -> FerrosGrynnResult<Self> {
 		// SAFETY: the generated binding returns an owned capabilities value and
 		// has no caller-provided pointers.
@@ -206,7 +209,11 @@ impl WindowsIoRing {
 			queue_depth,
 			completion_depth,
 		};
-		for (operation, name) in [(IORING_OP_READ, "read"), (IORING_OP_WRITE, "write")] {
+		for operation in [NativeOperation::Read, NativeOperation::Write] {
+			let (operation, name) = match operation {
+				NativeOperation::Read => (IORING_OP_READ, "read"),
+				NativeOperation::Write => (IORING_OP_WRITE, "write"),
+			};
 			// SAFETY: `result.ring` is owned and valid for the duration of the
 			// capability query.
 			let supported = unsafe { IsIoRingOpSupported(result.ring, operation) };
@@ -221,6 +228,7 @@ impl WindowsIoRing {
 	}
 
 	/// Builds and executes queued reads into disjoint aligned page ranges.
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	pub(super) fn read_extents(
 		&mut self,
 		extents: &[FilePageExtent],
@@ -258,7 +266,14 @@ impl WindowsIoRing {
 
 	/// Forces the native extent path even for one extent, avoiding the
 	/// production QD1 synchronous bypass in controlled transport comparisons.
-	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	///
+	/// # Errors
+	///
+	/// Returns an error for invalid buffer or file extents, arithmetic or
+	/// integer-conversion failure, or a missing overlapped file handle. Also
+	/// returns an error if ring recreation, request construction, submission,
+	/// or completion fails, including malformed completions or short transfers.
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn read_extents_forced(
 		&mut self,
 		extents: &[FilePageExtent],
@@ -273,7 +288,7 @@ impl WindowsIoRing {
 	///
 	/// Returns a range, conversion, native submission, completion, or
 	/// exact-byte error. On failure no partial statistics are returned.
-	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	#[cfg(feature = "storage-engine-prototype-api")]
 	pub fn read_extents_forced_measured(
 		&mut self,
 		extents: &[FilePageExtent],
@@ -303,6 +318,13 @@ impl WindowsIoRing {
 	}
 
 	/// Reads one page per SQE into caller-owned disjoint frames.
+	///
+	/// # Errors
+	///
+	/// Returns an error for an out-of-range page, arithmetic or integer-
+	/// conversion failure, or a missing overlapped file handle. Also returns
+	/// an error if ring recreation, request construction, submission, or
+	/// completion fails, including malformed completions or short transfers.
 	pub fn read_frames(&mut self, reads: &mut [FrameRead<'_>]) -> FerrosGrynnResult<()> {
 		let requests = Self::frame_requests(reads)?;
 		self.execute(&requests)
@@ -342,6 +364,7 @@ impl WindowsIoRing {
 	}
 
 	/// Builds and executes queued writes from aligned page ranges.
+	#[cfg(test)]
 	pub(super) fn write_extents(
 		&mut self,
 		extents: &[FilePageExtent],
@@ -573,6 +596,7 @@ impl WindowsIoRing {
 }
 
 impl Drop for WindowsIoRing {
+	/// Runs cleanup for this `WindowsIoRing` before its fields are released.
 	fn drop(&mut self) {
 		self.close_ring();
 	}
