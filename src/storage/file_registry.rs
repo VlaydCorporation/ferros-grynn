@@ -1,6 +1,7 @@
 //! Sealed mapping from persisted file identities to owned Direct-I/O handles.
 
 use std::{
+	collections::BTreeSet,
 	fs,
 	path::PathBuf,
 	sync::{Arc, OnceLock, Weak},
@@ -117,6 +118,9 @@ pub(super) struct FileRegistry {
 	files: RapidHashMap<(DataSpaceId, DataFileId), Arc<RegisteredDataFile>>,
 }
 
+/// Trusted physical identity retained without extending a retired file's life.
+pub(super) type RetiredFileMarker = ((DataSpaceId, DataFileId), Weak<RegisteredDataFile>);
+
 impl FileRegistry {
 	/// Opens and seals one trusted set of physical data files.
 	///
@@ -132,6 +136,22 @@ impl FileRegistry {
 		io_mode: DirectFileOpenMode,
 		degradable: &RapidHashSet<(DataSpaceId, DataFileId)>,
 	) -> FerrosGrynnResult<Self> {
+		Self::open_with_reuse(registrations, io_mode, degradable, None)
+	}
+
+	/// Reuses the exact file owner across catalog refreshes so snapshots and
+	/// checkpoint share native handles, cached lengths and retirement markers.
+	///
+	/// # Errors
+	///
+	/// Returns the same validation errors as [`Self::open`], or an error when
+	/// a previously registered identity changes its physical contract.
+	pub(super) fn open_with_reuse(
+		registrations: Vec<DataFileRegistration>,
+		io_mode: DirectFileOpenMode,
+		degradable: &RapidHashSet<(DataSpaceId, DataFileId)>,
+		previous: Option<&Self>,
+	) -> FerrosGrynnResult<Self> {
 		let mut files = RapidHashMap::with_capacity(registrations.len());
 		let mut seen = RapidHashSet::with_capacity(registrations.len());
 		for registration in registrations {
@@ -142,9 +162,20 @@ impl FileRegistry {
 				));
 			}
 			validate_registration(registration.space_id, registration.file_id, registration.role)?;
+			let old = previous.and_then(|registry| registry.files.get(&key));
+			if let Some(old) = old
+				&& (old.path != registration.path
+					|| old.role != registration.role
+					|| old.open_mode != io_mode)
+			{
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"registered identity changed its path, role or I/O mode",
+				));
+			}
 			match open_registration(registration, io_mode) {
 				Ok(file) => {
-					files.insert(key, Arc::new(file));
+					let file = old.map_or_else(|| Arc::new(file), Arc::clone);
+					files.insert(key, file);
 				}
 				Err(_error) if degradable.contains(&key) => {}
 				Err(error) => return Err(error),
@@ -193,15 +224,16 @@ impl FileRegistry {
 		self.files.iter().map(|(key, file)| (*key, file.clone())).collect()
 	}
 
-	/// Pins only replaced directories, independently of retained statistics.
-	pub(super) fn directory_markers(
+	/// Remembers every removed registration, including files whose directory
+	/// stays reachable through an independently retained index.
+	pub(super) fn markers_except(
 		&self,
-		directories: &[std::path::PathBuf],
-	) -> Vec<Weak<RegisteredDataFile>> {
+		retained: &BTreeSet<(DataSpaceId, DataFileId)>,
+	) -> Vec<RetiredFileMarker> {
 		self.files
-			.values()
-			.filter(|file| directories.iter().any(|directory| file.path().starts_with(directory)))
-			.map(Arc::downgrade)
+			.iter()
+			.filter(|(key, _file)| !retained.contains(key))
+			.map(|(key, file)| (*key, Arc::downgrade(file)))
 			.collect()
 	}
 
@@ -319,13 +351,14 @@ mod tests {
 		created.resize_pages(1).assert_ok();
 		drop(created);
 		let file_id = DataFileId::for_kind(DataFileKind::NodesHot);
+		let registration = DataFileRegistration {
+			space_id: DataSpaceId::Database,
+			file_id,
+			role: DataFileRole::WalBackfilled,
+			path: path.clone(),
+		};
 		let registry = FileRegistry::open(
-			vec![DataFileRegistration {
-				space_id: DataSpaceId::Database,
-				file_id,
-				role: DataFileRole::WalBackfilled,
-				path: path.clone(),
-			}],
+			vec![registration.clone()],
 			DirectFileOpenMode::Synchronous,
 			&RapidHashSet::default(),
 		)
@@ -333,6 +366,32 @@ mod tests {
 		assert_eq!(registry.handle_counts(), (1, 0));
 		drop(registry.resolve_file(DataSpaceId::Database, file_id).assert_ok().file().assert_ok());
 		assert_eq!(registry.handle_counts(), (1, 1));
+		let next = FileRegistry::open_with_reuse(
+			vec![registration.clone()],
+			DirectFileOpenMode::Synchronous,
+			&RapidHashSet::default(),
+			Some(&registry),
+		)
+		.assert_ok();
+		assert!(Arc::ptr_eq(
+			&registry.resolve_file(DataSpaceId::Database, file_id).assert_ok(),
+			&next.resolve_file(DataSpaceId::Database, file_id).assert_ok()
+		));
+		assert_eq!(next.handle_counts(), (1, 1));
+		let mut changed = registration;
+		changed.path = path.with_extension("missing");
+		let mut degradable = RapidHashSet::default();
+		degradable.insert((DataSpaceId::Database, file_id));
+		assert!(
+			FileRegistry::open_with_reuse(
+				vec![changed],
+				DirectFileOpenMode::Synchronous,
+				&degradable,
+				Some(&registry)
+			)
+			.is_err()
+		);
+		drop(next);
 		drop(registry);
 		drop(std::fs::remove_file(path));
 	}

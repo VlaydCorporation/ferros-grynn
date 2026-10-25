@@ -50,9 +50,10 @@ indexes и schema одним storage snapshot.
   revisions; import restamp меняет только unpublished primary stamps и переносит
   уже committed LIVE controls без изменения. Admission предшествует COW.
 - `root` — единый immutable commit image AtomStore + graphs + logical versions;
-  Primary replay и operation-image changefeed replay используют один hydrated
-  immutable before-root. Lazy current statistics headers после reopen нельзя
-  передавать в replay, который применяет exact counter deltas; FCW/SSI остаются
+  Primary replay и operation-image changefeed replay используют один immutable
+  before-root. Journal только из existing-key Base setters меняет eager dirty
+  metadata и сохраняет lazy auxiliary maps. Перед остальными exact counter
+  deltas, включая ReadCommitted replay, before-root гидратируется; FCW/SSI остаются
   привязаны к original current, ACK/close не требуют data hydration.
   First ON import segment гидратирует working statistics до retained before-root;
   spool admission и savepoints остаются у changefeed_import, OFF origin не удерживает.
@@ -63,7 +64,9 @@ indexes и schema одним storage snapshot.
   metadata, activation, FCW/SSI и publication не пропускаются. Identity clocks
   не отделяют schema при равных обоих clocks; statistics revision не делает
   COW без touched counters. Replay сравнивает hydrated before-root, FCW/SSI —
-  исходный current root.
+  исходный current root. Full-generation fallback после lazy setters загружает
+  unchanged auxiliary maps по timestamp опубликованного source, сохраняя eager
+  revisions и staleness; новый candidate timestamp ещё не имеет physical binding.
 - `live_catalog` — snapshot-owned logical LIVE identities/recipes; registry
   mutations используют обычные FCW/SSI replay и transaction savepoints. Consumer
   queues не принадлежат immutable root. Исторические catalogs удерживаются одним
@@ -131,6 +134,13 @@ indexes и schema одним storage snapshot.
   одновременно с logical snapshot при begin и Read Committed refresh.
 - `index_store` — Base и Effective index images, class/label/count lookup и
   проверка Unique;
+  occurrence replacement готовит engine-owned label transition вместе с
+  explicit keys, даже при отсутствии explicit indexes. Insert/replacement/
+  detach/reopen используют общий label posting updater; пустые buckets
+  удаляются, чтобы dense durable label IDs совпадали с source labels.
+  Write-set admission labels включает journal, occurrence и отдельно owned
+  lookup/statistics keys. Final audit сохраняет оба before/after targets;
+  общие keys допускают консервативный повторный charge без обхода maps.
 - `conflict` — независимые `BaseAtom`, `GraphMembership`, `GraphOverlay` и
   `GraphIncidence` conflict keys;
 - `transaction` — private root, FCW/SSI validation, bounded fanout preflight и

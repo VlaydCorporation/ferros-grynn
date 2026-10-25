@@ -34,6 +34,14 @@ const ENTRY_BYTES: usize = 16;
 /// Configured per page value.
 const PER_PAGE: usize = (PAGE_SIZE - ENTRIES) / ENTRY_BYTES;
 
+/// Exact page count and borrowed-entry scratch used by the class encoder.
+pub(super) fn encoding_size(count: usize) -> FerrosGrynnResult<(usize, usize)> {
+	let scratch = count
+		.checked_mul(size_of::<(&ClassId, &u64)>())
+		.ok_or_else(|| invalid("class statistics scratch overflows usize"))?;
+	Ok((count.div_ceil(PER_PAGE), scratch))
+}
+
 /// Encodes class statistics.
 pub(in crate::storage) fn encode_class_statistics(
 	classes: &BTreeMap<ClassId, u64>,
@@ -41,7 +49,7 @@ pub(in crate::storage) fn encode_class_statistics(
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
 	let entries = classes.iter().collect::<Vec<_>>();
-	let page_count = entries.len().div_ceil(PER_PAGE);
+	let (page_count, _) = encoding_size(entries.len())?;
 	let mut pages = Vec::with_capacity(page_count);
 	for (index, chunk) in entries.chunks(PER_PAGE).enumerate() {
 		let page_no = checked_page_no(index, first_page, "class statistics")?;
@@ -68,15 +76,46 @@ where
 
 /// Decodes class statistics range.
 pub(in crate::storage) fn decode_class_statistics_range<ReadPage>(
-	mut read_page: ReadPage,
+	read_page: ReadPage,
 	first: Option<PageNo>,
 	page_count: u32,
 ) -> FerrosGrynnResult<BTreeMap<ClassId, u64>>
 where
 	ReadPage: FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 {
+	decode_class_range_bounded(read_page, first, page_count, usize::MAX)
+}
+
+/// Decodes source classes under the owning schema's admitted cardinality.
+///
+/// # Errors
+/// Rejects excessive page/entry counts before map growth and all codec errors.
+pub(in crate::storage) fn decode_class_statistics_bounded<ReadPage>(
+	read_page: ReadPage,
+	layout: super::StatisticsLayout,
+	maximum: usize,
+) -> FerrosGrynnResult<BTreeMap<ClassId, u64>>
+where
+	ReadPage: FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+{
+	decode_class_range_bounded(read_page, layout.class_first, layout.class_pages, maximum)
+}
+
+/// Keeps the legacy reader and schema-bounded source reader on one validator.
+fn decode_class_range_bounded<ReadPage>(
+	mut read_page: ReadPage,
+	first: Option<PageNo>,
+	page_count: u32,
+	maximum: usize,
+) -> FerrosGrynnResult<BTreeMap<ClassId, u64>>
+where
+	ReadPage: FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+{
 	let count = usize::try_from(page_count)
 		.map_err(|_error| invalid("class statistics page count exceeds usize"))?;
+	if count > maximum.div_ceil(PER_PAGE) {
+		return Err(invalid("class statistics pages exceed the owning schema bound"));
+	}
 	let Some(first) = first else {
 		if count != 0 {
 			return Err(invalid("class statistics range has pages without a start"));
@@ -102,12 +141,45 @@ where
 				return Err(invalid_page(page_no, "class statistics are not strictly ordered"));
 			}
 			previous = Some(class);
+			if result.len() >= maximum {
+				return Err(invalid("class statistics entries exceed the owning schema bound"));
+			}
 			if result.insert(class, atom_count).is_some() {
 				return Err(invalid_page(page_no, "duplicate class statistic"));
 			}
 		}
 	}
 	Ok(result)
+}
+
+/// Patches accepted class populations without changing keys or page layout.
+/// Matched targets are removed so the caller can reject missing classes.
+///
+/// # Errors
+/// Rejects malformed pages and unordered or duplicate class keys.
+pub(in crate::storage) fn rewrite_class_statistics_page(
+	page: &mut AlignedPage,
+	page_no: PageNo,
+	expected_next: Option<PageNo>,
+	targets: &mut BTreeMap<ClassId, u64>,
+) -> FerrosGrynnResult<bool> {
+	let entries = decode_page(page, page_no, expected_next)?;
+	if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+		return Err(invalid_page(page_no, "class statistics are not strictly ordered"));
+	}
+	let mut changed = false;
+	for (index, (class, previous)) in entries.into_iter().enumerate() {
+		if let Some(count) = targets.remove(&class)
+			&& count != previous
+		{
+			write_u64(page.as_bytes_mut(), ENTRIES + index * ENTRY_BYTES + 8, count);
+			changed = true;
+		}
+	}
+	if changed {
+		page.seal()?;
+	}
+	Ok(changed)
 }
 
 /// Encodes page.

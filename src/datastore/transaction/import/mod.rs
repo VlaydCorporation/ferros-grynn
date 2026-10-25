@@ -119,6 +119,7 @@ impl Transaction {
 	/// boundary.
 	/// Returns capture admission/replay failures without clearing pending work.
 	pub(crate) fn seal_import_segment(&mut self, commit_ts: u64) -> FerrosGrynnResult<bool> {
+		self.validate_write_set_payload()?;
 		let captured = self.retain_import_segment()?;
 		for key in self.writes.keys().copied().chain(self.range_writes.iter().copied()) {
 			self.working.mark_version(key, commit_ts);
@@ -131,6 +132,7 @@ impl Transaction {
 		self.requirements.clear();
 		self.fanout_reservations.clear();
 		self.write_bytes = 0;
+		self.payload_bytes = 0;
 		self.mutations.clear();
 		self.change_journal.clear_segment();
 		Ok(captured)
@@ -150,6 +152,7 @@ impl Transaction {
 		full_validation: bool,
 	) -> FerrosGrynnResult<(Self, Vec<IndexId>)> {
 		self.ensure_live()?;
+		self.validate_write_set_payload()?;
 		let graphs = self
 			.working
 			.schema

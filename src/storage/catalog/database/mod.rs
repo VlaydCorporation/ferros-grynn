@@ -35,6 +35,8 @@ mod validate;
 /// Regression tests for database behavior.
 mod tests;
 
+use std::sync::Arc;
+
 use crate::{
 	datastore::{
 		AnalyzerId,
@@ -342,8 +344,8 @@ pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) next_graph_id: u64,
 	/// Next schema id associated with this database catalog.
 	pub(in crate::storage) next_schema_id: u64,
-	/// Time zones associated with this database catalog.
-	pub(in crate::storage) time_zones: Vec<Text>,
+	/// Immutable identifier order shared with exact physical snapshots.
+	pub(in crate::storage) time_zones: Arc<[Text]>,
 	/// Atom store associated with this database catalog.
 	pub(in crate::storage) atom_store: AtomStoreCatalogBinding,
 	/// Classes associated with this database catalog.

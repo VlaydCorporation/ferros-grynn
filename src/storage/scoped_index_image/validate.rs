@@ -37,10 +37,12 @@ pub(in crate::storage) fn validate_scoped_index_images(
 						actual.push(atom);
 						Ok(())
 					})?;
-					let expected = expected
+					let mut expected = expected
 						.into_iter()
 						.map(|atom| DiskAtomRef::from_parts(kind, atom.slot()))
 						.collect::<FerrosGrynnResult<Vec<_>>>()?;
+					// Disk refs discard generation; class pages use slot order.
+					expected.sort_unstable_by_key(|atom| atom.slot());
 					if actual != expected {
 						return Err(invalid("class index disagrees with graph occurrences"));
 					}

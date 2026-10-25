@@ -24,6 +24,32 @@ mod live_reader;
 mod open;
 mod physical_index;
 mod physical_traversal;
+/// Checked streaming merge shared by immutable class and label arrays.
+mod point_array;
+/// Base Hot pages, property appends and allocator ceilings.
+mod point_base;
+/// Selected immutable class posting arrays.
+mod point_class;
+/// Retained endpoint headers follow the global database snapshot boundary.
+mod point_endpoint;
+/// Stable overlays and edge weights share the sparse publication barrier.
+mod point_graph;
+/// Shared NODE/EDGE membership and incident adjacency publication.
+mod point_incidence;
+/// Selected Primary/scalar images share the source publication barrier.
+mod point_index;
+/// Selected immutable label arrays and shared dense-name resolution.
+mod point_label;
+/// Forward/reverse membership leaves and selected physical-source fallbacks.
+mod point_membership;
+/// Shared label namespace and bounded physical-publication preparation.
+mod point_namespace;
+/// Final allocator states retain transient and reused occurrence slots.
+mod point_occurrence;
+/// Eager statistics roots and exact sparse child-counter publication.
+mod point_statistics;
+/// Sparse plans retain unchanged AtomStore and graph files.
+mod point_update;
 mod statistics;
 
 #[cfg(test)]
@@ -31,7 +57,7 @@ mod statistics;
 mod tests;
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fs,
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
@@ -76,7 +102,7 @@ use self::{
 		build_generation,
 		build_import_generation,
 		build_streamed_generation_with_reuse,
-		prime_value_context,
+		point_value_context,
 	},
 	index_delta::IndexReusePlan,
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
@@ -95,12 +121,11 @@ use super::{
 	graph_store::GraphFileSet,
 	graph_superblock::GraphSuperblock,
 	hybrid_engine::HybridReadEngine,
-	image_io::{read_pages, stage_pages},
 	job_catalog::{JobCatalog, MAX_JOB_CATALOG_BYTES},
 	local::{DatabaseLock, write_database_superblock},
 	metadata_cow::{select_metadata_bytes, write_metadata_bytes},
 	page_io::{PageIo, PageIoMode},
-	property_dictionary::{BuiltPropertyDictionary, extend_property_dictionary},
+	property_dictionary::plan_property_dictionary_update,
 	quarantine::{QuarantineArchiveReader, QuarantineArtifact, quarantine_path},
 	types::{CheckpointGeneration, CommitTs, Lsn, TxId},
 	wal::FrameWal,
@@ -115,6 +140,7 @@ use crate::{
 		LocalOptions,
 		LocalStorageStatus,
 		MaintenanceJobInfo,
+		PublicationDelta,
 		SchemaAnalyzer,
 		SchemaVersion,
 	},
@@ -334,7 +360,7 @@ impl LocalStore {
 		let engine = HybridReadEngine::new(pool_pages);
 		let database = DatabaseRoot::default();
 		let generation = build_generation(&database, 1)?;
-		create_generation_files(root, &generation, true)?;
+		create_generation_files(root, &generation, true, None)?;
 		let job_catalog = JobCatalog::default();
 		let job_path = root.join(JOB_CATALOG_PATH);
 		let job_parent =
@@ -367,7 +393,7 @@ impl LocalStore {
 			&rapidhash::RapidHashSet::default(),
 		)?;
 		let physical_indexes =
-			bind_physical_indexes(&generation.database_catalog, &registry, None)?;
+			bind_physical_indexes(&generation.database_catalog, &registry, None, &BTreeSet::new())?;
 		let state = LocalState {
 			database_superblock_path: superblock_path,
 			database_superblock: superblock,
@@ -443,7 +469,8 @@ impl LocalStore {
 		cleanup_orphan_quarantines(root, &file_catalog)?;
 		cleanup_orphan_changefeeds(root, &file_catalog)?;
 		cleanup::cleanup_orphan_events(root, &file_catalog)?;
-		let physical_indexes = bind_physical_indexes(&database_catalog, &registry, None)?;
+		let physical_indexes =
+			bind_physical_indexes(&database_catalog, &registry, None, &BTreeSet::new())?;
 		let changefeed_files = changefeed::bind_files(&file_catalog, &database_catalog, &registry)?;
 		let state = LocalState {
 			database_superblock_path: root.join(DATABASE_SUPERBLOCK_FILE),
@@ -570,7 +597,7 @@ impl LocalStore {
 		&self,
 		database: &DatabaseRoot,
 		previous: Option<&DatabaseRoot>,
-		changed_records: Option<&std::collections::BTreeSet<RecordId>>,
+		delta: Option<&PublicationDelta>,
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
 		analyze_function: &mut dyn FnMut(
@@ -585,12 +612,16 @@ impl LocalStore {
 		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<()> {
 		if graph_catalog_only {
-			self.persist_graph_catalog(database, dictionary_changed)
+			self.persist_existing_files(database, dictionary_changed, None)
+		} else if let (Some(previous), Some(delta)) = (previous, delta)
+			&& point_update::PointUpdatePlan::eligible(previous, database, delta)?
+		{
+			self.persist_existing_files(database, dictionary_changed, Some((previous, delta)))
 		} else {
 			self.persist_generation(
 				database,
 				previous,
-				changed_records,
+				delta.map(|delta| &delta.records),
 				false,
 				None,
 				None,
@@ -601,11 +632,13 @@ impl LocalStore {
 		}
 	}
 
-	/// Returns the persist graph catalog result.
-	fn persist_graph_catalog(
+	/// Publishes a catalog and optional sparse data plan through one WAL
+	/// barrier.
+	fn persist_existing_files(
 		&self,
 		database: &DatabaseRoot,
 		dictionary_changed: bool,
+		point_records: Option<(&DatabaseRoot, &PublicationDelta)>,
 	) -> FerrosGrynnResult<()> {
 		let mut state = self.state.lock();
 		if !database.live_catalog().queries.is_empty() {
@@ -624,46 +657,98 @@ impl LocalStore {
 			return Err(invalid("MVCC and frame-WAL commit clocks diverged"));
 		}
 
-		let mut context = super::atom_store_image::value_context(
-			&database.schema,
-			database.dictionary.as_ref().clone(),
+		let mut publication_budget = point_namespace::PublicationBudget::new();
+		let mut context = point_value_context(
+			database,
+			&state._database_catalog.time_zones,
+			&mut publication_budget,
 		)?;
-		prime_value_context(database, &mut context)?;
-		if context.property_dictionary().len() != database.dictionary.len() {
-			return Err(invalid(
-				"graph property value contains dictionary keys absent from the MVCC root",
-			));
-		}
-		let mut catalog = self::catalog::encode_database_catalog(
+		let mut labels = point_records
+			.map(|(previous, delta)| {
+				point_namespace::LabelPlan::build_with_budget(
+					self,
+					&state,
+					previous,
+					database,
+					delta,
+					std::mem::replace(
+						&mut publication_budget,
+						point_namespace::PublicationBudget::new(),
+					),
+				)
+			})
+			.transpose()?;
+		let point = point_records
+			.map(|(previous, delta)| {
+				point_update::PointUpdatePlan::build(
+					self,
+					&state,
+					previous,
+					database,
+					delta,
+					labels.as_mut().ok_or_else(|| invalid("point label plan is absent"))?,
+					&mut context,
+				)
+			})
+			.transpose()?;
+		let mut point_indexes = match point_records {
+			Some((previous, delta)) => point_index::PointIndexPlan::build(
+				self,
+				&state,
+				previous,
+				database,
+				delta,
+				point.as_ref().map(|plan| &plan.graph_arenas),
+				labels.as_mut().ok_or_else(|| invalid("point label plan is absent"))?,
+				&mut context,
+			)?,
+			None => None,
+		};
+		let endpoints = point_endpoint::EndpointRevisionPlan::build(
+			self,
+			&state,
+			database,
+			labels.as_mut().map_or(&mut publication_budget, |plan| &mut plan.budget),
+			point_indexes.as_ref().map(|plan| &plan.endpoints),
+		)?;
+		let mut catalog = self::catalog::encode_point_catalog(
 			database,
 			state._database_catalog.atom_store,
-			&state.bindings.graphs,
-			&state.bindings.physical_indexes,
-			&state.bindings.physical_deltas,
+			&state.bindings,
+			point_indexes.as_ref(),
+			point.as_ref(),
 			&mut context,
 		)?;
-		let mut next_atom_superblock = state.atom_superblock;
-		let mut dictionary_image = None;
+		let mut next_atom_superblock =
+			point.as_ref().map_or(state.atom_superblock, |plan| plan.atom_superblock);
+		let mut dictionary_update = None;
 		if dictionary_changed {
-			let snapshot = self.wal.snapshot();
-			let pages = read_pages(
-				&self.wal,
-				&state.registry,
-				snapshot,
-				crate::datastore::DataSpaceId::Database,
-				state.bindings.atoms.property_dictionary,
-				state.atom_superblock.property_dictionary_pages,
-			)?;
-			let image = extend_property_dictionary(
-				BuiltPropertyDictionary {
-					pages,
+			let update = plan_property_dictionary_update(
+				&mut |number, destination: &mut super::page::AlignedPage| {
+					self.read_update_page_into(
+						&state,
+						super::types::PageKey::new(
+							crate::datastore::DataSpaceId::Database,
+							state.bindings.atoms.property_dictionary,
+							number,
+						),
+						destination,
+					)
 				},
+				state.atom_superblock.property_dictionary_pages,
 				database.dictionary.as_ref(),
 				super::page::PageLsn::ZERO,
 			)?;
-			next_atom_superblock.property_dictionary_pages = u64::try_from(image.pages.len())
-				.map_err(|_error| invalid("property dictionary page count exceeds u64"))?;
-			dictionary_image = Some(image);
+			next_atom_superblock.property_dictionary_pages = update.page_ceiling;
+			// Overlay-only and pure dictionary commits also use database
+			// authority; a failed checkpoint can leave subordinate
+			// home headers ahead.
+			next_atom_superblock.page_lsn = super::page::PageLsn::ZERO;
+			next_atom_superblock.checkpoint_generation = state.database_superblock.generation;
+			next_atom_superblock.backfilled_lsn = state.database_superblock.checkpoint_lsn;
+			next_atom_superblock.checkpoint_record_lsn =
+				state.database_superblock.checkpoint_record_lsn;
+			dictionary_update = Some(update);
 		}
 
 		let capture = catalog
@@ -674,7 +759,8 @@ impl LocalStore {
 			.live_history
 			.iter()
 			.any(|entry| changefeed::fresh_live_groups(database, entry.id).next().is_some());
-		let refresh_files = capture
+		let refresh_files = point_indexes.as_ref().is_some_and(|plan| plan.catalog.is_some())
+			|| capture
 			|| database.bridges.generation
 				!= state._database_catalog.bridges.map_or(0, |binding| binding.generation)
 			|| live_capture
@@ -683,7 +769,8 @@ impl LocalStore {
 			|| !std::sync::Arc::ptr_eq(database.event_outbox(), &state.event_outbox)
 			|| database.changefeed_segments() != &state.changefeed_segments
 			|| database.live_segments() != &state.live_segments;
-		let mut feed_files = Vec::new();
+		let mut feed_files =
+			point_indexes.as_mut().map_or_else(Vec::new, |plan| std::mem::take(&mut plan.files));
 		let mut pending_mappings = None;
 		let mut file_catalog = None;
 		let mut segments = None;
@@ -691,7 +778,11 @@ impl LocalStore {
 		let mut live_graph_segments = None;
 		let mut event_segments = None;
 		if refresh_files {
-			let mut files = state.file_catalog.clone();
+			let mut files = point_indexes
+				.as_ref()
+				.and_then(|plan| plan.catalog.as_ref())
+				.unwrap_or(&state.file_catalog)
+				.clone();
 			pending_mappings = bridge::prepare_catalog(
 				database,
 				&mut files,
@@ -724,13 +815,15 @@ impl LocalStore {
 		#[cfg(test)]
 		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
 		let mut tx = self.wal.begin_tx()?;
-		if let Some(image) = &dictionary_image {
-			stage_pages(
-				&mut tx,
-				crate::datastore::DataSpaceId::Database,
-				state.bindings.atoms.property_dictionary,
-				&image.pages,
-			)?;
+		endpoints.stage(&mut tx)?;
+		if let Some(plan) = &point {
+			plan.stage(&mut tx)?;
+		}
+		if let Some(plan) = &point_indexes {
+			plan.stage(&mut tx)?;
+		}
+		if let Some(update) = &dictionary_update {
+			update.stage(&mut tx, state.bindings.atoms.property_dictionary)?;
 			tx.stage_page(
 				super::types::PageKey::new(
 					crate::datastore::DataSpaceId::Database,
@@ -747,13 +840,14 @@ impl LocalStore {
 		}
 		let mut pending_feeds = cleanup::PendingChangefeedFiles::new(&self.root, &feed_files)?;
 		let registry = if let Some(files) = &file_catalog {
-			create_file_images(&self.root, &feed_files, false, false)?;
+			create_file_images(&self.root, &feed_files, false, false, Some(&state.registry))?;
 			#[cfg(test)]
 			inject_generation_failure(GenerationFailurePoint::AfterFileSync)?;
-			Some(FileRegistry::open(
+			Some(FileRegistry::open_with_reuse(
 				files.registrations(&self.root),
 				self.io.file_open_mode(),
 				&changefeed::degradable(files),
+				Some(&state.registry),
 			)?)
 		} else {
 			None
@@ -765,6 +859,19 @@ impl LocalStore {
 			}
 			_ => None,
 		};
+		// Leaf-only publication also needs fresh owners; pinned old caches stay
+		// immutable.
+		let physical_indexes = point_indexes
+			.as_ref()
+			.map(|plan| {
+				bind_physical_indexes(
+					&catalog,
+					registry.as_ref().unwrap_or(&state.registry),
+					Some(&state.physical_indexes),
+					&plan.changed,
+				)
+			})
+			.transpose()?;
 		let retired_feeds = if let Some(files) = &file_catalog {
 			cleanup::RetiredChangefeedFile::between(&self.root, &state.file_catalog, files)?
 		} else {
@@ -784,6 +891,9 @@ impl LocalStore {
 			inject_generation_failure(GenerationFailurePoint::BeforeWalCommit)?;
 		}
 		pending_feeds.preserve_for_recovery();
+		if let Some(cleanup) = point_indexes.as_mut().and_then(|plan| plan.cleanup.as_mut()) {
+			cleanup.preserve_for_recovery();
+		}
 		if let Some(cleanup) = &mut pending_mappings {
 			cleanup.preserve_for_recovery();
 		}
@@ -791,7 +901,14 @@ impl LocalStore {
 		if outcome.commit_ts().get() != database.commit_ts {
 			return Err(invalid("WAL published an unexpected logical commit timestamp"));
 		}
+		catalog::install_graph_metadata(&mut state.bindings.graphs, &catalog);
 		state._database_catalog = catalog;
+		if let Some(plan) = point_indexes {
+			catalog::install_point_files(&mut state.bindings, plan);
+		}
+		if let Some(indexes) = physical_indexes {
+			state.physical_indexes = indexes;
+		}
 		if let Some(retired) = retired_mappings {
 			state.retired_generations.push(retired);
 		}
@@ -820,6 +937,18 @@ impl LocalStore {
 		}
 		state.retired_changefeeds.extend(retired_feeds);
 		state.atom_superblock = next_atom_superblock;
+		if let Some(plan) = &point {
+			for (&graph, &header) in &plan.graph_superblocks {
+				// Preparation validated each existing key under this same lock;
+				// replacing its value cannot allocate a new map entry.
+				state.graph_superblocks.insert(graph, header);
+			}
+		}
+		if point.as_ref().is_some_and(|plan| plan.replaces_statistics) {
+			// Counter preparation completed the candidate before WAL; old
+			// snapshots retain their own lazy owner and its WAL pin.
+			state.physical_statistics = None;
+		}
 		// Catalog-only publication keeps the immutable statistics files and
 		// their deferred binding, including across LIVE ACK and CLOSE.
 		if database.live_catalog().queries.is_empty() {
@@ -877,6 +1006,9 @@ impl LocalStore {
 			&Vector,
 		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
+		if database.statistics.auxiliary_deferred() {
+			return Err(invalid("full generation requires prepared publication statistics"));
+		}
 		self.wal.ensure_writable()?;
 		let mut reuse = match (previous, changed_records, import) {
 			(Some(previous), Some(changed), false) => {
@@ -973,19 +1105,20 @@ impl LocalStore {
 			stage_generation(&mut tx, &generation)?;
 		}
 		if import {
-			create_import_generation_files(&self.root, &generation)?;
+			create_import_generation_files(&self.root, &generation, &state.registry)?;
 		} else {
-			create_generation_files(&self.root, &generation, false)?;
+			create_generation_files(&self.root, &generation, false, Some(&state.registry))?;
 		}
 		if let Some(artifact) = quarantine.as_deref_mut() {
 			artifact.install(&self.root)?;
 		}
 		#[cfg(test)]
 		inject_generation_failure(GenerationFailurePoint::AfterFileSync)?;
-		let registry = FileRegistry::open(
+		let registry = FileRegistry::open_with_reuse(
 			generation.file_catalog.registrations(&self.root),
 			self.io.file_open_mode(),
 			&changefeed::degradable(&generation.file_catalog),
+			Some(&state.registry),
 		)?;
 		let feed_pins = changefeed::bind_files(
 			&generation.file_catalog,
@@ -1001,6 +1134,7 @@ impl LocalStore {
 			&generation.database_catalog,
 			&registry,
 			Some(&state.physical_indexes),
+			&BTreeSet::new(),
 		)?;
 		let retired = RetiredGeneration::between(
 			&self.root,
@@ -1222,10 +1356,16 @@ fn sweep_retired_generations(state: &mut LocalState) {
 		let rotate = 1024 % state.retired_changefeeds.len();
 		state.retired_changefeeds.rotate_left(rotate);
 	}
-	state.retired_generations.retain_mut(|generation| {
-		failures = failures.saturating_add(generation.sweep());
-		!generation.is_empty()
-	});
+	if let Ok(pinned) = cleanup::pin_retired_files(&state.retired_generations) {
+		state.retired_generations.retain_mut(|generation| {
+			failures = failures.saturating_add(generation.sweep(&pinned));
+			!generation.is_empty()
+		});
+	} else {
+		// Cleanup remains retryable when even its bounded pin list cannot be
+		// reserved; the source commit has already been published.
+		failures = failures.saturating_add(1);
+	}
 	state.generation_cleanup_failures = state.generation_cleanup_failures.saturating_add(failures);
 }
 

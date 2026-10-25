@@ -146,7 +146,6 @@ impl RowCollector {
 		let bytes = estimated_row_bytes(&row);
 		let must_spill = self.force_disk || !self.account.reserve(bytes);
 		if must_spill {
-			self.account.release_all();
 			let mut sorter = QuerySorter::new(
 				&self.root,
 				read.spill_context(snapshot)?,
@@ -154,13 +153,18 @@ impl RowCollector {
 					descending: false,
 					nulls_first: false,
 				}],
-				std::mem::replace(&mut self.account, BarrierAccount::new(0)),
+				self.account.empty_shared(),
 				true,
 			);
-			for row in self.memory.drain(..) {
+			for row in std::mem::take(&mut self.memory) {
+				let retained = estimated_row_bytes(&row);
 				sorter.push(row_record(row, self.next_ordinal))?;
+				// The iterator retains its backing row slots until the loop
+				// ends.
+				self.account.release(retained.saturating_sub(size_of::<Row>()));
 				self.next_ordinal += 1;
 			}
+			self.account.release_all();
 			self.memory_bytes = 0;
 			self.sorter = Some(sorter);
 		}
@@ -469,4 +473,76 @@ fn decode_u64(value: Option<Value>, name: &str) -> FerrosGrynnResult<u64> {
 /// Returns the invalid row number result.
 fn invalid_row_number(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_file(format!("query row run has invalid {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		datastore::Datastore,
+		test_assertions::{AssertOption as _, AssertResult as _},
+	};
+
+	/// Spill context must overlap the still-owned resident input buffer.
+	#[test]
+	fn collector_spill_keeps_resident_rows_admitted() {
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		for ordinal in 0..128 {
+			setup.intern_property(&format!("unused_{ordinal}")).assert_ok();
+		}
+		setup.commit().assert_ok();
+		let root = store.inner.current_root();
+		let options = crate::gql::QueryExecutionOptions {
+			barrier_memory_bytes: std::num::NonZeroUsize::new(100 << 10).assert_some(),
+			..Default::default()
+		};
+		let control = ExecutionControl::new(&options, None);
+		let observe = |_| {};
+		let work = |_| Ok(());
+		let read = RootRead::new(&root, &control, &observe, &work, std::env::temp_dir());
+		let snapshot = read.snapshot().assert_ok();
+		let mut rows = RowCollector::new(&read, &control, false);
+		for _ in 0..2 {
+			rows.push(&read, snapshot, Row::new(vec!["x".repeat(40 << 10).into()])).assert_ok();
+		}
+		assert!(rows.push(&read, snapshot, Row::new(vec!["x".repeat(40 << 10).into()])).is_err());
+		assert!(control.barrier_memory_peak() <= options.barrier_memory_bytes.get());
+	}
+
+	/// The row scope releases scratch while the sorter keeps its codec context.
+	#[test]
+	fn collector_forced_spill_retains_context_and_releases_row_scratch() {
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		for ordinal in 0..128 {
+			setup.intern_property(&format!("unused_{ordinal}")).assert_ok();
+		}
+		setup.commit().assert_ok();
+		let root = store.inner.current_root();
+		let control = ExecutionControl::new(&crate::gql::QueryExecutionOptions::default(), None);
+		let observe = |_| {};
+		let work = |_| Ok(());
+		let read = RootRead::new(&root, &control, &observe, &work, std::env::temp_dir());
+		let snapshot = read.snapshot().assert_ok();
+		let fields = read.fields();
+		let available = control.barrier_memory_available();
+		let mut rows = RowCollector::new(&read, &control, true);
+		for ordinal in 0..8 {
+			let _scope = fields.transient_scope();
+			fields.admit(1 << 20).assert_ok();
+			rows.push(&read, snapshot, Row::new(vec![ordinal.into()])).assert_ok();
+		}
+		assert!(control.barrier_memory_available() < available - (32 << 10));
+		assert!(control.barrier_memory_available() > available - (1 << 20));
+		let rows = rows.finish().assert_ok();
+		assert!(matches!(&rows, RowSet::Disk { .. }));
+		let mut count = 0;
+		rows.consume(|_row| {
+			count += 1;
+			Ok(())
+		})
+		.assert_ok();
+		assert_eq!(count, 8);
+	}
 }

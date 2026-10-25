@@ -1,7 +1,7 @@
 //! Backend ownership and resource-policy conversion for one MVCC store.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fs,
 	num::NonZeroUsize,
 	path::PathBuf,
@@ -35,7 +35,7 @@ use super::{
 use crate::{
 	gql::PureFunctionEvaluator,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{AtomKind, GraphId, GraphStorageMode},
+	graph::{AtomId, AtomKind, GraphId, GraphStorageMode},
 	stats::StatisticsStore,
 	storage::{
 		LocalChangefeedSnapshot,
@@ -51,6 +51,23 @@ use crate::{
 	},
 	values::{RecordId, Uuid, Vector, storage::DecodeContext},
 };
+
+/// Final replay targets needed by physical publication.
+#[derive(Debug)]
+pub struct PublicationDelta {
+	/// Logical keys retained for existing index and full-generation reuse.
+	pub(crate) records: BTreeSet<RecordId>,
+	/// Slots include transient allocations whose RecordId no longer exists.
+	pub(crate) global_slots: BTreeSet<u64>,
+	/// Explicit graph-local property targets after final replay remapping.
+	pub(crate) overlays: BTreeSet<(GraphId, super::GlobalAtomId)>,
+	/// Generation-aware occurrence targets after final replay remapping.
+	pub(crate) incidence: BTreeSet<(GraphId, AtomId)>,
+	/// Membership targets retain both the graph and final global identity.
+	pub(crate) memberships: BTreeSet<(GraphId, super::GlobalAtomId)>,
+	/// A closed journal subset excludes unplanned graph mutation categories.
+	pub(crate) point_graph_only: bool,
+}
 
 /// Store inner state.
 pub struct StoreInner {
@@ -164,7 +181,7 @@ impl StoreInner {
 		&self,
 		root: &mut DatabaseRoot,
 		previous: Option<&DatabaseRoot>,
-		changed_records: Option<&std::collections::BTreeSet<RecordId>>,
+		delta: Option<&PublicationDelta>,
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
@@ -182,11 +199,17 @@ impl StoreInner {
 				root.resident_geometry = Arc::new(crate::storage::build_resident_geometry_indexes(
 					previous,
 					root,
-					changed_records,
+					delta.map(|delta| &delta.records),
 				)?);
 				Ok(())
 			}
 			StoreBackend::Local(local) => {
+				local.prepare_publication_statistics(
+					root,
+					previous.or(current.as_deref()),
+					delta,
+					graph_catalog_only,
+				)?;
 				if !root.bridges.databases.is_empty() {
 					let _bridge = Arc::make_mut(&mut root.bridges);
 				}
@@ -214,8 +237,8 @@ impl StoreInner {
 					|| {
 						local.persist_root(
 							root,
-							previous,
-							changed_records,
+							previous.or(current.as_deref()),
+							delta,
 							graph_catalog_only,
 							dictionary_changed,
 							&mut analyze,
@@ -344,6 +367,10 @@ impl StoreInner {
 				let _commit = self.commit.lock();
 				let snapshot = self.current_root();
 				let mut next = (*snapshot).clone();
+				// Full publication replaces the lazy binding; hydrate the
+				// actual candidate while its source timestamp
+				// is still authoritative.
+				local.hydrate_statistics(&mut next)?;
 				next.commit_ts = snapshot.commit_ts.checked_add(1).ok_or_else(|| {
 					FerrosGrynnError::invalid_argument(
 						"quarantine removal commit clock is exhausted",
@@ -744,6 +771,11 @@ impl StoreInner {
 			}
 			MaintenanceJobKind::CompactGraph | MaintenanceJobKind::CompactDatabase => {}
 			MaintenanceJobKind::PurgeChangefeed => {}
+		}
+		// Full-generation maintenance needs complete entries, including after a
+		// lazy reopen.
+		if next.indexes.has_deferred_indexes() {
+			next.rebuild_indexes()?;
 		}
 		next.validate_full_import_state()?;
 		Ok(next)

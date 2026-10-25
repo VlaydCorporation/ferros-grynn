@@ -91,6 +91,8 @@ mod external_sort;
 mod label_dict;
 /// Per-label sorted atom arrays.
 mod label_idx;
+/// Shared bounded writer for sorted label-membership streams.
+mod label_stream;
 /// Primary RecordId index.
 mod primary_idx;
 #[cfg(test)]
@@ -112,9 +114,9 @@ pub(super) use count_idx::{
 	CountIndexValue,
 	decode_count_index,
 	encode_count_index,
+	rewrite_count_index_population,
 	stamp_count_index_lsn,
 };
-pub(super) use external_sort::cleanup_external_index_sort;
 pub use external_sort::{
 	ExternalIndexSorter,
 	SortedIndexRecords,
@@ -124,45 +126,53 @@ pub use external_sort::{
 	with_external_sort_control,
 	with_external_sort_options,
 };
+pub(super) use external_sort::{
+	INDEX_SORT_FAN_IN,
+	INDEX_SORT_METADATA_BYTES,
+	cleanup_external_index_sort,
+	with_external_sort_budget,
+};
 pub(super) use label_dict::{
 	LabelDictionary,
+	LabelDictionaryLayout,
 	LabelKind,
 	decode_label_dictionary,
 	encode_label_dictionary,
 };
 pub(super) use label_idx::{build_label_index, visit_label_index_pages};
+pub(super) use label_stream::{LabelIndexWriter, stream_label_index};
 #[cfg(test)]
 use primary_idx::build_primary_index_with_fill;
 pub(super) use primary_idx::{
 	BuiltPrimaryIndex,
 	PrimaryIndexEntry,
+	PrimaryIndexMutation,
 	build_primary_index,
+	leftmost_primary_leaf,
 	lookup_primary_index,
+	mutate_primary_index_leaves,
 	scan_primary_index,
 	visit_primary_index,
+	visit_primary_leaf_page,
 };
-#[cfg(test)]
-pub(super) use primary_idx::{PrimaryIndexMutation, mutate_primary_index_leaves};
 #[cfg(test)]
 use scalar_idx::build_standard_scalar_index_with_fill;
 pub(super) use scalar_idx::{
 	ScalarIndexEntry,
 	ScalarIndexMode,
+	ScalarIndexMutation,
 	build_scalar_index,
+	mutate_scalar_index_leaves,
 	scan_scalar_index,
 	visit_unique_range,
 };
+
+/// Changed index pages remain heap-stable through encoding and WAL staging.
+pub(super) type IndexLeafPages = Vec<(PageNo, Box<AlignedPage>)>;
 #[cfg(test)]
-pub(super) use scalar_idx::{
-	ScalarIndexMutation,
-	apply_scalar_mutations,
-	lookup_scalar_index,
-	mutate_scalar_index_leaves,
-	range_scalar_index,
-};
+pub(super) use scalar_idx::{apply_scalar_mutations, lookup_scalar_index, range_scalar_index};
 pub(super) use streaming::{
 	StreamedIndex,
-	stream_label_index,
 	stream_standard_index,
 	stream_unique_index,
 	stream_unique_index_with_layout,
@@ -205,6 +215,14 @@ const POSTING_ATOMS_PER_PAGE: usize = (PAGE_SIZE - POSTING_ATOMS_OFFSET) / DISK_
 const MUTABLE_PRIMARY_LEAF_BYTES: usize = PAGE_SIZE * 90 / 100;
 /// Configured mutable standard leaf bytes value.
 const MUTABLE_STANDARD_LEAF_BYTES: usize = PAGE_SIZE * 80 / 100;
+
+/// Resource and malformed-input regressions before scalar production promotion.
+#[cfg(test)]
+mod scalar_mutation_tests;
+
+/// Malformed-input regressions before primary production promotion.
+#[cfg(test)]
+mod primary_mutation_tests;
 
 #[cfg(test)]
 /// Regression tests for graph index behavior.
@@ -349,11 +367,13 @@ mod tests {
 			&[
 				PrimaryIndexMutation {
 					key: b"alpha".to_vec(),
-					atom: None,
+					atom: entries[0].atom,
+					insert: false,
 				},
 				PrimaryIndexMutation {
 					key: b"middle".to_vec(),
-					atom: Some(DiskAtomRef::from_parts(AtomKind::Node, 2).assert_ok()),
+					atom: DiskAtomRef::from_parts(AtomKind::Node, 2).assert_ok(),
+					insert: true,
 				},
 			],
 			PageLsn::ZERO,
@@ -361,7 +381,7 @@ mod tests {
 		.assert_ok()
 		.assert_some_with("one root leaf needs no separator update");
 		for (page_no, page) in pages {
-			built.pages[page_no.get() as usize] = page;
+			built.pages[page_no.get() as usize].as_bytes_mut().copy_from_slice(page.as_bytes());
 		}
 		let scanned: Vec<PrimaryIndexEntry<DiskAtomRef>> = scan_primary_index(
 			|page_no, output| {
@@ -390,7 +410,7 @@ mod tests {
 		let built = build_primary_index(&many, PageLsn::ZERO).assert_ok();
 		let page = &built.pages[1];
 		let (count, area_start) = validate_leaf_layout(page).assert_ok();
-		let (separator, _atom) = leaf_entry(page.as_bytes(), area_start, count, 0).assert_ok();
+		let (separator, atom) = leaf_entry(page.as_bytes(), area_start, count, 0).assert_ok();
 		assert!(
 			mutate_primary_index_leaves(
 				|page_no, output| {
@@ -402,7 +422,8 @@ mod tests {
 				built.root,
 				&[PrimaryIndexMutation::<DiskAtomRef> {
 					key: separator.to_vec(),
-					atom: None,
+					atom: DiskAtomRef::from_raw(atom).assert_ok(),
+					insert: false,
 				}],
 				PageLsn::ZERO,
 			)
@@ -439,10 +460,11 @@ mod tests {
 						let ordinal = (index as u64 * 7_919 + 123) % ENTRY_COUNT;
 						Ok(PrimaryIndexMutation {
 							key: format!("person:{:012}", ordinal * 2 + 1).into_bytes(),
-							atom: Some(DiskAtomRef::from_parts(
+							atom: DiskAtomRef::from_parts(
 								AtomKind::Node,
 								ENTRY_COUNT + index as u64,
-							)?),
+							)?,
+							insert: true,
 						})
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -584,8 +606,10 @@ mod tests {
 
 		let mut entries = scan_primary_index(read_page, built.root)?;
 		for mutation in mutations {
-			let atom =
-				mutation.atom.ok_or_else(|| invalid_index("benchmark expects insertions"))?;
+			if !mutation.insert {
+				return Err(invalid_index("benchmark expects insertions"));
+			}
+			let atom = mutation.atom;
 			let index = entries
 				.binary_search_by(|entry| entry.key.cmp(&mutation.key))
 				.assert_err_with("benchmark mutation keys are absent");
@@ -783,7 +807,7 @@ mod tests {
 		.assert_ok()
 		.assert_some_with("a two-key root leaf swap needs no separator update");
 		for (page_no, page) in pages {
-			built.pages[page_no.get() as usize] = page;
+			built.pages[page_no.get() as usize] = *page;
 		}
 		assert_eq!(
 			lookup_scalar_index::<DiskAtomRef>(
@@ -843,6 +867,35 @@ mod tests {
 		assert!(!first_leaf_read);
 	}
 
+	/// Codec sizing follows greedy name packing and complete hash-page
+	/// boundaries.
+	#[test]
+	fn label_dictionary_sizing_matches_encoded_pages() {
+		use crate::test_assertions::AssertResult as _;
+
+		for count in [0, 1, 611, 612, 613, 1_225] {
+			let names = (0..count).map(|id| format!("name-{id:04}")).collect::<Vec<_>>();
+			let dictionary = LabelDictionary::from_labels(
+				names.iter().map(|name| (LabelKind::Node, name.as_str())),
+			)
+			.assert_ok();
+			let measured = LabelDictionaryLayout::measure(&dictionary).assert_ok();
+			let pages = encode_label_dictionary(&dictionary, PageLsn::ZERO).assert_ok();
+			assert_eq!(measured.pages, pages.len());
+			assert_eq!(pages.capacity(), pages.len());
+		}
+		let dictionary = LabelDictionary {
+			node_labels: (0..3).map(|id| format!("{id}{}", "x".repeat(9_000))).collect(),
+			edge_labels: Vec::new(),
+		};
+		let measured = LabelDictionaryLayout::measure(&dictionary).assert_ok();
+		assert_eq!(measured.pages, 5);
+		assert_eq!(
+			encode_label_dictionary(&dictionary, PageLsn::ZERO).assert_ok().len(),
+			measured.pages
+		);
+	}
+
 	/// Verifies label index round trips multiple pages and rejects wrong kind.
 	#[test]
 	fn label_index_round_trips_multiple_pages_and_rejects_wrong_kind() {
@@ -874,6 +927,87 @@ mod tests {
 		assert!(build_label_index(&atoms, AtomKind::Edge, PageLsn::ZERO).is_err());
 	}
 
+	/// Stream packing preserves bulk bytes at empty, full and tail boundaries.
+	#[test]
+	fn label_stream_writer_matches_bulk_page_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
+		let capacity = label_idx::label_atoms_per_page();
+		for count in [0, 1, capacity, capacity + 1, capacity * 2, capacity * 2 + 1] {
+			for kind in [AtomKind::Node, AtomKind::Edge] {
+				let atoms = (0..count)
+					.map(|slot| DiskAtomRef::from_parts(kind, slot as u64))
+					.collect::<FerrosGrynnResult<Vec<_>>>()
+					.assert_ok();
+				let lsn = PageLsn::new(17);
+				let expected = build_label_index(&atoms, kind, lsn).assert_ok();
+				let mut written = 0;
+				let mut writer = label_stream::LabelIndexWriter::new(
+					count,
+					kind,
+					lsn,
+					|no, page: &AlignedPage| {
+						assert_eq!(no.get() as usize, written);
+						assert_eq!(page.as_bytes(), expected[written].as_bytes());
+						page.validate(no)?;
+						written += 1;
+						Ok(())
+					},
+				);
+				for atom in atoms {
+					writer.push(atom).assert_ok();
+				}
+				let built = writer.finish().assert_ok();
+				assert_eq!(built.root, PageNo::new(0));
+				assert_eq!(built.page_count as usize, expected.len());
+				assert_eq!(written, expected.len());
+			}
+		}
+	}
+
+	/// Exact population checks reject short tails within the same page count.
+	#[test]
+	fn label_stream_writer_rejects_count_order_kind_and_write_failures() {
+		use crate::test_assertions::AssertResult as _;
+
+		let first = DiskAtomRef::from_parts(AtomKind::Node, 1).assert_ok();
+		let second = DiskAtomRef::from_parts(AtomKind::Node, 2).assert_ok();
+		let edge = DiskAtomRef::from_parts(AtomKind::Edge, 3).assert_ok();
+		let mut short = label_stream::LabelIndexWriter::new(
+			2,
+			AtomKind::Node,
+			PageLsn::ZERO,
+			|_no, _page: &AlignedPage| Ok(()),
+		);
+		short.push(first).assert_ok();
+		assert!(short.finish().is_err());
+		let mut excess = label_stream::LabelIndexWriter::new(
+			1,
+			AtomKind::Node,
+			PageLsn::ZERO,
+			|_no, _page: &AlignedPage| Ok(()),
+		);
+		excess.push(first).assert_ok();
+		assert!(excess.push(second).is_err());
+		for (left, right) in [(first, first), (second, first), (first, edge)] {
+			let mut invalid = label_stream::LabelIndexWriter::new(
+				2,
+				AtomKind::Node,
+				PageLsn::ZERO,
+				|_no, _page: &AlignedPage| Ok(()),
+			);
+			invalid.push(left).assert_ok();
+			assert!(invalid.push(right).is_err());
+		}
+		let failing = label_stream::LabelIndexWriter::<DiskAtomRef, _>::new(
+			0,
+			AtomKind::Node,
+			PageLsn::ZERO,
+			|_no, _page: &AlignedPage| Err(invalid_index("injected label writer failure")),
+		);
+		assert!(failing.finish().is_err());
+	}
+
 	/// Verifies count index round trips and rejects trailing bytes.
 	#[test]
 	fn count_index_round_trips_and_rejects_trailing_bytes() {
@@ -891,6 +1025,37 @@ mod tests {
 		page.as_bytes_mut()[72] = 1;
 		page.seal().assert_ok();
 		assert!(decode_count_index(&page).is_err());
+	}
+
+	/// Population rewrites preserve WAL clocks and reject foreign owners.
+	#[test]
+	fn count_index_population_rewrite_preserves_clocks_and_checks_owner() {
+		use crate::test_assertions::AssertResult as _;
+		let value = CountIndexValue {
+			class_id: 7,
+			scope: CountIndexScope::Base,
+			atom_count: 42,
+			last_updated_lsn: 11,
+			created_at_lsn: 3,
+		};
+		let mut page = Box::new(encode_count_index(value, PageLsn::new(11)).assert_ok());
+		rewrite_count_index_population(&mut page, 7, CountIndexScope::Base, 0).assert_ok();
+		assert_eq!(decode_count_index(&page).assert_ok(), CountIndexValue {
+			atom_count: 0,
+			..value
+		});
+		let saved = page.as_bytes().to_vec();
+		assert!(rewrite_count_index_population(&mut page, 8, CountIndexScope::Base, 2).is_err());
+		assert!(
+			rewrite_count_index_population(
+				&mut page,
+				7,
+				CountIndexScope::Effective(crate::graph::GraphId::new(1).assert_some()),
+				2
+			)
+			.is_err()
+		);
+		assert_eq!(page.as_bytes().as_slice(), saved);
 	}
 
 	/// Verifies count index wal stamp updates payload and checksum.

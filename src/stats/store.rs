@@ -99,7 +99,8 @@ impl StatisticsStore {
 		self.base_touched || !self.graphs_touched.is_empty()
 	}
 
-	/// Publishes revision.
+	/// Publishes revisions and invalidates distributions with no final label
+	/// owner.
 	pub(crate) fn publish_revision(&mut self, revision: u64) {
 		if self.base_touched {
 			self.base.revision = revision;
@@ -107,6 +108,14 @@ impl StatisticsStore {
 		}
 		for graph in std::mem::take(&mut self.graphs_touched) {
 			if let Some(statistics) = self.graphs.get_mut(&graph) {
+				if !self.auxiliary_deferred {
+					// Replay can remove/re-add a name; only final ownership
+					// invalidates its histogram.
+					let labels = &statistics.labels;
+					statistics.degree_histograms.retain(|key, _| {
+						key.label.as_ref().is_none_or(|label| labels.contains_key(label))
+					});
+				}
 				statistics.revision = revision;
 			}
 		}

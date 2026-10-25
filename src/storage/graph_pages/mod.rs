@@ -20,6 +20,8 @@ mod overlay;
 mod statistics;
 /// Persistent nested-graph references.
 mod subgraphs;
+/// Shared conversion of borrowed runtime topology into physical endpoints.
+mod topology;
 
 pub(super) use adjacency::{
 	EndpointSide,
@@ -27,6 +29,7 @@ pub(super) use adjacency::{
 	decode_adjacency_overflow,
 	decode_cross_level_overflow,
 	encode_adjacency_overflow,
+	encode_adjacency_overflow_into,
 	encode_cross_level_overflow,
 };
 pub(super) use hot::{
@@ -52,10 +55,20 @@ pub(super) use image::{
 	build_import_graph_image,
 	open_graph_image,
 };
-pub(super) use overlay::{GraphOverlayStore, decode_overlay, encode_overlay, read_overlay_record};
+pub(super) use overlay::{
+	GraphOverlayStore,
+	decode_overlay,
+	encode_overlay,
+	encode_overlay_bounded,
+	read_overlay_record,
+};
 pub(super) use statistics::{
+	GraphLabelStatisticsLayout,
+	GraphStatisticsLayout,
+	LabelStatisticsChanges,
 	StatisticsLayout,
 	decode_class_statistics,
+	decode_class_statistics_bounded,
 	decode_class_statistics_range,
 	decode_degree_statistics,
 	decode_label_statistics,
@@ -63,10 +76,28 @@ pub(super) use statistics::{
 	decode_property_statistics_range,
 	decode_statistics_root,
 	encode_class_statistics,
+	encode_graph_label_statistics,
+	encode_graph_statistics,
 	encode_property_statistics,
 	encode_statistics,
+	rewrite_class_statistics_page,
+	rewrite_label_statistics_page,
+	rewrite_statistics_root,
 };
-pub(super) use subgraphs::{SubgraphEntry, decode_subgraph_directory, encode_subgraph_directory};
+pub(super) use subgraphs::{
+	SubgraphEntry,
+	decode_subgraph_directory,
+	encode_subgraph_directory,
+	encode_subgraph_directory_into,
+};
+pub(super) use topology::{
+	EncodedEndpoint,
+	EncodedHotSide,
+	EncodedTopology,
+	HotSideOverflow,
+	plan_hot_side,
+	resolve_topology,
+};
 
 /// Configured hot slot bytes value.
 pub(super) const HOT_SLOT_BYTES: usize = 160;
@@ -178,9 +209,9 @@ const OVERFLOW_RESERVED_OFFSET: usize = OVERFLOW_COUNT_OFFSET + 4;
 /// Byte offset of overflow entries in its encoded layout.
 const OVERFLOW_ENTRIES_OFFSET: usize = OVERFLOW_RESERVED_OFFSET + 4;
 /// Configured overflow refs per page value.
-const OVERFLOW_REFS_PER_PAGE: usize = (PAGE_SIZE - OVERFLOW_ENTRIES_OFFSET) / 8;
+pub(super) const OVERFLOW_REFS_PER_PAGE: usize = (PAGE_SIZE - OVERFLOW_ENTRIES_OFFSET) / 8;
 /// Configured cross level refs per page value.
-const CROSS_LEVEL_REFS_PER_PAGE: usize =
+pub(super) const CROSS_LEVEL_REFS_PER_PAGE: usize =
 	(PAGE_SIZE - OVERFLOW_ENTRIES_OFFSET) / QualifiedDiskAtomRef::ENCODED_BYTES;
 
 /// Byte offset of subgraph next page in its encoded layout.
@@ -196,7 +227,8 @@ const SUBGRAPH_ENTRIES_OFFSET: usize = SUBGRAPH_RESERVED_OFFSET + 16;
 /// Configured subgraph entry bytes value.
 const SUBGRAPH_ENTRY_BYTES: usize = 32;
 /// Configured subgraphs per page value.
-const SUBGRAPHS_PER_PAGE: usize = (PAGE_SIZE - SUBGRAPH_ENTRIES_OFFSET) / SUBGRAPH_ENTRY_BYTES;
+pub(in crate::storage) const SUBGRAPHS_PER_PAGE: usize =
+	(PAGE_SIZE - SUBGRAPH_ENTRIES_OFFSET) / SUBGRAPH_ENTRY_BYTES;
 
 /// Validates overflow header.
 fn validate_overflow_header(

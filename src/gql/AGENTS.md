@@ -409,8 +409,10 @@ SDK spans не отменяют этот учёт. Общий graph assembler с
 
 Direct root SELECT Class callback удерживает transient BarrierAccount от cursor.next
 до завершения projection/visitor. Retained results до insertion отдельно учитывают
-value и qualified identity heap. Nested SELECT, index pages, row unions, ORDER,
-GROUP/JOIN и materializing collectors не включают этот scope: их escaping values
-остаются под прежней conservative policy. Scope восстанавливает enclosing account
+value и qualified identity heap. Materializing Class scan сохраняет такой scope
+до окончания RowCollector::push: RowSet/QuerySorter отдельно удерживает rows,
+а spill EncodeContext допускается в retained account до construction. Остальные
+Nested SELECT, index pages, row unions и GROUP/JOIN escaping values остаются под
+прежней conservative policy. Scope восстанавливает enclosing account
 при EOF/early return/error/cancellation; не сбрасывать общий retained/read budget
 и не делить admission token между infallible deep Row clones. Work limits сохраняются.

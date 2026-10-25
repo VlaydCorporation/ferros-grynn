@@ -68,6 +68,7 @@ use crate::{
 	values::{
 		PropertyMap,
 		RecordId,
+		Text,
 		storage::{DecodeContext, DiskAtomRef, codec::DecodeLimits},
 	},
 };
@@ -202,6 +203,8 @@ pub(super) struct LocalQuerySnapshotInner {
 	pub(super) home_generation: crate::storage::types::CheckpointGeneration,
 	/// Highest WAL position admitted by the snapshot home-page mappings.
 	pub(super) home_ceiling: crate::storage::types::Lsn,
+	/// Exact catalog identifier order retained with these physical files.
+	time_zones: Arc<[Text]>,
 	/// Physical atom files retained by the layout or read snapshot.
 	atoms: PhysicalAtomSnapshot,
 	/// Graph references or physical graph snapshots indexed for resolution.
@@ -287,6 +290,7 @@ impl LocalStore {
 			snapshot,
 			home_generation,
 			home_ceiling,
+			time_zones: Arc::clone(&state._database_catalog.time_zones),
 			atoms,
 			graphs,
 			indexes: state.physical_indexes.clone(),
@@ -347,12 +351,13 @@ impl LocalStore {
 		let Some(graph) = snapshot.0.graphs.get(&graph) else {
 			return Ok(None);
 		};
+		let context = context.with_time_zone_names(&snapshot.0.time_zones);
 		PhysicalTraversalCursor {
 			store: self,
 			snapshot: &snapshot.0,
 			graph,
 		}
-		.fields(owner, context)
+		.fields(owner, &context)
 	}
 }
 
@@ -580,7 +585,7 @@ impl PhysicalTraversalCursor<'_> {
 		};
 		let graph = arena_slot
 			.map(|slot| {
-				self.graph.arena.graph_by_slot.get(&slot).copied().ok_or_else(|| {
+				self.graph.arena.graph_by_slot().get(&slot).copied().ok_or_else(|| {
 					invalid("physical meta owner references an absent graph arena slot")
 				})
 			})

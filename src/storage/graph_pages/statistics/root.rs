@@ -87,6 +87,11 @@ pub(in crate::storage) struct StatisticsLayout {
 }
 
 impl StatisticsLayout {
+	/// Exposes the validated class range without sharing byte offsets.
+	pub(in crate::storage) const fn class_range(self) -> (Option<PageNo>, u32) {
+		(self.class_first, self.class_pages)
+	}
+
 	/// Creates from counts.
 	pub(super) fn from_counts(
 		degree: usize,

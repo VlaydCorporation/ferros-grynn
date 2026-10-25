@@ -23,7 +23,6 @@ use crate::{
 		graph_index::{LabelDictionary, LabelKind, SortedIndexRecords, encode_label_dictionary},
 		graph_pages::{
 			EdgeHotSlot,
-			EdgeSlotFlags,
 			GraphOverlayStore,
 			HOT_SLOTS_PER_PAGE,
 			NodeHotSlot,
@@ -174,7 +173,6 @@ fn build_graph_image_with_membership<Membership>(
 				flags.set(NodeSlotFlags::META, subgraph_slot.is_some());
 				flags.set(NodeSlotFlags::HAS_OVERLAY, occurrence.has_overlay());
 				write_node(&mut nodes, local, &NodeHotSlot {
-					generation: local.generation(),
 					subgraph_slot,
 					label_id: label,
 					out_count: u32_len(incident.outgoing.len(), "node outgoing")?,
@@ -185,10 +183,10 @@ fn build_graph_image_with_membership<Membership>(
 					in_overflow,
 					undirected_overflow,
 					overlay,
-					global_atom: Some(occurrence.global_id()),
 					out_inline: inline_refs(&incident.outgoing),
 					in_inline: inline_refs(&incident.incoming),
 					undirected_inline: inline_refs(&incident.undirected),
+					..NodeHotSlot::isolated(local.generation(), occurrence.global_id())
 				})?;
 			}
 			OccurrenceStateRef::Edge {
@@ -221,31 +219,22 @@ fn build_graph_image_with_membership<Membership>(
 							.ok_or_else(|| invalid("transition graph has no direct arena binding"))
 					})
 					.transpose()?;
-				let mut flags = EdgeSlotFlags::empty();
-				flags.set(EdgeSlotFlags::META, transition_subgraph_slot.is_some());
-				flags.set(EdgeSlotFlags::CROSS_LEVEL, cross_level);
-				flags.set(EdgeSlotFlags::HAS_OVERLAY, occurrence.has_overlay());
-				write_edge(&mut edges, occurrence.local_id(), &EdgeHotSlot {
-					topology: encoded.code,
-					flags,
-					has_transition: transition_subgraph_slot.is_some(),
-					generation: occurrence.local_id().generation(),
-					source_count: u32_len(encoded.source.len(), "edge source")?,
-					target_count: u32_len(encoded.target.len(), "edge target")?,
-					label_id: label,
-					weight: weight.map(f64::try_from).transpose()?,
-					transition_subgraph_slot,
-					source_subgraph_slot: source.graph_slot,
-					target_subgraph_slot: target.graph_slot,
+				// Keep bulk count diagnostics before the fallible weight
+				// conversion.
+				u32_len(encoded.source.len(), "edge source")?;
+				u32_len(encoded.target.len(), "edge target")?;
+				let slot = EdgeHotSlot::live(
+					occurrence.local_id().generation(),
+					occurrence.global_id(),
+					&encoded,
+					(&source, &target),
+					cross_level,
+					label,
+					weight.map(f64::try_from).transpose()?,
 					overlay,
-					source_overflow: source.local_overflow,
-					target_overflow: target.local_overflow,
-					global_atom: Some(occurrence.global_id()),
-					source_subgraph_overflow: source.graph_overflow,
-					target_subgraph_overflow: target.graph_overflow,
-					source_inline: source.inline,
-					target_inline: target.inline,
-				})?;
+					transition_subgraph_slot,
+				)?;
+				write_edge(&mut edges, occurrence.local_id(), &slot)?;
 			}
 		}
 	}

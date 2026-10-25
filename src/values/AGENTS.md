@@ -15,7 +15,7 @@
 
 - `runtime/value.rs`, `kind.rs`, `types.rs` — основной `Value`, стабильный
   порядок видов и type descriptions;
-- `runtime/number.rs`, `temporal.rs`, `geometry.rs`, `vector.rs`, `regex.rs` —
+- `runtime/number.rs`, `temporal.rs`, `geometry/mod.rs`, `vector.rs`, `regex.rs` —
   предметные scalar/runtime values;
 - `runtime/array.rs`, `object.rs`, `set.rs`, `range.rs`, `bytes.rs`, `text.rs` —
   runtime collections и owning wrappers;
@@ -24,7 +24,9 @@
 - `runtime/conversions.rs`, `formatting.rs`, `laws.rs`, `closure.rs` —
   conversions, presentation, law tests и runtime-only callable values;
 - `storage/tags_refs.rs` — stable tags и storage references;
-  `dto.rs` — внутренние storage DTO; `context.rs` — conversion contexts;
+  `dto/mod.rs` — внутренние storage DTO; `dto/bounded/` — borrowed conversion
+  с admission до DTO allocations; `context/mod.rs` — conversion contexts;
+  `encode_budget.rs` — operation envelope для DTO, нового context и scratch;
   `order_key.rs` — order-preserving index keys;
 - `storage/codec/encode.rs`, `decode.rs`, `envelope.rs` — canonical payload,
   bounded decoding и versioned archive envelope;

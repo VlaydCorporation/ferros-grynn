@@ -1162,7 +1162,8 @@ mod tests {
 		let root = store.inner.current_root();
 		let options_defaults = InMemoryOptions::default();
 		let options = InMemoryOptions {
-			max_write_set_bytes: 8192,
+			// The recursive source delta fits; two retained FULL images do not.
+			max_write_set_bytes: 160 * 1024,
 			..options_defaults
 		};
 		let limited = Datastore::from_root_for_test(options, (*root).clone());
@@ -1187,6 +1188,7 @@ mod tests {
 			},
 			|session| {
 				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(3)))?;
+				session.apply_item(|tx| tx.set_base_property(&record, key, Value::from(4)))?;
 				Ok(())
 			},
 		);

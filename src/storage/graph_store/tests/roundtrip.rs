@@ -253,6 +253,7 @@ fn open_snapshot(
 		atom_authority,
 		atom_files,
 		&fixture.database.schema,
+		&[],
 	)?;
 	let mut database = DatabaseRoot::default();
 	database.schema = fixture.database.schema.clone();

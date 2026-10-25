@@ -98,7 +98,7 @@ mod vector_distance;
 /// Snapshot-owned logical conflict revisions.
 mod versions;
 pub(crate) use atom_store::{AtomStoreRoot, BaseAtom, GlobalAtomId};
-pub(crate) use backend::{StoreBackend, StoreInner, validate_local_options};
+pub(crate) use backend::{PublicationDelta, StoreBackend, StoreInner, validate_local_options};
 pub(crate) use conflict::ConflictKey;
 pub(crate) use identity::DataSpaceId;
 pub use import::{
@@ -117,9 +117,11 @@ pub use import::{
 	QuarantinedItem,
 };
 pub(crate) use index_store::{
+	IndexAddress,
 	IndexBinding,
 	IndexEntries,
 	IndexStoreRoot,
+	PreparedIndexChange,
 	index_context,
 	rebuild_index_store,
 	rebuild_lookup_index_store,

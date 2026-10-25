@@ -19,6 +19,11 @@ impl Bytes {
 		self.0.len()
 	}
 
+	/// Returns the retained allocation size, including spare byte capacity.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		self.0.capacity()
+	}
+
 	/// Reports whether this `Bytes` contains no logical elements.
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()

@@ -20,6 +20,7 @@ use crate::{
 		ClassIndexKind,
 		ClassIndexOptions,
 		DataSpaceId,
+		GlobalAtomId,
 		IndexId,
 		IndexScope,
 		SchemaVersion,
@@ -31,7 +32,13 @@ use crate::{
 		file_registry::{FileRegistry, RegisteredDataFile},
 		fulltext_index::{DecodedFulltextIndex, decode_fulltext_index},
 		fulltext_index_delta::{DecodedFulltextDelta, decode_fulltext_delta},
-		graph_index::{CountIndexScope, ScalarIndexMode, decode_count_index, scan_scalar_index},
+		graph_index::{
+			CountIndexScope,
+			ScalarIndexEntry,
+			ScalarIndexMode,
+			decode_count_index,
+			scan_scalar_index,
+		},
 		hybrid_engine::MAX_READ_SCOPE_OPERATIONS,
 		page::{AlignedPage, PageHeader, PageNo},
 		vector_index::{
@@ -518,21 +525,33 @@ impl PhysicalIndexFile {
 				} else {
 					ScalarIndexMode::Unique
 				};
-				let entries =
-					scan_scalar_index::<DiskAtomRef>(&mut read_page, self.binding.root, mode)?
-						.into_iter()
-						.map(|entry| PhysicalScalarGroup {
-							key: entry.key,
-							atoms: entry
-								.atoms
-								.into_iter()
-								.map(|atom| PhysicalIndexAtom {
-									kind: atom.kind(),
-									slot: atom.slot(),
-								})
-								.collect(),
-						})
-						.collect();
+				// Base postings retain allocator generations; Effective
+				// postings encode only graph-local kind/slot
+				// addresses.
+				let entries = match self.scope {
+					IndexScope::Base => scalar_groups(
+						scan_scalar_index::<GlobalAtomId>(&mut read_page, self.binding.root, mode)?,
+						|atom| {
+							Ok(PhysicalIndexAtom {
+								kind: atom
+									.kind()
+									.ok_or_else(|| invalid("scalar index atom is null"))?,
+								slot: atom.slot(),
+							})
+						},
+					)?,
+					IndexScope::Effective {
+						..
+					} => scalar_groups(
+						scan_scalar_index::<DiskAtomRef>(&mut read_page, self.binding.root, mode)?,
+						|atom| {
+							Ok(PhysicalIndexAtom {
+								kind: atom.kind(),
+								slot: atom.slot(),
+							})
+						},
+					)?,
+				};
 				PhysicalIndexEntries::Scalar(entries)
 			}
 			ClassIndexKind::Count => {
@@ -1256,13 +1275,42 @@ fn read_all_pages(
 	Ok(pages)
 }
 
+/// Normalizes decoded addresses for resolution against the pinned snapshot.
+///
+/// # Errors
+///
+/// Returns the address validator's error without caching a partial decode.
+fn scalar_groups<Address>(
+	entries: Vec<ScalarIndexEntry<Address>>,
+	mut address: impl FnMut(Address) -> FerrosGrynnResult<PhysicalIndexAtom>,
+) -> FerrosGrynnResult<Vec<PhysicalScalarGroup>> {
+	entries
+		.into_iter()
+		.map(|entry| {
+			Ok(PhysicalScalarGroup {
+				key: entry.key,
+				atoms: entry
+					.atoms
+					.into_iter()
+					.map(&mut address)
+					.collect::<FerrosGrynnResult<_>>()?,
+			})
+		})
+		.collect()
+}
+
 /// Binds catalog identities to lazy registered handles without opening the
 /// underlying native files. An unchanged binding reuses its prior handle so
 /// resident decoded state survives unrelated catalog publications.
+/// Changed leaf bindings receive new owners even when file/root stay equal.
+///
+/// # Errors
+/// Rejects duplicate identities, absent files and exhausted cache namespaces.
 pub(super) fn bind_physical_indexes(
 	catalog: &DatabaseCatalog,
 	registry: &FileRegistry,
 	previous: Option<&BTreeMap<IndexId, Arc<PhysicalIndexFile>>>,
+	invalidated: &BTreeSet<IndexId>,
 ) -> FerrosGrynnResult<BTreeMap<IndexId, Arc<PhysicalIndexFile>>> {
 	let mut files = BTreeMap::new();
 	for class in &catalog.classes {
@@ -1276,10 +1324,11 @@ pub(super) fn bind_physical_indexes(
 					graph,
 				} => crate::datastore::DataSpaceId::Graph(graph),
 			};
-			if let Some(existing) = previous
-				.and_then(|previous| previous.get(&index.id))
-				.filter(|existing| existing.matches_catalog(class.id, index, binding))
-			{
+			if let Some(existing) =
+				previous.and_then(|previous| previous.get(&index.id)).filter(|existing| {
+					!invalidated.contains(&index.id)
+						&& existing.matches_catalog(class.id, index, binding)
+				}) {
 				if files.insert(index.id, Arc::clone(existing)).is_some() {
 					return Err(invalid("duplicate physical IndexId in database catalog"));
 				}

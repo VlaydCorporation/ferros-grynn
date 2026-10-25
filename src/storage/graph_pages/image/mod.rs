@@ -1,10 +1,14 @@
 //! Complete immutable graph-occurrence image construction and reopen.
 
 mod arena;
+/// Shared immutable canonical maps used by catalog and physical owners.
+mod bindings;
 mod build;
 mod builders;
 mod decode_topology;
 mod open;
+/// Borrowed route validation is independent of arena slot planning.
+mod qualified;
 mod readers;
 mod topology;
 
@@ -12,31 +16,18 @@ mod topology;
 /// Regression tests for image behavior.
 mod tests;
 
-use std::collections::BTreeMap;
-
+pub(in crate::storage) use bindings::GraphArenaBindings;
 pub(in crate::storage) use build::{build_graph_image, build_import_graph_image};
 pub(in crate::storage) use open::open_graph_image;
 
 use crate::{
-	graph::{GraphId, GraphRef},
+	graph::GraphRef,
 	storage::{
 		graph_index::BuiltPrimaryIndex,
 		graph_superblock::GraphSuperblock,
 		page::AlignedPage,
 	},
 };
-
-/// Runtime catalog bindings accompanying one graph image.
-///
-/// The durable form belongs to `FGDC`; the page image stores only compact
-/// root-arena slots.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(in crate::storage) struct GraphArenaBindings {
-	/// Graph by slot associated with this graph arena bindings.
-	pub(in crate::storage) graph_by_slot: BTreeMap<u32, GraphId>,
-	/// Scope by slot associated with this graph arena bindings.
-	pub(in crate::storage) scope_by_slot: BTreeMap<u32, Box<[crate::graph::AtomId]>>,
-}
 
 /// Complete immutable graph-local generation used by WAL publication.
 pub(in crate::storage) struct BuiltGraphImage<Membership = BuiltPrimaryIndex> {

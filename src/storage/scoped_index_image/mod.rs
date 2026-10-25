@@ -12,7 +12,12 @@ mod stream;
 mod validate;
 mod vector;
 
-pub(in crate::storage) use build::{build_scoped_index_images, local_address};
+pub(in crate::storage) use build::{
+	build_scoped_index_images,
+	explicit_index_paths,
+	label_filename,
+	local_address,
+};
 pub(in crate::storage) use fulltext::{
 	build_fulltext_index_images,
 	write_streamed_fulltext_index_images,
@@ -29,6 +34,7 @@ pub(in crate::storage) use model::{
 	StreamedScopedIndexImages,
 };
 pub(in crate::storage) use stream::{
+	write_streamed_binding,
 	write_streamed_file,
 	write_streamed_scoped_indexes,
 	write_streamed_unique_file,

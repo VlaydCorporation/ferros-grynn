@@ -179,13 +179,111 @@ struct HashBucket {
 	binding: LabelBinding,
 }
 
+/// Exact output allocation and conservative simultaneous encoder scratch.
+pub(in crate::storage) struct LabelDictionaryLayout {
+	/// Root, independently packed name chains and complete hash range.
+	pub(in crate::storage) pages: usize,
+	/// Temporary locations, bindings, buckets and page/hash-key construction.
+	pub(in crate::storage) scratch_bytes: usize,
+}
+
+impl LabelDictionaryLayout {
+	/// Measures the same packing rules used by the encoder before allocation.
+	pub(in crate::storage) fn measure(dictionary: &LabelDictionary) -> FerrosGrynnResult<Self> {
+		validate_dictionary(dictionary)?;
+		let count = dictionary
+			.node_labels
+			.len()
+			.checked_add(dictionary.edge_labels.len())
+			.ok_or_else(|| invalid_index("label dictionary count overflows usize"))?;
+		let (hash_pages, capacity) = hash_layout(count)?;
+		let pages = entry_page_count(&dictionary.node_labels)?
+			.checked_add(entry_page_count(&dictionary.edge_labels)?)
+			.and_then(|pages| pages.checked_add(hash_pages))
+			.and_then(|pages| pages.checked_add(1))
+			.ok_or_else(|| invalid_index("label dictionary page count overflows usize"))?;
+		let bindings = count
+			.checked_mul(size_of::<LabelBinding>())
+			.ok_or_else(|| invalid_index("label dictionary bindings overflow usize"))?;
+		let locations = count
+			.checked_mul(size_of::<NameLocation>())
+			.and_then(|bytes| bytes.checked_add(bindings))
+			.ok_or_else(|| invalid_index("label dictionary locations overflow usize"))?;
+		let longest = dictionary
+			.node_labels
+			.iter()
+			.chain(&dictionary.edge_labels)
+			.map(String::len)
+			.max()
+			.unwrap_or(0);
+		let hash = capacity
+			.checked_mul(size_of::<Option<HashBucket>>())
+			.and_then(|bytes| bytes.checked_add(bindings))
+			.and_then(|bytes| bytes.checked_add(longest))
+			.and_then(|bytes| bytes.checked_add(3))
+			.ok_or_else(|| invalid_index("label dictionary hash scratch overflows usize"))?;
+		let scratch_bytes = locations
+			.max(hash)
+			.checked_add(PAGE_SIZE)
+			.ok_or_else(|| invalid_index("label dictionary scratch overflows usize"))?;
+		Ok(Self {
+			pages,
+			scratch_bytes,
+		})
+	}
+}
+
+/// Counts independently packed name pages without allocating encoded entries.
+fn entry_page_count(labels: &[String]) -> FerrosGrynnResult<usize> {
+	let mut pages = usize::from(!labels.is_empty());
+	let mut offset = ENTRY_DATA_OFFSET;
+	for name in labels {
+		let encoded = name
+			.len()
+			.checked_add(2)
+			.ok_or_else(|| invalid_index("label entry length overflows usize"))?;
+		if encoded > PAGE_SIZE - ENTRY_DATA_OFFSET {
+			return Err(invalid_index("one label does not fit an entry page"));
+		}
+		if offset + encoded > PAGE_SIZE {
+			pages = pages
+				.checked_add(1)
+				.ok_or_else(|| invalid_index("label entry page count overflows usize"))?;
+			offset = ENTRY_DATA_OFFSET;
+		}
+		offset += encoded;
+	}
+	Ok(pages)
+}
+
+/// Sizes the complete hash range, including its unused final-page buckets.
+fn hash_layout(count: usize) -> FerrosGrynnResult<(usize, usize)> {
+	if count == 0 {
+		return Ok((0, 0));
+	}
+	let minimum = count
+		.checked_mul(4)
+		.and_then(|value| value.checked_add(2))
+		.map(|value| value / 3)
+		.ok_or_else(|| invalid_index("label hash capacity overflows usize"))?;
+	let pages = minimum.div_ceil(HASH_BUCKETS_PER_PAGE);
+	let capacity = pages
+		.checked_mul(HASH_BUCKETS_PER_PAGE)
+		.ok_or_else(|| invalid_index("label hash range overflows usize"))?;
+	Ok((pages, capacity))
+}
+
 /// Encodes page zero, two disjoint entry chains, and one complete hash range.
 pub(in crate::storage) fn encode_label_dictionary(
 	dictionary: &LabelDictionary,
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
-	validate_dictionary(dictionary)?;
-	let mut pages = vec![AlignedPage::zeroed()];
+	let layout = LabelDictionaryLayout::measure(dictionary)?;
+	let mut pages = Vec::new();
+	pages
+		.try_reserve_exact(layout.pages)
+		.map_err(|_error| invalid_index("label dictionary page allocation failed"))?;
+	pages.push(AlignedPage::zeroed());
 	let (node_first, node_last, node_locations) =
 		append_entries(&mut pages, LabelKind::Node, &dictionary.node_labels, page_lsn)?;
 	let (edge_first, edge_last, edge_locations) =
@@ -441,16 +539,7 @@ fn append_hash(
 	if bindings.is_empty() {
 		return Ok((PageNo::NULL, 0, 0));
 	}
-	let minimum = bindings
-		.len()
-		.checked_mul(4)
-		.and_then(|value| value.checked_add(2))
-		.map(|value| value / 3)
-		.ok_or_else(|| invalid_index("label hash capacity overflows usize"))?;
-	let page_count = minimum.div_ceil(HASH_BUCKETS_PER_PAGE).max(1);
-	let capacity = page_count
-		.checked_mul(HASH_BUCKETS_PER_PAGE)
-		.ok_or_else(|| invalid_index("label hash range overflows usize"))?;
+	let (page_count, capacity) = hash_layout(bindings.len())?;
 	let mut buckets = vec![None; capacity];
 	for binding in bindings {
 		let name = dictionary

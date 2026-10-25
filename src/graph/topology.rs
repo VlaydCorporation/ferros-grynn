@@ -153,6 +153,42 @@ pub enum EdgeTopology {
 }
 
 impl EdgeTopology {
+	/// Retained endpoint slots, including spare heap capacity of mutable
+	/// topologies.
+	pub(crate) fn retained_endpoint_slots(&self) -> usize {
+		match self {
+			Self::Directed {
+				source,
+				target,
+			}
+			| Self::Bidirectional {
+				source,
+				target,
+			} => {
+				let source_slots = if source.capacity() > INLINE_ENDPOINTS {
+					source.capacity()
+				} else {
+					source.len()
+				};
+				let target_slots = if target.capacity() > INLINE_ENDPOINTS {
+					target.capacity()
+				} else {
+					target.len()
+				};
+				source_slots.saturating_add(target_slots)
+			}
+			Self::Undirected {
+				endpoints,
+			} => {
+				if endpoints.capacity() > INLINE_ENDPOINTS {
+					endpoints.capacity()
+				} else {
+					endpoints.len()
+				}
+			}
+		}
+	}
+
 	/// Returns directed for `EdgeTopology`.
 	pub fn directed<S, T, SE, TE>(source: S, target: T) -> Self
 	where

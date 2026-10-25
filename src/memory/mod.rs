@@ -53,14 +53,43 @@ pub fn tree_allocation_bytes(
 	if count == 0 {
 		return Ok(0);
 	}
+	tree_slot_bytes(count, entry_bytes).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::operation_overflow("runtime tree allocation")
+	})
+}
+
+/// Estimates retained tree storage separately from temporary split scratch.
+/// Rust 1.98 B-trees hold eleven entries per node and at least five per
+/// non-root node. Below eleven total entries only one retained leaf is
+/// possible; an empty map may still own that leaf. Recheck this bound when
+/// updating the toolchain. Entry is the key/value tuple, or the set element.
+///
+/// # Errors
+///
+/// Returns typed overflow when the retained storage is not addressable.
+pub fn tree_retained_bytes<Entry>(count: usize) -> crate::gql_status::FerrosGrynnResult<usize> {
+	let nodes = if count < 11 {
+		1
+	} else {
+		(count - 1) / 5 + 1
+	};
+	// Parent metadata, twelve child pointers and two alignment boundaries.
+	11_usize
+		.checked_mul(size_of::<Entry>())
+		.and_then(|bytes| bytes.checked_add(128))
+		.and_then(|bytes| bytes.checked_add(align_of::<Entry>().checked_mul(2)?))
+		.and_then(|bytes| bytes.checked_mul(nodes))
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::operation_overflow("runtime retained tree")
+		})
+}
+
+/// Applies the shared conservative sparse-node slot and pointer allowance.
+fn tree_slot_bytes(count: usize, entry_bytes: usize) -> Option<usize> {
 	entry_bytes
 		.checked_add(32)
 		.and_then(|bytes| bytes.checked_mul(4))
 		.and_then(|bytes| bytes.checked_mul(count))
-		.and_then(|bytes| bytes.checked_add(4096))
-		.ok_or_else(|| {
-			crate::gql_status::FerrosGrynnError::operation_overflow("runtime tree allocation")
-		})
 }
 
 #[cfg(all(

@@ -30,6 +30,18 @@ pub(super) struct EncodedBaseStatisticsFiles {
 	pub(super) properties: Vec<AlignedPage>,
 }
 
+/// Replaces eager metadata while preserving validated auxiliary page ranges.
+pub(super) fn rewrite_base_statistics_root(
+	page: &mut AlignedPage,
+	statistics: &BaseStatistics,
+	class_pages: u64,
+	property_pages: u64,
+) -> FerrosGrynnResult<BaseStatisticsLayout> {
+	let (_, layout) = decode_base_statistics_root(page, class_pages, property_pages)?;
+	root::encode_base_statistics_root(page, statistics, layout, PageLsn::ZERO)?;
+	Ok(layout)
+}
+
 /// Encodes the two database-global statistics files.
 pub(super) fn encode_base_statistics(
 	statistics: &BaseStatistics,

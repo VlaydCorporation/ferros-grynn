@@ -39,6 +39,15 @@ pub(in crate::values::storage) fn canonicalize_set(
 		let bytes = CanonicalCodec::encode(value.as_ref())?;
 		encoded.push((bytes, value));
 	}
+	finish_set(values, encoded)
+}
+
+/// Shares ordering and duplicate validation across growing and reserved
+/// writers.
+pub(in crate::values::storage) fn finish_set(
+	values: &mut Vec<StorageValue>,
+	mut encoded: Vec<(Vec<u8>, StorageValue)>,
+) -> FerrosGrynnResult<()> {
 	encoded.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 	if encoded.windows(2).any(|pair| pair[0].0 == pair[1].0) {
 		return Err(invalid(0, "set contains duplicate canonical values"));
@@ -48,7 +57,11 @@ pub(in crate::values::storage) fn canonicalize_set(
 }
 
 /// Encodes value for this module.
-pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> FerrosGrynnResult<()> {
+pub(super) fn encode_value(
+	output: &mut Vec<u8>,
+	value: &StorageValue,
+	reserve_children: bool,
+) -> FerrosGrynnResult<()> {
 	match value {
 		StorageValue::None => output.push(TypeTag::None.byte()),
 		StorageValue::Null => output.push(TypeTag::Null.byte()),
@@ -101,7 +114,7 @@ pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> Ferros
 			output.push(TypeTag::Array.byte());
 			write_count(output, values.len())?;
 			for value in values {
-				encode_value(output, value)?;
+				encode_value(output, value, reserve_children)?;
 			}
 		}
 		StorageValue::Set(values) => {
@@ -109,7 +122,13 @@ pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> Ferros
 			write_count(output, values.len())?;
 			let mut previous: Option<Vec<u8>> = None;
 			for value in values {
-				let encoded = CanonicalCodec::encode(value.as_ref())?;
+				let encoded = if reserve_children {
+					// Parent admission already includes these nested child
+					// buffers.
+					CanonicalCodec::encode_bounded(value.as_ref(), usize::MAX)?
+				} else {
+					CanonicalCodec::encode(value.as_ref())?
+				};
 				if previous
 					.as_ref()
 					.is_some_and(|previous| previous.as_slice() >= encoded.as_slice())
@@ -135,11 +154,11 @@ pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> Ferros
 					));
 				}
 				output.extend_from_slice(&key.get().to_le_bytes());
-				encode_value(output, value)?;
+				encode_value(output, value, reserve_children)?;
 				previous = Some(*key);
 			}
 		}
-		StorageValue::Range(value) => encode_range(output, value)?,
+		StorageValue::Range(value) => encode_range(output, value, reserve_children)?,
 		StorageValue::Geometry(value) => {
 			value.validate()?;
 			encode_geometry(output, value)?;
@@ -285,7 +304,11 @@ fn encode_record_object(
 }
 
 /// Encodes range for this module.
-fn encode_range(output: &mut Vec<u8>, value: &StorageRange) -> FerrosGrynnResult<()> {
+fn encode_range(
+	output: &mut Vec<u8>,
+	value: &StorageRange,
+	reserve_children: bool,
+) -> FerrosGrynnResult<()> {
 	output.push(TypeTag::Range.byte());
 	let mut flags = 0;
 	flags |= match value.start {
@@ -300,10 +323,10 @@ fn encode_range(output: &mut Vec<u8>, value: &StorageRange) -> FerrosGrynnResult
 	};
 	output.push(flags);
 	if let StorageBound::Included(value) | StorageBound::Excluded(value) = &value.start {
-		encode_value(output, value)?;
+		encode_value(output, value, reserve_children)?;
 	}
 	if let StorageBound::Included(value) | StorageBound::Excluded(value) = &value.end {
-		encode_value(output, value)?;
+		encode_value(output, value, reserve_children)?;
 	}
 	Ok(())
 }
@@ -497,7 +520,7 @@ fn write_uleb(output: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Returns zigzag encode for this module.
-const fn zigzag_encode(value: i64) -> u64 {
+pub(super) const fn zigzag_encode(value: i64) -> u64 {
 	((value as u64) << 1) ^ ((value >> 63) as u64)
 }
 

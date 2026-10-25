@@ -241,6 +241,46 @@ pub struct GraphIndexRoot {
 	pub(crate) explicit: BTreeMap<IndexId, IndexBinding<AtomId>>,
 }
 
+impl GraphIndexRoot {
+	/// Maintains engine-owned label postings independently of explicit indexes.
+	///
+	/// # Errors
+	/// Rejects a null address or an absent source posting before insertion.
+	pub(super) fn replace_label(
+		&mut self,
+		local: AtomId,
+		before: Option<&Text>,
+		after: Option<&Text>,
+	) -> FerrosGrynnResult<()> {
+		if before == after {
+			return Ok(());
+		}
+		let kind = local.kind().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("live occurrence kind is null")
+		})?;
+		if let Some(label) = before {
+			let key = (kind, label.clone());
+			let members = self.labels.get_mut(&key).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("source label lookup is absent")
+			})?;
+			if !members.remove(&local) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"source label lookup does not contain the occurrence",
+				));
+			}
+			// Empty keys would shift dense durable label IDs away from source
+			// labels.
+			if members.is_empty() {
+				self.labels.remove(&key);
+			}
+		}
+		if let Some(label) = after {
+			self.labels.entry((kind, label.clone())).or_default().insert(local);
+		}
+		Ok(())
+	}
+}
+
 /// All transaction-visible indexes of one immutable database root.
 #[derive(Debug, Clone, Default)]
 pub struct IndexStoreRoot {

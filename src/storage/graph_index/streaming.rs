@@ -241,47 +241,6 @@ pub(in crate::storage) fn stream_standard_index<Address: PrimaryAddress + Ord>(
 	})
 }
 
-/// Writes one dense label array from an externally sorted address stream.
-pub(in crate::storage) fn stream_label_index<Address: PrimaryAddress>(
-	records: &SortedIndexRecords,
-	kind: AtomKind,
-	page_lsn: PageLsn,
-	mut write: impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
-) -> FerrosGrynnResult<StreamedIndex> {
-	let capacity = super::label_idx::label_atoms_per_page();
-	let item_count = records.len()?;
-	let page_count = item_count.max(1).div_ceil(capacity);
-	let mut page_index = 0_usize;
-	let mut atoms = Vec::with_capacity(capacity);
-	let mut previous = None::<Address>;
-	records.visit::<Address>(|_key, address| {
-		if address.kind() != Some(kind)
-			|| previous.is_some_and(|previous| previous.order_key() >= address.order_key())
-		{
-			return Err(invalid_index(
-				"label index atoms have the wrong kind or are not strictly ordered",
-			));
-		}
-		if atoms.len() == capacity {
-			flush_label_page(&mut write, page_index, page_count, &atoms, page_lsn)?;
-			page_index += 1;
-			atoms.clear();
-		}
-		previous = Some(address);
-		atoms.push(address);
-		Ok(())
-	})?;
-	flush_label_page(&mut write, page_index, page_count, &atoms, page_lsn)?;
-	if page_index + 1 != page_count {
-		return Err(invalid_index("label-index sizing pass disagrees with packing pass"));
-	}
-	Ok(StreamedIndex {
-		root: PageNo::new(0),
-		page_count: u64::try_from(page_count)
-			.map_err(|_error| invalid_index("label-index page count exceeds u64"))?,
-	})
-}
-
 /// Sizes unique leaves without retaining encoded output pages.
 fn count_unique_leaves<Address: PrimaryAddress>(
 	records: &SortedIndexRecords,
@@ -717,21 +676,6 @@ fn internal_accepts(group: &[ChildPage], candidate: &ChildPage) -> FerrosGrynnRe
 		.and_then(|used| used.checked_add((group.len() + 1) * size_of::<u64>()))
 		.map(|used| used <= PAGE_SIZE)
 		.ok_or_else(|| invalid_index("internal page size overflows usize"))
-}
-
-/// Encodes and writes one dense label page.
-fn flush_label_page<Address: PrimaryAddress>(
-	write: &mut impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
-	page_index: usize,
-	page_count: usize,
-	atoms: &[Address],
-	page_lsn: PageLsn,
-) -> FerrosGrynnResult<()> {
-	let page_no = usize_page_no(page_index, "label-index page number")?;
-	let next = (page_index + 1 < page_count).then(|| PageNo::new(page_no.get() + 1));
-	let mut page = Box::new(AlignedPage::zeroed());
-	super::label_idx::encode_label_page(&mut page, page_no, page_lsn, next, atoms)?;
-	write(page_no, &page)
 }
 
 /// Returns whether one more leaf entry fits within the selected byte ceiling.

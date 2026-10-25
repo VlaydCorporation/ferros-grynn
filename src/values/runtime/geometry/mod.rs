@@ -128,6 +128,11 @@ impl Position {
 		&self.0
 	}
 
+	/// Counts retained coordinates, including caller-supplied spare capacity.
+	pub(super) fn estimated_heap_bytes(&self) -> usize {
+		self.0.capacity().saturating_mul(size_of::<f64>())
+	}
+
 	/// Consumes the collection and returns its owned element vector.
 	pub fn into_vec(self) -> Vec<f64> {
 		self.0

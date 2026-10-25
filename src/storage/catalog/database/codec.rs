@@ -97,7 +97,7 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 		output.extend_from_slice(&[0; 104]);
 	}
 
-	for name in &catalog.time_zones {
+	for name in catalog.time_zones.iter() {
 		write_string(&mut output, name.as_str(), "time-zone name")?;
 	}
 	for class in &catalog.classes {
@@ -374,7 +374,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 		live_history,
 		next_graph_id,
 		next_schema_id,
-		time_zones,
+		time_zones: time_zones.into(),
 		atom_store: AtomStoreCatalogBinding {
 			generation,
 			primary,
@@ -737,7 +737,7 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 	output.extend_from_slice(&graph.owner_root.map_or(0, GraphId::get).to_le_bytes());
 	write_u32(output, graph.root.as_ref().map_or(0, Vec::len), "graph root value bytes")?;
 	write_u32(output, graph.properties.len(), "graph property count")?;
-	write_u32(output, graph.arena.graph_by_slot.len(), "graph arena slot count")?;
+	write_u32(output, graph.arena.graph_by_slot().len(), "graph arena slot count")?;
 	write_u32(output, graph.indexes.len(), "graph user index count")?;
 	let (endpoint_id, endpoint_version) =
 		graph.edge_endpoint_index.map_or((0, 0), |(id, version)| (id.get(), version.get()));
@@ -753,10 +753,10 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 		write_u32(output, property.value.len(), "graph property value bytes")?;
 		output.extend_from_slice(&property.value);
 	}
-	for (slot, child) in &graph.arena.graph_by_slot {
+	for (slot, child) in graph.arena.graph_by_slot() {
 		let scope = graph
 			.arena
-			.scope_by_slot
+			.scope_by_slot()
 			.get(slot)
 			.ok_or_else(|| invalid("graph arena slot has no scope path"))?;
 		output.extend_from_slice(&slot.to_le_bytes());
@@ -899,10 +899,7 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		owner_root,
 		root,
 		properties,
-		arena: GraphArenaBindings {
-			graph_by_slot,
-			scope_by_slot,
-		},
+		arena: GraphArenaBindings::new(graph_by_slot, scope_by_slot),
 	})
 }
 

@@ -115,7 +115,7 @@ impl Transaction {
 			));
 		}
 
-		let (nodes, edges, removed) = collect_delta(graph, origin, dirty)?;
+		let (nodes, edges, removed) = collect_delta(self, graph, origin, dirty)?;
 		self.detach_removed(reference.id(), &removed)?;
 		let mut locals = BTreeMap::new();
 		for node in &nodes {
@@ -301,6 +301,7 @@ impl Transaction {
 
 /// Collects delta.
 fn collect_delta<Reader: GraphRead>(
+	transaction: &Transaction,
 	graph: &Reader,
 	origin: &MaterializationOrigin,
 	dirty: &[DirtyTarget],
@@ -308,37 +309,60 @@ fn collect_delta<Reader: GraphRead>(
 	let mut nodes = Vec::new();
 	let mut edges = Vec::new();
 	let mut removed = Vec::new();
+	let mut bytes = 0_usize;
 	for target in dirty {
 		let DirtyTarget::Atom(local) = target else {
 			continue;
 		};
 		if let Some(node) = graph.node(*local)? {
-			let record =
-				checked_record(origin, *local, AtomKind::Node, node.record_id()?.into_owned())?;
+			let record = node.record_id()?;
+			let label = node.label_text()?;
+			let properties = node.properties()?;
+			bytes = bytes
+				.saturating_add(size_of::<DesiredNode>())
+				.saturating_add(record.estimated_heap_bytes())
+				.saturating_add(label.as_ref().map_or(0, |label| label.estimated_heap_bytes()))
+				.saturating_add(properties.estimated_heap_bytes());
+			transaction.ensure_capacity(bytes.saturating_mul(2))?;
+			let record = checked_record(origin, *local, AtomKind::Node, record.into_owned())?;
 			nodes.push(DesiredNode {
 				local: *local,
 				record,
-				label: node.label_text()?.map(|label| label.into_owned()),
-				properties: node.properties()?.into_owned(),
+				label: label.map(|label| label.into_owned()),
+				properties: properties.into_owned(),
 				nested_graph: node.inner_graph_ref()?.map(|graph| graph.id()),
 			});
 			continue;
 		}
 		if let Some(edge) = graph.edge(*local)? {
-			let record =
-				checked_record(origin, *local, AtomKind::Edge, edge.record_id()?.into_owned())?;
+			let record = edge.record_id()?;
+			let label = edge.label_text()?;
+			let properties = edge.properties()?;
+			let topology = edge.topology()?;
+			bytes = bytes
+				.saturating_add(size_of::<DesiredEdge>())
+				.saturating_add(record.estimated_heap_bytes())
+				.saturating_add(label.as_ref().map_or(0, |label| label.estimated_heap_bytes()))
+				.saturating_add(properties.estimated_heap_bytes())
+				.saturating_add(crate::graph::estimated_topology_heap_bytes(&topology));
+			transaction.ensure_capacity(bytes.saturating_mul(2))?;
+			let record = checked_record(origin, *local, AtomKind::Edge, record.into_owned())?;
 			edges.push(DesiredEdge {
 				local: *local,
 				record,
-				label: edge.label_text()?.map(|label| label.into_owned()),
-				properties: edge.properties()?.into_owned(),
-				topology: edge.topology()?.into_owned(),
+				label: label.map(|label| label.into_owned()),
+				properties: properties.into_owned(),
+				topology: topology.into_owned(),
 				weight: edge.weight(),
 				transition_graph: edge.transition_graph_ref()?.map(|graph| graph.id()),
 			});
 			continue;
 		}
 		if let Some(source) = origin.source_atom(*local) {
+			bytes = bytes
+				.saturating_add(size_of::<(AtomKind, RecordId)>())
+				.saturating_add(source.id().estimated_heap_bytes());
+			transaction.ensure_capacity(bytes.saturating_mul(2))?;
 			removed.push((source.kind(), source.id().clone()));
 		}
 	}

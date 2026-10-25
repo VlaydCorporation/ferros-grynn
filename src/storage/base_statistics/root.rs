@@ -31,11 +31,11 @@ const RESERVED: usize = 84;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::storage) struct BaseStatisticsLayout {
 	/// Class first associated with this base statistics layout.
-	pub(super) class_first: Option<PageNo>,
+	pub(in crate::storage) class_first: Option<PageNo>,
 	/// Property first associated with this base statistics layout.
 	pub(super) property_first: Option<PageNo>,
 	/// Class pages associated with this base statistics layout.
-	pub(super) class_pages: u32,
+	pub(in crate::storage) class_pages: u32,
 	/// Property pages associated with this base statistics layout.
 	pub(super) property_pages: u32,
 }

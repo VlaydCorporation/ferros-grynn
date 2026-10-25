@@ -641,8 +641,12 @@ impl DatabaseRoot {
 			)?;
 		}
 		let mut context = index_context(&self.schema, &self.dictionary)?;
-		let prepared =
-			self.indexes.prepare_base_replace(&before, &after, &memberships, &mut context)?;
+		let prepared = self.indexes.prepare_base_replace(
+			&before,
+			&after,
+			memberships.iter().map(|(graph, occurrence)| Ok((*graph, occurrence))),
+			&mut context,
+		)?;
 		let indexes = if prepared.is_empty() {
 			None
 		} else {
@@ -1514,7 +1518,7 @@ impl DatabaseRoot {
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.replace_occurrence(graph, &atom, &before, &after)?;
 		if !prepared.is_empty() {
-			Arc::make_mut(&mut self.indexes).apply_replace(prepared)?;
+			Arc::make_mut(&mut self.indexes).apply_occurrence_replace(prepared)?;
 		}
 		self.graph_mut(graph)?.replace_occurrence(after);
 		self.statistics = Arc::new(statistics);

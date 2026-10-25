@@ -199,10 +199,7 @@ impl Transaction {
 			.transaction_limits()
 			.max_write_set_bytes
 			.min(256 * 1024 * 1024)
-			.saturating_sub(self.write_bytes)
-			.saturating_sub(self.admitted_journal_bytes())
-			.saturating_sub(self.import_changefeed.retained_bytes())
-			.saturating_sub(self.import_events.as_ref().map_or(0, |spool| spool.retained_bytes()))
+			.saturating_sub(self.write_set_bytes())
 			.saturating_sub(additional)
 	}
 
@@ -254,10 +251,14 @@ fn event_definition_bytes(event: &EventDefinition) -> FerrosGrynnResult<usize> {
 	}
 	let sources = event
 		.name
-		.len()
-		.checked_add(event.when.len())
-		.and_then(|bytes| bytes.checked_add(event.then.len()))
-		.and_then(|bytes| bytes.checked_add(event.comment.as_ref().map_or(0, |value| value.len())))
+		.estimated_heap_bytes()
+		.checked_add(event.when.estimated_heap_bytes())
+		.and_then(|bytes| bytes.checked_add(event.then.estimated_heap_bytes()))
+		.and_then(|bytes| {
+			bytes.checked_add(
+				event.comment.as_ref().map_or(0, crate::values::Text::estimated_heap_bytes),
+			)
+		})
 		.and_then(|bytes| bytes.checked_mul(2))
 		.and_then(|bytes| bytes.checked_add(SCHEMA_WRITE_BYTES))
 		.ok_or_else(|| FerrosGrynnError::operation_overflow("EVENT definition bytes"))?;

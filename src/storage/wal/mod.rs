@@ -190,7 +190,25 @@ mod tests {
 		// staged keys to verify replacement and rejection have no
 		// write-set side effects.
 		tx.staged_bytes = MAX_TX_WRITE_BYTES;
-		tx.stage_page(keys[2], &page)?;
+		let frame = std::ptr::from_ref(
+			tx.staged_page(keys[2]).ok_or_else(|| io::Error::other("staged page absent"))?,
+		);
+		let replacement = marked_page(0, 2)?;
+		tx.stage_page(keys[2], &replacement)?;
+		let current =
+			tx.staged_page(keys[2]).ok_or_else(|| io::Error::other("staged page absent"))?;
+		assert_eq!(current.as_bytes(), replacement.as_bytes());
+		// Replacing a private frame must not briefly retain a second page.
+		assert!(std::ptr::eq(frame, current));
+		let mut invalid = marked_page(0, 3)?;
+		invalid.as_bytes_mut()[PAGE_HEADER_SIZE] ^= 1;
+		assert!(tx.stage_page(keys[2], &invalid).is_err());
+		assert_eq!(
+			tx.staged_page(keys[2])
+				.ok_or_else(|| io::Error::other("staged page absent"))?
+				.as_bytes(),
+			replacement.as_bytes()
+		);
 		assert_eq!(tx.staged_bytes, MAX_TX_WRITE_BYTES);
 		let before = tx.staged.len();
 		let rejected = PageKey::new(DataSpaceId::Database, keys[2].file_id(), PageNo::new(1));

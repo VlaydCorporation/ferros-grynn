@@ -709,17 +709,24 @@ impl QueryRead for RootRead<'_> {
 		self.check_snapshot(snapshot)?;
 		(self.observe)(ConflictKey::PropertyDictionary);
 		(self.observe)(ConflictKey::GraphCatalogRange);
-		for (_key, name) in self.root.dictionary.iter() {
+		// The sorter retains this context after the current row scope ends.
+		let admit = |bytes: usize, overhead: usize| {
 			self.work(1)?;
-			self.admit_copies(name.len(), 2, 256)?;
+			self.fields.admit_retained(
+				bytes
+					.checked_mul(2)
+					.and_then(|bytes| bytes.checked_add(overhead))
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE spill context"))?,
+			)
+		};
+		for (_key, name) in self.root.dictionary.iter() {
+			admit(name.len(), 256)?;
 		}
 		for class in self.root.schema.classes() {
-			self.work(1)?;
-			self.admit_copies(class.name().len(), 2, 256)?;
+			admit(class.name().len(), 256)?;
 		}
 		for graph in self.root.schema.all_graphs() {
-			self.work(1)?;
-			self.admit_copies(graph.name().len(), 2, 2 * size_of::<GraphRef>() + 256)?;
+			admit(graph.name().len(), 2 * size_of::<GraphRef>() + 256)?;
 		}
 		// The existing context encoder is shared with physical builders and
 		// preserves exact public identities in temporary SELECT runs.

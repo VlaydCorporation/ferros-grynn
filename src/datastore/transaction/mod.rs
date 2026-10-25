@@ -100,6 +100,8 @@ pub(in crate::datastore) mod live_result;
 mod operation;
 /// Owned operation image projection and representation comparison.
 mod operation_image;
+/// Final replay targets collected independently of commit coordination.
+mod publication;
 /// Logical qualified endpoint selections retained across private mutations.
 mod qualified_incidence;
 /// Snapshot-bound query reads, indexes and predicate tracking.
@@ -109,6 +111,8 @@ mod relate;
 /// Transactional schema definitions and validation.
 mod schema;
 mod tensor;
+/// Recursive payload admission and final logical write-set accounting.
+mod write_set;
 /// Explicit write-back of changed materialized graphs.
 mod writeback;
 
@@ -117,6 +121,9 @@ mod read_tracking_tests;
 #[cfg(test)]
 /// Regression tests for transaction behavior.
 mod tests;
+#[cfg(test)]
+/// Logical write-set payload and rollback regressions.
+mod write_set_tests;
 
 pub use graph_view::TransactionGraphView;
 #[allow(
@@ -578,6 +585,9 @@ pub struct Transaction {
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
 	/// Write bytes associated with this transaction.
 	write_bytes: usize,
+	/// Owned ordinary mutation operands, independent of conflict-key
+	/// deduplication.
+	payload_bytes: usize,
 	/// Mutations associated with this transaction.
 	mutations: Vec<Mutation>,
 	/// Bounded operation ranges and targets, without captured images.
@@ -647,6 +657,8 @@ pub struct TransactionSavepoint {
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
 	/// Write bytes associated with this transaction savepoint.
 	write_bytes: usize,
+	/// Payload admission restored with the corresponding mutation suffix.
+	payload_bytes: usize,
 	/// Mutation len associated with this transaction savepoint.
 	mutation_len: usize,
 	/// Capture journal rollback, including checked ordinals and reservations.
@@ -705,6 +717,7 @@ impl Transaction {
 			requirements: BTreeMap::new(),
 			fanout_reservations: BTreeSet::new(),
 			write_bytes: 0,
+			payload_bytes: 0,
 			mutations: Vec::new(),
 			change_journal: changefeed_journal::ChangeJournal::default(),
 			import_changefeed: changefeed_import::ImportCaptureSpool::default(),
@@ -790,6 +803,7 @@ impl Transaction {
 	/// Returns bytes already reserved by the logical write-set preflight.
 	pub const fn write_set_bytes(&self) -> usize {
 		self.write_bytes
+			.saturating_add(self.payload_bytes)
 			.saturating_add(self.admitted_journal_bytes())
 			.saturating_add(self.import_changefeed.retained_bytes())
 			.saturating_add(match &self.import_events {
@@ -971,6 +985,7 @@ impl Transaction {
 			requirements: self.requirements.clone(),
 			fanout_reservations: self.fanout_reservations.clone(),
 			write_bytes: self.write_bytes,
+			payload_bytes: self.payload_bytes,
 			mutation_len: self.mutations.len(),
 			change_journal: self.change_journal.checkpoint(),
 			import_changefeed: self.import_changefeed.checkpoint(),
@@ -999,6 +1014,7 @@ impl Transaction {
 		self.requirements = savepoint.requirements;
 		self.fanout_reservations = savepoint.fanout_reservations;
 		self.write_bytes = savepoint.write_bytes;
+		self.payload_bytes = savepoint.payload_bytes;
 		self.mutations.truncate(savepoint.mutation_len);
 		match (&mut self.qualified_incidence, savepoint.qualified_incidence) {
 			(Some(journal), Some(checkpoint)) => journal.restore(checkpoint),
@@ -1063,7 +1079,14 @@ impl Transaction {
 	///
 	/// Returns a schema, read-only, snapshot-age, identity-capacity, or
 	/// write-set-limit error.
-	pub fn define_class(&mut self, mut class: ClassSchema) -> FerrosGrynnResult<ClassId> {
+	/// Failed admission also restores dictionary keys interned for its fields.
+	pub fn define_class(&mut self, class: ClassSchema) -> FerrosGrynnResult<ClassId> {
+		self.atomic_mutation(|transaction| transaction.define_class_inner(class))
+	}
+
+	/// Keeps field interning and class installation within one rollback
+	/// boundary.
+	fn define_class_inner(&mut self, mut class: ClassSchema) -> FerrosGrynnResult<ClassId> {
 		self.prepare_schema_mutation()?;
 		if class.id.is_some() {
 			return Err(FerrosGrynnError::invalid_argument(
@@ -1073,7 +1096,9 @@ impl Transaction {
 		if self.working.schema.class(class.name().as_str()).is_some() {
 			return Err(FerrosGrynnError::class_already_exists(class.name().to_string()));
 		}
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			write_set::class_payload_bytes(&class),
+		)))?;
 
 		let id = ClassId::from_schema_id(self.store.inner.allocate_schema_id()?);
 		class.id = Some(id);
@@ -1095,9 +1120,12 @@ impl Transaction {
 			}
 			index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
 		}
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			write_set::class_payload_bytes(&class),
+		)))?;
 		self.working.install_class(class.clone(), self.snapshot.commit_ts)?;
 		self.write_bytes += SCHEMA_WRITE_BYTES;
-		self.mutations.push(Mutation::DefineClass(class));
+		self.record_mutation(Mutation::DefineClass(class));
 		Ok(id)
 	}
 
@@ -1157,7 +1185,12 @@ impl Transaction {
 		if self.working.schema.named_graph(name.as_str()).is_some() {
 			return Err(FerrosGrynnError::graph_already_exists(name.to_string()));
 		}
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let payload = Self::mutation_payload_charge(
+			name.estimated_heap_bytes()
+				.saturating_add(properties.estimated_heap_bytes())
+				.saturating_add(root.as_ref().map_or(0, RecordId::estimated_heap_bytes)),
+		);
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		let schema = self.allocate_graph_schema(
 			name,
 			kind,
@@ -1172,7 +1205,7 @@ impl Transaction {
 		self.write_bytes += SCHEMA_WRITE_BYTES;
 		self.mark_range_change(ConflictKey::GraphCatalogRange);
 		self.insert_write(ConflictKey::GraphDefinition(graph), 0);
-		self.mutations.push(Mutation::DefineGraph(schema));
+		self.record_mutation(Mutation::DefineGraph(schema));
 		Ok(reference)
 	}
 
@@ -1216,13 +1249,16 @@ impl Transaction {
 			return Ok(key);
 		}
 		let conflict = ConflictKey::PropertyDictionary;
-		if !self.writes.contains_key(&conflict) {
-			self.ensure_capacity(PROPERTY_DICTIONARY_WRITE_BYTES)?;
-		}
+		let payload = Self::mutation_payload_charge(name.len());
+		self.ensure_capacity(payload.saturating_add(if self.writes.contains_key(&conflict) {
+			0
+		} else {
+			PROPERTY_DICTIONARY_WRITE_BYTES
+		}))?;
 		let name = Text::from(name);
 		let key = Arc::make_mut(&mut self.working.dictionary).intern(name.clone())?;
 		self.insert_write(conflict, PROPERTY_DICTIONARY_WRITE_BYTES);
-		self.mutations.push(Mutation::InternProperty {
+		self.record_mutation(Mutation::InternProperty {
 			key,
 			name,
 		});
@@ -1313,6 +1349,10 @@ impl Transaction {
 		record_id: RecordId,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomSnapshot> {
+		let payload = Self::mutation_payload_charge(
+			record_id.estimated_heap_bytes().saturating_add(properties.estimated_heap_bytes()),
+		);
+		self.ensure_capacity(payload)?;
 		let class = self
 			.working
 			.schema
@@ -1324,13 +1364,13 @@ impl Transaction {
 		for (_key, value) in &properties {
 			self.intern_value_keys(value)?;
 		}
-		self.admit_change_target(BASE_ATOM_WRITE_BYTES)?;
+		self.admit_change_target(BASE_ATOM_WRITE_BYTES.saturating_add(payload))?;
 		let global = self.working.insert_atom(&class, record_id.clone(), properties.clone())?;
 		self.record_created_change_target(global, class_id);
 		let key = ConflictKey::BaseAtom(global);
 		self.insert_write(key, BASE_ATOM_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
-		self.mutations.push(Mutation::CreateAtom {
+		self.record_mutation(Mutation::CreateAtom {
 			id: global,
 			class_id,
 			record_id,
@@ -1382,8 +1422,16 @@ impl Transaction {
 		key: PropertyKeyId,
 		value: Value,
 	) -> FerrosGrynnResult<Option<Value>> {
-		self.prepare_mutation()?;
+		self.prepare_write_state()?;
+		let payload = Self::mutation_payload_charge(value.estimated_heap_bytes());
+		self.ensure_capacity(payload)?;
 		let global = self.require_atom(record_id)?;
+		// Existing-key replacement changes eager dirty metadata only. A new
+		// key needs exact inherited label counters before its first delta.
+		if !self.working.atom(global).is_some_and(|atom| atom.properties().contains_key(key)) {
+			self.store.inner.hydrate_statistics(&mut self.working)?;
+		}
+		self.prepare_write_indexes(true)?;
 		self.note_change_target(global, None, ConflictKey::BaseAtom(global))?;
 		self.intern_value_keys(&value)?;
 		let (class_id, _kind) = self.atom_domain(global)?;
@@ -1405,7 +1453,7 @@ impl Transaction {
 				.ok_or_else(|| self.limit_error(usize::MAX))?,
 		)
 		.ok_or_else(|| self.limit_error(usize::MAX))?;
-		self.ensure_capacity(additional)?;
+		self.ensure_capacity(additional.saturating_add(payload))?;
 
 		let previous = self.working.set_base_property(global, key, value.clone())?;
 		self.insert_write(write, BASE_ATOM_WRITE_BYTES);
@@ -1426,7 +1474,7 @@ impl Transaction {
 				self.write_bytes += EFFECTIVE_FANOUT_WRITE_BYTES;
 			}
 		}
-		self.mutations.push(Mutation::SetBaseProperty {
+		self.record_mutation(Mutation::SetBaseProperty {
 			global,
 			key,
 			value,
@@ -1590,6 +1638,14 @@ impl Transaction {
 
 	/// Prepares write.
 	fn prepare_write(&mut self, defer_indexes: bool) -> FerrosGrynnResult<()> {
+		self.prepare_write_state()?;
+		self.store.inner.hydrate_statistics(&mut self.working)?;
+		self.prepare_write_indexes(defer_indexes)
+	}
+
+	/// Checks write authority and refreshes the transaction before inspecting
+	/// data.
+	fn prepare_write_state(&mut self) -> FerrosGrynnResult<()> {
 		self.ensure_live()?;
 		self.store.inner.ensure_write_allowed(self.id)?;
 		if self.options.access == TransactionAccess::ReadOnly {
@@ -1598,7 +1654,11 @@ impl Transaction {
 		if self.gql_statement_depth == 0 {
 			self.refresh_read_committed()?;
 		}
-		self.store.inner.hydrate_statistics(&mut self.working)?;
+		Ok(())
+	}
+
+	/// Restores deferred indexes before applying the next mutation.
+	fn prepare_write_indexes(&mut self, defer_indexes: bool) -> FerrosGrynnResult<()> {
 		if self.working.indexes.has_deferred_indexes() {
 			self.working.rebuild_indexes()?;
 		}
@@ -1606,6 +1666,18 @@ impl Transaction {
 			self.working.mark_deferred_indexes_stale()?;
 		}
 		Ok(())
+	}
+
+	/// Only existing-key setters can replay against eager statistics headers.
+	fn preserves_statistics_auxiliary(&self, root: &DatabaseRoot) -> bool {
+		self.mutations.iter().all(|mutation| match mutation {
+			Mutation::SetBaseProperty {
+				global,
+				key,
+				..
+			} => root.atom(*global).is_some_and(|atom| atom.properties().contains_key(*key)),
+			_ => false,
+		})
 	}
 
 	/// Prepares schema mutation.
@@ -1701,6 +1773,9 @@ impl Transaction {
 		}
 		self.validate_write_requirements(&current)?;
 		let mut working = (*current).clone();
+		if !self.preserves_statistics_auxiliary(&working) {
+			store.inner.hydrate_statistics(&mut working)?;
+		}
 		Self::apply_mutations(&mut working, &self.mutations, current.commit_ts, false).map_err(
 			|error| {
 				FerrosGrynnError::serialization_failure(

@@ -15,6 +15,12 @@ degree, label и property части читаются независимо и л
   revision stamps и очистку flags.
 - Degree/property histograms заменяются только полным bulk scan и могут быть
   устаревшими; это влияет лишь на качество будущего плана.
+  При final revision publication удаляется только degree histogram,
+  чья node-label отсутствует в окончательных exact label counters. Промежуточное
+  исчезновение имени при swap не инвалидирует distribution; global и surviving
+  histograms, их buckets и analyzed_revision сохраняются. Storage может
+  механически перекодировать dense label IDs при смене словаря, без пересчёта
+  распределения и без присвоения старых buckets другому имени.
 - Границы property buckets используют order-preserving codec из `values`.
 - Geometry distribution хранит до 1024 MBR и отдельную nonempty population;
   bulk ANALYZE учитывает BASE/EFFECTIVE overlays. Sample не меняет query correctness.

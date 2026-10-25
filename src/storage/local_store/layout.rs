@@ -1,4 +1,4 @@
-//! Canonical file names and physical identities for one full generation.
+//! Canonical physical identities for full and selected file generations.
 
 use std::collections::BTreeMap;
 
@@ -73,6 +73,11 @@ impl LayoutBuilder {
 		}
 	}
 
+	/// Reports additive images even when no previous identity is retired.
+	pub(super) fn has_new_files(&self) -> bool {
+		!self.files.is_empty()
+	}
+
 	/// Keeps one immutable file reachable without copying it into the new
 	/// generation. The retained identity must have been allocated by an older
 	/// catalog generation.
@@ -94,13 +99,15 @@ impl LayoutBuilder {
 		companion_of: Option<DataFileId>,
 		pages: Vec<AlignedPage>,
 	) -> FerrosGrynnResult<DataFileId> {
-		let page_numbers = (0..pages.len())
-			.map(|index| {
-				u64::try_from(index)
-					.map(PageNo::new)
-					.map_err(|_error| invalid("file page index exceeds u64"))
-			})
-			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut page_numbers = Vec::new();
+		page_numbers
+			.try_reserve_exact(pages.len())
+			.map_err(|_error| invalid("file page directory allocation failed"))?;
+		for index in 0..pages.len() {
+			page_numbers.push(PageNo::new(
+				u64::try_from(index).map_err(|_error| invalid("file page index exceeds u64"))?,
+			));
+		}
 		let file_id = DataFileId::new(self.next_file_instance_id, kind)
 			.ok_or_else(|| invalid("physical file identity clock is exhausted"))?;
 		self.next_file_instance_id = self
@@ -187,6 +194,19 @@ impl LayoutBuilder {
 	}
 }
 
+/// Bounds selected-file vector growth and two simultaneously owned catalog
+/// copies.
+pub(super) fn selected_file_metadata_bytes(path: &str) -> FerrosGrynnResult<usize> {
+	// Initial Vec capacity is four; later growth can retain old+new buffers.
+	// Both catalogs clone the selected entry/path while FileImage stays alive.
+	4_usize
+		.checked_mul(size_of::<FileImage>())
+		.and_then(|bytes| bytes.checked_add(6 * size_of::<FileCatalogEntry>()))
+		.and_then(|bytes| bytes.checked_add(path.len().checked_mul(4)?))
+		.and_then(|bytes| bytes.checked_add(3 * size_of::<String>()))
+		.ok_or_else(|| invalid("selected file metadata bytes overflow usize"))
+}
+
 /// Returns the atom prefix result.
 pub(super) fn atom_prefix(generation: &str) -> String {
 	format!("atoms/{generation}")
@@ -207,6 +227,75 @@ pub(super) fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 mod tests {
 	use super::*;
 	use crate::storage::page::{PageFlags, PageLsn, PageType};
+
+	/// Fallible directory construction retains only the admitted exact
+	/// capacity.
+	#[test]
+	fn file_image_page_directory_reserves_exact_capacity() {
+		use crate::test_assertions::AssertResult as _;
+		for count in [0, 1, 3, 5, 17] {
+			let mut layout = LayoutBuilder::new(1);
+			let pages = (0..count).map(|_| AlignedPage::zeroed()).collect();
+			layout
+				.add(
+					DataSpaceId::Database,
+					DataFileKind::Index,
+					DataFileRole::WalBackfilled,
+					"atoms/test/primary.fgidx".to_owned(),
+					None,
+					pages,
+				)
+				.assert_ok();
+			assert_eq!(layout.files[0].page_numbers.len(), count);
+			assert_eq!(layout.files[0].page_numbers.capacity(), count);
+		}
+	}
+
+	/// Selected additions reserve vector slack and both simultaneous catalog
+	/// copies.
+	#[test]
+	fn selected_file_metadata_reserve_covers_multiple_graph_catalog_copies() {
+		use crate::{
+			graph::GraphId,
+			test_assertions::{AssertOption as _, AssertResult as _},
+			values::Uuid,
+		};
+		let graphs = [GraphId::new(1).assert_some(), GraphId::new(2).assert_some()];
+		for count in [1_usize, 3, 5, 17, 33] {
+			let mut layout = LayoutBuilder::new(1);
+			let mut admitted = 4096_usize;
+			for index in 0..count {
+				let graph = graphs[index % 2];
+				let path = format!(
+					"{}/idx/lbl_node_{index}.fgidx",
+					graph_prefix(graph, &Uuid::now_v7().to_string())
+				);
+				admitted += selected_file_metadata_bytes(&path).assert_ok();
+				layout
+					.add_prewritten(
+						DataSpaceId::Graph(graph),
+						DataFileKind::Index,
+						DataFileRole::WalBackfilled,
+						path,
+						1,
+					)
+					.assert_ok();
+			}
+			let (catalog, images) = layout.finish().assert_ok();
+			let second = catalog.clone();
+			let vectors = images.capacity() * size_of::<FileImage>()
+				+ (catalog.files.capacity() + second.files.capacity())
+					* size_of::<FileCatalogEntry>();
+			let paths = images.iter().map(|image| image.entry.path.as_str().len()).sum::<usize>()
+				+ catalog
+					.files
+					.iter()
+					.chain(&second.files)
+					.map(|entry| entry.path.as_str().len())
+					.sum::<usize>();
+			assert!(admitted >= vectors + paths);
+		}
+	}
 
 	/// Keeps over-aligned page storage separate from per-page numbers so moving
 	/// a generated image cannot corrupt its first header byte.

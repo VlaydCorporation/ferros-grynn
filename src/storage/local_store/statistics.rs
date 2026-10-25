@@ -286,13 +286,23 @@ impl LocalStore {
 		files.load_planner(self, &snapshot.0, database, demand, statistics);
 	}
 
-	/// Strictly loads every auxiliary part before the first mutation of a root
-	/// recovered with root-only statistics.
+	/// Strictly loads auxiliary parts before exact-counter mutation or full
+	/// image publication; existing-key replacements need only eager metadata.
 	pub(crate) fn hydrate_statistics(&self, database: &mut DatabaseRoot) -> FerrosGrynnResult<()> {
+		self.hydrate_statistics_at(database, database.commit_ts)
+	}
+
+	/// Preserves candidate eager deltas while loading unchanged auxiliary maps
+	/// from the still-published source version before a full-image fallback.
+	pub(super) fn hydrate_statistics_at(
+		&self,
+		database: &mut DatabaseRoot,
+		source_commit_ts: u64,
+	) -> FerrosGrynnResult<()> {
 		if !database.statistics.auxiliary_deferred() {
 			return Ok(());
 		}
-		let Some(snapshot) = self.capture_query_snapshot(database.commit_ts)? else {
+		let Some(snapshot) = self.capture_query_snapshot(source_commit_ts)? else {
 			return database.rebuild_statistics_at(&self.root.join("tmp").join("statistics"));
 		};
 		let files = snapshot

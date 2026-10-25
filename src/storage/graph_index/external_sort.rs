@@ -27,10 +27,10 @@ use crate::{
 /// Default in-memory payload retained before one sorted run is spilled.
 pub(super) const INDEX_SORT_RUN_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of run readers participating in one merge pass.
-const INDEX_SORT_FAN_IN: usize = 64;
+pub(in crate::storage) const INDEX_SORT_FAN_IN: usize = 64;
 /// Bounds retained run paths and vector capacity slack independently of input
 /// length.
-const INDEX_SORT_METADATA_BYTES: usize = 256 * 1024;
+pub(in crate::storage) const INDEX_SORT_METADATA_BYTES: usize = 256 * 1024;
 /// Fixed record prefix: key length followed by one opaque sortable payload.
 const RUN_RECORD_PREFIX_BYTES: usize = size_of::<u32>() + size_of::<u64>();
 
@@ -113,6 +113,24 @@ pub fn with_external_sort_options<T, RunArg: FnOnce() -> FerrosGrynnResult<T>>(
 	let previous = SORT_OPTIONS.replace(SortOptions {
 		run_budget: max_memory_bytes.get(),
 		parallelism: max_parallelism.get(),
+	});
+	let _guard = SortOptionsGuard(previous);
+	run()
+}
+
+/// Narrows run buffering while preserving the caller's parallelism and
+/// cancellation.
+pub(in crate::storage) fn with_external_sort_budget<T>(
+	maximum: usize,
+	run: impl FnOnce() -> FerrosGrynnResult<T>,
+) -> FerrosGrynnResult<T> {
+	let options = SORT_OPTIONS.get();
+	if maximum == 0 || maximum > options.run_budget {
+		return Err(invalid_sort("nested external-sort budget is empty or exceeds its owner"));
+	}
+	let previous = SORT_OPTIONS.replace(SortOptions {
+		run_budget: maximum,
+		parallelism: options.parallelism,
 	});
 	let _guard = SortOptionsGuard(previous);
 	run()
@@ -766,6 +784,35 @@ mod tests {
 
 	/// Unique test-directory suffix within one process.
 	static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+	/// Nested namespace reservations preserve worker/cancellation settings on
+	/// errors.
+	#[test]
+	fn nested_run_budget_preserves_parallelism_cancellation_and_restores_limits() {
+		use crate::test_assertions::{AssertOption as _, AssertResult as _};
+		let previous = SORT_OPTIONS.get();
+		with_external_sort_control(
+			NonZeroUsize::new(1024).assert_some(),
+			NonZeroUsize::new(3).assert_some(),
+			Arc::new(AtomicBool::new(true)),
+			|| {
+				let result = with_external_sort_budget(128, || {
+					assert_eq!(external_sort_run_budget(), 128);
+					assert_eq!(SORT_OPTIONS.get().parallelism, 3);
+					check_external_sort_cancelled()
+				});
+				assert!(result.is_err());
+				assert_eq!(external_sort_run_budget(), 1024);
+				assert_eq!(SORT_OPTIONS.get().parallelism, 3);
+				assert!(with_external_sort_budget(2048, || Ok(())).is_err());
+				assert_eq!(external_sort_run_budget(), 1024);
+				Ok(())
+			},
+		)
+		.assert_ok();
+		assert_eq!(SORT_OPTIONS.get().parallelism, previous.parallelism);
+		assert_eq!(external_sort_run_budget(), previous.run_budget);
+	}
 
 	/// Forced tiny runs merge into one replayable total order.
 	#[test]

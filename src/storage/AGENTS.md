@@ -110,11 +110,16 @@
 - `edge_endpoint_index` — engine-owned qualified postings, shared Unique B+tree
   с concrete leaf/header и snapshot identity. Header page 0 и topology публикуются
   одной WAL/COW generation; lookup возвращает только connector/side, не query values.
+  Retained tree получает header WAL-version на каждый global commit timestamp,
+  включая catalog-only publication; old pins сохраняют прежнюю версию.
 - `store` — open/load, transaction views, commit и startup GC;
 - `local` — адаптер локального datastore.
 
 ## Инварианты
 
+- Scalar Base postings декодируются как generation-aware `GlobalAtomId`,
+  Effective — как graph-local `DiskAtomRef`. Нормализованные kind/slot
+  разрешаются по root pinned snapshot, а не по текущему root datastore.
 - Checkpoint backfill использует WAL-owned FrameReadScope с одним last-segment
   handle. Shared prune guard удерживается через физические чтения/home sync;
   scope завершается до publish_checkpoint exclusive gate. File закрывается до
@@ -134,6 +139,122 @@
   maintenance; pinned paths/markers и сохранённая Vec capacity входят в budget.
 - Checkpoint публикуется атомарно и не удаляет данные, удерживаемые активным
   snapshot.
+- Sparse Base update сохраняет file identities и immutable property prefix;
+  append address учитывает WAL-only tail. Physical plan строится отдельно от
+  full generation и публикуется тем же source/history WAL barrier.
+  Base lifecycle без memberships использует final replay slots, включая
+  Create→Delete и Node/Edge generation reuse. Hot pages, allocator ceilings,
+  Primary, scalar/Count и child class counters входят в один commit. Reserved
+  freelist companions не являются allocator authority (§15 disk specification)
+  и сохраняют bytes/IDs: reopen восстанавливает free slots из Hot tombstones.
+  Lifecycle candidate содержит полные statistics до WAL; после публикации
+  прежний lazy owner снимается, captured old snapshots сохраняют собственный.
+- Stable Node/Edge overlays имеют отдельные final replay targets, не Base slots.
+  Mixed Base+overlay готовит один Effective before/after переход на graph/global
+  pair. При неизменных identity и structure Hot slots меняют выбранные поля;
+  overlay append начинается после WAL-visible
+  tail. Slots одной страницы декодируются до первой mutation и затем seal-ятся
+  вместе. Graph superblocks используют актуальную database checkpoint authority
+  и устанавливаются в runtime только после общего WAL commit. Effective presence
+  обновляет точные label counters; Edge weight сохраняет topology/transition.
+  Один LabelPlan разделяет source/final dense namespaces: Hot targets включают
+  explicit mutations и postings имён со сдвинутыми ID. Selected arrays объединяют
+  весь проверенный canonical source с bounded explicit insertions без полной
+  повторной сортировки. Namespace change заменяет Labels/graph/label statistics,
+  сохраняя property statistics и остальные identities; bindings устанавливаются
+  без fallible work после WAL. Plain isolated NODE ATTACH/DETACH существующих
+  Base atoms в standalone root Graph имеет отдельный sparse publisher: allocator/
+  Hot, forward/reverse membership, class arrays, Effective indexes и exact stats
+  публикуются вместе. Последний physical empty class source сохраняет authority
+  после cold reopen. Plain EDGE ATTACH/DETACH существующего Base в том же
+  standalone Graph с local NODE endpoints публикует explicit EdgeHot и touched
+  NodeHot/overflow, сохраняя n-ary role order и multiplicity. Generation-aware
+  adjacency merge проверяет source chains до WAL; старые chains сохраняются до
+  rebuild для pinned snapshots. Plain existing-Base NODE+EDGE memberships имеют
+  общий per-graph incidence publisher: explicit lifecycle и derived endpoints
+  объединяются в один NodeHot pass; один header содержит обе capacities/counts.
+  Before/final generations разделены, CASCADE/reuse не переносит старую adjacency
+  новому NODE. Логический CASCADE planner всё ещё ищет NODE incidences обходом;
+  bounded physical publication не доказывает устранение этого CPU scan.
+  Global NODE/EDGE create/delete/reuse с plain memberships использует те же Base и
+  incidence builders: final replay содержит каждый before/final membership и
+  local Hot target, один WAL включает обе allocator authorities. Stable Base
+  edits вместе с membership DML обновляют inherited Effective scopes и label
+  counters других graphs; raw Primary/Base postings проверяют полные global
+  generations независимо от нормализации query adapter. Fully transient global
+  NODE/EDGE допускается при consumed global/local generations и отсутствующих обоих
+  membership sides; новые empty class buckets сохраняют physical authority для
+  следующего warm ATTACH. Metadata проверяется один раз на GraphId, consumed
+  local witnesses — отдельно по NODE/EDGE, не более двух scans explicit incidence.
+  EDGE topology ограничена root-local NODE/EDGE endpoints; transient NODE endpoint может
+  исчезнуть в том же commit. Pure transient EDGE не пишет NODE Hot/adjacency.
+  Cold empty source проверяется до сохранения. LABEL-only NODE/EDGE lifecycle
+  в том же standalone Graph использует source/final namespaces без клонирования
+  dictionaries: старые Hot metadata проверяются, final label ID ставится вместе
+  с allocator/adjacency. Explicit membership owner формируется incidence renderer
+  один раз; stable namespace suffix меняет только остальных shifted owners.
+  Final dictionary ceiling входит в incidence header даже без stable suffix,
+  включая переход3→1. При local/global reuse старый label не переносится новому
+  owner. Connected NODE CASCADE удаляет connector membership, сохраняя его Base;
+  старые physical Hot/Base и label arrays остаются доступны после Passive.
+  Lifecycle NODE/EDGE overlay в том же standalone Graph использует один
+  graph-local append allocator вместе со stable metadata. Старый payload
+  проверяется canonical bytes принятого root и physical format validators;
+  чтение ограничено старым graph header ceiling даже при доступном WAL tail.
+  Full local/global generation определяет owner: новый owner не наследует ref,
+  same-owner reuse требует проверенного source и равенства overlay. Tombstones
+  и fully transient owners не получают payload. Hot writes backing удерживается
+  в shared envelope до nested adjacency/overlay codecs, включая capacity excess.
+  Plain EDGE rewire при прежних full local/global identities и local NODE
+  endpoints использует общий source/final target classifier и incidence renderer.
+  Старые роли проверяются до WAL; removals/additions сохраняют multiplicity.
+  Structural EDGE получает один final Hot slot, включая label/weight/overlay;
+  metadata другого NODE объединяется с уже подготовленными adjacency frames.
+  Weight-only сохраняет прежний metadata path. Pure rewire не меняет capacities/
+  counts и parent SubgraphDir; containment/qualified endpoints остаются fallback.
+  При уже существующей endpoint capability root-local EDGE ATTACH/DETACH/rewire
+  сохраняет AtomStore/Hot/arena и unrelated graph files. Меняется только endpoint
+  tree затронутого graph при смене canonical connector-side postings; exact shared
+  builder создаёт unreachable side-file, catalog/runtime bindings входят в общий
+  WAL commit. Прежний header проверяется до output; retained trees получают только
+  новую header revision. NODE adjacency содержит только NODE endpoints. First
+  capability использует тот же selected publisher при строгом additive schema
+  classifier; accepted catalog capability/runtime bindings должны отсутствовать.
+  Новая capability сохраняет header/empty leaf даже при пустых final postings;
+  retirement применяется только к прежнему physical file. Любые остальные schema
+  changes и прежние artifact Arc guards сохраняют fallback. Cleanup распознаёт только
+  graph-owned `ee_endpoint.fgidx`; pins защищают прежний tree. Selected sort имеет
+  отдельный reserve merge readers/keys/metadata и serial worker, общий all-graph
+  cleanup vector учитывается до allocation. Это logical accounting, не RSS quota.
+  Plain standalone Graph/Dag/Forest/Tree/RootedTree/Hypergraph/Metagraph используют общий family
+  predicate и incidence renderer; final replay family/root/orthogonal validators
+  остаются до persistence. В Metagraph меняются только plain local NODE/EDGE;
+  существующие containers, children и arena сохраняются. Membership DML дочернего
+  plain graph обновляет также
+  SubgraphDir каждого непосредственного parent: все shared slots получают четыре
+  final child counters в общем GraphUpdatePlan и одной WAL publication. Deep-only
+  ancestors не имеют соответствующей direct entry. Source chain, page ceiling,
+  unique slots, container generations и старые child counters проверяются до WAL;
+  сохраняются entry order, links, page count и file identities. Parent header при
+  count-only patch не меняется. Общий бюджет учитывает reusable decoder/page
+  backing, validation trees, retained pages и WAL copies. Format-v1 entries все
+  живые: codec отклоняет live_count != entry_count до allocation. Обе production
+  eligibility проверки используют один pure PointUpdatePlan contract без отдельного
+  child guard. GEN_MAX retirement, specialized
+  buckets и containment structural DML сохраняют
+  full fallback.
+  Subgraph — runtime result family; catalog validator не допускает её как durable graph.
+  Namespace admission включает prepared buffers, codec scratch, selected metadata
+  и private WAL staging copies. Это logical envelope; общий WAL publication
+  workspace, registry и retained catalogs не объявляются allocator/RSS bound.
+- Checkpoint COW superblock берётся из exact ticket frame с его PageFrame LSN.
+  Runtime ceilings остаются latest; checkpoint tuple устанавливается только
+  после durable database authority. Отсутствующий frame не разрешает записать
+  after-target binding в home metadata.
+- Before prune backfill включает trusted current и pinned retired regular files.
+  Same physical ID сохраняет registration Arc между catalog refreshes;
+  path/role/native mode mismatch фатален. Retirement хранит removed file keys
+  независимо от directory reachability; unlink проверяет pins всей очереди.
 - Pinned physical snapshot допускает home page LSN до своего `visible_lsn`:
   passive checkpoint может backfill/prune после capture. Direct/IoRing bypass
   проверяет тот же page identity/checksum/ceiling, что resident admission.
@@ -142,6 +263,8 @@
   Cleanup failure не отменяет уже опубликованный commit: generation остаётся
   pending, счётчик ошибки наблюдаем, checkpoint/следующий commit повторяет
   удаление.
+  Sparse class COW может сохранять прежние Hot roots и отдельный class root;
+  число live directories не константа, authority задаёт catalog reachability.
 - Direct I/O сохраняет alignment, полный page transfer и платформенную
   семантику ошибок.
 - On-disk числа, magic, tags и checksums меняются только вместе со
@@ -180,9 +303,29 @@
   границы доказанного описаны в
   `docs/reports/aligned_page_corruption_investigation.md`.
 - Immutable external-sort B+tree generations заполняют leaves до capacity.
-  Point-DML сначала применяет page-WAL leaf update при стабильных separators и
-  posting layout; bulk fallback использует measured mutable fill `0.90` для
-  primary/Unique и `0.80` для Standard. Это writer policy, не новый disk tag.
+  Selected scalar images используют тот же streaming builder и namespace ordinal
+  authority `std_<ordinal:04>` / `uniq_<ordinal:04>`; неизменные bindings сохраняются.
+  При замене отдельного scalar file в retained UUID directory retirement учитывает
+  exact file pins всех batches. Recovery удаляет только canonical orphan scalar
+  files после проверки recovered catalog; неизвестные имена и symlinks сохраняются.
+  Global Primary fallback использует тот же allocation clock и отдельную
+  explicit binding. Orphan `primary.fgidx` удаляется только в canonical global
+  AtomStore UUID directory; registry handles удерживают retired Primary по
+  точному path. LocalQuerySnapshot сам по себе не удерживает Primary handle.
+  Base property replacements используют production scalar leaf mutator при
+  стабильных separators/page count/posting layout. Borrowed Standard metadata
+  проверяется до чтения external postings; внешние postings затронутого leaf
+  требуют selected streaming fallback. Fallback выбирается отдельно для binding,
+  все leaf pages и новые files публикуются одним WAL commit. Changed bindings
+  получают новые decoded owners до WAL даже при прежних file/root; старые owners
+  и их caches не очищаются. Leaf-only publication не меняет FileCatalog.
+  Fallback перестраивает только затронутый индекс. Primary mutator проверяет
+  ordering и exact removal address, включая generation, во всех затронутых
+  leaves до разрешения fallback. Q-05 остаётся открытым для остальных DML и
+  полной backend/performance matrix. Параметры существующего mutable builder
+  `0.90` для primary/Unique и `0.80` для Standard не являются новым disk tag;
+  прежние microbenchmarks не
+  подтверждают performance текущего production commit.
 - Любая входная длина/счётчик проверяется до allocation; ошибки проходят через
   `gql_status` без раскрытия локальных путей и сырых страниц.
 - Graph-owned definitions хранятся в FGDC v13 отдельно от availability/build revision,

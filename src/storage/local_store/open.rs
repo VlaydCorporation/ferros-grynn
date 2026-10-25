@@ -189,6 +189,7 @@ pub(super) fn open_local_state(
 		authority,
 		bindings.atoms,
 		&schema,
+		&database_catalog.time_zones,
 	)?;
 	decode_catalog_values(&database_catalog, &dictionary, &mut schema)?;
 
@@ -214,7 +215,7 @@ pub(super) fn open_local_state(
 	database.dictionary = Arc::new(dictionary);
 	database.atoms = Arc::new(atoms);
 	let mut decode = value_context(&database.schema, database.dictionary.as_ref().clone())?;
-	for zone in &database_catalog.time_zones {
+	for zone in database_catalog.time_zones.iter() {
 		decode.register_time_zone_name(zone.clone())?;
 	}
 	let decode = decode.decoder();
@@ -231,7 +232,7 @@ pub(super) fn open_local_state(
 			.position(|binding| {
 				binding
 					.arena
-					.graph_by_slot
+					.graph_by_slot()
 					.iter()
 					.all(|(slot, child)| *slot == 0 || database.graph(*child).is_some())
 			})
@@ -614,6 +615,10 @@ fn bindings(
 		.iter()
 		.flat_map(|class| class.indexes.iter())
 		.filter_map(|index| index.physical.map(|physical| (index.id, physical)))
+		// Sparse publication reuses graph artifacts through the same binding map.
+		.chain(database.graphs.iter().flat_map(|graph| {
+			graph.index_bindings.iter().map(|(&id, &binding)| (id, binding))
+		}))
 		.collect();
 	let physical_deltas = database
 		.classes

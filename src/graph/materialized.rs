@@ -432,7 +432,7 @@ pub fn estimated_node_fields_heap_bytes(
 ) -> FerrosGrynnResult<usize> {
 	let mut bytes = record_id
 		.estimated_heap_bytes()
-		.saturating_add(label.map_or(0, Text::len))
+		.saturating_add(label.map_or(0, Text::estimated_heap_bytes))
 		.saturating_add(properties.estimated_heap_bytes());
 	if let Some(inner) = inner {
 		bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(inner)?);
@@ -450,7 +450,7 @@ pub fn estimated_edge_fields_heap_bytes(
 ) -> FerrosGrynnResult<usize> {
 	let mut bytes = record_id
 		.estimated_heap_bytes()
-		.saturating_add(label.map_or(0, Text::len))
+		.saturating_add(label.map_or(0, Text::estimated_heap_bytes))
 		.saturating_add(properties.estimated_heap_bytes())
 		.saturating_add(estimated_topology_heap_bytes(topology));
 	if let Some(transition) = transition {
@@ -585,7 +585,7 @@ where
 /// Estimates the recursively owned endpoint buffers of one topology.
 pub fn estimated_topology_heap_bytes(topology: &EdgeTopology) -> usize {
 	let mut bytes = topology
-		.endpoint_count()
+		.retained_endpoint_slots()
 		.saturating_mul(size_of::<EdgeEndpoint>().saturating_add(size_of::<AtomId>()));
 	for endpoint in topology.endpoints() {
 		if let EdgeEndpoint::Nested(qualified) = endpoint {

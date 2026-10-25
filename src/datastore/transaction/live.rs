@@ -673,12 +673,7 @@ mod tests {
 			max_write_set_bytes: SCHEMA_WRITE_BYTES,
 			..limits_defaults
 		};
-		let limited = Datastore::in_memory_with(limits);
-		let mut setup = limited.begin();
-		let class = setup
-			.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok())
-			.assert_ok();
-		setup.commit().assert_ok();
+		let limited = Datastore::from_root_for_test(limits, (*store.inner.current_root()).clone());
 		let mut rejected = limited.begin();
 		assert!(
 			rejected

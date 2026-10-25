@@ -20,6 +20,8 @@ use super::{
 		graph_prefix,
 		invalid,
 	},
+	point_endpoint::add_edge_endpoint,
+	point_namespace::PublicationBudget,
 };
 use crate::{
 	datastore::{
@@ -855,60 +857,6 @@ fn add_graph(
 	})
 }
 
-/// Publishes synchronous endpoint postings in the same generation as topology.
-fn add_edge_endpoint(
-	layout: &mut LayoutBuilder,
-	prefix: &str,
-	database: &DatabaseRoot,
-	graph: crate::graph::GraphId,
-	arena: &crate::storage::graph_pages::GraphArenaBindings,
-	stream_root: Option<&Path>,
-) -> FerrosGrynnResult<Option<PhysicalIndexBinding>> {
-	let Some(capability) =
-		database.schema.graph(graph).and_then(|schema| schema.edge_endpoint_index())
-	else {
-		return Ok(None);
-	};
-	let temporary = std::env::temp_dir();
-	let scratch = stream_root.unwrap_or(&temporary);
-	let (records, posting_count) =
-		crate::storage::edge_endpoint_index::prepare(database, graph, arena, scratch)?;
-	let header = crate::storage::edge_endpoint_index::EndpointHeader {
-		graph,
-		capability,
-		revision: database.commit_ts,
-		root: PageNo::NULL,
-		page_count: 0,
-		posting_count,
-	};
-	let path = format!("{prefix}/idx/ee_endpoint.fgidx");
-	let space = DataSpaceId::Graph(graph);
-	let file_id = if let Some(root) = stream_root {
-		let built = crate::storage::scoped_index_image::write_streamed_file(root, &path, |file| {
-			crate::storage::edge_endpoint_index::stream(
-				&records,
-				header,
-				scratch,
-				|number, page| file.write_page(number, page),
-			)
-		})?;
-		layout.add_prewritten(
-			space,
-			DataFileKind::Index,
-			DataFileRole::WalBackfilled,
-			path,
-			built.page_count,
-		)?
-	} else {
-		let pages = crate::storage::edge_endpoint_index::buffered(&records, header, scratch)?;
-		layout.add(space, DataFileKind::Index, DataFileRole::WalBackfilled, path, None, pages)?
-	};
-	Ok(Some(PhysicalIndexBinding {
-		file_id,
-		root: PageNo::new(0),
-	}))
-}
-
 /// Publishes complete graph artifacts through the existing generation writer.
 fn add_graph_artifacts(
 	layout: &mut LayoutBuilder,
@@ -1424,18 +1372,100 @@ pub(super) fn append_catalog_pages(
 	Ok(())
 }
 
+/// Sizes initial retained context ownership and the shared builder's largest
+/// per-graph name temporary without cloning any descriptor.
+///
+/// # Errors
+/// Preserves the representation owners' checked sizing diagnostics.
+pub(super) fn initial_context_reservation(
+	database: &DatabaseRoot,
+) -> FerrosGrynnResult<(usize, usize)> {
+	let retained = EncodeContext::initial_retained_bytes(
+		&database.dictionary,
+		database.schema.classes().map(|class| class.name()),
+		database.schema.all_graphs().map(|graph| graph.reference()),
+	)?;
+	let overlap = database.schema.all_graphs().fold(0, |maximum, graph| {
+		maximum.max(graph.reference().name().estimated_clone_heap_bytes())
+	});
+	Ok((retained, overlap))
+}
+
+/// Builds point context in the same published-prefix and catalog-value order.
+///
+/// # Errors
+/// Preserves setup, conversion and dictionary-validation failures. The caller
+/// must discard this private context after an error.
+pub(super) fn point_value_context(
+	database: &DatabaseRoot,
+	time_zones: &[crate::values::Text],
+	budget: &mut PublicationBudget,
+) -> FerrosGrynnResult<EncodeContext> {
+	let (retained, overlap) = initial_context_reservation(database)?;
+	let mut context = budget.with_scratch(overlap, |budget| {
+		budget.retain(retained)?;
+		value_context(&database.schema, database.dictionary.as_ref().clone())
+	})?;
+	// Unchanged physical payloads still use every published identifier.
+	// New names may only append until a full generation rewrites them all.
+	let retained =
+		context.restore_time_zone_names_bounded(time_zones, budget.available_bytes()?)?;
+	budget.retain(retained)?;
+	prime_point_context(database, &mut context, budget)?;
+	if context.property_dictionary().len() != database.dictionary.len() {
+		return Err(invalid(
+			"graph property value contains dictionary keys absent from the MVCC root",
+		));
+	}
+	Ok(context)
+}
+
+/// Keeps point-context preparation on the same publication owner as pages.
+///
+/// # Errors
+/// Returns conversion, reader-policy and preallocation limit failures; the
+/// caller must discard its private context after failure.
+pub(super) fn prime_point_context(
+	database: &DatabaseRoot,
+	context: &mut EncodeContext,
+	budget: &mut PublicationBudget,
+) -> FerrosGrynnResult<()> {
+	prime_with_values(database, context, |value, context| {
+		let retained =
+			StorageValue::prime_context_bounded(value, context, budget.available_bytes()?)?;
+		budget.retain(retained)
+	})
+}
+
 /// Returns the prime value context result.
 pub(super) fn prime_value_context(
 	database: &DatabaseRoot,
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<()> {
+	prime_with_values(database, context, |value, context| {
+		drop(StorageValue::from_runtime(value.clone(), context)?);
+		Ok(())
+	})
+}
+
+/// Shares catalog order while each publication path owns graph and parameter
+/// conversion.
+///
+/// # Errors
+/// Preserves conversion and callback failures in graph/parameter/analyzer
+/// order.
+fn prime_with_values(
+	database: &DatabaseRoot,
+	context: &mut EncodeContext,
+	mut prime_value: impl FnMut(&crate::values::Value, &mut EncodeContext) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
 	for graph in database.schema.all_graphs() {
 		for (_key, value) in graph.properties() {
-			drop(StorageValue::from_runtime(value.clone(), context)?);
+			prime_value(value, context)?;
 		}
 	}
 	for parameter in database.schema.parameters() {
-		drop(StorageValue::from_runtime(parameter.value().clone(), context)?);
+		prime_value(parameter.value(), context)?;
 	}
 	for analyzer in database.schema.analyzers() {
 		for filter in analyzer.filters() {

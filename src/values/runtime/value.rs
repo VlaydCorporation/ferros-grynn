@@ -279,21 +279,27 @@ impl Value {
 			| Self::Ulid(_)
 			| Self::Uuid(_)
 			| Self::Cursor(_) => 0,
-			Self::String(value) => value.len(),
-			Self::Array(values) => estimated_values_heap_bytes(values.iter(), values.len()),
-			Self::Set(values) => estimated_values_heap_bytes(values.iter(), values.len()),
+			Self::String(value) => value.estimated_heap_bytes(),
+			Self::Array(values) => estimated_values_heap_bytes(values.iter(), values.capacity()),
+			Self::Set(values) => values
+				.iter()
+				.map(Self::estimated_heap_bytes)
+				.fold(estimated_tree_heap_bytes::<Value>(values.len()), usize::saturating_add),
 			Self::Object(values) => values
 				.iter()
 				.map(|(key, value)| {
-					size_of::<(Text, Value)>()
-						.saturating_add(key.len())
-						.saturating_add(value.estimated_heap_bytes())
+					key.estimated_heap_bytes().saturating_add(value.estimated_heap_bytes())
 				})
-				.fold(0_usize, usize::saturating_add),
+				.fold(
+					estimated_tree_heap_bytes::<(Text, Value)>(values.len()),
+					usize::saturating_add,
+				),
 			Self::Geometry(value) => estimated_geometry_heap_bytes(value),
 			Self::Vector(value) => estimated_vector_heap_bytes(value),
-			Self::Bytes(value) => value.len(),
-			Self::GraphRef(value) => size_of::<GraphRef>().saturating_add(value.name().len()),
+			Self::Bytes(value) => value.estimated_heap_bytes(),
+			Self::GraphRef(value) => {
+				size_of::<GraphRef>().saturating_add(value.name().estimated_heap_bytes())
+			}
 			Self::Record(value) => {
 				size_of::<RecordId>().saturating_add(estimated_record_id_heap_bytes(value))
 			}
@@ -305,7 +311,9 @@ impl Value {
 				size_of::<AtomRef>().saturating_add(estimated_record_id_heap_bytes(value.id()))
 			}
 			Self::AtomOccurrence(value) => size_of::<AtomOccurrenceRef>()
-				.saturating_add(estimated_record_id_heap_bytes(value.atom().id())),
+				.saturating_add(estimated_record_id_heap_bytes(value.atom().id()))
+				.saturating_add(size_of::<GraphRef>())
+				.saturating_add(value.graph().name().estimated_heap_bytes()),
 			Self::Path(value) => {
 				size_of_val(value.as_ref()).saturating_add(value.estimated_heap_bytes())
 			}
@@ -636,25 +644,30 @@ fn estimated_values_heap_bytes<'a>(
 	)
 }
 
+/// Reserves complete B-tree nodes, including sparse singleton containers.
+fn estimated_tree_heap_bytes<Entry>(count: usize) -> usize {
+	crate::memory::tree_retained_bytes::<Entry>(count).unwrap_or(usize::MAX)
+}
+
 /// Returns the estimated record id heap bytes result.
 pub fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
-	record.class().len().saturating_add(estimated_record_part_heap_bytes(record.id()))
+	record.estimated_heap_bytes()
 }
 
 /// Returns the estimated record part heap bytes result.
-fn estimated_record_part_heap_bytes(part: &RecordIdPart) -> usize {
+pub(super) fn estimated_record_part_heap_bytes(part: &RecordIdPart) -> usize {
 	match part {
 		RecordIdPart::Int(_) | RecordIdPart::Uuid(_) | RecordIdPart::Ulid(_) => 0,
-		RecordIdPart::String(value) => value.len(),
-		RecordIdPart::Array(values) => estimated_values_heap_bytes(values.iter(), values.len()),
+		RecordIdPart::String(value) => value.estimated_heap_bytes(),
+		RecordIdPart::Array(values) => {
+			estimated_values_heap_bytes(values.iter(), values.capacity())
+		}
 		RecordIdPart::Object(values) => values
 			.iter()
 			.map(|(key, value)| {
-				size_of::<(Text, Value)>()
-					.saturating_add(key.len())
-					.saturating_add(value.estimated_heap_bytes())
+				key.estimated_heap_bytes().saturating_add(value.estimated_heap_bytes())
 			})
-			.fold(0_usize, usize::saturating_add),
+			.fold(estimated_tree_heap_bytes::<(Text, Value)>(values.len()), usize::saturating_add),
 	}
 }
 
@@ -670,12 +683,12 @@ fn estimated_bound_heap_bytes(bound: Bound<&Value>) -> usize {
 
 /// Returns the estimated position heap bytes result.
 fn estimated_position_heap_bytes(position: &Position) -> usize {
-	position.as_slice().len().saturating_mul(size_of::<f64>())
+	position.estimated_heap_bytes()
 }
 
 /// Returns the estimated positions heap bytes result.
-fn estimated_positions_heap_bytes(positions: &[Position]) -> usize {
-	positions.len().saturating_mul(size_of::<Position>()).saturating_add(
+fn estimated_positions_heap_bytes(positions: &[Position], capacity: usize) -> usize {
+	capacity.saturating_mul(size_of::<Position>()).saturating_add(
 		positions.iter().map(estimated_position_heap_bytes).fold(0_usize, usize::saturating_add),
 	)
 }
@@ -685,39 +698,54 @@ pub(super) fn estimated_geometry_heap_bytes(geometry: &Geometry) -> usize {
 	match geometry {
 		Geometry::Point(position) => estimated_position_heap_bytes(position),
 		Geometry::MultiPoint(positions) | Geometry::LineString(positions) => {
-			estimated_positions_heap_bytes(positions)
+			estimated_positions_heap_bytes(positions, positions.capacity())
 		}
-		Geometry::MultiLineString(lines) | Geometry::Polygon(lines) => lines
-			.iter()
-			.map(|line| {
-				size_of::<Vec<Position>>().saturating_add(estimated_positions_heap_bytes(line))
-			})
-			.fold(0_usize, usize::saturating_add),
-		Geometry::MultiPolygon(polygons) => polygons
-			.iter()
-			.flat_map(|polygon| polygon.iter())
-			.map(|ring| {
-				size_of::<Vec<Position>>().saturating_add(estimated_positions_heap_bytes(ring))
-			})
-			.fold(0_usize, usize::saturating_add),
+		Geometry::MultiLineString(lines) | Geometry::Polygon(lines) => {
+			lines.capacity().saturating_mul(size_of::<Vec<Position>>()).saturating_add(
+				lines
+					.iter()
+					.map(|line| estimated_positions_heap_bytes(line, line.capacity()))
+					.fold(0_usize, usize::saturating_add),
+			)
+		}
+		Geometry::MultiPolygon(polygons) => {
+			polygons.capacity().saturating_mul(size_of::<Vec<Vec<Position>>>()).saturating_add(
+				polygons
+					.iter()
+					.map(|polygon| {
+						polygon
+							.capacity()
+							.saturating_mul(size_of::<Vec<Position>>())
+							.saturating_add(
+								polygon
+									.iter()
+									.map(|ring| {
+										estimated_positions_heap_bytes(ring, ring.capacity())
+									})
+									.fold(0_usize, usize::saturating_add),
+							)
+					})
+					.fold(0_usize, usize::saturating_add),
+			)
+		}
 		Geometry::Collection(values) => values
 			.iter()
-			.map(|value| size_of::<Geometry>().saturating_add(estimated_geometry_heap_bytes(value)))
-			.fold(0_usize, usize::saturating_add),
+			.map(estimated_geometry_heap_bytes)
+			.fold(values.capacity().saturating_mul(size_of::<Geometry>()), usize::saturating_add),
 	}
 }
 
 /// Returns the estimated vector heap bytes result.
 fn estimated_vector_heap_bytes(vector: &Vector) -> usize {
 	match vector {
-		Vector::F32(values) => values.len().saturating_mul(size_of::<f32>()),
-		Vector::F64(values) => values.len().saturating_mul(size_of::<f64>()),
-		Vector::F16(values) => values.len().saturating_mul(size_of::<half::f16>()),
-		Vector::I16(values) => values.len().saturating_mul(size_of::<i16>()),
-		Vector::I32(values) => values.len().saturating_mul(size_of::<i32>()),
-		Vector::I64(values) => values.len().saturating_mul(size_of::<i64>()),
-		Vector::I8(values) => values.len().saturating_mul(size_of::<i8>()),
-		Vector::U8(values) => values.len().saturating_mul(size_of::<u8>()),
+		Vector::F32(values) => values.capacity().saturating_mul(size_of::<f32>()),
+		Vector::F64(values) => values.capacity().saturating_mul(size_of::<f64>()),
+		Vector::F16(values) => values.capacity().saturating_mul(size_of::<half::f16>()),
+		Vector::I16(values) => values.capacity().saturating_mul(size_of::<i16>()),
+		Vector::I32(values) => values.capacity().saturating_mul(size_of::<i32>()),
+		Vector::I64(values) => values.capacity().saturating_mul(size_of::<i64>()),
+		Vector::I8(values) => values.capacity().saturating_mul(size_of::<i8>()),
+		Vector::U8(values) => values.capacity().saturating_mul(size_of::<u8>()),
 	}
 }
 

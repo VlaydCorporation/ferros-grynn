@@ -112,3 +112,75 @@ fn class(id: u32, name: &str, kind: AtomKind) -> FerrosGrynnResult<ClassSchema> 
 	class.id = ClassId::new(id);
 	Ok(class)
 }
+
+/// Real writers preserve full qualified roles, side tags, order and duplicates.
+#[test]
+fn hot_side_writers_preserve_local_suffix_and_whole_qualified_roles() {
+	use super::{
+		builders::{OverflowBuilder, QualifiedOverflowBuilder},
+		topology::encode_hot_side,
+	};
+	use crate::{
+		storage::{
+			graph_pages::{
+				EncodedEndpoint,
+				EndpointSide,
+				decode_adjacency_overflow,
+				decode_cross_level_overflow,
+			},
+			page::PageNo,
+		},
+		test_assertions::AssertResult as _,
+		values::storage::DiskAtomRef,
+	};
+	let a = DiskAtomRef::from_parts(AtomKind::Node, 4).assert_ok();
+	let b = DiskAtomRef::from_parts(AtomKind::Edge, 9).assert_ok();
+	for (scopes, cross) in [([0, 0, 0], false), ([7, 7, 7], true), ([0, 7, 0], true)] {
+		for side in [EndpointSide::Source, EndpointSide::Target] {
+			let entries = scopes
+				.into_iter()
+				.zip([a, b, a])
+				.map(|(graph_slot, atom)| EncodedEndpoint {
+					graph_slot,
+					atom,
+				})
+				.collect::<Vec<_>>();
+			let mut local = OverflowBuilder::default();
+			let mut qualified = QualifiedOverflowBuilder::default();
+			let encoded =
+				encode_hot_side(&entries, side, cross, PageLsn::ZERO, &mut local, &mut qualified)
+					.assert_ok();
+			let local = local.finish();
+			let qualified = qualified.finish();
+			if cross {
+				assert_eq!(encoded.inline, [None; 2]);
+				assert_eq!(encoded.graph_slot, None);
+				assert_eq!(encoded.local_overflow, None);
+				assert_eq!(encoded.graph_overflow, Some(PageNo::new(0)));
+				assert!(local.is_empty());
+				assert_eq!(qualified.len(), 1);
+				let (next, decoded) =
+					decode_cross_level_overflow(&qualified[0], PageNo::new(0)).assert_ok();
+				assert_eq!(next, None);
+				assert_eq!(
+					decoded
+						.iter()
+						.map(|entry| (entry.graph_slot, entry.atom, entry.side))
+						.collect::<Vec<_>>(),
+					vec![(scopes[0], a, side), (scopes[1], b, side), (scopes[2], a, side)]
+				);
+			} else {
+				assert_eq!(encoded.inline, [Some(a), Some(b)]);
+				assert_eq!(encoded.graph_slot, None);
+				assert_eq!(encoded.local_overflow, Some(PageNo::new(0)));
+				assert_eq!(encoded.graph_overflow, None);
+				assert!(qualified.is_empty());
+				assert_eq!(local.len(), 1);
+				let (next, decoded) =
+					decode_adjacency_overflow(&local[0], PageNo::new(0)).assert_ok();
+				assert_eq!(next, None);
+				assert_eq!(decoded, vec![a]);
+			}
+		}
+	}
+}

@@ -347,6 +347,27 @@ impl AtomStoreRoot {
 		self.atoms.get(&id).filter(|atom| atom.id == id).map(Arc::as_ref)
 	}
 
+	/// Resolves final slot occupancy without scanning atoms or losing
+	/// generation.
+	///
+	/// # Errors
+	/// Rejects slots outside the platform or packed identity range.
+	pub(crate) fn atom_by_slot(&self, slot: u64) -> FerrosGrynnResult<Option<&BaseAtom>> {
+		AtomId::from_parts(AtomKind::Node, slot, 0)?;
+		let index = usize::try_from(slot)
+			.map_err(|_error| FerrosGrynnError::graph_capacity_exceeded("global atom store"))?;
+		let Some(generation) = self.slot_generation(index) else {
+			return Ok(None);
+		};
+		for kind in [AtomKind::Node, AtomKind::Edge] {
+			if let Some(atom) = self.atom(GlobalAtomId(AtomId::from_parts(kind, slot, generation)?))
+			{
+				return Ok(Some(atom));
+			}
+		}
+		Ok(None)
+	}
+
 	/// Returns the atom arc result.
 	pub(crate) fn atom_arc(&self, id: GlobalAtomId) -> Option<Arc<BaseAtom>> {
 		self.atoms.get(&id).filter(|atom| atom.id == id).cloned()
@@ -472,6 +493,8 @@ mod tests {
 		let mut class = ClassSchema::new("person", AtomKind::Node, []).assert_ok();
 		class.id = ClassId::new(1);
 		let mut store = AtomStoreRoot::default();
+		assert!(store.atom_by_slot(0).assert_ok().is_none());
+		assert!(store.atom_by_slot(u64::MAX).is_err());
 		let first = store
 			.insert(
 				&class,
@@ -492,5 +515,6 @@ mod tests {
 		assert_ne!(first.generation(), second.generation());
 		assert!(store.atom(first).is_none());
 		assert!(store.atom(second).is_some());
+		assert_eq!(store.atom_by_slot(first.slot()).assert_ok().map(BaseAtom::id), Some(second));
 	}
 }

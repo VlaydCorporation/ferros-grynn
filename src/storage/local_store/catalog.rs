@@ -1,13 +1,14 @@
-//! Conversion between the MVCC schema root and exact `FGDC v12` entries.
+//! Conversion between the MVCC schema root and exact FGDC entries.
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use super::GraphBinding;
+use super::{GraphBinding, layout::GenerationBindings, point_index::PointIndexPlan};
 use crate::{
 	datastore::{
 		AnalyzerFilter,
 		ClassField,
 		ClassIndex,
+		ClassIndexState,
 		ClassSchema,
 		DatabaseRoot,
 		IndexId,
@@ -51,6 +52,79 @@ use crate::{
 		},
 	},
 };
+
+/// Installs prepared stamps and immutable owners after WAL without allocation.
+pub(super) fn install_graph_metadata(bindings: &mut [GraphBinding], catalog: &DatabaseCatalog) {
+	for (binding, entry) in bindings.iter_mut().zip(&catalog.graphs) {
+		binding.generation = entry.generation;
+		if !binding.arena.same_owner(&entry.arena) {
+			binding.arena = entry.arena.clone();
+		}
+	}
+}
+
+/// Installs prepared point bindings after WAL without allocation or
+/// fallibility.
+pub(super) fn install_point_files(bindings: &mut GenerationBindings, plan: PointIndexPlan) {
+	for binding in &mut bindings.graphs {
+		if let Some(file) = plan.label_files.get(&binding.graph_id) {
+			binding.files.labels = *file;
+		}
+		if let Some(endpoint) = plan.endpoints.get(&binding.graph_id) {
+			binding.edge_endpoint = Some(*endpoint);
+		}
+		if let Some(membership) = plan.memberships.get(&binding.graph_id) {
+			binding.membership = *membership;
+		}
+	}
+	bindings.atoms.primary = plan.primary.file_id;
+	bindings.atoms.primary_root = plan.primary.root;
+	bindings.reverse = crate::storage::graph_store::ReverseMembershipFile {
+		file: plan.reverse.file_id,
+		root: plan.reverse.root,
+	};
+	bindings.physical_indexes = plan.bindings;
+}
+
+/// Encodes prepared point roots while preserving unrelated catalog bindings.
+///
+/// # Errors
+/// Propagates the ordinary catalog conversion and admission errors before WAL.
+pub(super) fn encode_point_catalog(
+	root: &DatabaseRoot,
+	mut atoms: AtomStoreCatalogBinding,
+	source: &GenerationBindings,
+	point: Option<&PointIndexPlan>,
+	prepared: Option<&super::point_update::PointUpdatePlan>,
+	context: &mut EncodeContext,
+) -> FerrosGrynnResult<DatabaseCatalog> {
+	if let Some(point) = point {
+		atoms.primary = point.primary;
+		atoms.reverse_membership = point.reverse;
+	}
+	let mut catalog = encode_database_catalog(
+		root,
+		atoms,
+		&source.graphs,
+		point.map_or(&source.physical_indexes, |plan| &plan.bindings),
+		&source.physical_deltas,
+		context,
+	)?;
+	for graph in &mut catalog.graphs {
+		if let Some(arena) = prepared.and_then(|plan| plan.graph_arenas.get(&graph.id)) {
+			graph.arena = arena.clone();
+		}
+		if let Some(point) = point {
+			if let Some(binding) = point.endpoints.get(&graph.id) {
+				graph.edge_endpoint = Some(*binding);
+			}
+			if let Some(binding) = point.memberships.get(&graph.id) {
+				graph.membership = *binding;
+			}
+		}
+	}
+	Ok(catalog)
+}
 
 /// Encodes database catalog.
 pub(super) fn encode_database_catalog(
@@ -255,7 +329,9 @@ pub(super) fn encode_database_catalog(
 				id: binding.graph_id,
 				version: schema.version(),
 				published_at: schema.published_at,
-				generation: binding.generation,
+				// Same-file incidence publication advances this logical image
+				// timestamp without changing any physical file identity.
+				generation: binding.generation.max(tensor_revision),
 				name: schema.name().clone(),
 				kind: schema.reference().kind(),
 				storage_mode: GraphStorageMode::DiskBacked,
@@ -269,6 +345,8 @@ pub(super) fn encode_database_catalog(
 				indexes: schema.indexes().cloned().collect(),
 				index_bindings: schema
 					.indexes()
+					// Retained source files do not make an invalidated definition Ready.
+					.filter(|index| index.state() == ClassIndexState::Ready && !index.is_on_demand())
 					.filter_map(|index| {
 						let id = index.id()?;
 						physical_indexes.get(&id).copied().map(|binding| (id, binding))
@@ -785,7 +863,7 @@ pub(super) fn decode_catalog_values(
 	schema: &mut SchemaCatalog,
 ) -> FerrosGrynnResult<()> {
 	let mut context = value_context(schema, dictionary.clone())?;
-	for zone in &catalog.time_zones {
+	for zone in catalog.time_zones.iter() {
 		context.register_time_zone_name(zone.clone())?;
 	}
 	for entry in &catalog.graphs {

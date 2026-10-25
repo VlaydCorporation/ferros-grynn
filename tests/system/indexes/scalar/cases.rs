@@ -1,9 +1,72 @@
 use ferros_grynn::{
-	datastore::{ClassIndex, ClassIndexKind, ClassIndexState, IndexScope},
-	values::{Object, Value},
+	datastore::{ClassIndex, ClassIndexKind, ClassIndexState, ClassSchema, Datastore, IndexScope},
+	graph::{AtomKind, GraphKind},
+	values::{Object, PropertyMap, RecordId, Value},
 };
 
 use crate::support::{create_person, execute, people, record, value};
+
+/// Reads label-only MATCH through the downstream query API.
+fn occurrence_label_ids(store: &Datastore, source: &str) -> Vec<RecordId> {
+	let rows = value(store, source, &Object::new());
+	let mut ids = rows
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|row| {
+			row.as_object()
+				.unwrap()
+				.get("n")
+				.unwrap()
+				.as_atom_occurrence()
+				.unwrap()
+				.atom()
+				.id()
+				.clone()
+		})
+		.collect::<Vec<_>>();
+	ids.sort();
+	ids
+}
+
+/// Label replacement, reset and abort preserve exact MATCH after recovery.
+#[test]
+fn occurrence_label_lookup_matches_query_after_replace_reset_and_reopen() {
+	const LABEL_A: &str = "MATCH (* AS n LABEL A) IN GRAPH selected RETURN n";
+	const LABEL_B: &str = "MATCH (* AS n LABEL B) IN GRAPH selected RETURN n";
+	let db = database();
+	let mut seed = db.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	let graph = seed.define_graph("selected", GraphKind::Graph).unwrap();
+	let other = seed.define_graph("other", GraphKind::Graph).unwrap();
+	let records = ["person:a", "person:b", "person:c"].map(record);
+	for (record, label) in records.iter().zip(["A", "B", "A"]) {
+		seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		seed.attach_node(graph.id(), record, Some(label.into()), None).unwrap();
+	}
+	seed.attach_node(other.id(), &records[0], Some("A".into()), None).unwrap();
+	seed.commit().unwrap();
+	{
+		let mut aborted = db.begin();
+		aborted.set_occurrence_label(graph.id(), &records[0], Some("C".into())).unwrap();
+	}
+	assert_eq!(occurrence_label_ids(&db, LABEL_A), [records[0].clone(), records[2].clone()]);
+	let mut write = db.begin();
+	write.set_occurrence_label(graph.id(), &records[0], Some("B".into())).unwrap();
+	write.commit().unwrap();
+	assert_eq!(occurrence_label_ids(&db, LABEL_B), records[..2]);
+	let mut reset = db.begin();
+	reset.set_occurrence_label(graph.id(), &records[2], None).unwrap();
+	reset.commit().unwrap();
+	db.assert_committed(|store| {
+		assert!(occurrence_label_ids(store, LABEL_A).is_empty());
+		assert_eq!(occurrence_label_ids(store, LABEL_B), records[..2]);
+		assert_eq!(
+			occurrence_label_ids(store, "MATCH (* AS n LABEL A) IN GRAPH other RETURN n"),
+			std::slice::from_ref(&records[0]),
+		);
+	});
+}
 
 /// Verifies sdk scalar index matches scan after update delete and rollback.
 #[test]
@@ -108,7 +171,7 @@ fn effective_scalar_index_tracks_overlay_reset_and_detach() {
 	});
 }
 
-/// Verifies deferred index requires rebuild and count remains exact.
+/// Verifies deferred index visibility follows its snapshot and count remains exact.
 #[test]
 fn deferred_index_requires_rebuild_and_count_remains_exact() {
 	let db = database();
@@ -119,11 +182,23 @@ fn deferred_index_requires_rebuild_and_count_remains_exact() {
 		 CLASS person COUNT SCOPE BASE; CREATE person:a SET name = 'A', age = 10;",
 		&Object::new(),
 	);
-	let class = db.class("person").unwrap();
+	// Background catch-up may publish Ready between independent datastore reads.
+	let mut reader = db.begin();
+	let class = reader.class("person").unwrap().unwrap();
 	let index = class.indexes().find(|index| index.name().as_str() == "by_age").unwrap();
-	assert_eq!(index.state(), ClassIndexState::Stale);
+	assert!(matches!(index.state(), ClassIndexState::Stale | ClassIndexState::Ready));
 	let forced = "SELECT VALUE id FROM person WITH INDEX by_age WHERE age = 10;";
-	assert!(db.execute(forced, &Object::new()).unwrap()[0].result.is_err());
+	let rows = reader.execute(forced, &Object::new()).unwrap();
+	assert_eq!(rows.len(), 1);
+	if index.state() == ClassIndexState::Stale {
+		assert_eq!(rows[0].result.as_ref().unwrap_err().status().code().to_string(), "FG-42F03");
+	} else {
+		assert_eq!(
+			rows[0].result.as_ref().unwrap().value(),
+			&Value::Array(vec![Value::from(record("person:a"))].into())
+		);
+	}
+	drop(reader);
 	assert_eq!(
 		value(&db, "SELECT VALUE id FROM person WHERE age = 10;", &Object::new())
 			.as_array()
@@ -131,7 +206,12 @@ fn deferred_index_requires_rebuild_and_count_remains_exact() {
 			.len(),
 		1
 	);
-	execute(&db, "REBUILD INDEX by_age ON CLASS person;", &Object::new());
+	let rebuild = db.execute("REBUILD INDEX by_age ON CLASS person;", &Object::new()).unwrap();
+	assert_eq!(rebuild.len(), 1);
+	// A winning background publication must leave the same exact Ready index below.
+	if let Err(error) = &rebuild[0].result {
+		assert_eq!(error.status().code().to_string(), "FG-40F02");
+	}
 	db.assert_committed(|store| {
 		assert_eq!(
 			store

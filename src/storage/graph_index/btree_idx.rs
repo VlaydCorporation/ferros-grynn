@@ -50,14 +50,6 @@ pub(super) fn validate_scalar_entries<Address: PrimaryAddress + Ord>(
 	Ok(())
 }
 
-/// Returns the partition standard leaf entries result.
-#[cfg(test)]
-pub(super) fn partition_standard_leaf_entries<Address: PrimaryAddress + Ord>(
-	entries: &[ScalarIndexEntry<Address>],
-) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry<Address>]>> {
-	partition_standard_leaf_entries_with_limit(entries, PAGE_SIZE)
-}
-
 /// Returns the partition standard leaf entries with limit result.
 pub(super) fn partition_standard_leaf_entries_with_limit<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
@@ -301,6 +293,26 @@ pub(super) fn decode_standard_leaf_entries<Address: PrimaryAddress + Ord>(
 		});
 	}
 	Ok(entries)
+}
+
+/// Validates borrowed descriptors before a leaf mutator may allocate postings.
+///
+/// # Errors
+/// Returns a codec error for malformed descriptors, empty postings or unordered
+/// keys.
+pub(super) fn standard_leaf_has_external_postings(page: &AlignedPage) -> FerrosGrynnResult<bool> {
+	let (count, area_start) = validate_standard_leaf_layout(page)?;
+	let mut previous = None;
+	let mut external = false;
+	for index in 0..count {
+		let entry = standard_leaf_entry(page.as_bytes(), area_start, count, index)?;
+		if entry.total_count == 0 || previous.is_some_and(|key| key >= entry.key) {
+			return Err(invalid_index("scalar leaf has empty postings or unordered keys"));
+		}
+		previous = Some(entry.key);
+		external |= entry.posting != PageNo::NULL;
+	}
+	Ok(external)
 }
 
 /// Standard leaf entry state.

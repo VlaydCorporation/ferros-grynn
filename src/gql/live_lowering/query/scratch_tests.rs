@@ -8,6 +8,24 @@ use crate::{
 	values::{PropertyMap, Type},
 };
 
+/// Sharing the borrowed Type walker does not relax the LIVE embedding's bound.
+#[test]
+fn live_schema_type_admission_preserves_its_depth_limit() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut ty = Type::Int;
+	for _ in 0..64 {
+		ty = Type::Array(Box::new(ty));
+	}
+	super::super::admit_type_shape(&ty, 0, 1, &mut |_bytes, _work| Ok(())).assert_ok();
+	let ty = Type::Array(Box::new(ty));
+	let error = super::super::admit_type_shape(&ty, 0, 1, &mut |_bytes, _work| Ok(())).assert_err();
+	assert!(matches!(
+		error.status().status(),
+		crate::gql_status::Status::TraversalResourceLimitExceeded { .. }
+	));
+}
+
 /// Builds a fixed scalar shape with four matching rows and optional long keys.
 fn streaming_fixture(rows: usize, key_bytes: usize) -> FerrosGrynnResult<(Datastore, ClassId)> {
 	let store = Datastore::in_memory();
@@ -120,9 +138,9 @@ fn live_streaming_retained_identity_remains_bounded() -> FerrosGrynnResult<()> {
 	))
 }
 
-/// One oversized input still fails before constructing its public row copy.
+/// Streaming and materialized inputs reject before constructing oversized rows.
 #[test]
-fn live_streaming_oversized_row_still_rejects() -> FerrosGrynnResult<()> {
+fn live_root_oversized_row_still_rejects() -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
 	let class =
@@ -136,16 +154,22 @@ fn live_streaming_oversized_row_still_rejects() -> FerrosGrynnResult<()> {
 		PropertyMap::from_iter([(payload, "x".repeat(256 << 10).into())]),
 	)?;
 	setup.commit()?;
-	let query = LiveQuery::new(LiveSource::Class(class))
-		.with_projection(LiveProjection::Value(LiveExpr::Literal(0.into())));
-	assert_resource(evaluate_query(
-		&store.inner.current_root(),
-		&query,
-		&|_id| Err(FerrosGrynnError::invalid_argument("unexpected binding")),
-		&LiveOptions::default().with_budgets(320 << 10, 1_000_000)?,
-		std::env::temp_dir(),
-		&|_| {},
-	))
+	for projection in [LiveExpr::Literal(0.into()), LiveExpr::Call {
+		name: "count".into(),
+		arguments: Vec::new(),
+	}] {
+		let query = LiveQuery::new(LiveSource::Class(class))
+			.with_projection(LiveProjection::Value(projection));
+		assert_resource(evaluate_query(
+			&store.inner.current_root(),
+			&query,
+			&|_id| Err(FerrosGrynnError::invalid_argument("unexpected binding")),
+			&LiveOptions::default().with_budgets(320 << 10, 1_000_000)?,
+			std::env::temp_dir(),
+			&|_| {},
+		))?;
+	}
+	Ok(())
 }
 
 /// Nested collectors keep payloads admitted while their outer row is alive.

@@ -16,7 +16,7 @@ use crate::{
 	values::{PropertyMap, RecordId, RecordIdPart, Type},
 };
 
-/// Verifies last label member removal and renaming remove empty counters.
+/// Final label removal drops orphan histograms; transient renames retain them.
 #[test]
 fn last_label_member_removal_and_renaming_remove_empty_counters() {
 	use crate::test_assertions::AssertResult as _;
@@ -29,6 +29,21 @@ fn last_label_member_removal_and_renaming_remove_empty_counters() {
 	seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
 	seed.attach_node(graph.id(), &record, Some("old".into()), None).assert_ok();
 	seed.commit().assert_ok();
+	let mut analyzed = store.inner.current_root().as_ref().clone();
+	analyzed.statistics = std::sync::Arc::new(analyze_database(&analyzed).assert_ok());
+	let source = analyzed.statistics.graph(graph.id()).assert_some().clone();
+	assert!(source.degree_histograms.keys().any(|key| key.label.is_some()));
+	assert!(source.degree_histograms.keys().any(|key| key.label.is_none()));
+	let store =
+		Datastore::from_root_for_test(crate::datastore::InMemoryOptions::default(), analyzed);
+	let mut transient = store.begin();
+	transient.set_occurrence_label(graph.id(), &record, Some("temporary".into())).assert_ok();
+	transient.set_occurrence_label(graph.id(), &record, Some("old".into())).assert_ok();
+	transient.commit().assert_ok();
+	assert_eq!(
+		store.inner.current_root().statistics.graph(graph.id()).assert_some().degree_histograms,
+		source.degree_histograms
+	);
 	let mut rename = store.begin();
 	rename.set_occurrence_label(graph.id(), &record, Some("new".into())).assert_ok();
 	rename.commit().assert_ok();
@@ -43,6 +58,16 @@ fn last_label_member_removal_and_renaming_remove_empty_counters() {
 		.labels;
 	assert_eq!(counters.len(), 1);
 	assert_eq!(counters.keys().next().map(|key| key.label.as_str()), Some("new"));
+	let renamed = root.statistics.graph(graph.id()).assert_some();
+	let global = source
+		.degree_histograms
+		.iter()
+		.filter(|(key, _)| key.label.is_none())
+		.map(|(key, histogram)| (key.clone(), histogram.clone()))
+		.collect::<std::collections::BTreeMap<_, _>>();
+	assert_eq!(renamed.degree_histograms, global);
+	assert_eq!(renamed.analyzed_revision, source.analyzed_revision);
+	assert!(renamed.dirty_rows > source.dirty_rows);
 	let mut remove = store.begin();
 	remove.detach_occurrence(graph.id(), &record, false).assert_ok();
 	remove.commit().assert_ok();

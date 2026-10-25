@@ -43,6 +43,7 @@ const LARGE_DATA_OFFSET: usize = LARGE_RESERVED_OFFSET + 4;
 pub(super) const LARGE_CHUNK_BYTES: usize = PAGE_SIZE - LARGE_DATA_OFFSET;
 
 /// Mutable builder for one canonical slotted property page.
+#[derive(Clone, Copy)]
 pub(super) struct PropertyPageBuilder {
 	/// Number of populated slot entries.
 	slot_count: u16,
@@ -71,6 +72,11 @@ impl PropertyPageBuilder {
 		page_lsn: PageLsn,
 	) -> Self {
 		page.reset(page_type, PageFlags::empty(), page_lsn, page_no);
+		Self::empty()
+	}
+
+	/// Counter-only state also predicts packing before page allocation.
+	pub(super) const fn empty() -> Self {
 		Self {
 			slot_count: 0,
 			free_start: SLOT_DIRECTORY_OFFSET as u16,
@@ -84,39 +90,52 @@ impl PropertyPageBuilder {
 		page: &mut AlignedPage,
 		record: &[u8],
 	) -> FerrosGrynnResult<Option<u16>> {
-		if record.len() > MAX_INLINE_BYTES {
+		let Some((slot, record_offset, record_len)) = self.try_insert_len(record.len())? else {
 			return Ok(None);
-		}
-		let required = record
-			.len()
-			.checked_add(SLOT_ENTRY_BYTES)
-			.ok_or_else(|| invalid(0, "property record size overflows usize"))?;
-		if required > usize::from(self.free_end - self.free_start) {
-			return Ok(None);
-		}
-		let record_len = u16::try_from(record.len())
-			.map_err(|_error| invalid(0, "inline property record exceeds u16"))?;
-		let record_offset = self
-			.free_end
-			.checked_sub(record_len)
-			.ok_or_else(|| invalid(0, "property page free range underflows"))?;
-		let slot_offset = usize::from(self.free_start);
+		};
+		let slot_offset = SLOT_DIRECTORY_OFFSET + usize::from(slot) * SLOT_ENTRY_BYTES;
 		let bytes = page.as_bytes_mut();
 		write_u16(bytes, slot_offset, record_offset);
 		write_u16(bytes, slot_offset + 2, record_len);
 		bytes[usize::from(record_offset)..usize::from(record_offset) + record.len()]
 			.copy_from_slice(record);
+		Ok(Some(slot))
+	}
+
+	/// Advances packing without materializing a record or mutating page bytes.
+	/// A rejected record leaves all counters unchanged.
+	pub(super) fn try_insert_len(
+		&mut self,
+		length: usize,
+	) -> FerrosGrynnResult<Option<(u16, u16, u16)>> {
+		if length > MAX_INLINE_BYTES {
+			return Ok(None);
+		}
+		let required = length
+			.checked_add(SLOT_ENTRY_BYTES)
+			.ok_or_else(|| invalid(0, "property record size overflows usize"))?;
+		if required > usize::from(self.free_end - self.free_start) {
+			return Ok(None);
+		}
+		let record_len = u16::try_from(length)
+			.map_err(|_error| invalid(0, "inline property record exceeds u16"))?;
+		let record_offset = self
+			.free_end
+			.checked_sub(record_len)
+			.ok_or_else(|| invalid(0, "property page free range underflows"))?;
 		let slot = self.slot_count;
-		self.slot_count = self
+		let slot_count = self
 			.slot_count
 			.checked_add(1)
 			.ok_or_else(|| invalid(0, "property slot count overflows u16"))?;
-		self.free_start = self
+		let free_start = self
 			.free_start
 			.checked_add(SLOT_ENTRY_BYTES as u16)
 			.ok_or_else(|| invalid(0, "property slot directory overflows u16"))?;
+		self.slot_count = slot_count;
+		self.free_start = free_start;
 		self.free_end = record_offset;
-		Ok(Some(slot))
+		Ok(Some((slot, record_offset, record_len)))
 	}
 
 	/// Seals metadata in the caller-owned final page.
@@ -220,6 +239,28 @@ pub(super) fn encode_property_map(
 		));
 	}
 	Ok(encoded[1..].to_vec())
+}
+
+/// Encodes a borrowed property body while preserving its admitted allocation.
+///
+/// # Errors
+/// Returns preallocation, resolution and canonical encoding failures.
+pub(super) fn encode_property_map_bounded(
+	properties: &PropertyMap,
+	context: &mut EncodeContext,
+	maximum: usize,
+) -> FerrosGrynnResult<(Vec<u8>, usize)> {
+	let (mut bytes, context_bytes) =
+		StorageValue::encode_properties_bounded(properties, context, maximum)?;
+	if bytes.first().copied() != Some(TypeTag::Object.byte()) {
+		return Err(FerrosGrynnError::invalid_storage_value_encoding(
+			0,
+			"property codec did not produce a canonical object",
+		));
+	}
+	// Keep the admitted allocation; copying the whole body would overlap it.
+	bytes.remove(0);
+	Ok((bytes, context_bytes))
 }
 
 /// Encodes one complete canonical `RecordId` value.
@@ -495,6 +536,28 @@ fn invalid(page_no: u64, reason: impl Into<String>) -> FerrosGrynnError {
 mod tests {
 	use super::*;
 	use crate::values::{PropertyDictionary, PropertyKeyId, Value};
+
+	/// Zero bytes consume a slot at the page layer, but not a durable
+	/// PropertyRef.
+	#[test]
+	fn slotted_packing_zero_and_oversized_lengths_preserve_counter_boundaries() {
+		use crate::test_assertions::AssertResult as _;
+
+		let mut counters = PropertyPageBuilder::empty();
+		assert_eq!(counters.try_insert_len(0).assert_ok(), Some((0, PAGE_SIZE as u16, 0)));
+		assert!(counters.try_insert_len(usize::MAX).assert_ok().is_none());
+		assert_eq!(counters.slot_count, 1);
+		assert_eq!(counters.free_end, PAGE_SIZE as u16);
+		assert_eq!(counters.free_start as usize, SLOT_DIRECTORY_OFFSET + SLOT_ENTRY_BYTES);
+		let mut page = AlignedPage::zeroed();
+		let mut builder = PropertyPageBuilder::new(&mut page, PageNo::new(7), PageLsn::ZERO);
+		assert_eq!(builder.try_insert(&mut page, &[]).assert_ok(), Some(0));
+		assert_eq!(builder.try_insert(&mut page, b"a").assert_ok(), Some(1));
+		builder.finish(&mut page).assert_ok();
+		assert!(read_property_record(&page, PageNo::new(7), 0, 0).assert_ok().is_empty());
+		assert_eq!(read_property_record(&page, PageNo::new(7), 1, 1).assert_ok(), b"a");
+		assert!(crate::storage::atom_page::PropertyRef::inline(PageNo::new(7), 0, 0).is_err());
+	}
 
 	/// Verifies property map round trips through a slotted page.
 	#[test]

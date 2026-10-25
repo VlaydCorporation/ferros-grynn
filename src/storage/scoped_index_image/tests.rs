@@ -90,3 +90,77 @@ fn scoped_images_round_trip_base_effective_class_label_and_count() {
 	assert!(graph_files.iter().any(|file| file.relative_path == "idx/lbl_node_0.fgidx"));
 	assert!(graph_files.iter().any(|file| file.relative_path == "idx/uniq_0000.fgidx"));
 }
+
+/// A reused NODE slot sorts differently in logical and generation-free order.
+#[test]
+fn scoped_class_images_accept_reused_node_generation_and_reject_missing_membership() {
+	reused_class(AtomKind::Node);
+}
+
+/// EDGE class postings retain the same slot ordering after local generation
+/// reuse.
+#[test]
+fn scoped_class_images_accept_reused_edge_generation_and_reject_missing_membership() {
+	reused_class(AtomKind::Edge);
+}
+
+/// Exercises the actual SDK before building and independently validating pages.
+fn reused_class(kind: AtomKind) {
+	use crate::{
+		graph::EdgeTopology,
+		test_assertions::{AssertOption as _, AssertResult as _},
+	};
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("node", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("edge", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("g", GraphKind::Graph).assert_ok();
+	let nodes = ["node:a", "node:b"].map(|name| {
+		let record = name.parse::<RecordId>().assert_ok();
+		seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+		seed.attach_node(graph.id(), &record, None, None).assert_ok()
+	});
+	let record = match kind {
+		AtomKind::Node => "node:a".parse::<RecordId>().assert_ok(),
+		AtomKind::Edge => {
+			for name in ["edge:a", "edge:b"] {
+				let record = name.parse::<RecordId>().assert_ok();
+				seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+				seed.attach_edge(
+					graph.id(),
+					&record,
+					None,
+					EdgeTopology::directed([nodes[0]], [nodes[1]]),
+					None,
+					None,
+				)
+				.assert_ok();
+			}
+			"edge:a".parse::<RecordId>().assert_ok()
+		}
+	};
+	seed.commit().assert_ok();
+	let mut reuse = store.begin();
+	reuse.detach_occurrence(graph.id(), &record, false).assert_ok();
+	let local = match kind {
+		AtomKind::Node => reuse.attach_node(graph.id(), &record, None, None).assert_ok(),
+		AtomKind::Edge => reuse
+			.attach_edge(
+				graph.id(),
+				&record,
+				None,
+				EdgeTopology::directed([nodes[0]], [nodes[1]]),
+				None,
+				None,
+			)
+			.assert_ok(),
+	};
+	assert_eq!((local.slot(), local.generation()), (0, 1));
+	reuse.commit().assert_ok();
+	let root = store.inner.current_root();
+	let images = build_scoped_index_images(&root).assert_ok();
+	validate_scoped_index_images(&images, &root).assert_ok();
+	let mut missing = root.as_ref().clone();
+	missing.detach(graph.id(), root.resolve_atom(&record).assert_some()).assert_ok().assert_some();
+	validate_scoped_index_images(&images, &missing).assert_err();
+}

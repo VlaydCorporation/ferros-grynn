@@ -1,6 +1,6 @@
 //! Creation and WAL staging of one immutable generation's physical files.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use super::{
 	image::BuiltGeneration,
@@ -12,6 +12,7 @@ use crate::{
 	storage::{
 		catalog::{CatalogKind, DatabaseCatalog, encode_page_chain},
 		direct::DirectFile,
+		file_registry::FileRegistry,
 		page::PageLsn,
 		types::{DataFileKind, PageKey},
 		wal::TxHandle,
@@ -24,8 +25,9 @@ pub(super) fn create_generation_files(
 	root: &Path,
 	generation: &BuiltGeneration,
 	install_home: bool,
+	registry: Option<&FileRegistry>,
 ) -> FerrosGrynnResult<()> {
-	create_generation_files_with_mode(root, generation, install_home, false)
+	create_generation_files_with_mode(root, generation, install_home, false, registry)
 }
 
 /// Writes an unreachable import generation to its final home files while
@@ -33,8 +35,9 @@ pub(super) fn create_generation_files(
 pub(super) fn create_import_generation_files(
 	root: &Path,
 	generation: &BuiltGeneration,
+	registry: &FileRegistry,
 ) -> FerrosGrynnResult<()> {
-	create_generation_files_with_mode(root, generation, false, true)
+	create_generation_files_with_mode(root, generation, false, true, Some(registry))
 }
 
 /// Creates generation files with mode.
@@ -43,8 +46,9 @@ fn create_generation_files_with_mode(
 	generation: &BuiltGeneration,
 	install_home: bool,
 	write_unreachable_home: bool,
+	registry: Option<&FileRegistry>,
 ) -> FerrosGrynnResult<()> {
-	create_file_images(root, &generation.files, install_home, write_unreachable_home)
+	create_file_images(root, &generation.files, install_home, write_unreachable_home, registry)
 }
 
 /// Creates or extends only the catalog-authorized files of a pending commit.
@@ -53,6 +57,7 @@ pub(super) fn create_file_images(
 	images: &[FileImage],
 	install_home: bool,
 	write_unreachable_home: bool,
+	registry: Option<&FileRegistry>,
 ) -> FerrosGrynnResult<()> {
 	for image in images {
 		let path = image.entry.path.resolve(root);
@@ -67,7 +72,7 @@ pub(super) fn create_file_images(
 		let system = image.entry.space_id == DataSpaceId::Database
 			&& image.entry.file_id.kind() == Some(DataFileKind::SystemCatalog);
 		if system && !install_home {
-			let file = DirectFile::open_read_write(&path)?;
+			let file = existing_file(&path, image, registry)?;
 			let required = page_count(image)?;
 			if file.page_count() < required {
 				file.resize_pages(required)?;
@@ -80,7 +85,7 @@ pub(super) fn create_file_images(
 			Some(DataFileKind::Changefeed | DataFileKind::EventOutbox)
 		) && image.page_numbers.get(1).is_some_and(|number| number.get() > 1)
 		{
-			let file = DirectFile::open_read_write(&path)?;
+			let file = existing_file(&path, image, registry)?;
 			let required = page_count(image)?;
 			if file.page_count() < required {
 				file.resize_pages(required)?;
@@ -106,6 +111,28 @@ pub(super) fn create_file_images(
 		file.sync_data()?;
 	}
 	Ok(())
+}
+
+/// Extends through the shared owner so checkpoint and pinned readers observe
+/// the same cached physical length, including reserved catalog-page gaps.
+fn existing_file(
+	path: &Path,
+	image: &FileImage,
+	registry: Option<&FileRegistry>,
+) -> FerrosGrynnResult<Arc<DirectFile>> {
+	if let Some(registry) = registry
+		&& registry.contains(image.entry.space_id, image.entry.file_id)
+	{
+		let registered = registry.resolve_file(image.entry.space_id, image.entry.file_id)?;
+		if registered.path() != path {
+			return Err(invalid("existing file identity changed its physical path"));
+		}
+		registered.file()
+	} else {
+		// Streaming history can create an unreachable prefix before this
+		// publication; its new identity has no registered owner to reuse yet.
+		DirectFile::open_read_write(path).map(Arc::new)
+	}
 }
 
 /// Stages every data, index, metadata, and catalog page in one WAL handle.

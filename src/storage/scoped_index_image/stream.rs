@@ -11,11 +11,12 @@ use super::{
 	ScopedIndexKind,
 	StreamedScopedIndexFile,
 	StreamedScopedIndexImages,
-	build::{label_filename, label_ids, local_address, scalar_filename},
+	build::{explicit_index_paths, label_filename, label_ids, local_address},
 };
 use crate::{
-	datastore::{ClassIndexKind, DatabaseRoot, IndexBinding, IndexEntries, IndexScope},
+	datastore::{DatabaseRoot, IndexBinding, IndexEntries, IndexScope},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::{AtomId, AtomKind},
 	storage::{
 		direct::DirectFile,
 		graph_index::{
@@ -43,6 +44,30 @@ pub(in crate::storage) fn write_streamed_unique_file<Address: PrimaryAddress>(
 ) -> FerrosGrynnResult<StreamedIndex> {
 	write_streamed_file(database_root, relative_path, |file| {
 		stream_unique_index::<Address>(records, database_root, PageLsn::ZERO, |page_no, page| {
+			write_next(file, page_no, page)
+		})
+	})
+}
+
+/// Streams one engine-owned class or label membership without a full scope
+/// build.
+///
+/// # Errors
+/// Propagates address validation, bounded sorting, codec and file-sync errors.
+pub(in crate::storage) fn write_streamed_membership_file(
+	database_root: &Path,
+	relative_path: &str,
+	kind: AtomKind,
+	atoms: impl IntoIterator<Item = AtomId>,
+) -> FerrosGrynnResult<StreamedIndex> {
+	let mut sorter = ExternalIndexSorter::new(database_root);
+	for atom in atoms {
+		let address = local_address(atom)?;
+		sorter.push(address.slot().to_be_bytes().to_vec(), address)?;
+	}
+	let records = sorter.finish()?;
+	write_streamed_file(database_root, relative_path, |file| {
+		stream_label_index::<DiskAtomRef>(&records, kind, PageLsn::ZERO, |page_no, page| {
 			write_next(file, page_no, page)
 		})
 	})
@@ -78,21 +103,13 @@ pub(in crate::storage) fn write_streamed_scoped_indexes(
 				.schema
 				.class_by_id(*class)
 				.ok_or_else(|| invalid("graph class index references an absent class"))?;
-			let mut sorter = ExternalIndexSorter::new(database_root);
-			for atom in atoms {
-				let address = local_address(*atom)?;
-				sorter.push(address.slot().to_be_bytes().to_vec(), address)?;
-			}
-			let records = sorter.finish()?;
 			let path = format!("{prefix}/idx/cls_{}.fgidx", class.get());
-			let built = write_streamed_file(database_root, &path, |file| {
-				stream_label_index::<DiskAtomRef>(
-					&records,
-					schema.kind(),
-					PageLsn::ZERO,
-					|page_no, page| write_next(file, page_no, page),
-				)
-			})?;
+			let built = write_streamed_membership_file(
+				database_root,
+				&path,
+				schema.kind(),
+				atoms.iter().copied(),
+			)?;
 			files.push(StreamedScopedIndexFile {
 				scope: IndexScope::Effective {
 					graph: *graph_id,
@@ -112,21 +129,9 @@ pub(in crate::storage) fn write_streamed_scoped_indexes(
 			let label_id = *label_ids
 				.get(&(*kind, label.clone()))
 				.ok_or_else(|| invalid("label index has no dense label identity"))?;
-			let mut sorter = ExternalIndexSorter::new(database_root);
-			for atom in atoms {
-				let address = local_address(*atom)?;
-				sorter.push(address.slot().to_be_bytes().to_vec(), address)?;
-			}
-			let records = sorter.finish()?;
 			let path = format!("{prefix}/{}", label_filename(*kind, label_id));
-			let built = write_streamed_file(database_root, &path, |file| {
-				stream_label_index::<DiskAtomRef>(
-					&records,
-					*kind,
-					PageLsn::ZERO,
-					|page_no, page| write_next(file, page_no, page),
-				)
-			})?;
+			let built =
+				write_streamed_membership_file(database_root, &path, *kind, atoms.iter().copied())?;
 			files.push(StreamedScopedIndexFile {
 				scope: IndexScope::Effective {
 					graph: *graph_id,
@@ -169,110 +174,115 @@ fn write_explicit<Source, Address>(
 	database_root: &Path,
 	files: &mut Vec<StreamedScopedIndexFile>,
 	timings: &mut BTreeMap<crate::datastore::IndexId, Duration>,
-	mut address: impl FnMut(Source) -> FerrosGrynnResult<Address> + Copy,
+	address: impl FnMut(Source) -> FerrosGrynnResult<Address> + Copy,
 ) -> FerrosGrynnResult<()>
 where
 	Source: Copy + Ord,
 	Address: PrimaryAddress + Ord,
 {
-	let mut standard = 0_u32;
-	let mut unique = 0_u32;
-	for binding in bindings.values() {
-		if binding.deferred {
-			return Err(invalid("deferred physical index reached the generation builder"));
-		}
+	for planned in explicit_index_paths(bindings) {
+		let (binding, relative_path) = planned?;
 		let started = Instant::now();
-		let (relative_path, built) = match &binding.entries {
-			IndexEntries::Standard(entries) => {
-				let mut sorter = ExternalIndexSorter::new(database_root);
-				for (key, atoms) in entries {
-					for atom in atoms {
-						sorter.push(key.clone(), address(*atom)?)?;
-					}
-				}
-				let records = sorter.finish()?;
-				let relative_path = scalar_filename(ClassIndexKind::Standard, standard);
-				standard = standard
-					.checked_add(1)
-					.ok_or_else(|| invalid("standard index ordinal overflows u32"))?;
-				let path = format!("{prefix}/{relative_path}");
-				let built = write_streamed_file(database_root, &path, |file| {
-					stream_standard_index::<Address>(
-						&records,
-						database_root,
-						PageLsn::ZERO,
-						|page_no, page| write_next(file, page_no, page),
-					)
-				})?;
-				(relative_path, built)
-			}
-			IndexEntries::Unique(entries) => {
-				let mut sorter = ExternalIndexSorter::new(database_root);
-				for (key, atom) in entries {
-					sorter.push(key.clone(), address(*atom)?)?;
-				}
-				let records = sorter.finish()?;
-				let relative_path = scalar_filename(ClassIndexKind::Unique, unique);
-				unique = unique
-					.checked_add(1)
-					.ok_or_else(|| invalid("unique index ordinal overflows u32"))?;
-				let path = format!("{prefix}/{relative_path}");
-				let built = write_streamed_file(database_root, &path, |file| {
-					stream_unique_index::<Address>(
-						&records,
-						database_root,
-						PageLsn::ZERO,
-						|page_no, page| write_next(file, page_no, page),
-					)
-				})?;
-				(relative_path, built)
-			}
-			IndexEntries::Count(count) => {
-				let relative_path = format!("idx/cnt_{}.fgidx", binding.class_id.get());
-				let count_scope = match scope {
-					IndexScope::Base => CountIndexScope::Base,
-					IndexScope::Effective {
-						graph,
-					} => CountIndexScope::Effective(graph),
-				};
-				let page = encode_count_index(
-					CountIndexValue {
-						class_id: binding.class_id.get(),
-						scope: count_scope,
-						atom_count: *count,
-						last_updated_lsn: 0,
-						created_at_lsn: 0,
-					},
-					PageLsn::ZERO,
-				)?;
-				let path = format!("{prefix}/{relative_path}");
-				let built = write_streamed_file(database_root, &path, |file| {
-					write_next(file, PageNo::new(0), &page)?;
-					Ok(StreamedIndex {
-						root: PageNo::new(0),
-						page_count: 1,
-					})
-				})?;
-				(relative_path, built)
-			}
-		};
-		files.push(StreamedScopedIndexFile {
+		files.push(write_streamed_binding(
+			binding,
 			scope,
-			path: format!("{prefix}/{relative_path}"),
-			kind: ScopedIndexKind::Explicit {
-				index: binding.id,
-				version: binding.version,
-				class: binding.class_id,
-				kind: binding.kind,
-			},
-			root: built.root,
-			page_count: built.page_count,
-		});
+			database_root,
+			format!("{prefix}/{relative_path}"),
+			address,
+		)?);
 		if timings.insert(binding.id, started.elapsed()).is_some() {
 			return Err(invalid("duplicate IndexId while recording import index timing"));
 		}
 	}
 	Ok(())
+}
+
+/// Streams one final binding without traversing unrelated scopes or indexes.
+pub(in crate::storage) fn write_streamed_binding<Source, Address>(
+	binding: &IndexBinding<Source>,
+	scope: IndexScope,
+	database_root: &Path,
+	path: String,
+	mut address: impl FnMut(Source) -> FerrosGrynnResult<Address>,
+) -> FerrosGrynnResult<StreamedScopedIndexFile>
+where
+	Source: Copy + Ord,
+	Address: PrimaryAddress + Ord,
+{
+	if binding.deferred {
+		return Err(invalid("deferred physical index reached the generation builder"));
+	}
+	let built = match &binding.entries {
+		IndexEntries::Standard(entries) => {
+			let mut sorter = ExternalIndexSorter::new(database_root);
+			for (key, atoms) in entries {
+				for atom in atoms {
+					sorter.push(key.clone(), address(*atom)?)?;
+				}
+			}
+			let records = sorter.finish()?;
+			write_streamed_file(database_root, &path, |file| {
+				stream_standard_index::<Address>(
+					&records,
+					database_root,
+					PageLsn::ZERO,
+					|page_no, page| write_next(file, page_no, page),
+				)
+			})?
+		}
+		IndexEntries::Unique(entries) => {
+			let mut sorter = ExternalIndexSorter::new(database_root);
+			for (key, atom) in entries {
+				sorter.push(key.clone(), address(*atom)?)?;
+			}
+			let records = sorter.finish()?;
+			write_streamed_file(database_root, &path, |file| {
+				stream_unique_index::<Address>(
+					&records,
+					database_root,
+					PageLsn::ZERO,
+					|page_no, page| write_next(file, page_no, page),
+				)
+			})?
+		}
+		IndexEntries::Count(count) => {
+			let count_scope = match scope {
+				IndexScope::Base => CountIndexScope::Base,
+				IndexScope::Effective {
+					graph,
+				} => CountIndexScope::Effective(graph),
+			};
+			let page = encode_count_index(
+				CountIndexValue {
+					class_id: binding.class_id.get(),
+					scope: count_scope,
+					atom_count: *count,
+					last_updated_lsn: 0,
+					created_at_lsn: 0,
+				},
+				PageLsn::ZERO,
+			)?;
+			write_streamed_file(database_root, &path, |file| {
+				write_next(file, PageNo::new(0), &page)?;
+				Ok(StreamedIndex {
+					root: PageNo::new(0),
+					page_count: 1,
+				})
+			})?
+		}
+	};
+	Ok(StreamedScopedIndexFile {
+		scope,
+		path,
+		kind: ScopedIndexKind::Explicit {
+			index: binding.id,
+			version: binding.version,
+			class: binding.class_id,
+			kind: binding.kind,
+		},
+		root: built.root,
+		page_count: built.page_count,
+	})
 }
 
 /// Creates, fills, syncs, and rereads one immutable side-file.

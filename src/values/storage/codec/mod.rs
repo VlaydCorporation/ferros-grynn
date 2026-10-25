@@ -6,14 +6,22 @@
 
 //! Canonical format-version-1 codec and checked archive envelope.
 
+/// Logical resource policy shared with allocation-free DTO admission.
+mod admission;
 /// Bounded decoding of canonical storage values.
 mod decode;
 /// Canonical storage-value encoding and set normalization.
 mod encode;
 /// Versioned archive framing, length checks and checksum validation.
 mod envelope;
+/// Exact output length and reserved-encoder temporary allocation layout.
+mod layout;
+/// Allocation-free admission in the final canonical DTO order.
+mod read_limits;
 
+pub(in crate::values::storage) use admission::DecodeAdmission;
 pub(super) use encode::canonicalize_set;
+pub(in crate::values::storage) use encode::finish_set;
 #[allow(
 	unused_imports,
 	reason = "archive framing is part of the crate-private storage codec facade"
@@ -21,6 +29,8 @@ pub(super) use encode::canonicalize_set;
 pub use envelope::ArchiveEnvelope;
 #[cfg(test)]
 use envelope::crc32;
+pub use layout::EncodingLayout;
+pub(in crate::values::storage) use read_limits::geometry_allocation;
 
 use super::{StorageValue, StorageValueRef};
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
@@ -95,10 +105,69 @@ impl Default for DecodeLimits {
 pub struct CanonicalCodec;
 
 impl CanonicalCodec {
+	/// Checks whether a canonical DTO fits an existing reader's resource
+	/// policy.
+	///
+	/// This does not allocate, encode or validate canonical value content. The
+	/// return value is the reader's retained logical charge, not a heap quota.
+	///
+	/// # Errors
+	/// Returns the same typed depth, length and allocation limit failures as
+	/// decoding the value with the supplied limits.
+	pub(crate) fn check_decode_limits(
+		value: StorageValueRef<'_>,
+		limits: DecodeLimits,
+	) -> FerrosGrynnResult<usize> {
+		read_limits::check(&value, limits)
+	}
+
 	/// Returns encode for `CanonicalCodec`.
 	pub fn encode(value: StorageValueRef<'_>) -> FerrosGrynnResult<Vec<u8>> {
 		let mut output = Vec::new();
-		encode::encode_value(&mut output, &value)?;
+		encode::encode_value(&mut output, &value, false)?;
+		Ok(output)
+	}
+
+	/// Measures canonical output and peak scratch without materializing bytes.
+	///
+	/// The caller separately owns the DTO, conversion and dictionary budgets.
+	/// Payload canonical validation still runs in the shared encoder; the
+	/// layout also applies the geometry owner's shape/resource checks.
+	pub(crate) fn encoding_layout(value: StorageValueRef<'_>) -> FerrosGrynnResult<EncodingLayout> {
+		layout::value_layout(&value)
+	}
+
+	/// Admits output plus encoder scratch before reserving canonical bytes.
+	///
+	/// Nested Set buffers use the same exact-capacity path. This logical limit
+	/// excludes the caller's DTO and allocator bookkeeping.
+	///
+	/// # Errors
+	/// Returns typed size, resource, allocation or canonical validation errors.
+	pub(crate) fn encode_bounded(
+		value: StorageValueRef<'_>,
+		maximum_bytes: usize,
+	) -> FerrosGrynnResult<Vec<u8>> {
+		let layout = Self::encoding_layout(value)?;
+		let bytes = layout
+			.encoded_len
+			.checked_add(layout.scratch_bytes)
+			.ok_or_else(|| invalid(0, "canonical encoding memory overflows usize"))?;
+		if bytes > maximum_bytes {
+			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+				"canonical encoding memory",
+				bytes as u64,
+				maximum_bytes as u64,
+			));
+		}
+		let mut output = Vec::new();
+		output
+			.try_reserve_exact(layout.encoded_len)
+			.map_err(|_error| invalid(0, "canonical output allocation failed"))?;
+		encode::encode_value(&mut output, &value, true)?;
+		if output.len() != layout.encoded_len {
+			return Err(invalid(0, "canonical output disagrees with admitted layout"));
+		}
 		Ok(output)
 	}
 
@@ -122,7 +191,7 @@ impl CanonicalCodec {
 		if decoder.position != bytes.len() {
 			return Err(invalid(decoder.position, "trailing bytes after StorageValue"));
 		}
-		Ok((value, decoder.allocated))
+		Ok((value, decoder.admission.allocated))
 	}
 
 	/// Decodes one self-delimiting value from the beginning of a larger
@@ -158,9 +227,10 @@ fn invalid(offset: usize, reason: impl Into<String>) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_storage_value_encoding(offset as u64, reason)
 }
 
-/// Returns limit error for this module.
+/// Maps reader policy order onto the status constructor's observed/maximum
+/// order.
 fn limit_error(name: &str, maximum: usize, actual: usize) -> FerrosGrynnError {
-	FerrosGrynnError::storage_decode_limit_exceeded(name, maximum as u64, actual as u64)
+	FerrosGrynnError::storage_decode_limit_exceeded(name, actual as u64, maximum as u64)
 }
 
 #[cfg(test)]
@@ -329,6 +399,13 @@ mod tests {
 
 		for value in values {
 			let encoded = CanonicalCodec::encode(value.as_ref()).assert_ok();
+			let layout = CanonicalCodec::encoding_layout(value.as_ref()).assert_ok();
+			assert_eq!(layout.encoded_len, encoded.len(), "layout for {value:?}");
+			assert_eq!(
+				CanonicalCodec::encode_bounded(value.as_ref(), usize::MAX).assert_ok(),
+				encoded,
+				"bounded bytes for {value:?}"
+			);
 			let decoded = CanonicalCodec::decode(&encoded, DecodeLimits::default()).assert_ok();
 			assert_eq!(decoded, value);
 		}

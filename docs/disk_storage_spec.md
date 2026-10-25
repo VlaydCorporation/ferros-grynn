@@ -1909,6 +1909,11 @@ Offset  Size   Содержимое
 Total = PAGE_SIZE байт
 ```
 
+Format-v1 хранит только живые directory entries: `live_count` обязан равняться
+`entry_count`. Удаление containment binding убирает entry из следующего layout;
+отдельного tombstone encoding для `SubgraphDirEntry` нет. Несогласованные counters
+считаются corruption, даже если checksum страницы корректна.
+
 `SubgraphDirEntry` не является authority для filesystem path. Durable binding хранится в
 `DatabaseCatalog`: arena slot содержит child `GraphId`, exact parent slot/scope и container atom.
 Разные slots могут ссылаться на один child `GraphId`; пара `(scope, child)` уникальна, slots dense.
@@ -2693,6 +2698,18 @@ row/null/property counters, но использует HLL `p=12` (4096 одно�
   `label_stats.fgb` публикуются в той же frame-WAL транзакции, что и данные. Degree pages в
   `graph_stats.fgb` и `prop_stats.fgb` не переписываются; `revision`, `dirty_rows` и
   `analyzed_revision` явно отмечают их устаревшими.
+  Исключение для смены namespace меток: при перенумерации dense label IDs
+  допускается COW-перекодировка ключей прежних degree pages вместе со словарём,
+  Hot и label-statistics pages в одной публикации. Buckets surviving/global
+  histograms и `analyzed_revision` сохраняются; распределение не пересчитывается
+  и не переносится на другое имя. Histogram исчезнувшей node-label удаляется
+  по окончательным exact counters после replay всех действий, поэтому временно
+  пустая метка при swap не теряет свою гистограмму.
+  При изменении набора graph-local class counters допускается механическая
+  COW-переупаковка `graph_stats.fgb`: прежние degree histograms и
+  `analyzed_revision` сохраняются, распределения не пересчитываются. Это
+  исключает недостижимый хвост при сокращении class pages; label/property
+  statistics сохраняют свои файлы и содержимое.
 - **Bulk-путь:** создание полного graph image и schema-affected materialized rebuild выполняют
   один полный scan и атомарно публикуют все три файла с точными counts и распределениями. Если
   новый файл короче существующего in-place файла, writer выбирает новое COW-поколение вместо
@@ -3474,6 +3491,13 @@ derived projection; condensation numbering использует минимум G
 `building/ready/stale/error` хранится только в catalog. `algorithm_parameter`: 0 для TREE_COVER и
 CHAIN_COVER, `k` для GRAIL, `max_ranges` для FERRARI, `bits` для BFL.
 
+Cold reopen восстанавливает физические bindings materialized graph indexes вместе с class
+indexes; unrelated point/catalog-only commit сохраняет их file/root identity. В новый catalog
+попадают только bindings `Ready` materialized definitions. Переход в `Stale` либо `ON_DEMAND`
+исключает старый binding атомарно с изменением определения. Overwrite повышает version и
+обнуляет build revision; materialized definition требует нового rebuild даже при передаче
+клона прежнего `Ready` объекта. Старые snapshots удерживают свой immutable artifact.
+
 Canonical descriptor содержит полный label set, MODE/direction, budgets и captured function
 versions. Binding сверяет полные bytes, а не только fingerprint. TREE_COVER auxiliary section
 отсутствует; GRAIL auxiliary отсутствует; FERRARI auxiliary использует PostorderRanks (width 8,
@@ -3810,6 +3834,10 @@ Header:
 Status находится только в catalog. Header записывается первым в недостижимом файле;
 после bottom-up packing root/extent обновляются, затем файл sync/validate и WAL/COW publication.
 Пустая capability сохраняет header и один пустой leaf; tree root не равен NULL.
+`snapshot revision` равна глобальному database commit timestamp физического snapshot.
+Если ordinary data или catalog-only commit сохраняет endpoint tree, его проверенный
+header получает новую WAL-версию в той же транзакции, что и catalog. Postings,
+root/extent и DataFileId сохраняются; старые snapshots читают прежнюю header version.
 Packed leaf record состоит из 24-byte key и 8-byte value плюс key length/offset overhead:
 
 ```

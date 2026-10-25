@@ -27,6 +27,276 @@ use crate::{
 	values::storage::TypeTag,
 };
 
+/// Sparse class changes preserve key layout and reject malformed key order.
+#[test]
+fn class_population_rewrite_preserves_layout_and_validates_keys() {
+	use std::collections::BTreeMap;
+
+	use crate::test_assertions::AssertResult as _;
+	let class = ClassId::new(3).assert_some();
+	let next = ClassId::new(4).assert_some();
+	let classes = BTreeMap::from([(class, 9), (next, 4)]);
+	let mut pages = encode_class_statistics(&classes, 1, PageLsn::new(7)).assert_ok();
+	let mut targets = BTreeMap::from([(class, 0)]);
+	assert!(
+		rewrite_class_statistics_page(&mut pages[0], PageNo::new(1), None, &mut targets)
+			.assert_ok()
+	);
+	assert!(targets.is_empty());
+	let decoded = decode_class_statistics_range(
+		|number, output| {
+			assert_eq!(number, PageNo::new(1));
+			output.as_bytes_mut().copy_from_slice(pages[0].as_bytes());
+			Ok(())
+		},
+		Some(PageNo::new(1)),
+		1,
+	)
+	.assert_ok();
+	assert_eq!(decoded, BTreeMap::from([(class, 0), (next, 4)]));
+	let mut targets = BTreeMap::from([(class, 0)]);
+	assert!(
+		!rewrite_class_statistics_page(&mut pages[0], PageNo::new(1), None, &mut targets)
+			.assert_ok()
+	);
+	// Reverse valid class keys while retaining a correct checksum.
+	pages[0].as_bytes_mut()[48..52].copy_from_slice(&next.get().to_le_bytes());
+	pages[0].as_bytes_mut()[64..68].copy_from_slice(&class.get().to_le_bytes());
+	pages[0].seal().assert_ok();
+	let saved = pages[0].as_bytes().to_vec();
+	let mut targets = BTreeMap::from([(class, 2)]);
+	assert!(
+		rewrite_class_statistics_page(&mut pages[0], PageNo::new(1), None, &mut targets).is_err()
+	);
+	assert_eq!(targets, BTreeMap::from([(class, 2)]));
+	assert_eq!(pages[0].as_bytes().as_slice(), saved);
+}
+
+/// Schema bounds reject excessive pages before reads and entries before growth.
+#[test]
+fn class_decode_schema_bound_precedes_reads_and_map_growth() {
+	use std::collections::BTreeMap;
+
+	use crate::test_assertions::AssertResult as _;
+	let classes =
+		BTreeMap::from([(ClassId::new(1).assert_some(), 1), (ClassId::new(2).assert_some(), 0)]);
+	let pages = encode_class_statistics(&classes, 1, PageLsn::ZERO).assert_ok();
+	let layout = StatisticsLayout::from_counts(0, 1, 0, 0).assert_ok();
+	let reads = Cell::new(0);
+	let mut read = |number, output: &mut crate::storage::page::AlignedPage| {
+		assert_eq!(number, PageNo::new(1));
+		reads.set(reads.get() + 1);
+		output.as_bytes_mut().copy_from_slice(pages[0].as_bytes());
+		Ok(())
+	};
+	assert!(decode_class_statistics_bounded(&mut read, layout, 0).is_err());
+	assert_eq!(reads.get(), 0);
+	assert!(decode_class_statistics_bounded(&mut read, layout, 1).is_err());
+	assert_eq!(reads.get(), 1);
+	assert_eq!(decode_class_statistics_bounded(&mut read, layout, 2).assert_ok(), classes);
+}
+
+/// Sparse writes validate all entries before consuming any target.
+#[test]
+fn label_counter_rewrite_is_sparse_and_rejects_invalid_sources() {
+	use crate::test_assertions::AssertResult as _;
+
+	let dictionary = LabelDictionary::from_labels([
+		(LabelKind::Node, "a"),
+		(LabelKind::Node, "b"),
+		(LabelKind::Edge, "a"),
+	])
+	.assert_ok();
+	let mut statistics = crate::stats::GraphStatistics::default();
+	for (kind, label) in [(AtomKind::Node, "a"), (AtomKind::Node, "b"), (AtomKind::Edge, "a")] {
+		statistics.labels.insert(
+			LabelStatisticKey {
+				kind,
+				label: label.into(),
+			},
+			LabelStatistic {
+				atom_count: 1,
+				property_count: 2,
+			},
+		);
+	}
+	let mut pages =
+		label::encode_label_statistics(&statistics, &dictionary, PageLsn::new(7)).assert_ok();
+	let key = (LabelKind::Node, 1);
+	let old = LabelStatistic {
+		atom_count: 1,
+		property_count: 2,
+	};
+	let new = LabelStatistic {
+		atom_count: 1,
+		property_count: 1,
+	};
+	let changes = LabelStatisticsChanges::from([(key, (old.clone(), new.clone()))]);
+	let original = pages[0].as_bytes().to_vec();
+	for (offset, value, reseal) in [
+		(48, 2, true),
+		(52, 2, true),
+		(76, 0, true),
+		(73, 1, true),
+		(44, 1, true),
+		(120, 1, true),
+		(32, 0, true),
+		(80, 0, true),
+		(88, 3, true),
+		(40, 255, true),
+		(64, 3, false),
+	] {
+		pages[0].as_bytes_mut().copy_from_slice(&original);
+		pages[0].as_bytes_mut()[offset] = value;
+		if reseal {
+			pages[0].seal().assert_ok();
+		}
+		let malformed = pages[0].as_bytes().to_vec();
+		let mut pending = changes.clone();
+		assert!(
+			rewrite_label_statistics_page(
+				&mut pages[0],
+				PageNo::new(0),
+				None,
+				[2, 1],
+				&mut pending
+			)
+			.is_err()
+		);
+		assert_eq!(pending, changes);
+		assert_eq!(pages[0].as_bytes().as_slice(), malformed);
+	}
+	pages[0].as_bytes_mut().copy_from_slice(&original);
+	let mut invalid = new.clone();
+	invalid.atom_count = 0;
+	let mut pending = LabelStatisticsChanges::from([(key, (old, invalid))]);
+	assert!(
+		rewrite_label_statistics_page(&mut pages[0], PageNo::new(0), None, [2, 1], &mut pending)
+			.is_err()
+	);
+	assert_eq!(pages[0].as_bytes().as_slice(), original);
+	let mut pending = changes;
+	assert!(
+		rewrite_label_statistics_page(&mut pages[0], PageNo::new(0), None, [2, 1], &mut pending)
+			.assert_ok()
+	);
+	assert!(pending.is_empty());
+	let mut pending = LabelStatisticsChanges::from([(key, (new.clone(), new))]);
+	assert!(
+		!rewrite_label_statistics_page(&mut pages[0], PageNo::new(0), None, [2, 1], &mut pending)
+			.assert_ok()
+	);
+	assert!(pending.is_empty());
+	// Apart from the checksum and the selected counter, the layout is
+	// identical.
+	let bytes = pages[0].as_bytes();
+	assert_eq!(&bytes[32..88], &original[32..88]);
+	assert_eq!(&bytes[96..], &original[96..]);
+}
+
+/// Missing dictionary labels must not shift the dense IDs used by sparse
+/// writes.
+#[test]
+fn label_statistics_reject_incomplete_namespaces() {
+	use crate::test_assertions::AssertResult as _;
+
+	let dictionary = LabelDictionary::from_labels([
+		(LabelKind::Node, "a"),
+		(LabelKind::Node, "b"),
+		(LabelKind::Node, "c"),
+	])
+	.assert_ok();
+	let mut statistics = crate::stats::GraphStatistics::default();
+	for label in ["b", "c"] {
+		statistics.labels.insert(
+			LabelStatisticKey {
+				kind: AtomKind::Node,
+				label: label.into(),
+			},
+			LabelStatistic {
+				atom_count: 1,
+				property_count: 0,
+			},
+		);
+	}
+	let pages = label::encode_label_statistics(&statistics, &dictionary, PageLsn::ZERO).assert_ok();
+	let layout = StatisticsLayout::from_counts(0, 0, pages.len(), 0).assert_ok();
+	assert!(
+		decode_label_statistics(
+			|page, destination| copy_page(&pages, page, destination, &Cell::new(0)),
+			layout,
+			&dictionary
+		)
+		.is_err()
+	);
+}
+
+/// A late label target leaves earlier pages unstaged and preserves their bytes.
+#[test]
+fn label_counter_rewrite_only_changes_the_matching_page() {
+	use crate::test_assertions::AssertResult as _;
+
+	let names = (0..681).map(|id| format!("label-{id:04}")).collect::<Vec<_>>();
+	let dictionary =
+		LabelDictionary::from_labels(names.iter().map(|name| (LabelKind::Node, name.as_str())))
+			.assert_ok();
+	let mut statistics = crate::stats::GraphStatistics::default();
+	let old = LabelStatistic {
+		atom_count: 1,
+		property_count: 2,
+	};
+	let new = LabelStatistic {
+		atom_count: 1,
+		property_count: 1,
+	};
+	for name in &names {
+		statistics.labels.insert(
+			LabelStatisticKey {
+				kind: AtomKind::Node,
+				label: name.as_str().into(),
+			},
+			old.clone(),
+		);
+	}
+	let mut pages =
+		label::encode_label_statistics(&statistics, &dictionary, PageLsn::ZERO).assert_ok();
+	assert_eq!(pages.len(), 2);
+	let saved = pages[0].as_bytes().to_vec();
+	let mut pending = LabelStatisticsChanges::from([((LabelKind::Node, 680), (old, new.clone()))]);
+	assert!(
+		!rewrite_label_statistics_page(
+			&mut pages[0],
+			PageNo::new(0),
+			Some(PageNo::new(1)),
+			[681, 0],
+			&mut pending
+		)
+		.assert_ok()
+	);
+	assert_eq!(pages[0].as_bytes().as_slice(), saved);
+	assert_eq!(pending.len(), 1);
+	assert!(
+		rewrite_label_statistics_page(&mut pages[1], PageNo::new(1), None, [681, 0], &mut pending)
+			.assert_ok()
+	);
+	assert!(pending.is_empty());
+	let layout = StatisticsLayout::from_counts(0, 0, pages.len(), 0).assert_ok();
+	let decoded = decode_label_statistics(
+		|page, destination| copy_page(&pages, page, destination, &Cell::new(0)),
+		layout,
+		&dictionary,
+	)
+	.assert_ok();
+	statistics.labels.insert(
+		LabelStatisticKey {
+			kind: AtomKind::Node,
+			label: "label-0680".into(),
+		},
+		new,
+	);
+	assert_eq!(decoded, statistics.labels);
+}
+
 /// Verifies split statistics are exact and auxiliary files are lazy.
 #[test]
 fn split_statistics_are_exact_and_auxiliary_files_are_lazy() {
@@ -92,9 +362,31 @@ fn split_statistics_are_exact_and_auxiliary_files_are_lazy() {
 	});
 	let dictionary = LabelDictionary::from_labels([(LabelKind::Node, label.as_str())]).assert_ok();
 	let files = encode_statistics(&statistics, &dictionary, PageLsn::new(5)).assert_ok();
+	let graph_layout =
+		GraphStatisticsLayout::measure(&statistics, files.labels.len(), files.properties.len())
+			.assert_ok();
+	let graph_only =
+		encode_graph_statistics(&statistics, &dictionary, &graph_layout, PageLsn::new(5))
+			.assert_ok();
+	assert_eq!(graph_layout.output_pages, graph_only.len());
+	for (selected, full) in graph_only.iter().zip(&files.graph) {
+		assert_eq!(selected.as_bytes(), full.as_bytes());
+	}
 	assert_eq!(files.graph.len(), 3);
 	assert_eq!(files.labels.len(), 1);
 	assert_eq!(files.properties.len(), 1);
+	let measured =
+		GraphLabelStatisticsLayout::measure(&statistics, files.properties.len()).assert_ok();
+	let selected =
+		encode_graph_label_statistics(&statistics, &dictionary, &measured, PageLsn::new(5))
+			.assert_ok();
+	assert_eq!(selected.graph.len(), files.graph.len());
+	assert_eq!(selected.labels.len(), files.labels.len());
+	for (selected, full) in
+		selected.graph.iter().chain(&selected.labels).zip(files.graph.iter().chain(&files.labels))
+	{
+		assert_eq!(selected.as_bytes(), full.as_bytes());
+	}
 
 	let (mut decoded, layout) = decode_statistics_root(
 		&files.graph[0],

@@ -129,7 +129,6 @@ pub(super) fn build_standard_scalar_index_with_fill<Address: PrimaryAddress + Or
 }
 
 /// One atom insertion or removal for a canonical scalar key.
-#[cfg(test)]
 pub(in crate::storage) struct ScalarIndexMutation<Address = DiskAtomRef> {
 	/// Key associated with this scalar index mutation.
 	pub(in crate::storage) key: Vec<u8>,
@@ -141,14 +140,16 @@ pub(in crate::storage) struct ScalarIndexMutation<Address = DiskAtomRef> {
 
 /// Re-encodes only scalar leaves whose separators and posting layout remain
 /// stable. `None` requests the existing bulk builder.
-#[cfg(test)]
+///
+/// # Errors
+/// Propagates page-read failures, malformed pages and inconsistent mutations.
 pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	mode: ScalarIndexMode,
 	mutations: &[ScalarIndexMutation<Address>],
 	page_lsn: PageLsn,
-) -> FerrosGrynnResult<Option<Vec<(PageNo, AlignedPage)>>> {
+) -> FerrosGrynnResult<Option<IndexLeafPages>> {
 	let leaf_type = match mode {
 		ScalarIndexMode::Standard => PageType::IndexNonUniqueBtreeLeaf,
 		ScalarIndexMode::Unique => PageType::IndexUniqueBtreeLeaf,
@@ -167,16 +168,22 @@ pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + O
 
 	let mut pages = Vec::with_capacity(grouped.len());
 	for (page_no, changes) in grouped {
-		let mut current = AlignedPage::zeroed();
+		let mut current = Box::new(AlignedPage::zeroed());
 		read_page(page_no, &mut current)?;
 		if current.validate(page_no)?.page_type() != leaf_type {
 			return Err(invalid_index("scalar mutation did not reach its expected leaf"));
+		}
+		// An unchanged neighbour can also own an arbitrarily long posting
+		// chain.
+		if mode == ScalarIndexMode::Standard && standard_leaf_has_external_postings(&current)? {
+			return Ok(None);
 		}
 		let next = PageNo::new(read_u64(current.as_bytes(), LEAF_NEXT_OFFSET));
 		let mut entries = match mode {
 			ScalarIndexMode::Standard => decode_standard_leaf_entries(&mut read_page, &current)?,
 			ScalarIndexMode::Unique => decode_unique_leaf_entries(&current)?,
 		};
+		validate_scalar_entries(&entries, mode)?;
 		let previous_first = entries.first().map(|entry| entry.key.clone());
 		apply_scalar_mutations(&mut entries, changes, mode)?;
 		if page_no != root
@@ -185,11 +192,13 @@ pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + O
 		{
 			return Ok(None);
 		}
-		let mut page = AlignedPage::zeroed();
+		// Moving the box preserves the encoded page's heap slot through WAL
+		// staging.
+		let mut page = Box::new(AlignedPage::zeroed());
 		match mode {
 			ScalarIndexMode::Standard => {
 				if entries.iter().any(|entry| entry.atoms.len() > STANDARD_INLINE_ATOMS)
-					|| partition_standard_leaf_entries(&entries)?.len() != 1
+					|| partition_standard_leaf_entries_with_limit(&entries, PAGE_SIZE)?.len() != 1
 				{
 					return Ok(None);
 				}
@@ -210,7 +219,7 @@ pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + O
 						atom: entry.atoms[0],
 					})
 					.collect::<Vec<_>>();
-				if partition_leaf_entries(&unique)?.len() != 1 {
+				if partition_leaf_entries_with_limit(&unique, PAGE_SIZE)?.len() != 1 {
 					return Ok(None);
 				}
 				encode_unique_leaf(
@@ -228,7 +237,6 @@ pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + O
 }
 
 /// Applies removals before insertions so a valid unique-key swap is atomic.
-#[cfg(test)]
 pub(in crate::storage) fn apply_scalar_mutations<'mutation, Address>(
 	entries: &mut Vec<ScalarIndexEntry<Address>>,
 	mutations: impl IntoIterator<Item = &'mutation ScalarIndexMutation<Address>>,
@@ -288,7 +296,6 @@ pub(in crate::storage) fn scan_scalar_index<Address: PrimaryAddress + Ord>(
 }
 
 /// Decodes unique leaf entries.
-#[cfg(test)]
 fn decode_unique_leaf_entries<Address: PrimaryAddress>(
 	page: &AlignedPage,
 ) -> FerrosGrynnResult<Vec<ScalarIndexEntry<Address>>> {
@@ -305,7 +312,6 @@ fn decode_unique_leaf_entries<Address: PrimaryAddress>(
 }
 
 /// Applies scalar mutation.
-#[cfg(test)]
 fn apply_scalar_mutation<Address: PrimaryAddress + Ord>(
 	entries: &mut Vec<ScalarIndexEntry<Address>>,
 	mutation: &ScalarIndexMutation<Address>,

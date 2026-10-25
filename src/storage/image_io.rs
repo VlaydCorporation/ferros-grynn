@@ -1,14 +1,19 @@
 //! Shared WAL-first transport for immutable data-space page images.
 
-use std::collections::BTreeSet;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+};
 
+#[cfg(test)]
+use super::wal::TxHandle;
 use super::{
 	file_registry::{FileRegistry, RegisteredDataFile},
 	hybrid_engine::HybridReadEngine,
 	page::{AlignedPage, PageNo},
 	page_cache::{PageCacheKey, PageCacheVersion},
 	types::{CheckpointGeneration, DataFileId, Lsn, PageKey, StorageSnapshot},
-	wal::{CheckpointTicket, FrameWal, TxHandle},
+	wal::{CheckpointTicket, FrameWal},
 };
 use crate::{
 	datastore::DataSpaceId,
@@ -16,6 +21,7 @@ use crate::{
 };
 
 /// Returns the stage pages result.
+#[cfg(test)]
 pub(super) fn stage_pages(
 	tx: &mut TxHandle,
 	space: DataSpaceId,
@@ -186,6 +192,7 @@ pub(super) fn visible_file_page_count(
 }
 
 /// Copies selected WAL frames for ordinary files into their registered homes.
+#[cfg(test)]
 pub(super) fn backfill_pages(
 	wal: &FrameWal,
 	registry: &FileRegistry,
@@ -193,21 +200,42 @@ pub(super) fn backfill_pages(
 	files: &[DataFileId],
 	ticket: &CheckpointTicket,
 ) -> FerrosGrynnResult<()> {
+	let files = files
+		.iter()
+		.map(|file| Ok(((space, *file), registry.resolve_file(space, *file)?)))
+		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
+	backfill_pinned_pages(wal, &files, ticket)
+}
+
+/// Backfills current and retired trusted handles before their WAL versions
+/// are pruned. The owned pins keep retired files alive through synchronization.
+pub(super) fn backfill_pinned_pages(
+	wal: &FrameWal,
+	files: &BTreeMap<(DataSpaceId, DataFileId), Arc<RegisteredDataFile>>,
+	ticket: &CheckpointTicket,
+) -> FerrosGrynnResult<()> {
 	let mut touched = BTreeSet::new();
 	let mut reader = wal.frame_read_scope();
 	for frame in ticket.frames() {
 		let key = frame.key();
-		if key.space_id() != space || !files.contains(&key.file_id()) {
+		let identity = (key.space_id(), key.file_id());
+		let Some(registered) = files.get(&identity) else {
 			continue;
+		};
+		if registered.role() != super::file_registry::DataFileRole::WalBackfilled {
+			return Err(invalid("checkpoint positional map contains a metadata file"));
 		}
-		let registered = registry.resolve(key)?;
 		let mut page = AlignedPage::zeroed();
 		reader.read_frame(*frame, &mut page)?;
 		registered.file()?.write_page(key.page_no(), &page)?;
-		touched.insert(key.file_id());
+		touched.insert(identity);
 	}
 	for file in touched {
-		registry.resolve_file(space, file)?.file()?.sync_data()?;
+		files
+			.get(&file)
+			.ok_or_else(|| invalid("checkpoint lost its registered file"))?
+			.file()?
+			.sync_data()?;
 	}
 	Ok(())
 }

@@ -201,9 +201,7 @@ impl InstallBuiltGraphTree {
 					.saturating_add(edge.record.estimated_heap_bytes())
 					.saturating_add(edge.label.as_ref().map_or(0, Text::len))
 					.saturating_add(edge.properties.estimated_heap_bytes())
-					.saturating_add(
-						edge.topology.endpoint_count().saturating_mul(size_of::<AtomId>()),
-					)
+					.saturating_add(crate::graph::estimated_topology_heap_bytes(&edge.topology))
 			});
 			bytes.saturating_add(node_bytes).saturating_add(edge_bytes)
 		})

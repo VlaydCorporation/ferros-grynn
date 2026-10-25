@@ -638,6 +638,14 @@ pub struct BarrierAccount {
 }
 
 impl BarrierAccount {
+	/// Creates another owner in the same pool without releasing live bytes.
+	pub(crate) fn empty_shared(&self) -> Self {
+		Self {
+			memory: Arc::clone(&self.memory),
+			bytes: 0,
+		}
+	}
+
 	/// Creates a new `BarrierAccount` value.
 	pub(crate) fn new(limit: usize) -> Self {
 		Self {

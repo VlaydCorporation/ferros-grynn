@@ -22,6 +22,101 @@ fn record(name: &str) -> FerrosGrynnResult<RecordId> {
 	RecordId::new("person", RecordIdPart::String(name.into()))
 }
 
+/// Compares derived labels to source occurrences, including kind and scope.
+fn assert_label_lookup_matches_occurrences(root: &crate::datastore::DatabaseRoot) {
+	for (graph, occurrences) in &root.graphs {
+		assert!(root.indexes.graphs[graph].labels.values().all(|members| !members.is_empty()));
+		for kind in [AtomKind::Node, AtomKind::Edge] {
+			for label in ["A", "B", "C"] {
+				let expected = occurrences
+					.occurrences()
+					.filter(|occurrence| {
+						occurrence.local_id().kind() == Some(kind)
+							&& occurrence.label().is_some_and(|value| value.as_str() == label)
+					})
+					.map(crate::datastore::GraphOccurrence::local_id)
+					.collect::<Vec<_>>();
+				assert_eq!(root.indexes.graph_label(*graph, kind, &label.into()), expected);
+			}
+		}
+	}
+}
+
+/// Label-only changes must update lookup even without explicit indexes.
+#[test]
+fn occurrence_label_lookup_tracks_replacements_removals_and_old_roots() {
+	use crate::test_assertions::AssertResult as _;
+
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
+	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).assert_ok()).assert_ok();
+	let graph = seed.define_graph("selected", GraphKind::Graph).assert_ok();
+	let other = seed.define_graph("other", GraphKind::Graph).assert_ok();
+	let records = [
+		record("a").assert_ok(),
+		record("b").assert_ok(),
+		"relation:r".parse::<RecordId>().assert_ok(),
+	];
+	for record in &records {
+		seed.create_atom(record.clone(), PropertyMap::new()).assert_ok();
+	}
+	let a = seed.attach_node(graph.id(), &records[0], Some("A".into()), None).assert_ok();
+	let b = seed.attach_node(graph.id(), &records[1], Some("B".into()), None).assert_ok();
+	let edge = seed
+		.attach_edge(
+			graph.id(),
+			&records[2],
+			Some("A".into()),
+			crate::graph::EdgeTopology::directed([a], [b]),
+			None,
+			None,
+		)
+		.assert_ok();
+	seed.attach_node(other.id(), &records[0], Some("A".into()), None).assert_ok();
+	seed.commit().assert_ok();
+	let old = store.inner.current_root();
+	let mut candidate = old.as_ref().clone();
+	assert_label_lookup_matches_occurrences(&candidate);
+	for label in [Some("B"), None, Some("C"), Some("C")] {
+		for local in [a, edge] {
+			candidate.set_occurrence_label(graph.id(), local, label.map(Into::into)).assert_ok();
+		}
+		assert_label_lookup_matches_occurrences(&candidate);
+		assert_label_lookup_matches_occurrences(&old);
+		for local in [a, edge] {
+			assert_eq!(
+				old.occurrence(graph.id(), local).assert_some().label().map(|label| label.as_str()),
+				Some("A"),
+			);
+		}
+	}
+	for record in [&records[2], &records[0]] {
+		let global = candidate.atom_by_record(record).assert_some().id();
+		candidate.detach(graph.id(), global).assert_ok().assert_some();
+	}
+	assert_label_lookup_matches_occurrences(&candidate);
+	assert_label_lookup_matches_occurrences(&old);
+}
+
+/// A malformed source lookup must fail before inserting a replacement label.
+#[test]
+fn occurrence_label_lookup_rejects_missing_source_postings() {
+	use crate::test_assertions::AssertResult as _;
+
+	let mut indexes = super::model::GraphIndexRoot::default();
+	let local = crate::graph::AtomId::from_parts(AtomKind::Node, 4, 0).assert_ok();
+	let missing = crate::graph::AtomId::from_parts(AtomKind::Node, 5, 0).assert_ok();
+	let before = "A".into();
+	let after = "B".into();
+	assert!(indexes.replace_label(local, Some(&before), Some(&after)).is_err());
+	assert!(indexes.labels.is_empty());
+	indexes.replace_label(local, None, Some(&before)).assert_ok();
+	let original = indexes.labels.clone();
+	assert!(indexes.replace_label(missing, Some(&before), Some(&after)).is_err());
+	assert_eq!(indexes.labels, original);
+}
+
 /// Verifies base and effective indexes track normalized mutations.
 #[test]
 fn base_and_effective_indexes_track_normalized_mutations() {

@@ -65,6 +65,10 @@ impl Transaction {
 		nested_graph: Option<GraphId>,
 	) -> FerrosGrynnResult<AtomId> {
 		self.prepare_mutation()?;
+		let payload =
+			Self::mutation_payload_charge(label.as_ref().map_or(0, Text::estimated_heap_bytes))
+				.saturating_add(super::write_set::label_sidecar_bytes(label.as_ref()));
+		self.ensure_capacity(payload)?;
 		let global = self.require_atom(record_id)?;
 		self.note_change_target(global, Some(graph), ConflictKey::GraphMembership(graph, global))?;
 		let (class_id, kind) = self.atom_domain(global)?;
@@ -76,6 +80,7 @@ impl Transaction {
 		}
 		let additional = GRAPH_MEMBERSHIP_WRITE_BYTES
 			.checked_add(GRAPH_INCIDENCE_WRITE_BYTES)
+			.and_then(|bytes| bytes.checked_add(payload))
 			.ok_or_else(|| self.limit_error(usize::MAX))?;
 		self.ensure_capacity(additional)?;
 		let local = self.working.attach_node(graph, global, label.clone(), nested_graph)?;
@@ -86,7 +91,7 @@ impl Transaction {
 		self.insert_write(ConflictKey::GraphIncidence(graph, local), GRAPH_INCIDENCE_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));
-		self.mutations.push(Mutation::AttachNode {
+		self.record_mutation(Mutation::AttachNode {
 			graph,
 			local,
 			global,
@@ -134,6 +139,14 @@ impl Transaction {
 		transition_graph: Option<GraphId>,
 	) -> FerrosGrynnResult<AtomId> {
 		self.prepare_mutation()?;
+		let payload = Self::mutation_payload_charge(
+			label
+				.as_ref()
+				.map_or(0, Text::estimated_heap_bytes)
+				.saturating_add(crate::graph::estimated_topology_heap_bytes(&topology)),
+		)
+		.saturating_add(super::write_set::label_sidecar_bytes(label.as_ref()));
+		self.ensure_capacity(payload)?;
 		let global = self.require_atom(record_id)?;
 		self.note_change_target(global, Some(graph), ConflictKey::GraphMembership(graph, global))?;
 		let (class_id, kind) = self.atom_domain(global)?;
@@ -156,19 +169,19 @@ impl Transaction {
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		let endpoint_capability = self.prepare_edge_endpoint_capability(graph, &topology)?;
+		let capability_bytes = endpoint_capability.as_ref().map_or(0, |schema| {
+			SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+				super::write_set::graph_payload_bytes(schema),
+			))
+		});
 		let posting_bytes = endpoint_posting_write_bytes(&topology)?;
 		let incidence_bytes = GRAPH_INCIDENCE_WRITE_BYTES
 			.checked_add(posting_bytes)
 			.ok_or_else(|| self.limit_error(usize::MAX))?;
 		let additional = GRAPH_MEMBERSHIP_WRITE_BYTES
-			.checked_add(incidence_bytes)
-			.and_then(|bytes| {
-				bytes.checked_add(if endpoint_capability.is_some() {
-					SCHEMA_WRITE_BYTES
-				} else {
-					0
-				})
-			})
+			.checked_add(payload)
+			.and_then(|bytes| bytes.checked_add(incidence_bytes))
+			.and_then(|bytes| bytes.checked_add(capability_bytes))
 			.ok_or_else(|| self.limit_error(usize::MAX))?;
 		let anchor = self.prepare_qualified_anchor(graph, record_id, &topology, additional)?;
 		let pending = additional.saturating_add(anchor.as_ref().map_or(0, |anchor| anchor.bytes));
@@ -196,7 +209,7 @@ impl Transaction {
 		self.insert_write(ConflictKey::GraphIncidence(graph, local), incidence_bytes);
 		self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));
-		self.mutations.push(Mutation::AttachEdge {
+		self.record_mutation(Mutation::AttachEdge {
 			graph,
 			local,
 			global,
@@ -547,6 +560,16 @@ impl Transaction {
 		{
 			return Ok(());
 		}
+		let payload =
+			Self::mutation_payload_charge(label.as_ref().map_or(0, Text::estimated_heap_bytes))
+				.saturating_add(super::write_set::label_sidecar_bytes(label.as_ref()));
+		self.ensure_capacity(payload.saturating_add(
+			if self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
+				0
+			} else {
+				GRAPH_INCIDENCE_WRITE_BYTES
+			},
+		))?;
 		if !self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
 			self.ensure_capacity(GRAPH_INCIDENCE_WRITE_BYTES)?;
 		}
@@ -555,7 +578,7 @@ impl Transaction {
 		let (class_id, kind) = self.atom_domain(global)?;
 		self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));
-		self.mutations.push(Mutation::SetOccurrenceLabel {
+		self.record_mutation(Mutation::SetOccurrenceLabel {
 			graph,
 			local,
 			label,
@@ -623,6 +646,11 @@ impl Transaction {
 		} else {
 			0
 		};
+		let capability_bytes = endpoint_capability.as_ref().map_or(0, |schema| {
+			SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+				super::write_set::graph_payload_bytes(schema),
+			))
+		});
 		let incidence_bytes = GRAPH_INCIDENCE_WRITE_BYTES
 			.checked_add(posting_bytes)
 			.ok_or_else(|| self.limit_error(usize::MAX))?;
@@ -641,17 +669,9 @@ impl Transaction {
 			return Err(FerrosGrynnError::graph_does_not_exist(nested.to_string()));
 		}
 		let pending = if !self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
-			incidence_bytes.saturating_add(if endpoint_capability.is_some() {
-				SCHEMA_WRITE_BYTES
-			} else {
-				0
-			})
+			incidence_bytes.saturating_add(capability_bytes)
 		} else {
-			posting_bytes.saturating_add(if endpoint_capability.is_some() {
-				SCHEMA_WRITE_BYTES
-			} else {
-				0
-			})
+			posting_bytes.saturating_add(capability_bytes)
 		};
 		let anchor = if let OccurrenceStateRef::Edge {
 			topology,
@@ -662,7 +682,11 @@ impl Transaction {
 		} else {
 			None
 		};
-		let pending = pending.saturating_add(anchor.as_ref().map_or(0, |anchor| anchor.bytes));
+		let payload =
+			Self::mutation_payload_charge(super::write_set::state_payload_bytes(state.view()));
+		let pending = pending
+			.saturating_add(anchor.as_ref().map_or(0, |anchor| anchor.bytes))
+			.saturating_add(payload);
 		if let OccurrenceStateRef::Edge {
 			topology,
 			..
@@ -699,7 +723,7 @@ impl Transaction {
 		let (class_id, kind) = self.atom_domain(global)?;
 		self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));
-		self.mutations.push(Mutation::ReplaceOccurrenceState {
+		self.record_mutation(Mutation::ReplaceOccurrenceState {
 			graph,
 			local,
 			state,
@@ -739,17 +763,27 @@ impl Transaction {
 		value: Option<Value>,
 	) -> FerrosGrynnResult<()> {
 		self.prepare_mutation()?;
+		let payload =
+			Self::mutation_payload_charge(value.as_ref().map_or(0, Value::estimated_heap_bytes));
+		self.ensure_capacity(payload)?;
 		let global = self.require_atom(record_id)?;
 		let local = self.require_membership(graph, global)?;
 		self.note_change_target(global, Some(graph), ConflictKey::GraphOverlay(graph, global))?;
 		if let Some(value) = &value {
 			self.intern_value_keys(value)?;
 		}
+		self.ensure_capacity(payload.saturating_add(
+			if self.writes.contains_key(&ConflictKey::GraphOverlay(graph, global)) {
+				0
+			} else {
+				GRAPH_OVERLAY_WRITE_BYTES
+			},
+		))?;
 		self.reserve_overlay_write(graph, global)?;
 		match value {
 			Some(value) => {
 				self.working.set_overlay(graph, local, key, value.clone())?;
-				self.mutations.push(Mutation::SetOverlay {
+				self.record_mutation(Mutation::SetOverlay {
 					graph,
 					local,
 					key,
@@ -758,7 +792,7 @@ impl Transaction {
 			}
 			None => {
 				self.working.hide_property(graph, local, key)?;
-				self.mutations.push(Mutation::HideProperty {
+				self.record_mutation(Mutation::HideProperty {
 					graph,
 					local,
 					key,

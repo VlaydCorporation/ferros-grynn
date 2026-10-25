@@ -96,21 +96,13 @@ where
 	Source: Copy + Ord,
 	Target: crate::storage::graph_index::PrimaryAddress + Ord,
 {
-	let mut standard = 0_u32;
-	let mut unique = 0_u32;
-	for binding in bindings.values() {
-		if binding.deferred {
-			return Err(invalid("deferred physical index reached the generation builder"));
-		}
-		let (relative_path, root, pages) = match &binding.entries {
+	for planned in explicit_index_paths(bindings) {
+		let (binding, relative_path) = planned?;
+		let (root, pages) = match &binding.entries {
 			IndexEntries::Standard(entries) => {
 				let entries = scalar_entries(entries, address)?;
 				let built = build_scalar_index(&entries, ScalarIndexMode::Standard, PageLsn::ZERO)?;
-				let path = scalar_filename(ClassIndexKind::Standard, standard);
-				standard = standard
-					.checked_add(1)
-					.ok_or_else(|| invalid("standard index ordinal overflows u32"))?;
-				(path, built.root, built.pages)
+				(built.root, built.pages)
 			}
 			IndexEntries::Unique(entries) => {
 				let entries = entries
@@ -123,11 +115,7 @@ where
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let built = build_scalar_index(&entries, ScalarIndexMode::Unique, PageLsn::ZERO)?;
-				let path = scalar_filename(ClassIndexKind::Unique, unique);
-				unique = unique
-					.checked_add(1)
-					.ok_or_else(|| invalid("unique index ordinal overflows u32"))?;
-				(path, built.root, built.pages)
+				(built.root, built.pages)
 			}
 			IndexEntries::Count(count) => {
 				let count_scope = match scope {
@@ -136,18 +124,16 @@ where
 						graph,
 					} => CountIndexScope::Effective(graph),
 				};
-				(format!("idx/cnt_{}.fgidx", binding.class_id.get()), PageNo::new(0), vec![
-					encode_count_index(
-						CountIndexValue {
-							class_id: binding.class_id.get(),
-							scope: count_scope,
-							atom_count: *count,
-							last_updated_lsn: 0,
-							created_at_lsn: 0,
-						},
-						PageLsn::ZERO,
-					)?,
-				])
+				(PageNo::new(0), vec![encode_count_index(
+					CountIndexValue {
+						class_id: binding.class_id.get(),
+						scope: count_scope,
+						atom_count: *count,
+						last_updated_lsn: 0,
+						created_at_lsn: 0,
+					},
+					PageLsn::ZERO,
+				)?])
 			}
 		};
 		files.push(ScopedIndexFile {
@@ -164,6 +150,38 @@ where
 		});
 	}
 	Ok(())
+}
+
+/// One naming authority for full and selected builds: ordered IndexIds assign
+/// independent Standard/Unique ordinals within their final scope.
+pub(in crate::storage) fn explicit_index_paths<Address>(
+	bindings: &BTreeMap<crate::datastore::IndexId, IndexBinding<Address>>,
+) -> impl Iterator<Item = FerrosGrynnResult<(&IndexBinding<Address>, String)>> {
+	let mut standard = 0_u32;
+	let mut unique = 0_u32;
+	bindings.values().map(move |binding| {
+		if binding.deferred {
+			return Err(invalid("deferred physical index reached the generation builder"));
+		}
+		let path = match &binding.entries {
+			IndexEntries::Standard(_) => {
+				let path = scalar_filename(ClassIndexKind::Standard, standard);
+				standard = standard
+					.checked_add(1)
+					.ok_or_else(|| invalid("standard index ordinal overflows u32"))?;
+				path
+			}
+			IndexEntries::Unique(_) => {
+				let path = scalar_filename(ClassIndexKind::Unique, unique);
+				unique = unique
+					.checked_add(1)
+					.ok_or_else(|| invalid("unique index ordinal overflows u32"))?;
+				path
+			}
+			IndexEntries::Count(_) => format!("idx/cnt_{}.fgidx", binding.class_id.get()),
+		};
+		Ok((binding, path))
+	})
 }
 
 /// Returns the scalar entries result.
@@ -236,7 +254,7 @@ pub(super) fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 }
 
 /// Returns the label filename result.
-pub(super) fn label_filename(kind: AtomKind, label_id: u32) -> String {
+pub(in crate::storage) fn label_filename(kind: AtomKind, label_id: u32) -> String {
 	let kind = match kind {
 		AtomKind::Node => "node",
 		AtomKind::Edge => "edge",

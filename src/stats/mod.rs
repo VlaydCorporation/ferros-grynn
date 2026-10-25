@@ -19,6 +19,7 @@ pub(crate) use analyze::{
 	analyze_database_with_method_at,
 	analyze_graph_with_method_at,
 };
+pub(crate) use delta::effective_property_count;
 pub use model::{
 	BaseStatistics,
 	DegreeBucket,

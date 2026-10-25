@@ -1,4 +1,5 @@
 use std::{
+	collections::BTreeSet,
 	fs,
 	io::{Read, Seek, SeekFrom, Write},
 	num::NonZeroUsize,
@@ -42,13 +43,40 @@ use crate::{
 	values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Value, Vector},
 };
 
+/// Base lifecycle deltas preserve AtomStore identities and exact counters.
+mod base_lifecycle_tests;
+/// Base preparation rejects oversized private state before durable publication.
+pub(super) mod base_resource_tests;
 mod bridge_tests;
 mod changefeed_tests;
+/// Context priming shares admission with later point-publication work.
+mod context_resource_tests;
+/// EDGE membership publication preserves physical snapshots and file
+/// identities.
+mod edge_membership_tests;
+/// Point commits preserve endpoint snapshot-header authority.
+mod endpoint_tests;
 mod event_outbox_tests;
+/// Graph artifact bindings follow definition availability across publication.
+mod graph_artifact_tests;
+/// Overlay commits retain graph files and publish only their changed pages.
+mod graph_overlay_tests;
+/// Stable scalar output shares the complete publication envelope.
+mod index_resource_tests;
 mod live_history_tests;
+/// Structural point publication retains unaffected generations.
+mod node_membership_tests;
+/// Point publication preserves existing physical file identities.
+mod point_update_tests;
 mod qualified_incidence_tests;
 /// Regression tests for local store behavior.
 mod search_scope_tests;
+/// Shared statistics admission covers every sparse output path.
+mod statistics_resource_tests;
+/// IANA identifiers follow the exact catalog and physical snapshot authority.
+mod timezone_authority_tests;
+/// Write-set rejection stays ahead of the local WAL barrier.
+mod write_set_tests;
 
 /// Verifies edge endpoint physical hyperwalk pins old generation and reopens.
 #[test]
@@ -273,9 +301,9 @@ fn geometry_physical_delta_matches_scan_and_survives_reopen() {
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 /// Temporary directory owner used to keep test files alive for their scenario.
-struct TestDirectory(
+pub(super) struct TestDirectory(
 	/// Path retained for the lifetime of the temporary directory owner.
-	PathBuf,
+	pub(super) PathBuf,
 );
 
 impl TestDirectory {
@@ -723,6 +751,18 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 /// reopen.
 #[test]
 fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
+	derived_graph_artifact_publication(crate::datastore::IoMode::Sync);
+}
+
+/// Native reopen and catalog-only commits retain exact graph artifact bindings.
+#[cfg(feature = "native-async-io")]
+#[test]
+fn derived_graph_artifact_native_async_publication_reuse_and_corrupt_reopen() {
+	derived_graph_artifact_publication(crate::datastore::IoMode::NativeAsync);
+}
+
+/// Exercises every materialized artifact family through the same durable path.
+fn derived_graph_artifact_publication(io_mode: crate::datastore::IoMode) {
 	use crate::datastore::{
 		GraphIndex,
 		GraphIndexCost,
@@ -772,8 +812,12 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 		},
 	] {
 		let directory = TestDirectory::new();
-		let options = LocalOptions::default();
+		let options = LocalOptions {
+			io_mode,
+			..LocalOptions::default()
+		};
 		let store = Datastore::create_local(&directory.0, options).assert_ok();
+		assert_eq!(store.local_storage_status().assert_some().options().io_mode, io_mode);
 		let mut seed = store.begin();
 		seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
 		seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).assert_ok()).assert_ok();
@@ -867,6 +911,7 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 		);
 		drop(store);
 		let reopened = Datastore::open_local(&directory.0, options).assert_ok();
+		assert_eq!(reopened.local_storage_status().assert_some().options().io_mode, io_mode);
 		assert_eq!(physical(&reopened), before);
 		assert!(
 			reopened.inner.current_root().reachability_artifacts.contains_key(&id)
@@ -874,6 +919,27 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 				|| reopened.inner.current_root().path_artifacts.contains_key(&id)
 				|| reopened.inner.current_root().tensor_artifacts.contains_key(&id)
 		);
+		// A cold binding must survive both sparse data and catalog-only
+		// publication.
+		let mut unrelated = reopened.begin();
+		unrelated
+			.create_atom("person:after_reopen".parse().assert_ok(), PropertyMap::new())
+			.assert_ok();
+		unrelated.commit().assert_ok();
+		assert_eq!(physical(&reopened), before);
+		let mut catalog = reopened.begin();
+		catalog
+			.define_parameter(
+				crate::datastore::SchemaParameter::new("artifact_parameter", Value::from(1))
+					.assert_ok(),
+			)
+			.assert_ok();
+		catalog.commit().assert_ok();
+		assert_eq!(physical(&reopened), before);
+		reopened.checkpoint(CheckpointMode::Restart).assert_ok();
+		drop(reopened);
+		let reopened = Datastore::open_local(&directory.0, options).assert_ok();
+		assert_eq!(physical(&reopened), before);
 		drop(reopened);
 		corrupt_page_checksum(&directory.0.join(&before.1));
 		let reopened = Datastore::open_local(&directory.0, options).assert_ok();
@@ -940,12 +1006,27 @@ fn quarantine_reopens_survives_cow_and_is_removed_by_catalog_publication() {
 	mutation.create_atom("person:bob".parse().assert_ok(), PropertyMap::new()).assert_ok();
 	mutation.commit().assert_ok();
 	assert!(store.open_quarantine(id).assert_ok().read_next().assert_ok().is_some());
+	drop(store);
+	let store = Datastore::open_local(&directory.0, options).assert_ok();
+	assert!(store.inner.current_root().statistics.auxiliary_deferred());
 	store.remove_quarantine(id).assert_ok();
 	assert!(store.open_quarantine(id).is_err());
+	// The removal publishes a full generation, so its next writer must retain
+	// the source counters even when the removed root was opened lazily.
+	let mut mutation = store.begin();
+	mutation.create_atom("person:carol".parse().assert_ok(), PropertyMap::new()).assert_ok();
+	mutation.commit().assert_ok();
+	assert_eq!(
+		store.inner.current_root().statistics.base().classes.values().copied().sum::<u64>(),
+		3
+	);
 	drop(store);
 
 	let reopened = Datastore::open_local(&directory.0, options).assert_ok();
 	assert!(reopened.open_quarantine(id).is_err());
+	let mut root = reopened.inner.current_root().as_ref().clone();
+	reopened.inner.hydrate_statistics(&mut root).assert_ok();
+	assert_eq!(root.statistics.base().classes.values().copied().sum::<u64>(), 3);
 }
 
 /// Verifies graph property catalog update reuses graph generation and reopens.
@@ -1038,8 +1119,24 @@ fn repeated_cow_commits_retire_unpinned_generations_at_runtime() {
 /// Verifies atom and graph cow churn keeps only live generations.
 #[test]
 fn atom_and_graph_cow_churn_keeps_only_live_generations() {
+	atom_graph_cow_churn(LocalOptions::default());
+}
+
+/// Native class COW must retire obsolete directories after every commit.
+#[cfg(feature = "native-async-io")]
+#[test]
+fn atom_and_graph_cow_churn_native_async_keeps_only_live_generations() {
+	atom_graph_cow_churn(LocalOptions {
+		io_mode: crate::datastore::IoMode::NativeAsync,
+		..LocalOptions::default()
+	});
+}
+
+/// Class COW shares the seed Hot files while replacing one selected image.
+fn atom_graph_cow_churn(options: LocalOptions) {
 	let directory = TestDirectory::new();
-	let store = Datastore::create_local(&directory.0, LocalOptions::default()).assert_ok();
+	let store = Datastore::create_local(&directory.0, options).assert_ok();
+	assert_eq!(store.local_storage_status().assert_some().options().io_mode, options.io_mode);
 	let mut seed = store.begin();
 	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
 	let graph = seed.define_graph("social", GraphKind::Graph).assert_ok();
@@ -1047,7 +1144,8 @@ fn atom_and_graph_cow_churn_keeps_only_live_generations() {
 	seed.create_atom(identity.clone(), PropertyMap::new()).assert_ok();
 	seed.attach_node(graph.id(), &identity, None, None).assert_ok();
 	seed.commit().assert_ok();
-	let expected = generation_directories(&directory.0);
+	let seeded = generation_directory_paths(&directory.0);
+	assert_eq!(seeded, catalog_generation_directory_paths(&directory.0, &store));
 
 	for index in 0..32 {
 		let identity = format!("person:churn-{index}").parse::<RecordId>().assert_ok();
@@ -1055,7 +1153,10 @@ fn atom_and_graph_cow_churn_keeps_only_live_generations() {
 		transaction.create_atom(identity.clone(), PropertyMap::new()).assert_ok();
 		transaction.attach_node(graph.id(), &identity, None, None).assert_ok();
 		transaction.commit().assert_ok();
-		assert_eq!(generation_directories(&directory.0), expected);
+		let current = generation_directory_paths(&directory.0);
+		assert_eq!(current, catalog_generation_directory_paths(&directory.0, &store));
+		// One selected class image can live apart from the retained Hot files.
+		assert!(current.len() <= seeded.len() + 1);
 	}
 	let status = store.local_storage_status().assert_some();
 	assert_eq!(status.pending_retired_generation_directories(), 0);
@@ -1079,6 +1180,8 @@ fn physical_snapshot_pins_replaced_generation_until_maintenance() {
 		.assert_some();
 
 	let mut transaction = store.begin();
+	// Plain Base inserts retain files; schema replacement forces this GC path.
+	transaction.define_class(ClassSchema::new("other", AtomKind::Node, []).assert_ok()).assert_ok();
 	transaction.create_atom("person:next".parse().assert_ok(), PropertyMap::new()).assert_ok();
 	transaction.commit().assert_ok();
 	assert_eq!(generation_directories(&directory.0), expected + 1);
@@ -1093,6 +1196,8 @@ fn physical_snapshot_pins_replaced_generation_until_maintenance() {
 fn cleanup_failure_does_not_undo_commit_and_is_retried() {
 	let directory = TestDirectory::new();
 	let store = Datastore::create_local(&directory.0, LocalOptions::default()).assert_ok();
+	// Keep the pending state until this test explicitly retries the cleanup.
+	store.inner.maintenance.shutdown();
 	let mut seed = store.begin();
 	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).assert_ok()).assert_ok();
 	seed.create_atom("person:seed".parse().assert_ok(), PropertyMap::new()).assert_ok();
@@ -1102,6 +1207,8 @@ fn cleanup_failure_does_not_undo_commit_and_is_retried() {
 
 	let next = "person:next".parse::<RecordId>().assert_ok();
 	let mut transaction = store.begin();
+	// Keep the cleanup-failure oracle on a full-generation publication.
+	transaction.define_class(ClassSchema::new("other", AtomKind::Node, []).assert_ok()).assert_ok();
 	transaction.create_atom(next.clone(), PropertyMap::new()).assert_ok();
 	transaction.commit().assert_ok();
 	assert!(store.begin().atom(&next).assert_ok().is_some());
@@ -2134,25 +2241,62 @@ fn relational_select_spill_matches_after_local_reopen() {
 
 /// Returns generation directories for this module.
 fn generation_directories(root: &Path) -> usize {
-	let mut count = 0;
+	generation_directory_paths(root).len()
+}
+
+/// Enumerates physical generation roots independently of the file catalog.
+fn generation_directory_paths(root: &Path) -> BTreeSet<PathBuf> {
+	let mut directories = BTreeSet::new();
 	for family in ["atoms", "graphs"] {
 		let family = root.join(family);
-		let Ok(entries) = fs::read_dir(&family) else {
-			continue;
+		let entries = match fs::read_dir(&family) {
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			entries => entries.assert_ok(),
 		};
-		for entry in entries.flatten() {
-			let path = entry.path();
+		for entry in entries {
+			let path = entry.assert_ok().path();
 			if !path.is_dir() {
 				continue;
 			}
 			if family.ends_with("atoms") {
-				count += 1;
-			} else if let Ok(generations) = fs::read_dir(path) {
-				count += generations.flatten().filter(|entry| entry.path().is_dir()).count();
+				directories.insert(path);
+			} else {
+				for entry in fs::read_dir(path).assert_ok() {
+					let path = entry.assert_ok().path();
+					if path.is_dir() {
+						directories.insert(path);
+					}
+				}
 			}
 		}
 	}
-	count
+	directories
+}
+
+/// Current catalog roots suffice when the churn fixture holds no snapshot.
+fn catalog_generation_directory_paths(root: &Path, store: &Datastore) -> BTreeSet<PathBuf> {
+	let local = match &store.inner.backend {
+		StoreBackend::Local(local) => Some(local),
+		StoreBackend::InMemory => None,
+	}
+	.assert_some_with("test requires a local datastore");
+	let state = local.state.lock();
+	let mut directories = BTreeSet::new();
+	for file in &state.file_catalog.files {
+		let path = Path::new(file.path.as_str());
+		let depth = if path.starts_with("atoms") {
+			2
+		} else if path.starts_with("graphs") {
+			3
+		} else {
+			continue;
+		};
+		assert!(path.components().count() > depth);
+		let generation =
+			path.ancestors().find(|ancestor| ancestor.components().count() == depth).assert_some();
+		directories.insert(root.join(generation));
+	}
+	directories
 }
 
 /// Returns physical index files for this module.

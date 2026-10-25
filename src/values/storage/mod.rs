@@ -15,6 +15,8 @@ pub mod codec;
 mod context;
 /// Internal storage value representations, separate from runtime SDK types.
 mod dto;
+/// Values-owned operation accounting, independent of physical publication.
+mod encode_budget;
 mod order_key;
 /// Explicit value tags and validated durable graph and atom references.
 mod tags_refs;

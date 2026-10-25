@@ -3,6 +3,7 @@
 use super::super::{
 	AlignedPage,
 	CROSS_LEVEL_REFS_PER_PAGE,
+	EncodedEndpoint,
 	EndpointSide,
 	FerrosGrynnResult,
 	OVERFLOW_REFS_PER_PAGE,
@@ -62,7 +63,7 @@ impl QualifiedOverflowBuilder {
 	/// Appends qualified overflow builder.
 	pub(super) fn append(
 		&mut self,
-		entries: &[super::topology::EncodedEndpoint],
+		entries: &[EncodedEndpoint],
 		side: EndpointSide,
 		page_lsn: PageLsn,
 	) -> FerrosGrynnResult<Option<PageNo>> {

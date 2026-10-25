@@ -18,23 +18,16 @@ use super::{
 	StatisticsScope,
 	StatisticsStore,
 	bounded_histogram::{HistogramInput, finish_histograms},
+	effective_property_count,
 };
 use crate::{
-	datastore::{
-		DatabaseRoot,
-		GraphOccurrence,
-		GraphRoot,
-		OccurrenceStateRef,
-		OverlayValue,
-		index_context,
-	},
+	datastore::{DatabaseRoot, GraphOccurrence, GraphRoot, OccurrenceStateRef, index_context},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeEndpoint, EdgeTopology, GraphId},
 	math::HyperLogLog,
 	storage::{ExternalIndexSorter, SortedIndexRecords},
 	values::{
 		PropertyKeyId,
-		PropertyMap,
 		Type,
 		Value,
 		storage::{EncodeContext, TypeTag, encode_index_key},
@@ -593,26 +586,6 @@ fn fraction(numerator: u64, denominator: u64) -> f32 {
 	} else {
 		numerator as f32 / denominator as f32
 	}
-}
-
-/// Returns the effective property count result.
-fn effective_property_count(
-	base: &PropertyMap,
-	occurrence: &GraphOccurrence,
-) -> FerrosGrynnResult<usize> {
-	let inherited = base
-		.iter()
-		.filter(|(key, value)| occurrence.effective_value(Some(value), *key).is_some())
-		.count();
-	let additional = occurrence
-		.overlay()
-		.into_iter()
-		.flat_map(crate::datastore::PropertyOverlay::iter)
-		.filter(|(key, value)| !base.contains_key(*key) && matches!(value, OverlayValue::Value(_)))
-		.count();
-	inherited
-		.checked_add(additional)
-		.ok_or_else(|| invalid("effective property count overflows usize"))
 }
 
 /// Records topology.

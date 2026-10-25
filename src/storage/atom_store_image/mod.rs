@@ -51,6 +51,7 @@ use crate::{
 	values::{
 		PropertyDictionary,
 		PropertyMap,
+		Text,
 		storage::{DiskGraphRef, EncodeContext, codec::DecodeLimits},
 	},
 };
@@ -283,6 +284,7 @@ pub(super) fn stage_atom_store_superblock_if_changed(
 }
 
 /// Reopens one AtomStore version through WAL-first snapshot resolution.
+/// Time-zone names must belong to the catalog publishing these exact pages.
 pub(super) fn open_durable_atom_store_image(
 	wal: &FrameWal,
 	registry: &FileRegistry,
@@ -291,6 +293,7 @@ pub(super) fn open_durable_atom_store_image(
 	authority: AtomStoreCheckpointAuthority,
 	files: AtomStoreFileSet,
 	schema: &SchemaCatalog,
+	time_zones: &[Text],
 ) -> FerrosGrynnResult<(AtomStoreRoot, PropertyDictionary, AtomStoreSuperblock)> {
 	let superblock = read_atom_store_superblock(wal, registry, snapshot, authority, files)?;
 	let load = |file_id, page_count| match engine {
@@ -334,6 +337,7 @@ pub(super) fn open_durable_atom_store_image(
 			.map_err(|_error| invalid("AtomStore capacity exceeds usize"))?,
 		schema,
 		&dictionary,
+		time_zones,
 	)?;
 	validate_opened_counts(&atoms, superblock)?;
 	Ok((atoms, dictionary, superblock))
@@ -489,12 +493,13 @@ fn build_atom_store_data_with_context(
 }
 
 /// Reopens one complete AtomStore image using the capacity published by its
-/// snapshot-visible superblock.
+/// snapshot-visible superblock and the matching catalog time-zone order.
 pub(super) fn open_atom_store_image(
 	image: BuiltAtomStoreImage,
 	atom_capacity: usize,
 	schema: &SchemaCatalog,
 	dictionary: &PropertyDictionary,
+	time_zones: &[Text],
 ) -> FerrosGrynnResult<AtomStoreRoot> {
 	let BuiltAtomStoreImage {
 		atoms_hot,
@@ -517,6 +522,7 @@ pub(super) fn open_atom_store_image(
 
 	let context = value_context(schema, dictionary.clone())?;
 	let decoder = context.decoder();
+	let decoder = decoder.with_time_zone_names(time_zones);
 	let mut result = AtomStoreRoot::default();
 	for (page_index, page) in atoms_hot.into_iter().enumerate() {
 		let page_no = PageNo::new(
@@ -789,7 +795,9 @@ fn copy_page(
 
 #[derive(Default)]
 /// Append-only builder for inline and large property records.
-struct PropertyStoreBuilder {
+pub(super) struct PropertyStoreBuilder {
+	/// Absolute start of this append image; older pages stay immutable.
+	first_page: u64,
 	/// Next page number assigned to an appended property page.
 	next_page: u64,
 	/// Current unsealed slotted page, if any.
@@ -799,8 +807,95 @@ struct PropertyStoreBuilder {
 }
 
 impl PropertyStoreBuilder {
+	/// Starts a contiguous append image after the visible property-file tail.
+	pub(super) const fn at_page(first_page: u64) -> Self {
+		Self {
+			first_page,
+			next_page: first_page,
+			current: None,
+			pages: Vec::new(),
+		}
+	}
+
+	/// Predicts the next append from the same counters used by the byte writer.
+	///
+	/// # Errors
+	/// Rejects lengths outside the durable record limit and invalid counters.
+	pub(super) fn additional_pages(&self, length: usize) -> FerrosGrynnResult<usize> {
+		u32::try_from(length).map_err(|_error| invalid("property record exceeds u32"))?;
+		if length > MAX_INLINE_BYTES {
+			return Ok(length.div_ceil(LARGE_CHUNK_BYTES));
+		}
+		let Some((_number, mut builder)) = self.current else {
+			return Ok(1);
+		};
+		Ok(usize::from(builder.try_insert_len(length)?.is_none()))
+	}
+
+	/// Reports the live backing buffer, including already reserved page slots.
+	pub(super) fn allocation_bytes(&self) -> FerrosGrynnResult<usize> {
+		self.pages
+			.capacity()
+			.checked_mul(size_of::<AlignedPage>())
+			.ok_or_else(|| invalid("property append backing bytes overflow usize"))
+	}
+
+	/// Reports initialized frames without sealing the current inline page.
+	pub(super) fn page_count(&self) -> usize {
+		self.pages.len()
+	}
+
+	/// Admits replacement-buffer overlap before reserving the next append.
+	/// The caller separately admits the live encoded record and other frames.
+	///
+	/// # Errors
+	/// Rejects size, resource or allocation failures before changing page
+	/// bytes.
+	pub(super) fn insert_bounded(
+		&mut self,
+		record: &[u8],
+		page_lsn: PageLsn,
+		maximum_backing_bytes: usize,
+	) -> FerrosGrynnResult<PropertyRef> {
+		let required = self
+			.pages
+			.len()
+			.checked_add(self.additional_pages(record.len())?)
+			.ok_or_else(|| invalid("property append page count overflows usize"))?;
+		let old_bytes = self.allocation_bytes()?;
+		let peak = if required > self.pages.capacity() {
+			required
+				.checked_mul(size_of::<AlignedPage>())
+				.and_then(|bytes| bytes.checked_add(old_bytes))
+				.ok_or_else(|| invalid("property append reallocation bytes overflow usize"))?
+		} else {
+			old_bytes
+		};
+		if peak > maximum_backing_bytes {
+			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+				"property append backing",
+				peak as u64,
+				maximum_backing_bytes as u64,
+			));
+		}
+		if required > self.pages.capacity() {
+			// Preserve amortized growth whenever the overlap budget admits it.
+			let maximum_capacity = (maximum_backing_bytes - old_bytes) / size_of::<AlignedPage>();
+			let capacity =
+				required.max(self.pages.capacity().saturating_mul(2)).min(maximum_capacity);
+			self.pages.try_reserve_exact(capacity - self.pages.len()).map_err(|source| {
+				invalid("property append allocation failed").with_technical_source(source)
+			})?;
+		}
+		self.insert(record, page_lsn)
+	}
+
 	/// Stores one encoded record and returns its durable physical reference.
-	fn insert(&mut self, record: &[u8], page_lsn: PageLsn) -> FerrosGrynnResult<PropertyRef> {
+	pub(super) fn insert(
+		&mut self,
+		record: &[u8],
+		page_lsn: PageLsn,
+	) -> FerrosGrynnResult<PropertyRef> {
 		let length =
 			u32::try_from(record.len()).map_err(|_error| invalid("property record exceeds u32"))?;
 		if record.len() > MAX_INLINE_BYTES {
@@ -821,7 +916,7 @@ impl PropertyStoreBuilder {
 			self.start_page(page_lsn)?;
 		}
 		if let Some((page_no, builder)) = self.current.as_mut() {
-			let index = usize::try_from(page_no.get())
+			let index = usize::try_from(page_no.get() - self.first_page)
 				.map_err(|_error| invalid("property page number exceeds usize"))?;
 			let page = self
 				.pages
@@ -835,7 +930,7 @@ impl PropertyStoreBuilder {
 		self.start_page(page_lsn)?;
 		let (page_no, builder) =
 			self.current.as_mut().ok_or_else(|| invalid("property page was not started"))?;
-		let index = usize::try_from(page_no.get())
+		let index = usize::try_from(page_no.get() - self.first_page)
 			.map_err(|_error| invalid("property page number exceeds usize"))?;
 		let page =
 			self.pages.get_mut(index).ok_or_else(|| invalid("current property page is absent"))?;
@@ -848,7 +943,7 @@ impl PropertyStoreBuilder {
 	/// Starts the next slotted property page.
 	fn start_page(&mut self, page_lsn: PageLsn) -> FerrosGrynnResult<()> {
 		let page_no = PageNo::new(self.next_page);
-		let index = usize::try_from(page_no.get())
+		let index = usize::try_from(page_no.get() - self.first_page)
 			.map_err(|_error| invalid("property page number exceeds usize"))?;
 		if index != self.pages.len() {
 			return Err(invalid("property pages are not contiguous"));
@@ -867,7 +962,7 @@ impl PropertyStoreBuilder {
 	/// Seals and retains the current slotted page when present.
 	fn finish_current(&mut self) -> FerrosGrynnResult<()> {
 		if let Some((page_no, builder)) = self.current.take() {
-			let index = usize::try_from(page_no.get())
+			let index = usize::try_from(page_no.get() - self.first_page)
 				.map_err(|_error| invalid("property page number exceeds usize"))?;
 			let page = self
 				.pages
@@ -879,9 +974,9 @@ impl PropertyStoreBuilder {
 	}
 
 	/// Seals the builder and returns a contiguous page-number-ordered image.
-	fn finish(mut self) -> FerrosGrynnResult<Vec<AlignedPage>> {
+	pub(super) fn finish(mut self) -> FerrosGrynnResult<Vec<AlignedPage>> {
 		self.finish_current()?;
-		if u64::try_from(self.pages.len()).ok() != Some(self.next_page) {
+		if u64::try_from(self.pages.len()).ok() != Some(self.next_page - self.first_page) {
 			return Err(invalid("property pages are not contiguous"));
 		}
 		Ok(self.pages)

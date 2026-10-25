@@ -6,12 +6,7 @@ use crate::test_assertions::AssertOption as _;
 #[cfg(test)]
 use crate::test_assertions::AssertResult as _;
 use crate::{
-	datastore::{
-		InMemoryOptions,
-		OccurrenceStateRef,
-		TransactionAccess,
-		consts::{GRAPH_INCIDENCE_WRITE_BYTES, GRAPH_MEMBERSHIP_WRITE_BYTES},
-	},
+	datastore::{InMemoryOptions, OccurrenceStateRef, TransactionAccess},
 	graph::{AtomKind, EdgeTopology, GraphRead, GraphTopologyConstraint, GraphTopologyConstraints},
 	values::{Object, RecordIdPart},
 };
@@ -573,12 +568,11 @@ fn fanout_limit_fails_before_private_state_changes() {
 fn fanout_uses_reverse_memberships_not_all_graphs() {
 	let (store, identity, graphs) = setup(1, 32);
 	let root = (*store.inner.current_root()).clone();
+	let mut probe = store.begin();
+	probe.set_base_property(&identity, KEY, Value::from("allowed")).assert_ok();
 	let options_defaults = InMemoryOptions::default();
 	let options = InMemoryOptions {
-		max_write_set_bytes: BASE_ATOM_WRITE_BYTES
-			+ EFFECTIVE_FANOUT_WRITE_BYTES
-			+ std::mem::size_of::<changefeed_journal::CaptureOperation>()
-			+ std::mem::size_of::<changefeed_journal::CaptureIntent>(),
+		max_write_set_bytes: probe.recursive_write_set_bytes(),
 		..options_defaults
 	};
 	let limited = Datastore::from_root_for_test(options, root);
@@ -596,14 +590,19 @@ fn fanout_uses_reverse_memberships_not_all_graphs() {
 /// Verifies commit rechecks memberships added after base preflight.
 #[test]
 fn commit_rechecks_memberships_added_after_base_preflight() {
-	let (store, identity, graphs) = setup(0, 2);
+	let (store, identity, graphs) = setup(0, 8);
 	let root = (*store.inner.current_root()).clone();
+	let mut probe = store.begin();
+	probe.set_base_property(&identity, KEY, Value::from("pending")).assert_ok();
+	let baseline = probe.recursive_write_set_bytes();
+	let mut attach_probe = store.begin();
+	attach_probe.attach_node(graphs[0].id(), &identity, None, None).assert_ok();
+	let maximum =
+		baseline.max(attach_probe.recursive_write_set_bytes()) + EFFECTIVE_FANOUT_WRITE_BYTES;
+	assert!(maximum < baseline + graphs.len() * EFFECTIVE_FANOUT_WRITE_BYTES);
 	let options_defaults = InMemoryOptions::default();
 	let options = InMemoryOptions {
-		max_write_set_bytes: GRAPH_MEMBERSHIP_WRITE_BYTES
-			+ GRAPH_INCIDENCE_WRITE_BYTES
-			+ std::mem::size_of::<changefeed_journal::CaptureOperation>()
-			+ std::mem::size_of::<changefeed_journal::CaptureIntent>(),
+		max_write_set_bytes: maximum,
 		..options_defaults
 	};
 	let limited = Datastore::from_root_for_test(options, root);

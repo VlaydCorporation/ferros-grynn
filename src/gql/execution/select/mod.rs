@@ -2479,7 +2479,14 @@ fn source_rows<Read: QueryRead>(
 					)?;
 					let mut rows = RowCollector::new(read, control, false);
 					let mut ordinal = 0_usize;
-					while let Some(row) = cursor.next(control)? {
+					loop {
+						let _scope =
+							read.bounded_fields().and_then(|fields| fields.transient_scope());
+						let Some(row) = cursor.next(control)? else {
+							break;
+						};
+						// Keep construction scratch through retained admission,
+						// including the collector's spill transition.
 						rows.push(
 							read,
 							snapshot,

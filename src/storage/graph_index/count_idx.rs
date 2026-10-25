@@ -105,6 +105,24 @@ pub(in crate::storage) fn decode_count_index(
 	Ok(value)
 }
 
+/// Replaces only the population; WAL staging stamps the update clock.
+///
+/// # Errors
+/// Rejects malformed pages and an unexpected class or scope.
+pub(in crate::storage) fn rewrite_count_index_population(
+	page: &mut AlignedPage,
+	class: u32,
+	scope: CountIndexScope,
+	count: u64,
+) -> FerrosGrynnResult<()> {
+	let current = decode_count_index(page)?;
+	if current.class_id != class || current.scope != scope {
+		return Err(invalid_index("point Count binding disagrees with its page"));
+	}
+	write_u64(page.as_bytes_mut(), ATOM_COUNT_OFFSET, count);
+	page.seal()
+}
+
 /// Stamps the payload clock at the same LSN assigned to its WAL page frame.
 pub(in crate::storage) fn stamp_count_index_lsn(
 	page: &mut AlignedPage,

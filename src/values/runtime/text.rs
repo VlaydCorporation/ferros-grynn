@@ -24,6 +24,40 @@ pub struct Text(
 );
 
 impl Text {
+	/// Bounds a borrowed UTF-8 copy, including small heaps and wide-capacity
+	/// metadata.
+	pub(crate) fn estimated_copy_heap_bytes(length: usize) -> usize {
+		if length <= size_of::<Self>() {
+			0
+		} else {
+			// The extra word also covers compact_str's large 32-bit capacity
+			// header.
+			length.max(size_of::<Self>() + size_of::<usize>()).saturating_add(size_of::<usize>())
+		}
+	}
+
+	/// Counts retained heap storage without charging the inline representation
+	/// twice.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		if self.0.is_heap_allocated() {
+			self.0.capacity()
+		} else {
+			0
+		}
+	}
+
+	/// Estimates the new clone's allocation independently of source spare
+	/// capacity.
+	pub(crate) fn estimated_clone_heap_bytes(&self) -> usize {
+		if !self.0.is_heap_allocated() || self.0.len() <= size_of::<Self>() {
+			0
+		} else {
+			// compact_str 0.10 rebuilds heap clones from length, with a minimum
+			// capacity-word reserve; recheck this bound when upgrading it.
+			self.0.len().max(size_of::<Self>() + size_of::<usize>())
+		}
+	}
+
 	/// Constructs `Text` from the supplied initial state.
 	pub fn new<Str: AsRef<str>>(value: Str) -> Self {
 		Self(CompactString::new(value))
@@ -247,6 +281,95 @@ mod tests {
 	use crate::gql_status::Domain;
 	#[cfg(test)]
 	use crate::test_assertions::AssertResult as _;
+
+	/// Heap-clone admission includes the small-heap minimum, not old spare
+	/// capacity.
+	#[test]
+	fn clone_heap_estimate_matches_inline_small_and_overreserved_sources() {
+		for length in [0, 24, 25, 31, 32, 128] {
+			for overreserved in [false, true] {
+				let source = "x".repeat(length);
+				let value = if overreserved {
+					let mut inner = CompactString::with_capacity(4096);
+					inner.push_str(&source);
+					Text::from(inner)
+				} else {
+					Text::from(source)
+				};
+				let cloned = value.clone();
+				assert_eq!(cloned, value);
+				assert_eq!(value.estimated_clone_heap_bytes(), cloned.estimated_heap_bytes());
+			}
+		}
+		let static_value =
+			Text::from(CompactString::const_new("a static string longer than the inline buffer"));
+		assert_eq!(static_value.estimated_clone_heap_bytes(), 0);
+		let cloned = static_value.clone();
+		assert_eq!(cloned, static_value);
+		assert_eq!(cloned.estimated_heap_bytes(), 0);
+	}
+
+	/// Bounds copied text without charging source spare or static storage.
+	#[test]
+	fn bounded_storage_copies_cover_static_and_spare_text() {
+		use crate::values::{
+			PropertyKeyId,
+			PropertyMap,
+			Value,
+			storage::{EncodeContext, StorageValue, codec::CanonicalCodec},
+		};
+
+		let mut sources = vec![Text::from(CompactString::const_new(
+			"a static string longer than the inline buffer",
+		))];
+		for length in [0, 24, 25, 31, 32, 128] {
+			let mut inner = CompactString::with_capacity(4096);
+			inner.push_str(&"x".repeat(length));
+			sources.push(Text::from(inner));
+			sources.push(Text::from("x".repeat(length)));
+		}
+		for value in sources {
+			let clone = value.clone();
+			let copy = if value.estimated_clone_heap_bytes() == 0 {
+				0
+			} else {
+				Text::estimated_copy_heap_bytes(value.len())
+			};
+			assert!(copy >= clone.estimated_heap_bytes());
+			let key = PropertyKeyId::new(0);
+			let control = StorageValue::Object(vec![(key, StorageValue::String(clone))]);
+			let expected = CanonicalCodec::encode(control.as_ref()).assert_ok();
+			let maximum = size_of::<(PropertyKeyId, StorageValue)>() + copy + expected.len();
+			let mut properties = PropertyMap::new();
+			let value = Value::String(value);
+			assert_eq!(
+				StorageValue::prime_context_bounded(&value, &mut EncodeContext::default(), copy)
+					.assert_ok(),
+				0
+			);
+			if copy != 0 {
+				assert!(
+					StorageValue::prime_context_bounded(
+						&value,
+						&mut EncodeContext::default(),
+						copy - 1
+					)
+					.is_err()
+				);
+			}
+			properties.insert(key, value);
+			let mut context = EncodeContext::default();
+			assert!(
+				StorageValue::encode_properties_bounded(&properties, &mut context, maximum - 1)
+					.is_err()
+			);
+			let (actual, retained) =
+				StorageValue::encode_properties_bounded(&properties, &mut context, maximum)
+					.assert_ok();
+			assert_eq!(actual, expected);
+			assert_eq!(retained, 0);
+		}
+	}
 
 	/// Verifies round trips through std and compact strings.
 	#[test]

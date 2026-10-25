@@ -116,6 +116,79 @@ pub enum Type {
 }
 
 impl Type {
+	/// Visits borrowed nodes in declaration order, stopping on the caller's
+	/// error.
+	///
+	/// # Errors
+	///
+	/// Propagates the visitor's resource or validation error before descending.
+	pub(crate) fn try_visit<Error>(
+		&self,
+		depth: usize,
+		visit: &mut impl FnMut(&Self, usize) -> Result<(), Error>,
+	) -> Result<(), Error> {
+		visit(self, depth)?;
+		let depth = depth.saturating_add(1);
+		match self {
+			Self::Array(inner) | Self::Set(inner) | Self::Range(inner) | Self::Option(inner) => {
+				inner.try_visit(depth, visit)?;
+			}
+			Self::Union(types) => {
+				for value in types {
+					value.try_visit(depth, visit)?;
+				}
+			}
+			Self::RecordShape(fields) => {
+				for (_, value) in fields {
+					value.try_visit(depth, visit)?;
+				}
+			}
+			Self::Closure {
+				parameters,
+				result,
+			} => {
+				for value in parameters {
+					value.try_visit(depth, visit)?;
+				}
+				result.try_visit(depth, visit)?;
+			}
+			_ => {}
+		}
+		Ok(())
+	}
+
+	/// Estimates retained layout without imposing an embedding's type-depth
+	/// policy.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		let mut bytes = 0_usize;
+		let result = self.try_visit(0, &mut |value, _depth| {
+			let owned = match value {
+				Self::Array(_) | Self::Set(_) | Self::Range(_) | Self::Option(_) => {
+					size_of::<Self>()
+				}
+				Self::Union(values) => values.capacity().saturating_mul(size_of::<Self>()),
+				Self::RecordShape(fields) => fields.iter().fold(
+					fields.capacity().saturating_mul(size_of::<(Text, Self)>()),
+					|bytes, (name, _)| bytes.saturating_add(name.estimated_heap_bytes()),
+				),
+				Self::Closure {
+					parameters,
+					..
+				} => parameters
+					.capacity()
+					.saturating_mul(size_of::<Self>())
+					.saturating_add(size_of::<Self>()),
+				_ => 0,
+			};
+			bytes = bytes.saturating_add(owned);
+			Ok::<(), std::convert::Infallible>(())
+		});
+		match result {
+			Ok(()) => bytes,
+			Err(never) => match never {},
+		}
+	}
+
 	/// Returns of for `Type`.
 	pub fn of(value: &Value) -> Self {
 		match value {

@@ -96,6 +96,46 @@ impl PropertyDictionary {
 		Ok(())
 	}
 
+	/// Bounds new clone backing, including reserved hash buckets but excluding
+	/// the source vector's spare capacity.
+	///
+	/// # Errors
+	/// Returns an overflow diagnostic when the reservation cannot fit usize.
+	pub(crate) fn estimated_clone_heap_bytes(&self) -> FerrosGrynnResult<usize> {
+		let overflow = || FerrosGrynnError::operation_overflow("property dictionary clone bytes");
+		let capacity = self.ids.capacity();
+		let buckets = if capacity == 0 {
+			0
+		} else {
+			capacity
+				.checked_add(1)
+				.and_then(usize::checked_next_power_of_two)
+				.ok_or_else(overflow)?
+		};
+		let map = if buckets == 0 {
+			0
+		} else {
+			// std hashbrown 0.17 preserves buckets on clone. This append-only
+			// map recovers them from capacity; recheck on toolchain upgrades.
+			let align = align_of::<(Text, PropertyKeyId)>().max(16);
+			let entries =
+				buckets.checked_mul(size_of::<(Text, PropertyKeyId)>()).ok_or_else(overflow)?;
+			let aligned = entries.checked_add(align - 1).ok_or_else(overflow)? & !(align - 1);
+			// Current control groups need at most sixteen trailing bytes.
+			aligned
+				.checked_add(buckets)
+				.and_then(|bytes| bytes.checked_add(16))
+				.ok_or_else(overflow)?
+		};
+		let vector = self.names.len().checked_mul(size_of::<Text>()).ok_or_else(overflow)?;
+		self.names.iter().try_fold(map.checked_add(vector).ok_or_else(overflow)?, |bytes, name| {
+			name.estimated_clone_heap_bytes()
+				.checked_mul(2)
+				.and_then(|names| bytes.checked_add(names))
+				.ok_or_else(overflow)
+		})
+	}
+
 	/// Borrows the elements of this `PropertyDictionary` for iteration.
 	pub fn iter(&self) -> impl ExactSizeIterator<Item = (PropertyKeyId, &Text)> {
 		self.names.iter().enumerate().map(|(id, name)| (PropertyKeyId::new(id as u32), name))
@@ -136,5 +176,67 @@ mod tests {
 		assert_eq!(dictionary.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), [
 			"weight", "color"
 		],);
+	}
+	/// Hash clones preserve reservation even when empty; vector clones keep
+	/// only their logical elements.
+	#[test]
+	fn clone_admission_keeps_reserved_map_but_releases_vector_spare() {
+		assert_eq!(PropertyDictionary::new().estimated_clone_heap_bytes().assert_ok(), 0);
+		let mut source = PropertyDictionary::with_capacity(128);
+		let empty = source.clone();
+		assert!(source.ids.capacity() >= 128);
+		assert_eq!(empty.ids.capacity(), source.ids.capacity());
+		assert_eq!(empty.names.capacity(), 0);
+		let map = source.estimated_clone_heap_bytes().assert_ok();
+		assert!(map > 128 * size_of::<(super::Text, super::PropertyKeyId)>());
+		source.intern("p").assert_ok();
+		let retained = source.estimated_clone_heap_bytes().assert_ok();
+		assert_eq!(retained - map, size_of::<super::Text>());
+		source.names.reserve(512);
+		assert!(source.names.capacity() > source.names.len());
+		assert_eq!(source.estimated_clone_heap_bytes().assert_ok(), retained);
+		let cloned = source.clone();
+		assert_eq!(cloned.ids.capacity(), source.ids.capacity());
+		assert_eq!(cloned.names.capacity(), cloned.names.len());
+		assert_eq!(cloned.get("p"), source.get("p"));
+		assert_eq!(cloned.estimated_clone_heap_bytes().assert_ok(), retained);
+	}
+
+	/// The new clone owns two tight Text copies, not the source's extra
+	/// capacity.
+	#[test]
+	fn clone_admission_tracks_owned_text_without_source_spare() {
+		let mut inline = PropertyDictionary::with_capacity(4);
+		inline.intern("p").assert_ok();
+		let mut name = String::with_capacity(4096);
+		name.push_str("property_with_a_heap_name_beyond_the_inline_text_buffer");
+		let mut source = PropertyDictionary::with_capacity(4);
+		source.intern(name).assert_ok();
+		let cloned = source.clone();
+		assert_eq!(cloned.ids.capacity(), inline.ids.capacity());
+		assert_eq!(cloned.names.capacity(), 1);
+		let new_text = cloned
+			.ids
+			.keys()
+			.chain(cloned.names.iter())
+			.map(super::Text::estimated_heap_bytes)
+			.sum::<usize>();
+		let source_text = source
+			.ids
+			.keys()
+			.chain(source.names.iter())
+			.map(super::Text::estimated_heap_bytes)
+			.sum::<usize>();
+		assert!(new_text > 0 && source_text > new_text);
+		assert_eq!(
+			source.estimated_clone_heap_bytes().assert_ok()
+				- inline.estimated_clone_heap_bytes().assert_ok(),
+			new_text
+		);
+		assert_eq!(
+			source.estimated_clone_heap_bytes().assert_ok(),
+			cloned.estimated_clone_heap_bytes().assert_ok()
+		);
+		assert_eq!(source.names, cloned.names);
 	}
 }

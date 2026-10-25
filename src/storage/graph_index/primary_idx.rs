@@ -11,12 +11,13 @@ pub(in crate::storage) struct PrimaryIndexEntry<Address = DiskAtomRef> {
 }
 
 /// One primary-index insertion or removal applied by point DML.
-#[cfg(test)]
 pub(in crate::storage) struct PrimaryIndexMutation<Address = DiskAtomRef> {
 	/// Key associated with this primary index mutation.
 	pub(in crate::storage) key: Vec<u8>,
-	/// Atom associated with this primary index mutation.
-	pub(in crate::storage) atom: Option<Address>,
+	/// Exact inserted or expected removed identity, including generation.
+	pub(in crate::storage) atom: Address,
+	/// Insertion follows all removals in the same atomic publication.
+	pub(in crate::storage) insert: bool,
 }
 
 /// Complete immutable B+tree generation and its root page.
@@ -148,19 +149,20 @@ pub(in crate::storage) fn visit_primary_index<Address: PrimaryAddress>(
 ///
 /// `None` requests the existing bulk builder because a split, an empty
 /// non-root leaf, or a changed internal separator is required.
-#[cfg(test)]
+///
+/// # Errors
+/// Rejects malformed persisted leaves, duplicate mutations and source-address
+/// mismatches before either incremental publication or a bulk fallback.
 pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	mutations: &[PrimaryIndexMutation<Address>],
 	page_lsn: PageLsn,
-) -> FerrosGrynnResult<Option<Vec<(PageNo, AlignedPage)>>> {
+) -> FerrosGrynnResult<Option<IndexLeafPages>> {
 	let mut unique = BTreeSet::new();
 	let mut grouped = BTreeMap::<PageNo, Vec<&PrimaryIndexMutation<Address>>>::new();
 	for mutation in mutations {
-		if mutation.key.is_empty()
-			|| !unique.insert((mutation.key.as_slice(), mutation.atom.is_some()))
-		{
+		if mutation.key.is_empty() || !unique.insert((mutation.key.as_slice(), mutation.insert)) {
 			return Err(invalid_index("primary mutation keys must be non-empty and unique"));
 		}
 		let leaf =
@@ -169,8 +171,9 @@ pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 	}
 
 	let mut pages = Vec::with_capacity(grouped.len());
+	let mut stable = true;
 	for (page_no, changes) in grouped {
-		let mut current = AlignedPage::zeroed();
+		let mut current = Box::new(AlignedPage::zeroed());
 		read_page(page_no, &mut current)?;
 		let header = current.validate(page_no)?;
 		if header.page_type() != PageType::IndexUniqueBtreeLeaf {
@@ -187,18 +190,24 @@ pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		// Searching persisted entries requires ordering even with a valid CRC.
+		validate_primary_entries(&entries)?;
 		let previous_first = entries.first().map(|entry| entry.key.clone());
 		apply_primary_mutations(&mut entries, changes)?;
 		if page_no != root
 			&& (entries.is_empty()
 				|| previous_first.as_deref() != entries.first().map(|entry| entry.key.as_slice()))
 		{
-			return Ok(None);
+			stable = false;
 		}
-		if partition_leaf_entries(&entries)?.len() != 1 {
-			return Ok(None);
+		if partition_leaf_entries_with_limit(&entries, PAGE_SIZE)?.len() != 1 {
+			stable = false;
 		}
-		let mut page = AlignedPage::zeroed();
+		// Validate every changed leaf before allowing the bulk fallback.
+		if !stable {
+			continue;
+		}
+		let mut page = Box::new(AlignedPage::zeroed());
 		encode_unique_leaf(
 			&mut page,
 			page_no,
@@ -208,12 +217,11 @@ pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 		)?;
 		pages.push((page_no, page));
 	}
-	Ok(Some(pages))
+	Ok(stable.then_some(pages))
 }
 
 /// Applies removals before insertions so one stable `RecordId` can be reused
 /// atomically with a new generation.
-#[cfg(test)]
 pub(in crate::storage) fn apply_primary_mutations<
 	'mutation,
 	Address: PrimaryAddress + 'mutation,
@@ -223,7 +231,7 @@ pub(in crate::storage) fn apply_primary_mutations<
 ) -> FerrosGrynnResult<()> {
 	let mutations = mutations.into_iter().collect::<Vec<_>>();
 	for insert in [false, true] {
-		for mutation in mutations.iter().filter(|mutation| mutation.atom.is_some() == insert) {
+		for mutation in mutations.iter().filter(|mutation| mutation.insert == insert) {
 			match entries.binary_search_by(|entry| entry.key.cmp(&mutation.key)) {
 				Ok(_index) if insert => {
 					return Err(FerrosGrynnError::graph_constraint_violation(
@@ -232,14 +240,17 @@ pub(in crate::storage) fn apply_primary_mutations<
 					));
 				}
 				Ok(index) => {
+					if entries[index].atom != mutation.atom {
+						return Err(invalid_index(
+							"primary removal address disagrees with source atom",
+						));
+					}
 					entries.remove(index);
 				}
 				Err(index) if insert => {
 					entries.insert(index, PrimaryIndexEntry {
 						key: mutation.key.clone(),
-						atom: mutation.atom.ok_or_else(|| {
-							invalid_index("primary insertion has no atom reference")
-						})?,
+						atom: mutation.atom,
 					});
 				}
 				Err(_index) => {

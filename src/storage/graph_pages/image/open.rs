@@ -352,7 +352,7 @@ fn validate_subgraphs(
 		}
 		let scope = image
 			.arena
-			.scope_by_slot
+			.scope_by_slot()
 			.get(&entry.slot)
 			.ok_or_else(|| invalid("subgraph slot has no catalog scope binding"))?;
 		if scope.len() != 1 || scope[0].generation() != entry.generation {
@@ -360,7 +360,7 @@ fn validate_subgraphs(
 		}
 		let child_id = image
 			.arena
-			.graph_by_slot
+			.graph_by_slot()
 			.get(&entry.slot)
 			.copied()
 			.ok_or_else(|| invalid("subgraph slot has no graph binding"))?;
@@ -403,7 +403,7 @@ fn validate_subgraphs(
 	}
 	let direct = image
 		.arena
-		.scope_by_slot
+		.scope_by_slot()
 		.iter()
 		.filter(|(slot, scope)| **slot != 0 && scope.len() == 1)
 		.count();
@@ -437,9 +437,9 @@ fn validate_ceilings(image: &BuiltGraphImage) -> FerrosGrynnResult<()> {
 
 /// Validates arena root.
 fn validate_arena_root(arena: &GraphArenaBindings, graph: GraphId) -> FerrosGrynnResult<()> {
-	if arena.graph_by_slot.get(&0) != Some(&graph)
-		|| arena.scope_by_slot.get(&0).is_none_or(|scope| !scope.is_empty())
-		|| arena.graph_by_slot.len() != arena.scope_by_slot.len()
+	if arena.graph_by_slot().get(&0) != Some(&graph)
+		|| arena.scope_by_slot().get(&0).is_none_or(|scope| !scope.is_empty())
+		|| arena.graph_by_slot().len() != arena.scope_by_slot().len()
 	{
 		return Err(invalid("root-arena catalog binding is incomplete"));
 	}
@@ -456,7 +456,7 @@ fn child_graph(
 			return Err(invalid("nested graph uses reserved root-arena slot zero"));
 		}
 		arena
-			.graph_by_slot
+			.graph_by_slot()
 			.get(&slot)
 			.copied()
 			.ok_or_else(|| invalid("nested graph uses an unknown root-arena slot"))

@@ -1662,53 +1662,34 @@ pub(super) fn admit_type_shape(
 	copies: usize,
 	admit: &mut impl FnMut(usize, u64) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
-	if depth > 64 {
-		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
-			"LIVE schema type depth",
-			64,
-		));
-	}
-	let scale = copies
-		.checked_mul(8)
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("LIVE inferred type size overflows"))?;
-	admit(
-		scale.checked_mul(std::mem::size_of::<Type>()).ok_or_else(|| {
+	ty.try_visit(depth, &mut |ty, depth| {
+		if depth > 64 {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"LIVE schema type depth",
+				64,
+			));
+		}
+		let scale = copies.checked_mul(8).ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("LIVE inferred type size overflows")
-		})?,
-		copies as u64,
-	)?;
-	match ty {
-		Type::Array(inner) | Type::Set(inner) | Type::Range(inner) | Type::Option(inner) => {
-			admit_type_shape(inner, depth + 1, copies, admit)?;
-		}
-		Type::Union(types) => {
-			for ty in types {
-				admit_type_shape(ty, depth + 1, copies, admit)?;
-			}
-		}
-		Type::RecordShape(fields) => {
-			for (name, ty) in fields {
+		})?;
+		admit(
+			scale.checked_mul(std::mem::size_of::<Type>()).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("LIVE inferred type size overflows")
+			})?,
+			copies as u64,
+		)?;
+		if let Type::RecordShape(fields) = ty {
+			for (name, _) in fields {
 				admit(
 					name.len().checked_mul(scale).ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("LIVE type names overflow")
 					})?,
 					0,
 				)?;
-				admit_type_shape(ty, depth + 1, copies, admit)?;
 			}
 		}
-		Type::Closure {
-			parameters,
-			result,
-		} => {
-			for ty in parameters {
-				admit_type_shape(ty, depth + 1, copies, admit)?;
-			}
-			admit_type_shape(result, depth + 1, copies, admit)?;
-		}
-		_ => {}
-	}
-	Ok(())
+		Ok(())
+	})
 }
 
 /// Synthetic syntax carries no source text offsets.

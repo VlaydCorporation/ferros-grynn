@@ -2,7 +2,7 @@
 
 use std::{
 	fs,
-	io::{Seek, SeekFrom, Write},
+	io::{Read, Seek, SeekFrom, Write},
 };
 
 use super::{GenerationFailureGuard, GenerationFailurePoint, TestDirectory};
@@ -101,6 +101,9 @@ fn reopen_attempt_and_completion(mode: IoMode) -> FerrosGrynnResult<()> {
 	(&(invocation.attempts), &(1)).assert_equal();
 	(invocation.payload.is_some()).assert_true();
 	(root.resolve_atom(&"item:a".parse()?).is_some()).assert_true();
+	// This low-level fixture bypasses transaction preparation; exact counter
+	// maps must be loaded before inserting the synchronous effect directly.
+	local.hydrate_statistics(&mut root)?;
 	let before = root.clone();
 	let class = root.schema.class("item").ok_or_else(|| {
 		crate::gql_status::FerrosGrynnError::invalid_argument("fixture class absent")
@@ -562,9 +565,15 @@ fn event_outbox_pending_page_corruption_is_fatal_on_reopen() {
 		.assert_ok()
 		.path();
 	let corrupt = || -> std::io::Result<()> {
-		let mut file = fs::OpenOptions::new().write(true).open(path)?;
-		file.seek(SeekFrom::Start(PAGE_SIZE as u64 + 128))?;
-		file.write_all(&[255])?;
+		let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+		let offset = PAGE_SIZE as u64 + 128;
+		file.seek(SeekFrom::Start(offset))?;
+		let mut byte = [0];
+		file.read_exact(&mut byte)?;
+		// A constant overwrite can leave a random UUID byte unchanged.
+		byte[0] ^= 1;
+		file.seek(SeekFrom::Start(offset))?;
+		file.write_all(&byte)?;
 		file.sync_all()
 	};
 	corrupt()

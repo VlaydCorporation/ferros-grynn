@@ -160,7 +160,9 @@ impl RecordId {
 
 	/// Estimates heap bytes owned by the class name and composite identifier.
 	pub(crate) fn estimated_heap_bytes(&self) -> usize {
-		super::value::estimated_record_id_heap_bytes(self)
+		self.class
+			.estimated_heap_bytes()
+			.saturating_add(super::value::estimated_record_part_heap_bytes(&self.id))
 	}
 }
 

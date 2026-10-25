@@ -1189,8 +1189,8 @@ fn fgdc_v12_allows_one_internal_child_through_multiple_owner_scopes() {
 	let catalog = fixture_with_shared_child().assert_ok();
 	let decoded = DatabaseCatalog::decode(&catalog.encode().assert_ok()).assert_ok();
 	let root = &decoded.graphs[0];
-	assert_eq!(root.arena.graph_by_slot[&1], root.arena.graph_by_slot[&2]);
-	assert_ne!(root.arena.scope_by_slot[&1], root.arena.scope_by_slot[&2]);
+	assert_eq!(root.arena.graph_by_slot()[&1], root.arena.graph_by_slot()[&2]);
+	assert_ne!(root.arena.scope_by_slot()[&1], root.arena.scope_by_slot()[&2]);
 	assert_eq!(decoded.graphs[1].owner_root, Some(root.id));
 }
 
@@ -1200,8 +1200,10 @@ fn fgdc_v12_rejects_duplicate_scope_and_noncanonical_internal_name() {
 	use crate::test_assertions::AssertResult as _;
 
 	let mut duplicate_scope = fixture_with_shared_child().assert_ok();
-	let first_scope = duplicate_scope.graphs[0].arena.scope_by_slot[&1].clone();
-	duplicate_scope.graphs[0].arena.scope_by_slot.insert(2, first_scope);
+	let first_scope = duplicate_scope.graphs[0].arena.scope_by_slot()[&1].clone();
+	edit_arena(&mut duplicate_scope.graphs[0].arena, |_graphs, scopes| {
+		scopes.insert(2, first_scope);
+	});
 	assert!(duplicate_scope.encode().is_err());
 
 	let mut invalid_name = fixture_with_shared_child().assert_ok();
@@ -1239,22 +1241,28 @@ fn fgdc_v12_rejects_invalid_internal_ownership_and_scope_ancestry() {
 	assert!(missing_owner.encode().is_err());
 
 	let mut orphan = fixture_with_shared_child().assert_ok();
-	orphan.graphs[0].arena.graph_by_slot.remove(&1);
-	orphan.graphs[0].arena.scope_by_slot.remove(&1);
-	orphan.graphs[0].arena.graph_by_slot.remove(&2);
-	orphan.graphs[0].arena.scope_by_slot.remove(&2);
+	edit_arena(&mut orphan.graphs[0].arena, |graphs, scopes| {
+		for slot in [1, 2] {
+			graphs.remove(&slot);
+			scopes.remove(&slot);
+		}
+	});
 	assert!(orphan.encode().is_err());
 
 	let mut missing_parent = fixture_with_shared_child().assert_ok();
-	let owner = missing_parent.graphs[0].arena.scope_by_slot[&1][0];
+	let owner = missing_parent.graphs[0].arena.scope_by_slot()[&1][0];
 	let nested = AtomId::from_parts(AtomKind::Node, 2, 0).assert_ok();
-	missing_parent.graphs[0].arena.scope_by_slot.insert(2, vec![owner, nested].into_boxed_slice());
+	edit_arena(&mut missing_parent.graphs[0].arena, |_graphs, scopes| {
+		scopes.insert(2, vec![owner, nested].into_boxed_slice());
+	});
 	assert!(missing_parent.encode().is_err());
 
 	let mut cycle = fixture_with_shared_child().assert_ok();
-	let first = cycle.graphs[0].arena.scope_by_slot[&1][0];
-	let second = cycle.graphs[0].arena.scope_by_slot[&2][0];
-	cycle.graphs[0].arena.scope_by_slot.insert(2, vec![first, second].into_boxed_slice());
+	let first = cycle.graphs[0].arena.scope_by_slot()[&1][0];
+	let second = cycle.graphs[0].arena.scope_by_slot()[&2][0];
+	edit_arena(&mut cycle.graphs[0].arena, |_graphs, scopes| {
+		scopes.insert(2, vec![first, second].into_boxed_slice());
+	});
 	assert!(cycle.encode().is_err());
 }
 
@@ -1293,7 +1301,7 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 		live_history: Vec::new(),
 		next_graph_id: 8,
 		next_schema_id: 9,
-		time_zones: vec!["Europe/London".into()],
+		time_zones: vec!["Europe/London".into()].into(),
 		atom_store: AtomStoreCatalogBinding {
 			generation: 11,
 			primary: index(1)?,
@@ -1357,10 +1365,10 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 				key: PropertyKeyId::new(0),
 				value: vec![1],
 			}],
-			arena: GraphArenaBindings {
-				graph_by_slot: BTreeMap::from([(0, graph)]),
-				scope_by_slot: BTreeMap::from([(0, Box::default())]),
-			},
+			arena: GraphArenaBindings::new(
+				BTreeMap::from([(0, graph)]),
+				BTreeMap::from([(0, Box::default())]),
+			),
 		}],
 		parameters: vec![ParameterCatalogEntry {
 			id: SchemaId::new(6).ok_or_else(|| codec::invalid("invalid fixture parameter"))?,
@@ -1463,11 +1471,11 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 	let owner_b = AtomId::from_parts(AtomKind::Node, 1, 0)?;
 	catalog.next_graph_id = 9;
 	catalog.next_schema_id = 11;
-	catalog.graphs[0].arena.graph_by_slot.extend([(1, child), (2, child)]);
-	catalog.graphs[0]
-		.arena
-		.scope_by_slot
-		.extend([(1, vec![owner_a].into_boxed_slice()), (2, vec![owner_b].into_boxed_slice())]);
+	edit_arena(&mut catalog.graphs[0].arena, |graphs, scopes| {
+		graphs.extend([(1, child), (2, child)]);
+		scopes
+			.extend([(1, vec![owner_a].into_boxed_slice()), (2, vec![owner_b].into_boxed_slice())]);
+	});
 	catalog.graphs.push(GraphCatalogEntry {
 		tensor_revision: 0,
 		id: child,
@@ -1498,10 +1506,22 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 		index_bindings: BTreeMap::new(),
 		root: None,
 		properties: Vec::new(),
-		arena: GraphArenaBindings {
-			graph_by_slot: BTreeMap::from([(0, child)]),
-			scope_by_slot: BTreeMap::from([(0, Box::default())]),
-		},
+		arena: GraphArenaBindings::new(
+			BTreeMap::from([(0, child)]),
+			BTreeMap::from([(0, Box::default())]),
+		),
 	});
 	Ok(catalog)
+}
+
+/// Reconstructs canonical input for corruption tests without a production
+/// mutator.
+fn edit_arena(
+	arena: &mut GraphArenaBindings,
+	edit: impl FnOnce(&mut BTreeMap<u32, GraphId>, &mut BTreeMap<u32, Box<[AtomId]>>),
+) {
+	let mut graphs = arena.graph_by_slot().clone();
+	let mut scopes = arena.scope_by_slot().clone();
+	edit(&mut graphs, &mut scopes);
+	*arena = GraphArenaBindings::new(graphs, scopes);
 }

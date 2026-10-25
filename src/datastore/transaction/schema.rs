@@ -51,6 +51,15 @@ impl Transaction {
 	/// Defines one durable text analyzer.
 	pub(crate) fn define_analyzer(
 		&mut self,
+		analyzer: SchemaAnalyzer,
+	) -> FerrosGrynnResult<AnalyzerId> {
+		self.atomic_mutation(|transaction| transaction.define_analyzer_inner(analyzer))
+	}
+
+	/// Mapper-key interning and schema installation share one rollback
+	/// boundary.
+	fn define_analyzer_inner(
+		&mut self,
 		mut analyzer: SchemaAnalyzer,
 	) -> FerrosGrynnResult<AnalyzerId> {
 		self.prepare_schema_mutation()?;
@@ -63,19 +72,31 @@ impl Transaction {
 			return Err(analyzer_exists(analyzer.name.as_str()));
 		}
 		self.validate_analyzer_function(&analyzer)?;
+		let payload =
+			Self::mutation_payload_charge(super::write_set::analyzer_payload_bytes(&analyzer));
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		self.intern_analyzer_mapper_keys(&analyzer)?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		let id = AnalyzerId::from_schema_id(self.store.inner.allocate_schema_id()?);
 		analyzer.id = Some(id);
 		self.working.install_analyzer(analyzer.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaAnalyzer(id), SCHEMA_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::AnalyzerCatalogRange);
-		self.mutations.push(Mutation::DefineAnalyzer(analyzer));
+		self.record_mutation(Mutation::DefineAnalyzer(analyzer));
 		Ok(id)
 	}
 
 	/// Replaces one analyzer definition while preserving identity and name.
 	pub(crate) fn replace_analyzer(
+		&mut self,
+		name: &str,
+		replacement: SchemaAnalyzer,
+	) -> FerrosGrynnResult<()> {
+		self.atomic_mutation(|transaction| transaction.replace_analyzer_inner(name, replacement))
+	}
+
+	/// A resource failure cannot leave newly interned mapper keys behind.
+	fn replace_analyzer_inner(
 		&mut self,
 		name: &str,
 		mut replacement: SchemaAnalyzer,
@@ -93,11 +114,14 @@ impl Transaction {
 		replacement.id = Some(id);
 		replacement.version = current.version().next()?;
 		self.validate_analyzer_function(&replacement)?;
+		let payload =
+			Self::mutation_payload_charge(super::write_set::analyzer_payload_bytes(&replacement));
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		self.intern_analyzer_mapper_keys(&replacement)?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		self.working.replace_analyzer(replacement.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaAnalyzer(id), SCHEMA_WRITE_BYTES);
-		self.mutations.push(Mutation::ReplaceAnalyzer(replacement));
+		self.record_mutation(Mutation::ReplaceAnalyzer(replacement));
 		Ok(())
 	}
 
@@ -202,6 +226,9 @@ impl Transaction {
 				"define_function requires an unpublished function",
 			));
 		}
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::function_payload_bytes(&function),
+		)))?;
 		if self.working.schema.function_signatures.contains_key(&function.signature()) {
 			return Err(FerrosGrynnError::invalid_argument("function overload already exists"));
 		}
@@ -211,7 +238,7 @@ impl Transaction {
 		self.working.install_function(function.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaFunction(id), SCHEMA_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::FunctionCatalogRange);
-		self.mutations.push(Mutation::DefineFunction(function));
+		self.record_mutation(Mutation::DefineFunction(function));
 		Ok(())
 	}
 
@@ -221,7 +248,9 @@ impl Transaction {
 		mut replacement: SchemaFunction,
 	) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::function_payload_bytes(&replacement),
+		)))?;
 		let id = replacement
 			.id
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("replacement function has no id"))?;
@@ -229,7 +258,7 @@ impl Transaction {
 		self.working.replace_function(replacement.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaFunction(id), SCHEMA_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::FunctionCatalogRange);
-		self.mutations.push(Mutation::ReplaceFunction(replacement));
+		self.record_mutation(Mutation::ReplaceFunction(replacement));
 		Ok(())
 	}
 
@@ -289,14 +318,17 @@ impl Transaction {
 			return Err(parameter_exists(parameter.name.as_str()));
 		}
 		parameter.value.ensure_storable()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let payload =
+			Self::mutation_payload_charge(super::write_set::parameter_payload_bytes(&parameter));
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		self.intern_value_keys(&parameter.value)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		let id = self.store.inner.allocate_schema_id()?;
 		parameter.id = Some(id);
 		self.working.install_parameter(parameter.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaParameter(id), SCHEMA_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::ParameterCatalogRange);
-		self.mutations.push(Mutation::DefineParameter(parameter));
+		self.record_mutation(Mutation::DefineParameter(parameter));
 		Ok(())
 	}
 
@@ -310,12 +342,24 @@ impl Transaction {
 	) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
-		let mut replacement = self
-			.working
-			.schema
-			.parameter(name)
-			.map(|parameter| parameter.as_ref().clone())
-			.ok_or_else(|| parameter_missing(name))?;
+		let previous =
+			self.working.schema.parameter(name).ok_or_else(|| parameter_missing(name))?;
+		let comment_bytes = match &comment {
+			Some(FieldUpdate::Set(comment)) => comment.estimated_heap_bytes(),
+			Some(FieldUpdate::Clear) => 0,
+			None => previous.comment().map_or(0, crate::values::Text::estimated_heap_bytes),
+		};
+		let payload = Self::mutation_payload_charge(
+			previous
+				.name()
+				.estimated_heap_bytes()
+				.saturating_add(
+					value.as_ref().unwrap_or_else(|| previous.value()).estimated_heap_bytes(),
+				)
+				.saturating_add(comment_bytes),
+		);
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
+		let mut replacement = previous.as_ref().clone();
 		let id = replacement
 			.id
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("parameter has no SchemaId"))?;
@@ -328,10 +372,11 @@ impl Transaction {
 			replacement.comment = comment.into_optional();
 		}
 		replacement.version = replacement.version.next()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(payload))?;
 		self.working.replace_parameter(replacement.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaParameter(id), SCHEMA_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::ParameterCatalogRange);
-		self.mutations.push(Mutation::ReplaceParameter(replacement));
+		self.record_mutation(Mutation::ReplaceParameter(replacement));
 		Ok(())
 	}
 
@@ -463,7 +508,9 @@ impl Transaction {
 	}
 
 	/// Replaces a graph user index while preserving its identity and advancing
-	/// its version.
+	/// its version. Materialized replacements require a new rebuild, including
+	/// definitions cloned from a Ready index; OnDemand replacements remain
+	/// Ready.
 	///
 	/// # Errors
 	/// Returns a missing graph/index, definition, dependency, transaction, or
@@ -490,6 +537,14 @@ impl Transaction {
 		index.id = indexes[position].id;
 		index.graph = Some(current.id());
 		index.version = indexes[position].version.next()?;
+		// An artifact belongs to one definition version, never to its Ready
+		// clone.
+		index.state = if index.is_on_demand() {
+			ClassIndexState::Ready
+		} else {
+			ClassIndexState::Stale
+		};
+		index.build_revision = 0;
 		let write_bytes = SCHEMA_WRITE_BYTES.saturating_add(index.descriptor()?.len());
 		self.ensure_capacity(write_bytes)?;
 		indexes[position] = index;
@@ -603,11 +658,14 @@ impl Transaction {
 		replacement: crate::datastore::GraphSchema,
 		write_bytes: usize,
 	) -> FerrosGrynnResult<()> {
+		let payload =
+			Self::mutation_payload_charge(super::write_set::graph_payload_bytes(&replacement));
+		self.ensure_capacity(write_bytes.saturating_add(payload))?;
 		let id = replacement.id();
 		self.working.replace_graph_schema(replacement.clone(), self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::GraphDefinition(id), write_bytes);
 		self.mark_range_change(ConflictKey::GraphCatalogRange);
-		self.mutations.push(Mutation::ReplaceGraph(replacement));
+		self.record_mutation(Mutation::ReplaceGraph(replacement));
 		Ok(())
 	}
 
@@ -618,19 +676,17 @@ impl Transaction {
 		properties: crate::values::PropertyMap,
 	) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(
+			SCHEMA_WRITE_BYTES
+				.saturating_add(Self::mutation_payload_charge(properties.estimated_heap_bytes())),
+		)?;
 		let current = self
 			.working
 			.schema
 			.named_graph(name)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
 		let replacement = current.replace_properties(properties)?;
-		let id = replacement.id();
-		self.working.replace_graph_schema(replacement.clone(), self.snapshot.commit_ts)?;
-		self.insert_write(ConflictKey::GraphDefinition(id), SCHEMA_WRITE_BYTES);
-		self.mark_range_change(ConflictKey::GraphCatalogRange);
-		self.mutations.push(Mutation::ReplaceGraph(replacement));
-		Ok(())
+		self.publish_graph_replacement(replacement, SCHEMA_WRITE_BYTES)
 	}
 
 	/// Replaces graph definition.
@@ -649,12 +705,7 @@ impl Transaction {
 			.named_graph(name)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
 		let replacement = current.replace_definition(properties, constraints, root)?;
-		let id = replacement.id();
-		self.working.replace_graph_schema(replacement.clone(), self.snapshot.commit_ts)?;
-		self.insert_write(ConflictKey::GraphDefinition(id), SCHEMA_WRITE_BYTES);
-		self.mark_range_change(ConflictKey::GraphCatalogRange);
-		self.mutations.push(Mutation::ReplaceGraph(replacement));
-		Ok(())
+		self.publish_graph_replacement(replacement, SCHEMA_WRITE_BYTES)
 	}
 
 	/// Adds one field to an existing class.
@@ -663,9 +714,17 @@ impl Transaction {
 	///
 	/// Returns a schema, identity-capacity, read-only, snapshot, or
 	/// write-budget error.
-	pub fn define_field(&mut self, class: &str, mut field: ClassField) -> FerrosGrynnResult<()> {
+	/// Failed admission preserves both the class and the property dictionary.
+	pub fn define_field(&mut self, class: &str, field: ClassField) -> FerrosGrynnResult<()> {
+		self.atomic_mutation(|transaction| transaction.define_field_inner(class, field))
+	}
+
+	/// Restores dictionary interning when final replacement admission fails.
+	fn define_field_inner(&mut self, class: &str, mut field: ClassField) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::field_payload_bytes(&field),
+		)))?;
 		let mut definition = self.require_class(class)?;
 		let class_id = definition.id().ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("published class is missing ClassId")
@@ -688,7 +747,9 @@ impl Transaction {
 	/// error.
 	pub fn overwrite_field(&mut self, class: &str, field: ClassField) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::field_payload_bytes(&field),
+		)))?;
 		let mut definition = self.require_class(class)?;
 		let position = definition
 			.fields
@@ -751,7 +812,9 @@ impl Transaction {
 	/// error.
 	pub fn define_index(&mut self, class: &str, mut index: ClassIndex) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::index_payload_bytes(&index),
+		)))?;
 		self.validate_index_scope(index.scope())?;
 		index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
 		let definition = self.require_class(class)?.with_index(index)?;
@@ -766,7 +829,9 @@ impl Transaction {
 	/// error.
 	pub fn overwrite_index(&mut self, class: &str, mut index: ClassIndex) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
-		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::index_payload_bytes(&index),
+		)))?;
 		self.validate_index_scope(index.scope())?;
 		let mut definition = self.require_class(class)?;
 		let position = definition
@@ -924,20 +989,27 @@ impl Transaction {
 
 	/// Publishes class replacement.
 	fn publish_class_replacement(&mut self, mut definition: ClassSchema) -> FerrosGrynnResult<()> {
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::class_payload_bytes(&definition),
+		)))?;
 		definition.version = definition.version.next()?;
 		self.working.replace_class(definition.clone(), self.snapshot.commit_ts)?;
 		self.write_bytes += SCHEMA_WRITE_BYTES;
-		self.mutations.push(Mutation::ReplaceClass(definition));
+		self.record_mutation(Mutation::ReplaceClass(definition));
 		Ok(())
 	}
 
 	/// Returns the require class result.
 	fn require_class(&self, name: &str) -> FerrosGrynnResult<ClassSchema> {
-		self.working
+		let class = self
+			.working
 			.schema
 			.class(name)
-			.map(|class| class.as_ref().clone())
-			.ok_or_else(|| FerrosGrynnError::class_does_not_exist(name))
+			.ok_or_else(|| FerrosGrynnError::class_does_not_exist(name))?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES.saturating_add(Self::mutation_payload_charge(
+			super::write_set::class_payload_bytes(&class),
+		)))?;
+		Ok(class.as_ref().clone())
 	}
 
 	/// Validates index scope.

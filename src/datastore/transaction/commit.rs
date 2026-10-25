@@ -34,12 +34,12 @@ impl ReplayRemap {
 	}
 
 	/// Returns the local result.
-	fn local(&self, graph: GraphId, id: AtomId) -> AtomId {
+	pub(super) fn local(&self, graph: GraphId, id: AtomId) -> AtomId {
 		self.locals.get(&(graph, id)).copied().unwrap_or(id)
 	}
 
 	/// Returns the conflict result.
-	fn conflict(&self, key: ConflictKey) -> ConflictKey {
+	pub(super) fn conflict(&self, key: ConflictKey) -> ConflictKey {
 		match key {
 			ConflictKey::BaseAtom(global) => ConflictKey::BaseAtom(self.global(global)),
 			ConflictKey::GraphMembership(graph, global) => {
@@ -242,6 +242,8 @@ impl Transaction {
 		check: &impl Fn() -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<CommitResult> {
 		check()?;
+		self.ensure_live()?;
+		self.validate_write_set_payload()?;
 		let graphs = self
 			.working
 			.schema
@@ -308,13 +310,14 @@ impl Transaction {
 	/// Ordinary and graph SDK commits share validation and publication
 	/// unchanged.
 	fn commit_with_graph_feedback(
-		self,
+		mut self,
 		deadline: Option<Instant>,
 		check: &impl Fn() -> FerrosGrynnResult<()>,
 		feedback: &mut GraphFeedback,
 	) -> FerrosGrynnResult<CommitResult> {
 		check()?;
 		self.ensure_live()?;
+		self.validate_write_set_payload()?;
 		// Only mutations or targeted intents can publish, including a FULL
 		// policy enabled concurrently. Their BLOCK origin remains unchanged.
 		let could_publish = !self.mutations.is_empty() || !self.change_journal.intents.is_empty();
@@ -463,66 +466,7 @@ impl Transaction {
 		}) {
 			next.retain_event_revisions();
 		}
-		let graph_catalog_only = self.mutations.iter().all(|mutation| {
-			matches!(
-				mutation,
-				Mutation::RegisterBridgeDatabase(_)
-					| Mutation::RegisterBridgeMapping(_)
-					| Mutation::TransitionBridgeMapping { .. }
-					| Mutation::InternProperty { .. }
-					| Mutation::DefineLiveBinding(_)
-					| Mutation::ReplaceLiveBinding { .. }
-					| Mutation::RemoveLiveBinding(_)
-					| Mutation::ConfigureChangefeed { .. }
-					| Mutation::RegisterLive(_)
-					| Mutation::CloseLive(_)
-					| Mutation::AcknowledgeLive(_)
-					| Mutation::ReplaceGraph(_)
-					| Mutation::DefineParameter(_)
-					| Mutation::ReplaceParameter(_)
-					| Mutation::RemoveParameter(_)
-					| Mutation::DefineFunction(_)
-					| Mutation::DefineEvent(_)
-					| Mutation::ReplaceEvent(_)
-					| Mutation::RemoveEvent(_)
-					| Mutation::EnqueueEvent(_)
-					| Mutation::TransitionEvent { .. }
-					| Mutation::ReplaceFunction(_)
-					| Mutation::RemoveFunction(_)
-					| Mutation::DefineAnalyzer(_)
-					| Mutation::ReplaceAnalyzer(_)
-					| Mutation::RemoveAnalyzer(_)
-			)
-		}) && self.mutations.iter().any(|mutation| {
-			matches!(
-				mutation,
-				Mutation::RegisterBridgeDatabase(_)
-					| Mutation::RegisterBridgeMapping(_)
-					| Mutation::TransitionBridgeMapping { .. }
-					| Mutation::ReplaceGraph(_)
-					| Mutation::DefineLiveBinding(_)
-					| Mutation::ReplaceLiveBinding { .. }
-					| Mutation::RemoveLiveBinding(_)
-					| Mutation::ConfigureChangefeed { .. }
-					| Mutation::RegisterLive(_)
-					| Mutation::CloseLive(_)
-					| Mutation::AcknowledgeLive(_)
-					| Mutation::DefineParameter(_)
-					| Mutation::ReplaceParameter(_)
-					| Mutation::RemoveParameter(_)
-					| Mutation::DefineFunction(_)
-					| Mutation::DefineEvent(_)
-					| Mutation::ReplaceEvent(_)
-					| Mutation::RemoveEvent(_)
-					| Mutation::EnqueueEvent(_)
-					| Mutation::TransitionEvent { .. }
-					| Mutation::ReplaceFunction(_)
-					| Mutation::RemoveFunction(_)
-					| Mutation::DefineAnalyzer(_)
-					| Mutation::ReplaceAnalyzer(_)
-					| Mutation::RemoveAnalyzer(_)
-			)
-		});
+		let graph_catalog_only = mutations_retain_graph_files(&self.mutations);
 		let dictionary_changed = self
 			.mutations
 			.iter()
@@ -530,8 +474,10 @@ impl Transaction {
 		let dependency_indexes_changed = self.mutations.iter().any(|mutation| {
 			matches!(mutation, Mutation::ReplaceAnalyzer(_) | Mutation::ReplaceFunction(_))
 		});
-		let changed_records = self.index_delta_records(current, &next, &remap);
-		let delta_eligible = self.mutations.iter().all(mutation_allows_physical_index_delta);
+		let delta = self.publication_delta(current, &next, &remap);
+		// The closed graph journal also proves first-capability index deltas.
+		let delta_eligible = self.mutations.iter().all(mutation_allows_physical_index_delta)
+			|| delta.point_graph_only;
 		feedback.capture(&next);
 		let mut published = Arc::new(next);
 		let next = Arc::get_mut(&mut published).ok_or_else(|| {
@@ -540,7 +486,7 @@ impl Transaction {
 		store.inner.persist_root(
 			next,
 			Some(current),
-			delta_eligible.then_some(&changed_records),
+			delta_eligible.then_some(&delta),
 			graph_catalog_only,
 			dictionary_changed,
 		)?;
@@ -587,10 +533,10 @@ impl Transaction {
 		let commit_ts = current.commit_ts.checked_add(1).ok_or_else(|| {
 			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
 		})?;
-		// Primary and operation-image replay share one hydrated before-root.
-		// The published root may still hold only lazy statistics headers.
+		// Exact-counter replay needs auxiliary maps. Existing-key setters
+		// share the eager headers without loading unchanged distributions.
 		let mut before = current.as_ref().clone();
-		if !self.is_control_commit() {
+		if !self.is_control_commit() && !self.preserves_statistics_auxiliary(&before) {
 			self.store.inner.hydrate_statistics(&mut before)?;
 		}
 		let mut next = before.clone();
@@ -604,6 +550,7 @@ impl Transaction {
 				.with_cause(error)
 			},
 		)?;
+		self.validate_candidate_payload(&before, &next, &remap)?;
 		let stale_indexes = if self.mutations.iter().any(mutation_affects_explicit_indexes) {
 			next.mark_deferred_indexes_stale()?
 		} else {
@@ -749,27 +696,6 @@ impl Transaction {
 		graphs
 	}
 
-	/// Returns the index delta records result.
-	fn index_delta_records(
-		&self,
-		current: &DatabaseRoot,
-		next: &DatabaseRoot,
-		remap: &ReplayRemap,
-	) -> BTreeSet<crate::values::RecordId> {
-		self.writes
-			.keys()
-			.filter_map(|key| match remap.conflict(*key) {
-				ConflictKey::BaseAtom(global)
-				| ConflictKey::GraphMembership(_, global)
-				| ConflictKey::GraphOverlay(_, global) => current
-					.atom(global)
-					.or_else(|| next.atom(global))
-					.map(|atom| atom.record_id().clone()),
-				_ => None,
-			})
-			.collect()
-	}
-
 	/// Validates against.
 	fn validate_against(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		self.validate_write_requirements(current)?;
@@ -890,10 +816,16 @@ impl Transaction {
 	fn validate_commit_fanout(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		let initial_fanout_bytes =
 			self.fanout_reservations.len().saturating_mul(EFFECTIVE_FANOUT_WRITE_BYTES);
-		let non_fanout_bytes = self
-			.write_bytes
-			.saturating_sub(initial_fanout_bytes)
-			.saturating_add(self.change_journal.bytes);
+		let non_fanout_bytes = self.write_set_bytes().saturating_sub(initial_fanout_bytes);
+		let actual_bytes = non_fanout_bytes.saturating_add(self.commit_fanout_bytes(current));
+		if actual_bytes > self.store.inner.transaction_limits().max_write_set_bytes {
+			return Err(self.limit_error(actual_bytes));
+		}
+		Ok(())
+	}
+
+	/// Counts inherited effective targets against the current publication root.
+	pub(super) fn commit_fanout_bytes(&self, current: &DatabaseRoot) -> usize {
 		let mut actual = BTreeSet::new();
 		for mutation in &self.mutations {
 			let (Mutation::SetBaseProperty {
@@ -938,15 +870,7 @@ impl Transaction {
 				}
 			}
 		}
-		let actual_bytes = actual
-			.len()
-			.checked_mul(EFFECTIVE_FANOUT_WRITE_BYTES)
-			.and_then(|fanout| non_fanout_bytes.checked_add(fanout))
-			.unwrap_or(usize::MAX);
-		if actual_bytes > self.store.inner.transaction_limits().max_write_set_bytes {
-			return Err(self.limit_error(actual_bytes));
-		}
-		Ok(())
+		actual.len().saturating_mul(EFFECTIVE_FANOUT_WRITE_BYTES)
 	}
 
 	/// Applies mutations.
@@ -1295,6 +1219,74 @@ impl Transaction {
 		}
 		Ok(())
 	}
+}
+
+/// Selects the existing-file publisher independently of the WAL barrier.
+fn mutations_retain_graph_files(mutations: &[Mutation]) -> bool {
+	// Only validated FULL capture reaches publication without mutations.
+	if mutations.is_empty() {
+		return true;
+	}
+	mutations.iter().all(|mutation| {
+		matches!(
+			mutation,
+			Mutation::RegisterBridgeDatabase(_)
+				| Mutation::RegisterBridgeMapping(_)
+				| Mutation::TransitionBridgeMapping { .. }
+				| Mutation::InternProperty { .. }
+				| Mutation::DefineLiveBinding(_)
+				| Mutation::ReplaceLiveBinding { .. }
+				| Mutation::RemoveLiveBinding(_)
+				| Mutation::ConfigureChangefeed { .. }
+				| Mutation::RegisterLive(_)
+				| Mutation::CloseLive(_)
+				| Mutation::AcknowledgeLive(_)
+				| Mutation::ReplaceGraph(_)
+				| Mutation::DefineParameter(_)
+				| Mutation::ReplaceParameter(_)
+				| Mutation::RemoveParameter(_)
+				| Mutation::DefineFunction(_)
+				| Mutation::DefineEvent(_)
+				| Mutation::ReplaceEvent(_)
+				| Mutation::RemoveEvent(_)
+				| Mutation::EnqueueEvent(_)
+				| Mutation::TransitionEvent { .. }
+				| Mutation::ReplaceFunction(_)
+				| Mutation::RemoveFunction(_)
+				| Mutation::DefineAnalyzer(_)
+				| Mutation::ReplaceAnalyzer(_)
+				| Mutation::RemoveAnalyzer(_)
+		)
+	}) && mutations.iter().any(|mutation| {
+		matches!(
+			mutation,
+			Mutation::RegisterBridgeDatabase(_)
+				| Mutation::RegisterBridgeMapping(_)
+				| Mutation::TransitionBridgeMapping { .. }
+				| Mutation::ReplaceGraph(_)
+				| Mutation::DefineLiveBinding(_)
+				| Mutation::ReplaceLiveBinding { .. }
+				| Mutation::RemoveLiveBinding(_)
+				| Mutation::ConfigureChangefeed { .. }
+				| Mutation::RegisterLive(_)
+				| Mutation::CloseLive(_)
+				| Mutation::AcknowledgeLive(_)
+				| Mutation::DefineParameter(_)
+				| Mutation::ReplaceParameter(_)
+				| Mutation::RemoveParameter(_)
+				| Mutation::DefineFunction(_)
+				| Mutation::DefineEvent(_)
+				| Mutation::ReplaceEvent(_)
+				| Mutation::RemoveEvent(_)
+				| Mutation::EnqueueEvent(_)
+				| Mutation::TransitionEvent { .. }
+				| Mutation::ReplaceFunction(_)
+				| Mutation::RemoveFunction(_)
+				| Mutation::DefineAnalyzer(_)
+				| Mutation::ReplaceAnalyzer(_)
+				| Mutation::RemoveAnalyzer(_)
+		)
+	})
 }
 
 /// Returns whether the mutation affects explicit indexes condition holds.

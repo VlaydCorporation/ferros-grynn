@@ -71,7 +71,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	}
 
 	let mut time_zones = BTreeSet::new();
-	for name in &catalog.time_zones {
+	for name in catalog.time_zones.iter() {
 		if name.is_empty() || name.as_str().contains('\0') || !time_zones.insert(name.as_str()) {
 			return Err(invalid("time-zone table contains an invalid or duplicate name"));
 		}
@@ -231,15 +231,15 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			}
 			previous_property = Some(property.key);
 		}
-		if graph.arena.graph_by_slot.keys().ne(graph.arena.scope_by_slot.keys())
-			|| graph.arena.graph_by_slot.get(&0) != Some(&graph.id)
-			|| graph.arena.scope_by_slot.get(&0).is_none_or(|scope| !scope.is_empty())
+		if graph.arena.graph_by_slot().keys().ne(graph.arena.scope_by_slot().keys())
+			|| graph.arena.graph_by_slot().get(&0) != Some(&graph.id)
+			|| graph.arena.scope_by_slot().get(&0).is_none_or(|scope| !scope.is_empty())
 		{
 			return Err(invalid("graph arena root or slot maps are inconsistent"));
 		}
 		let mut scope_slots = BTreeMap::new();
 		let mut scoped_children = BTreeSet::new();
-		for (expected, (slot, child)) in graph.arena.graph_by_slot.iter().enumerate() {
+		for (expected, (slot, child)) in graph.arena.graph_by_slot().iter().enumerate() {
 			if usize::try_from(*slot).ok() != Some(expected) || !graph_ids.contains(child) {
 				return Err(invalid(
 					"graph arena slots are not dense or reference an absent graph",
@@ -247,7 +247,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			}
 			let scope = graph
 				.arena
-				.scope_by_slot
+				.scope_by_slot()
 				.get(slot)
 				.ok_or_else(|| invalid("graph arena slot has no scope"))?;
 			if (*slot != 0 && scope.is_empty())
@@ -263,7 +263,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				}
 			}
 		}
-		for (slot, scope) in &graph.arena.scope_by_slot {
+		for (slot, scope) in graph.arena.scope_by_slot() {
 			if *slot == 0 {
 				continue;
 			}
@@ -271,12 +271,12 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			if !scope_slots.contains_key(parent_scope) {
 				return Err(invalid("graph arena scope has no parent scope"));
 			}
-			let child = graph.arena.graph_by_slot[slot];
+			let child = graph.arena.graph_by_slot()[slot];
 			for depth in 0..scope.len() {
 				let ancestor_slot = scope_slots
 					.get(&scope[..depth])
 					.ok_or_else(|| invalid("graph arena ancestry is incomplete"))?;
-				if graph.arena.graph_by_slot[ancestor_slot] == child {
+				if graph.arena.graph_by_slot()[ancestor_slot] == child {
 					return Err(invalid("graph arena contains a containment cycle"));
 				}
 			}
@@ -290,7 +290,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		let owner_entry = graph_by_id
 			.get(&owner)
 			.ok_or_else(|| invalid("internal graph owner root is absent"))?;
-		if !owner_entry.arena.graph_by_slot.values().any(|child| *child == graph.id) {
+		if !owner_entry.arena.graph_by_slot().values().any(|child| *child == graph.id) {
 			return Err(invalid("internal graph is not reachable from its owner root arena"));
 		}
 	}

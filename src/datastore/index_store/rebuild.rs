@@ -89,17 +89,7 @@ pub fn rebuild_lookup_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<
 				.atom(occurrence.global_id())
 				.ok_or_else(|| invalid("graph occurrence references an absent base atom"))?;
 			graph_indexes.classes.entry(atom.class_id()).or_default().insert(occurrence.local_id());
-			if let Some(label) = occurrence.label() {
-				let kind = occurrence
-					.local_id()
-					.kind()
-					.ok_or_else(|| invalid("live occurrence kind is null"))?;
-				graph_indexes
-					.labels
-					.entry((kind, label.clone()))
-					.or_default()
-					.insert(occurrence.local_id());
-			}
+			graph_indexes.replace_label(occurrence.local_id(), None, occurrence.label())?;
 		}
 	}
 	Ok(indexes)

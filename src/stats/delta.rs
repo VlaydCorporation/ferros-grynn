@@ -334,8 +334,11 @@ impl StatisticsStore {
 	}
 }
 
-/// Returns the effective property count result.
-fn effective_property_count(
+/// Counts inherited and overlay-only properties without copying values.
+///
+/// # Errors
+/// Returns an accounting error if the combined count exceeds `usize`.
+pub fn effective_property_count(
 	base: &PropertyMap,
 	occurrence: &GraphOccurrence,
 ) -> FerrosGrynnResult<usize> {

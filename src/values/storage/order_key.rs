@@ -130,9 +130,9 @@ fn encode_typed(
 		(StorageValue::Bool(false), Type::Bool) => Ok(vec![0]),
 		(StorageValue::Bool(true), Type::Bool) => Ok(vec![1]),
 		(StorageValue::Int(value), Type::Int) => Ok(ordered_i64(*value).to_vec()),
-		(StorageValue::Float(bits), Type::Float) => encode_float(*bits),
+		(StorageValue::Float(bits), Type::Float) => encode_float(*bits).map(Vec::from),
 		(StorageValue::Decimal(value), Type::Decimal) => {
-			encode_decimal(value.mantissa, value.scale)
+			encode_decimal(value.mantissa, value.scale).map(Vec::from)
 		}
 		(StorageValue::String(value), Type::String) => {
 			let mut encoded = value.as_bytes().to_vec();
@@ -152,7 +152,7 @@ fn encode_typed(
 			encoded.extend_from_slice(&value.nanos.to_be_bytes());
 			Ok(encoded)
 		}
-		(StorageValue::Duration(value), Type::Duration) => encode_duration(value),
+		(StorageValue::Duration(value), Type::Duration) => encode_duration(value).map(Vec::from),
 		(StorageValue::Uuid(value), Type::Uuid) => Ok(value.as_inner().as_bytes().to_vec()),
 		(StorageValue::Ulid(value), Type::Ulid) => Ok(value.as_inner().to_bytes().to_vec()),
 		(StorageValue::Record(value), Type::Record) => encode_record(value, context),
@@ -185,7 +185,7 @@ fn encode_typed(
 }
 
 /// Encodes float for this module.
-fn encode_float(bits: u64) -> FerrosGrynnResult<Vec<u8>> {
+pub(super) fn encode_float(bits: u64) -> FerrosGrynnResult<[u8; 8]> {
 	let value = f64::from_bits(bits);
 	if value.is_nan() {
 		return Err(index_value_error("NaN cannot be inserted into a scalar B+tree index"));
@@ -200,27 +200,34 @@ fn encode_float(bits: u64) -> FerrosGrynnResult<Vec<u8>> {
 	} else {
 		!bits
 	};
-	Ok(ordered.to_be_bytes().to_vec())
+	Ok(ordered.to_be_bytes())
 }
 
 /// Encodes decimal for this module.
-fn encode_decimal(mut mantissa: i128, mut scale: u8) -> FerrosGrynnResult<Vec<u8>> {
+pub(super) fn encode_decimal(
+	mut mantissa: i128,
+	mut scale: u8,
+) -> FerrosGrynnResult<[u8; 1 + 2 + DECIMAL_DIGITS]> {
 	while scale > 0 && mantissa % 10 == 0 {
 		mantissa /= 10;
 		scale -= 1;
 	}
+	let mut encoded = [0; 1 + 2 + DECIMAL_DIGITS];
 	if mantissa == 0 {
-		return Ok(vec![1; 1]
-			.into_iter()
-			.chain(std::iter::repeat_n(0, 2 + DECIMAL_DIGITS))
-			.collect());
+		encoded[0] = 1;
+		return Ok(encoded);
 	}
 	let negative = mantissa < 0;
-	let digits = mantissa.unsigned_abs().to_string();
-	if digits.len() > DECIMAL_DIGITS {
-		return Err(index_value_error("decimal coefficient exceeds 39 digits"));
+	// An i128 magnitude needs at most 39 decimal digits, including MIN.
+	let mut digits = [0; DECIMAL_DIGITS];
+	let mut start = DECIMAL_DIGITS;
+	let mut magnitude = mantissa.unsigned_abs();
+	while magnitude != 0 {
+		start -= 1;
+		digits[start] = (magnitude % 10) as u8 + 1;
+		magnitude /= 10;
 	}
-	let digit_count = i16::try_from(digits.len())
+	let digit_count = i16::try_from(DECIMAL_DIGITS - start)
 		.map_err(|_error| index_value_error("decimal digit count exceeds i16"))?;
 	let adjusted = digit_count
 		.checked_sub(i16::from(scale))
@@ -228,15 +235,13 @@ fn encode_decimal(mut mantissa: i128, mut scale: u8) -> FerrosGrynnResult<Vec<u8
 		.ok_or_else(|| index_value_error("decimal adjusted exponent overflows i16"))?;
 	let mut exponent = adjusted.to_be_bytes();
 	exponent[0] ^= 0x80;
-	let mut encoded = Vec::with_capacity(1 + 2 + DECIMAL_DIGITS);
-	encoded.push(if negative {
+	encoded[0] = if negative {
 		0
 	} else {
 		2
-	});
-	encoded.extend_from_slice(&exponent);
-	encoded.extend(digits.bytes().map(|digit| digit - b'0' + 1));
-	encoded.resize(1 + 2 + DECIMAL_DIGITS, 0);
+	};
+	encoded[1..3].copy_from_slice(&exponent);
+	encoded[3..3 + DECIMAL_DIGITS - start].copy_from_slice(&digits[start..]);
 	if negative {
 		for byte in &mut encoded[1..] {
 			*byte = !*byte;
@@ -246,7 +251,7 @@ fn encode_decimal(mut mantissa: i128, mut scale: u8) -> FerrosGrynnResult<Vec<u8
 }
 
 /// Encodes duration for this module.
-fn encode_duration(value: &super::StorageDuration) -> FerrosGrynnResult<Vec<u8>> {
+pub(super) fn encode_duration(value: &super::StorageDuration) -> FerrosGrynnResult<[u8; 16]> {
 	let sign = if value.negative {
 		-1_i128
 	} else {
@@ -275,10 +280,10 @@ fn encode_duration(value: &super::StorageDuration) -> FerrosGrynnResult<Vec<u8>>
 		.map_err(|_error| index_value_error("duration days exceed the index format"))?;
 	let nanos = i64::try_from(nanos)
 		.map_err(|_error| index_value_error("duration nanoseconds exceed the index format"))?;
-	let mut encoded = Vec::with_capacity(16);
-	encoded.extend_from_slice(&ordered_i32(months));
-	encoded.extend_from_slice(&ordered_i32(days));
-	encoded.extend_from_slice(&ordered_i64(nanos));
+	let mut encoded = [0; 16];
+	encoded[..4].copy_from_slice(&ordered_i32(months));
+	encoded[4..8].copy_from_slice(&ordered_i32(days));
+	encoded[8..].copy_from_slice(&ordered_i64(nanos));
 	Ok(encoded)
 }
 
@@ -435,7 +440,7 @@ fn ordered_i32(value: i32) -> [u8; 4] {
 }
 
 /// Returns ordered i64 for this module.
-fn ordered_i64(value: i64) -> [u8; 8] {
+pub(super) fn ordered_i64(value: i64) -> [u8; 8] {
 	let mut bytes = value.to_be_bytes();
 	bytes[0] ^= 0x80;
 	bytes
@@ -609,5 +614,70 @@ mod tests {
 		assert!(encode(&Value::from(f64::NAN), &Type::Float).is_err());
 		assert!(validate_index_type(&Type::Number).is_err());
 		assert!(validate_index_type(&Type::Object).is_err());
+	}
+	/// Frozen pre-refactor allocating decimal writer is an independent oracle.
+	fn legacy_decimal(mut mantissa: i128, mut scale: u8) -> FerrosGrynnResult<Vec<u8>> {
+		while scale > 0 && mantissa % 10 == 0 {
+			mantissa /= 10;
+			scale -= 1;
+		}
+		if mantissa == 0 {
+			return Ok(vec![1; 1]
+				.into_iter()
+				.chain(std::iter::repeat_n(0, 2 + DECIMAL_DIGITS))
+				.collect());
+		}
+		let negative = mantissa < 0;
+		let digits = mantissa.unsigned_abs().to_string();
+		if digits.len() > DECIMAL_DIGITS {
+			return Err(index_value_error("decimal coefficient exceeds 39 digits"));
+		}
+		let digit_count = i16::try_from(digits.len())
+			.map_err(|_error| index_value_error("decimal digit count exceeds i16"))?;
+		let adjusted = digit_count
+			.checked_sub(i16::from(scale))
+			.and_then(|value| value.checked_sub(1))
+			.ok_or_else(|| index_value_error("decimal adjusted exponent overflows i16"))?;
+		let mut exponent = adjusted.to_be_bytes();
+		exponent[0] ^= 0x80;
+		let mut encoded = Vec::with_capacity(1 + 2 + DECIMAL_DIGITS);
+		encoded.push(if negative {
+			0
+		} else {
+			2
+		});
+		encoded.extend_from_slice(&exponent);
+		encoded.extend(digits.bytes().map(|digit| digit - b'0' + 1));
+		encoded.resize(1 + 2 + DECIMAL_DIGITS, 0);
+		if negative {
+			for byte in &mut encoded[1..] {
+				*byte = !*byte;
+			}
+		}
+		Ok(encoded)
+	}
+
+	/// Fixed stack digits preserve the former string-based encoding at
+	/// extremes.
+	#[test]
+	fn stack_numeric_decimal_preserves_frozen_allocating_oracle() {
+		use crate::test_assertions::AssertResult as _;
+		for value in [i128::MIN, i128::MAX, -10, -1, 0, 1, 10] {
+			for scale in [0, 1, 2, 28, 38, 255] {
+				assert_eq!(
+					encode_decimal(value, scale).assert_ok().as_slice(),
+					legacy_decimal(value, scale).assert_ok()
+				);
+			}
+		}
+		let mut state = i128::MIN;
+		for sample in 0..1024_u16 {
+			state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			let scale = (sample % 256) as u8;
+			assert_eq!(
+				encode_decimal(state, scale).assert_ok().as_slice(),
+				legacy_decimal(state, scale).assert_ok()
+			);
+		}
 	}
 }

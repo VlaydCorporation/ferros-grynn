@@ -55,7 +55,7 @@ pub(super) fn prepare(
 	let graph = database.graph(graph).ok_or_else(|| invalid("endpoint graph is absent"))?;
 	let budget = external_sort_run_budget();
 	let scope_bytes = arena
-		.scope_by_slot
+		.scope_by_slot()
 		.len()
 		.checked_mul(96)
 		.ok_or_else(|| invalid("endpoint scope metadata overflows"))?;
@@ -66,7 +66,7 @@ pub(super) fn prepare(
 		));
 	}
 	let scopes = arena
-		.scope_by_slot
+		.scope_by_slot()
 		.iter()
 		.map(|(slot, scope)| (scope.as_ref(), *slot))
 		.collect::<BTreeMap<_, _>>();
@@ -201,6 +201,26 @@ pub(super) fn decode_header(
 	})
 }
 
+/// Advances only a validated header; retained tree pages keep their identities.
+///
+/// # Errors
+/// Rejects stale source metadata or a non-advancing revision before mutation.
+pub(super) fn rewrite_header_revision(
+	page: &mut AlignedPage,
+	graph: GraphId,
+	capability: SystemIndex,
+	previous: u64,
+	next: u64,
+	page_count: u64,
+) -> FerrosGrynnResult<()> {
+	if next <= previous {
+		return Err(invalid("endpoint revision does not advance"));
+	}
+	let mut header = decode_header(page, graph, capability, previous, page_count)?;
+	header.revision = next;
+	encode_header(page, header)
+}
+
 /// Visits only the matching qualified key prefix with bounded owned postings.
 pub(super) fn lookup(
 	mut read: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
@@ -317,6 +337,43 @@ fn invalid(reason: &str) -> FerrosGrynnError {
 mod tests {
 	use super::*;
 	use crate::datastore::{IndexId, SystemIndexKind};
+
+	/// Rejection preserves source bytes; success changes only snapshot
+	/// metadata.
+	#[test]
+	fn endpoint_revision_rewrite_validates_before_changing_the_header() {
+		use crate::test_assertions::AssertResult as _;
+
+		let graph = GraphId::new(1).ok_or_else(|| invalid("test graph id")).assert_ok();
+		let capability = SystemIndex::new(
+			IndexId::new(9).ok_or_else(|| invalid("test index id")).assert_ok(),
+			SystemIndexKind::EdgeEndpoint,
+		);
+		let header = EndpointHeader {
+			graph,
+			capability,
+			revision: 7,
+			root: PageNo::new(1),
+			page_count: 2,
+			posting_count: 0,
+		};
+		let mut page = Box::new(AlignedPage::zeroed());
+		encode_header(&mut page, header).assert_ok();
+		let source = page.as_bytes().to_vec();
+		for (previous, next, page_count) in [(6, 8, 2), (7, 7, 2), (7, 6, 2), (7, 8, 3)] {
+			assert!(
+				rewrite_header_revision(&mut page, graph, capability, previous, next, page_count,)
+					.is_err()
+			);
+			assert_eq!(page.as_bytes().as_slice(), source);
+		}
+		rewrite_header_revision(&mut page, graph, capability, 7, 8, 2).assert_ok();
+		assert_eq!(decode_header(&page, graph, capability, 8, 2).assert_ok(), EndpointHeader {
+			revision: 8,
+			..header
+		});
+		assert!(decode_header(&page, graph, capability, 7, 2).is_err());
+	}
 
 	/// Verifies endpoint pages distinguish scopes and check metadata and
 	/// reserved keys.

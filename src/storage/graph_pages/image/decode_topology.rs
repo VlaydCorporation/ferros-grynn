@@ -170,12 +170,12 @@ fn resolve_qualified(
 			.ok_or_else(|| invalid("qualified local endpoint references a tombstone"));
 	}
 	let graph_id = arena
-		.graph_by_slot
+		.graph_by_slot()
 		.get(&entry.graph_slot)
 		.copied()
 		.ok_or_else(|| invalid("qualified endpoint uses an unknown graph slot"))?;
 	let scope = arena
-		.scope_by_slot
+		.scope_by_slot()
 		.get(&entry.graph_slot)
 		.ok_or_else(|| invalid("qualified endpoint graph slot has no scope"))?;
 	if scope.is_empty() {

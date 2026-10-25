@@ -1,4 +1,10 @@
-use super::{IndexBinding, IndexEntries, IndexStoreRoot, model::IndexField};
+use super::{
+	IndexBinding,
+	IndexEntries,
+	IndexStoreRoot,
+	key_preparation::{KeyPreparation, effective_index_key, index_key},
+	model::IndexField,
+};
 use crate::{
 	datastore::{
 		BaseAtom,
@@ -14,7 +20,7 @@ use crate::{
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, GraphId},
-	values::{PropertyDictionary, PropertyMap, Value, storage::EncodeContext},
+	values::{PropertyDictionary, PropertyMap, Text, storage::EncodeContext},
 };
 
 #[derive(Debug)]
@@ -45,23 +51,23 @@ pub struct PreparedOccurrenceInsert {
 }
 
 #[derive(Debug)]
-/// Key change state.
-struct KeyChange {
-	/// Graph associated with this key change.
-	graph: Option<GraphId>,
-	/// Index associated with this key change.
-	index: IndexId,
-	/// Address associated with this key change.
-	address: Address,
-	/// Before associated with this key change.
-	before: Option<Vec<u8>>,
-	/// After associated with this key change.
-	after: Option<Vec<u8>>,
+/// Canonical net keys and their typed address, shared with physical planning.
+pub struct PreparedIndexChange {
+	/// Effective graph, or the database-global Base scope.
+	pub(crate) graph: Option<GraphId>,
+	/// Globally unique catalog identity of the changed binding.
+	pub(crate) index: IndexId,
+	/// Logical address selected by the binding's Base or Effective scope.
+	pub(crate) address: IndexAddress,
+	/// Source canonical key, absent when the indexed value is omitted.
+	pub(crate) before: Option<Vec<u8>>,
+	/// Final candidate key after replay and synchronous effects.
+	pub(crate) after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
-/// Address alternatives.
-enum Address {
+/// Scope-specific address retained independently of durable page codecs.
+pub enum IndexAddress {
 	/// Global case of address.
 	Global(
 		/// Global case of address.
@@ -78,7 +84,7 @@ enum Address {
 #[derive(Debug, Default)]
 pub struct PreparedReplace {
 	/// Changes associated with this prepared replace.
-	changes: Vec<KeyChange>,
+	changes: Vec<PreparedIndexChange>,
 }
 
 impl PreparedReplace {
@@ -88,7 +94,108 @@ impl PreparedReplace {
 	}
 }
 
+/// Owned label transition prepared alongside the occurrence's explicit keys.
+#[derive(Debug)]
+struct PreparedLabelChange {
+	/// Source label removed from the same graph and atom kind.
+	before: Option<Text>,
+	/// Final label inserted after source validation.
+	after: Option<Text>,
+}
+
+/// Validated explicit and engine-owned work for one occurrence replacement.
+#[derive(Debug)]
+pub struct PreparedOccurrenceReplace {
+	/// Scope remains independent of database-global Base bindings.
+	graph: GraphId,
+	/// Stable local identity shared by the old and new occurrence.
+	local: AtomId,
+	/// Canonical explicit scalar changes keep the Base preparation unchanged.
+	explicit: PreparedReplace,
+	/// Absent for overlay/state changes whose label is unchanged.
+	label: Option<PreparedLabelChange>,
+}
+
+impl PreparedOccurrenceReplace {
+	/// Includes label-only work even when no explicit index is defined.
+	pub(in crate::datastore) fn is_empty(&self) -> bool {
+		self.explicit.is_empty() && self.label.is_none()
+	}
+}
+
 impl IndexStoreRoot {
+	/// Encodes one accepted Base insertion/removal without revalidating Unique
+	/// against the final index, which already contains the inserted atom.
+	///
+	/// # Errors
+	/// Propagates canonical key encoding failures.
+	pub(crate) fn prepare_base_transition(
+		&self,
+		atom: &BaseAtom,
+		insert: bool,
+		context: &mut EncodeContext,
+		maximum: usize,
+	) -> FerrosGrynnResult<(Vec<PreparedIndexChange>, usize)> {
+		let mut preparation = KeyPreparation::bounded(maximum);
+		let mut changes = Vec::new();
+		for binding in self.base.values().filter(|binding| binding.class_id == atom.class_id()) {
+			let key = preparation.key(binding, |key| atom.properties().get(key), context)?;
+			if let Some(key) = key {
+				let (before, after) = if insert {
+					(None, Some(key))
+				} else {
+					(Some(key), None)
+				};
+				preparation.push(&mut changes, PreparedIndexChange {
+					graph: None,
+					index: binding.id,
+					address: IndexAddress::Global(atom.id()),
+					before,
+					after,
+				})?;
+			}
+		}
+		preparation.finish(changes)
+	}
+
+	/// Encodes accepted membership transitions without checking final Unique
+	/// entries against an atom that is already present in the candidate.
+	///
+	/// # Errors
+	/// Propagates missing graph bindings and canonical key encoding failures.
+	pub(crate) fn prepare_effective_transition(
+		&self,
+		graph: GraphId,
+		atom: &BaseAtom,
+		occurrence: &GraphOccurrence,
+		insert: bool,
+		context: &mut EncodeContext,
+		maximum: usize,
+	) -> FerrosGrynnResult<(Vec<PreparedIndexChange>, usize)> {
+		let mut preparation = KeyPreparation::bounded(maximum);
+		let indexes = self.graphs.get(&graph).ok_or_else(|| invalid("graph has no indexes"))?;
+		let mut changes = Vec::new();
+		for binding in
+			indexes.explicit.values().filter(|binding| binding.class_id == atom.class_id())
+		{
+			if let Some(key) = preparation.effective_key(binding, atom, occurrence, context)? {
+				let (before, after) = if insert {
+					(None, Some(key))
+				} else {
+					(Some(key), None)
+				};
+				preparation.push(&mut changes, PreparedIndexChange {
+					graph: Some(graph),
+					index: binding.id,
+					address: IndexAddress::Local(occurrence.local_id()),
+					before,
+					after,
+				})?;
+			}
+		}
+		preparation.finish(changes)
+	}
+
 	/// Registers class.
 	pub(crate) fn register_class(&mut self, class: &ClassSchema) -> FerrosGrynnResult<()> {
 		self.register_class_with_mode(class, false)
@@ -287,19 +394,7 @@ impl IndexStoreRoot {
 			.get_mut(&graph)
 			.ok_or_else(|| invalid("prepared graph indexes disappeared"))?;
 		indexes.classes.entry(prepared.class).or_default().insert(occurrence.local_id());
-		if let Some(label) = occurrence.label() {
-			indexes
-				.labels
-				.entry((
-					occurrence
-						.local_id()
-						.kind()
-						.ok_or_else(|| invalid("live occurrence kind is null"))?,
-					label.clone(),
-				))
-				.or_default()
-				.insert(occurrence.local_id());
-		}
+		indexes.replace_label(occurrence.local_id(), None, occurrence.label())?;
 		for key in prepared.keys {
 			indexes
 				.explicit
@@ -312,12 +407,53 @@ impl IndexStoreRoot {
 	}
 
 	/// Prepares base replace.
-	pub(crate) fn prepare_base_replace(
+	pub(crate) fn prepare_base_replace<'a>(
 		&self,
 		before: &BaseAtom,
 		after: &BaseAtom,
-		memberships: &[(GraphId, GraphOccurrence)],
+		memberships: impl IntoIterator<Item = FerrosGrynnResult<(GraphId, &'a GraphOccurrence)>>,
 		context: &mut EncodeContext,
+	) -> FerrosGrynnResult<PreparedReplace> {
+		self.prepare_base_replace_with(
+			before,
+			after,
+			memberships,
+			context,
+			&mut KeyPreparation::logical(),
+		)
+	}
+
+	/// Encodes one publication-only Base replacement within its remaining
+	/// ceiling.
+	///
+	/// # Errors
+	/// Preserves key/Unique validation and rejects preparation resource excess.
+	pub(crate) fn prepare_base_replace_bounded(
+		&self,
+		before: &BaseAtom,
+		after: &BaseAtom,
+		context: &mut EncodeContext,
+		maximum: usize,
+	) -> FerrosGrynnResult<(Vec<PreparedIndexChange>, usize)> {
+		let mut preparation = KeyPreparation::bounded(maximum);
+		let prepared = self.prepare_base_replace_with(
+			before,
+			after,
+			std::iter::empty(),
+			context,
+			&mut preparation,
+		)?;
+		preparation.finish(prepared.changes)
+	}
+
+	/// Shares the existing logical walk and Unique validation with publication.
+	fn prepare_base_replace_with<'a>(
+		&self,
+		before: &BaseAtom,
+		after: &BaseAtom,
+		memberships: impl IntoIterator<Item = FerrosGrynnResult<(GraphId, &'a GraphOccurrence)>>,
+		context: &mut EncodeContext,
+		preparation: &mut KeyPreparation,
 	) -> FerrosGrynnResult<PreparedReplace> {
 		let mut prepared = PreparedReplace::default();
 		for binding in self.base.values().filter(|binding| binding.class_id == before.class_id()) {
@@ -326,30 +462,29 @@ impl IndexStoreRoot {
 				None,
 				binding,
 				before.id(),
-				index_key(binding, |key| before.properties().get(key), context)?,
-				index_key(binding, |key| after.properties().get(key), context)?,
+				preparation.key(binding, |key| before.properties().get(key), context)?,
+				preparation.key(binding, |key| after.properties().get(key), context)?,
+				preparation,
 			)?;
 		}
-		for (graph, occurrence) in memberships {
-			let indexes =
-				self.graphs.get(graph).ok_or_else(|| invalid("membership graph has no indexes"))?;
-			for binding in
-				indexes.explicit.values().filter(|binding| binding.class_id == before.class_id())
-			{
-				push_change(
-					&mut prepared,
-					Some(*graph),
-					binding,
-					occurrence.local_id(),
-					effective_index_key(binding, before, occurrence, context)?,
-					effective_index_key(binding, after, occurrence, context)?,
-				)?;
-			}
+		for membership in memberships {
+			let (graph, occurrence) = membership?;
+			self.append_effective_replace(
+				&mut prepared,
+				graph,
+				(before, occurrence),
+				(after, occurrence),
+				context,
+				preparation,
+			)?;
 		}
 		Ok(prepared)
 	}
 
-	/// Prepares occurrence replace.
+	/// Prepares explicit keys and a possible engine-owned label transition.
+	///
+	/// # Errors
+	/// Propagates missing graph, key encoding and uniqueness failures.
 	pub(crate) fn prepare_occurrence_replace(
 		&self,
 		graph: GraphId,
@@ -357,29 +492,121 @@ impl IndexStoreRoot {
 		before: &GraphOccurrence,
 		after: &GraphOccurrence,
 		context: &mut EncodeContext,
+	) -> FerrosGrynnResult<PreparedOccurrenceReplace> {
+		let prepared =
+			self.prepare_effective_replace(graph, (atom, before), (atom, after), context)?;
+		Ok(PreparedOccurrenceReplace {
+			graph,
+			local: before.local_id(),
+			explicit: prepared,
+			label: (before.label() != after.label()).then(|| PreparedLabelChange {
+				before: before.label().cloned(),
+				after: after.label().cloned(),
+			}),
+		})
+	}
+
+	/// Encodes one net Effective transition for a stable global/local identity.
+	/// Each side owns its Base and occurrence, so mixed commits need no
+	/// intermediate physical key.
+	///
+	/// # Errors
+	/// Propagates missing graph, key encoding and uniqueness failures.
+	pub(crate) fn prepare_effective_replace(
+		&self,
+		graph: GraphId,
+		before: (&BaseAtom, &GraphOccurrence),
+		after: (&BaseAtom, &GraphOccurrence),
+		context: &mut EncodeContext,
 	) -> FerrosGrynnResult<PreparedReplace> {
-		let indexes = self.graphs.get(&graph).ok_or_else(|| invalid("graph has no indexes"))?;
 		let mut prepared = PreparedReplace::default();
+		self.append_effective_replace(
+			&mut prepared,
+			graph,
+			before,
+			after,
+			context,
+			&mut KeyPreparation::logical(),
+		)?;
+		Ok(prepared)
+	}
+
+	/// Encodes one final Effective pair without resetting the per-side
+	/// envelope.
+	///
+	/// # Errors
+	/// Preserves key/Unique validation and rejects preparation resource excess.
+	pub(crate) fn prepare_effective_replace_bounded(
+		&self,
+		graph: GraphId,
+		before: (&BaseAtom, &GraphOccurrence),
+		after: (&BaseAtom, &GraphOccurrence),
+		context: &mut EncodeContext,
+		maximum: usize,
+	) -> FerrosGrynnResult<(Vec<PreparedIndexChange>, usize)> {
+		let mut preparation = KeyPreparation::bounded(maximum);
+		let mut prepared = PreparedReplace::default();
+		self.append_effective_replace(
+			&mut prepared,
+			graph,
+			before,
+			after,
+			context,
+			&mut preparation,
+		)?;
+		preparation.finish(prepared.changes)
+	}
+
+	/// Shares the borrowed key walk without allocating per-membership plans.
+	fn append_effective_replace(
+		&self,
+		prepared: &mut PreparedReplace,
+		graph: GraphId,
+		before: (&BaseAtom, &GraphOccurrence),
+		after: (&BaseAtom, &GraphOccurrence),
+		context: &mut EncodeContext,
+		preparation: &mut KeyPreparation,
+	) -> FerrosGrynnResult<()> {
+		let indexes = self.graphs.get(&graph).ok_or_else(|| invalid("graph has no indexes"))?;
 		for binding in
-			indexes.explicit.values().filter(|binding| binding.class_id == atom.class_id())
+			indexes.explicit.values().filter(|binding| binding.class_id == before.0.class_id())
 		{
 			push_change(
-				&mut prepared,
+				prepared,
 				Some(graph),
 				binding,
-				before.local_id(),
-				effective_index_key(binding, atom, before, context)?,
-				effective_index_key(binding, atom, after, context)?,
+				before.1.local_id(),
+				preparation.effective_key(binding, before.0, before.1, context)?,
+				preparation.effective_key(binding, after.0, after.1, context)?,
+				preparation,
 			)?;
 		}
-		Ok(prepared)
+		Ok(())
+	}
+
+	/// Applies explicit and label changes within the same private index root.
+	///
+	/// # Errors
+	/// Rejects inconsistent prepared bindings or missing source label postings.
+	pub(crate) fn apply_occurrence_replace(
+		&mut self,
+		prepared: PreparedOccurrenceReplace,
+	) -> FerrosGrynnResult<()> {
+		self.apply_replace(prepared.explicit)?;
+		if let Some(label) = prepared.label {
+			self.graphs
+				.get_mut(&prepared.graph)
+				.ok_or_else(|| invalid("prepared graph indexes disappeared"))?
+				.replace_label(prepared.local, label.before.as_ref(), label.after.as_ref())?;
+		}
+		Ok(())
 	}
 
 	/// Applies replace.
 	pub(crate) fn apply_replace(&mut self, prepared: PreparedReplace) -> FerrosGrynnResult<()> {
 		for change in prepared.changes {
 			match (change.graph, change.address) {
-				(None, Address::Global(address)) => replace(
+				(None, IndexAddress::Global(address)) => replace(
 					&mut self
 						.base
 						.get_mut(&change.index)
@@ -389,7 +616,7 @@ impl IndexStoreRoot {
 					change.before,
 					change.after,
 				),
-				(Some(graph), Address::Local(address)) => replace(
+				(Some(graph), IndexAddress::Local(address)) => replace(
 					&mut self
 						.graphs
 						.get_mut(&graph)
@@ -426,13 +653,7 @@ impl IndexStoreRoot {
 		if let Some(members) = indexes.classes.get_mut(&atom.class_id()) {
 			members.remove(&occurrence.local_id());
 		}
-		if let Some(label) = occurrence.label()
-			&& let Some(members) = indexes.labels.get_mut(&(
-				occurrence.local_id().kind().ok_or_else(|| invalid("occurrence kind is null"))?,
-				label.clone(),
-			)) {
-			members.remove(&occurrence.local_id());
-		}
+		indexes.replace_label(occurrence.local_id(), occurrence.label(), None)?;
 		Ok(())
 	}
 }
@@ -471,34 +692,6 @@ fn binding<Address: Copy + Ord>(
 	})
 }
 
-/// Returns the index key result.
-fn index_key<'value, Address>(
-	binding: &IndexBinding<Address>,
-	mut value: impl FnMut(crate::values::PropertyKeyId) -> Option<&'value Value>,
-	context: &mut EncodeContext,
-) -> FerrosGrynnResult<Option<Vec<u8>>> {
-	if binding.kind == ClassIndexKind::Count {
-		return Ok(None);
-	}
-	let missing = Value::None;
-	let components = binding
-		.fields
-		.iter()
-		.map(|field| (value(field.key).unwrap_or(&missing), &field.value_type))
-		.collect::<Vec<_>>();
-	crate::values::storage::encode_index_key(&components, context).map(Some)
-}
-
-/// Returns the effective index key result.
-fn effective_index_key(
-	binding: &IndexBinding<AtomId>,
-	atom: &BaseAtom,
-	occurrence: &GraphOccurrence,
-	context: &mut EncodeContext,
-) -> FerrosGrynnResult<Option<Vec<u8>>> {
-	index_key(binding, |key| occurrence.effective_value(atom.properties().get(key), key), context)
-}
-
 /// Pushes change.
 fn push_change<Address>(
 	prepared: &mut PreparedReplace,
@@ -507,43 +700,43 @@ fn push_change<Address>(
 	address: Address,
 	before: Option<Vec<u8>>,
 	after: Option<Vec<u8>>,
+	preparation: &mut KeyPreparation,
 ) -> FerrosGrynnResult<()>
 where
 	Address: Copy + Ord + IntoAddress,
 {
 	if before == after {
-		return Ok(());
+		return preparation.discard_equal(before, after);
 	}
 	if let Some(key) = &after {
 		binding.entries.can_insert(key, Some(address), &binding.name)?;
 	}
-	prepared.changes.push(KeyChange {
+	preparation.push(&mut prepared.changes, PreparedIndexChange {
 		graph,
 		index: binding.id,
 		address: address.into_address(),
 		before,
 		after,
-	});
-	Ok(())
+	})
 }
 
 /// Operations required for into address.
 trait IntoAddress {
 	/// Converts this value into address.
-	fn into_address(self) -> Address;
+	fn into_address(self) -> IndexAddress;
 }
 
 impl IntoAddress for GlobalAtomId {
 	/// Converts this value into address for `GlobalAtomId`.
-	fn into_address(self) -> Address {
-		Address::Global(self)
+	fn into_address(self) -> IndexAddress {
+		IndexAddress::Global(self)
 	}
 }
 
 impl IntoAddress for AtomId {
 	/// Converts this value into address for `AtomId`.
-	fn into_address(self) -> Address {
-		Address::Local(self)
+	fn into_address(self) -> IndexAddress {
+		IndexAddress::Local(self)
 	}
 }
 

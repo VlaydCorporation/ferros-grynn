@@ -25,6 +25,11 @@ impl Array {
 		self.0.len()
 	}
 
+	/// Retained slots remain owned even when the logical sequence is empty.
+	pub(crate) fn capacity(&self) -> usize {
+		self.0.capacity()
+	}
+
 	/// Reports whether this `Array` contains no logical elements.
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()

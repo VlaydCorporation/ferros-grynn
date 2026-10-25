@@ -18,6 +18,8 @@ mod graph_index;
 mod index;
 /// Atomic replacement and removal of published schema definitions.
 mod mutation;
+/// Strict additive endpoint capability admission for replay and storage.
+mod point;
 
 pub use analyzer::{
 	AnalyzerFilter,

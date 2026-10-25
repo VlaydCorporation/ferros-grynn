@@ -286,6 +286,25 @@ pub(in crate::storage) struct TxHandle {
 }
 
 impl TxHandle {
+	/// Reserves copied pages and their complete private staging-tree nodes.
+	///
+	/// # Errors
+	/// Returns typed overflow when the requested logical envelope is
+	/// unaddressable.
+	pub(in crate::storage) fn staging_bytes(count: usize) -> FerrosGrynnResult<usize> {
+		let pages = count
+			.checked_mul(PAGE_SIZE)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("WAL staging pages"))?;
+		let tree = if count == 0 {
+			0
+		} else {
+			crate::memory::tree_retained_bytes::<(PageKey, StagedPage)>(count)?
+		};
+		pages
+			.checked_add(tree)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("WAL staging reservation"))
+	}
+
 	/// Returns this transaction's stable identity.
 	#[cfg(test)]
 	pub(in crate::storage) const fn id(&self) -> TxId {
@@ -310,7 +329,7 @@ impl TxHandle {
 
 	/// Stages the final complete image for one physical page.
 	///
-	/// Replacing the same key does not increase the bounded write-set charge.
+	/// Replacing the same key reuses its private buffer and bounded charge.
 	/// The frame LSN is deliberately left unchanged until commit owns the WAL
 	/// writer lock.
 	///
@@ -323,23 +342,26 @@ impl TxHandle {
 		page: &AlignedPage,
 	) -> FerrosGrynnResult<()> {
 		page.validate(key.page_no())?;
-		if !self.staged.contains_key(&key) {
-			let next_bytes = self.staged_bytes.checked_add(PAGE_SIZE).ok_or_else(|| {
-				FerrosGrynnError::transaction_write_set_limit_exceeded(
-					self.id.get(),
-					u64::MAX,
-					MAX_TX_WRITE_BYTES as u64,
-				)
-			})?;
-			if next_bytes > MAX_TX_WRITE_BYTES {
-				return Err(FerrosGrynnError::transaction_write_set_limit_exceeded(
-					self.id.get(),
-					next_bytes as u64,
-					MAX_TX_WRITE_BYTES as u64,
-				));
-			}
-			self.staged_bytes = next_bytes;
+		if let Some(staged) = self.staged.get_mut(&key) {
+			// No published snapshot aliases this transaction-owned buffer.
+			staged.page.as_bytes_mut().copy_from_slice(page.as_bytes());
+			return Ok(());
 		}
+		let next_bytes = self.staged_bytes.checked_add(PAGE_SIZE).ok_or_else(|| {
+			FerrosGrynnError::transaction_write_set_limit_exceeded(
+				self.id.get(),
+				u64::MAX,
+				MAX_TX_WRITE_BYTES as u64,
+			)
+		})?;
+		if next_bytes > MAX_TX_WRITE_BYTES {
+			return Err(FerrosGrynnError::transaction_write_set_limit_exceeded(
+				self.id.get(),
+				next_bytes as u64,
+				MAX_TX_WRITE_BYTES as u64,
+			));
+		}
+		self.staged_bytes = next_bytes;
 		let mut staged = Box::new(AlignedPage::zeroed());
 		staged.as_bytes_mut().copy_from_slice(page.as_bytes());
 		self.staged.insert(key, StagedPage {

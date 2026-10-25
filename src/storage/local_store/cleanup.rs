@@ -4,7 +4,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs,
 	path::{Path, PathBuf},
-	sync::Weak,
+	sync::{Arc, Weak},
 };
 
 use super::layout::invalid;
@@ -80,15 +80,7 @@ impl RetiredChangefeedFile {
 		{
 			return Ok(false);
 		}
-		let metadata = match fs::symlink_metadata(&self.path) {
-			Ok(metadata) => metadata,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-			Err(error) => return Err(io_failure("inspect retired feed", error)),
-		};
-		if !metadata.is_file() || metadata.file_type().is_symlink() {
-			return Err(invalid("retired feed path is not a physical file"));
-		}
-		fs::remove_file(&self.path).map_err(|error| io_failure("remove retired feed", error))?;
+		remove_retired_file(&self.path)?;
 		Ok(true)
 	}
 }
@@ -98,8 +90,10 @@ impl RetiredChangefeedFile {
 pub(super) struct RetiredGeneration {
 	/// UUID directories reachable only from the replaced catalog.
 	directories: Vec<PathBuf>,
+	/// Selected owned files whose directory still holds other live bindings.
+	files: Vec<PathBuf>,
 	/// Non-owning markers for handles from the replaced registry.
-	markers: Vec<Weak<RegisteredDataFile>>,
+	markers: Vec<crate::storage::file_registry::RetiredFileMarker>,
 }
 
 impl RetiredGeneration {
@@ -111,36 +105,103 @@ impl RetiredGeneration {
 			.capacity()
 			.checked_mul(std::mem::size_of::<PathBuf>())
 			.and_then(|bytes| {
-				bytes.checked_add(
-					self.markers
-						.capacity()
-						.checked_mul(std::mem::size_of::<Weak<RegisteredDataFile>>())?,
-				)
+				bytes
+					.checked_add(self.files.capacity().checked_mul(std::mem::size_of::<PathBuf>())?)
+			})
+			.and_then(|bytes| {
+				bytes.checked_add(self.markers.capacity().checked_mul(std::mem::size_of::<
+					crate::storage::file_registry::RetiredFileMarker,
+				>())?)
 			})
 			.ok_or_else(|| invalid("generation retirement metadata overflows"))?;
-		self.directories.iter().try_fold(fixed, |bytes, path| {
+		self.directories.iter().chain(&self.files).try_fold(fixed, |bytes, path| {
 			bytes
 				.checked_add(path.capacity())
 				.ok_or_else(|| invalid("generation retirement paths overflow"))
 		})
 	}
 
-	/// Captures the directories retired by one durable catalog replacement.
+	/// Captures retired directories, selected indexes and snapshot markers.
 	pub(super) fn between(
 		root: &Path,
 		previous: &FileCatalog,
 		current: &FileCatalog,
 		registry: &FileRegistry,
 	) -> FerrosGrynnResult<Option<Self>> {
-		let previous = generation_directories(root, previous)?;
-		let current = generation_directories(root, current)?;
-		let directories = previous.difference(&current).cloned().collect::<Vec<_>>();
-		if directories.is_empty() {
+		let retained = current
+			.files
+			.iter()
+			.map(|entry| (entry.space_id, entry.file_id))
+			.collect::<BTreeSet<_>>();
+		let markers = registry.markers_except(&retained);
+		let previous_directories = generation_directories(root, previous)?;
+		let current_directories = generation_directories(root, current)?;
+		let files = previous
+			.files
+			.iter()
+			.filter_map(|entry| {
+				if retained.contains(&(entry.space_id, entry.file_id)) {
+					return None;
+				}
+				let path = entry.path.resolve(root);
+				let name = path.file_name()?.to_str()?;
+				let parent = path.parent()?;
+				let scalar = entry.file_id.kind() == Some(DataFileKind::Index)
+					&& is_selected_index_name(
+						name,
+						matches!(entry.space_id, crate::datastore::DataSpaceId::Graph(_)),
+					)
+					&& parent.file_name().is_some_and(|name| name == "idx")
+					&& parent
+						.parent()
+						.is_some_and(|directory| current_directories.contains(directory));
+				let root_index = entry.file_id.kind() == Some(DataFileKind::Index)
+					&& is_root_index_name(
+						name,
+						matches!(entry.space_id, crate::datastore::DataSpaceId::Graph(_)),
+					)
+					&& match entry.space_id {
+						crate::datastore::DataSpaceId::Database => {
+							parent.parent() == Some(root.join("atoms").as_path())
+						}
+						crate::datastore::DataSpaceId::Graph(graph) => {
+							parent.parent()
+								== Some(
+									root.join("graphs")
+										.join(format!("{:016x}", graph.get()))
+										.as_path(),
+								)
+						}
+					}
+					&& current_directories.contains(parent);
+				let metadata = matches!(entry.space_id, crate::datastore::DataSpaceId::Graph(_))
+					&& match entry.file_id.kind() {
+						Some(DataFileKind::Labels) => {
+							name == "labels.fgb" && current_directories.contains(parent)
+						}
+						Some(DataFileKind::Statistics | DataFileKind::LabelStatistics) => {
+							matches!(
+								(entry.file_id.kind(), name),
+								(Some(DataFileKind::Statistics), "graph_stats.fgb")
+									| (Some(DataFileKind::LabelStatistics), "label_stats.fgb")
+							) && parent.file_name().is_some_and(|name| name == "stats")
+								&& parent.parent().is_some_and(|directory| {
+									current_directories.contains(directory)
+								})
+						}
+						_ => false,
+					};
+				(scalar || root_index || metadata).then_some(path)
+			})
+			.collect::<Vec<_>>();
+		let directories =
+			previous_directories.difference(&current_directories).cloned().collect::<Vec<_>>();
+		if directories.is_empty() && files.is_empty() && markers.is_empty() {
 			return Ok(None);
 		}
-		let markers = registry.directory_markers(&directories);
 		Ok(Some(Self {
 			directories,
+			files,
 			markers,
 		}))
 	}
@@ -150,28 +211,73 @@ impl RetiredGeneration {
 		self.directories.len()
 	}
 
-	/// Removes every unpinned directory and returns the number of failed
+	/// Pins trusted retired files while checkpoint moves their snapshot pages
+	/// from WAL into home; weak markers alone protect only against unlink.
+	pub(super) fn pinned_files(
+		&self,
+	) -> impl Iterator<
+		Item = ((crate::datastore::DataSpaceId, DataFileId), std::sync::Arc<RegisteredDataFile>),
+	> + '_ {
+		self.markers.iter().filter_map(|(key, marker)| marker.upgrade().map(|file| (*key, file)))
+	}
+
+	/// Removes every unpinned file/directory and returns the number of failed
 	/// removals. A failure remains pending for the next maintenance sweep.
-	pub(super) fn sweep(&mut self) -> u64 {
-		if self.markers.iter().any(|marker| marker.strong_count() != 0) {
-			return 0;
-		}
-		self.markers.clear();
+	pub(super) fn sweep(&mut self, pinned: &[Arc<RegisteredDataFile>]) -> u64 {
+		self.markers.retain(|(_key, marker)| marker.strong_count() != 0);
 		let mut failures = 0_u64;
-		self.directories.retain(|directory| match remove_generation_directory(directory) {
-			Ok(()) => false,
-			Err(_error) => {
-				failures = failures.saturating_add(1);
-				true
+		self.files.retain(|path| {
+			if pinned.iter().any(|file| file.path() == path) {
+				return true;
+			}
+			match remove_retired_file(path) {
+				Ok(()) => false,
+				Err(_error) => {
+					failures = failures.saturating_add(1);
+					true
+				}
+			}
+		});
+		self.directories.retain(|directory| {
+			// A retained artifact can delay directory retirement until a later
+			// batch; readers from every earlier batch still protect its files.
+			if pinned.iter().any(|file| file.path().starts_with(directory)) {
+				return true;
+			}
+			match remove_generation_directory(directory) {
+				Ok(()) => false,
+				Err(_error) => {
+					failures = failures.saturating_add(1);
+					true
+				}
 			}
 		});
 		failures
 	}
 
-	/// Reports whether every retired directory has been removed.
+	/// Reports whether every retired path and snapshot marker was released.
 	pub(super) fn is_empty(&self) -> bool {
-		self.directories.is_empty()
+		self.directories.is_empty() && self.files.is_empty() && self.markers.is_empty()
 	}
+}
+
+/// Collects only handle pins, without cloning paths or resurrecting dead files.
+pub(super) fn pin_retired_files(
+	generations: &[RetiredGeneration],
+) -> FerrosGrynnResult<Vec<Arc<RegisteredDataFile>>> {
+	let count = generations.iter().try_fold(0_usize, |count, generation| {
+		count
+			.checked_add(generation.markers.len())
+			.ok_or_else(|| invalid("retired file pin count overflows"))
+	})?;
+	let mut pinned = Vec::new();
+	pinned
+		.try_reserve_exact(count)
+		.map_err(|_error| invalid("retired file pin allocation failed"))?;
+	pinned.extend(
+		generations.iter().flat_map(RetiredGeneration::pinned_files).map(|(_key, file)| file),
+	);
+	Ok(pinned)
 }
 
 /// Deletes a generation on unwind or error until its catalog commit is known
@@ -296,6 +402,22 @@ pub(super) fn cleanup_orphan_generations(
 	catalog: &FileCatalog,
 ) -> FerrosGrynnResult<()> {
 	let reachable = generation_directories(root, catalog)?;
+	let paths = catalog.files.iter().map(|entry| entry.path.resolve(root)).collect::<BTreeSet<_>>();
+	for directory in &reachable {
+		let atoms = directory.parent() == Some(root.join("atoms").as_path());
+		cleanup_orphan_index_files(&directory.join("idx"), &paths, |name| {
+			is_selected_index_name(name, !atoms)
+		})?;
+		if atoms {
+			cleanup_orphan_index_files(directory, &paths, |name| is_root_index_name(name, false))?;
+		} else {
+			cleanup_orphan_index_files(directory, &paths, |name| is_root_index_name(name, true))?;
+			cleanup_orphan_index_files(directory, &paths, |name| name == "labels.fgb")?;
+			cleanup_orphan_index_files(&directory.join("stats"), &paths, |name| {
+				matches!(name, "graph_stats.fgb" | "label_stats.fgb")
+			})?;
+		}
+	}
 	cleanup_generation_children(&root.join("atoms"), &reachable)?;
 	let graphs = root.join("graphs");
 	if !graphs.exists() {
@@ -314,6 +436,97 @@ pub(super) fn cleanup_orphan_generations(
 		}
 	}
 	Ok(())
+}
+
+/// Root membership names are distinct from scalar/class arrays below `idx`.
+fn is_root_index_name(name: &str, graph: bool) -> bool {
+	if graph {
+		name == "membership.fgidx"
+	} else {
+		matches!(name, "primary.fgidx" | "memberships.fgidx")
+	}
+}
+
+/// Recognizes owned basenames; only graph spaces own label/class arrays.
+fn is_selected_index_name(name: &str, graph: bool) -> bool {
+	if graph && name == "ee_endpoint.fgidx" {
+		return true;
+	}
+	let Some(stem) = name.strip_suffix(".fgidx") else {
+		return false;
+	};
+	if let Some(ordinal) = stem.strip_prefix("std_").or_else(|| stem.strip_prefix("uniq_")) {
+		return ordinal.len() >= 4
+			&& (ordinal.len() == 4 || !ordinal.starts_with('0'))
+			&& ordinal.bytes().all(|byte| byte.is_ascii_digit())
+			&& ordinal.parse::<u32>().is_ok();
+	}
+	if graph && let Some(id) = stem.strip_prefix("cls_") {
+		return !id.starts_with('0')
+			&& id.parse::<u32>().is_ok_and(|id| id != 0)
+			&& id.bytes().all(|byte| byte.is_ascii_digit());
+	}
+	if graph
+		&& let Some(id) = stem.strip_prefix("lbl_node_").or_else(|| stem.strip_prefix("lbl_edge_"))
+	{
+		return !id.is_empty()
+			&& (id.len() == 1 || !id.starts_with('0'))
+			&& id.bytes().all(|byte| byte.is_ascii_digit())
+			&& id.parse::<u32>().is_ok();
+	}
+	false
+}
+
+/// Recovery reachability also governs selected index files in retained
+/// directories; a crash may interrupt their post-publication retirement.
+fn cleanup_orphan_index_files(
+	directory: &Path,
+	reachable: &BTreeSet<PathBuf>,
+	owned_name: impl Fn(&str) -> bool,
+) -> FerrosGrynnResult<()> {
+	let metadata = match fs::symlink_metadata(directory) {
+		Ok(metadata) => metadata,
+		Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(source) => return Err(io_failure("inspect scalar index directory", source)),
+	};
+	if !metadata.is_dir() || metadata.file_type().is_symlink() {
+		return Ok(());
+	}
+	for entry in fs::read_dir(directory)
+		.map_err(|source| io_failure("read scalar index directory", source))?
+	{
+		let entry = entry.map_err(|source| io_failure("read scalar index entry", source))?;
+		let kind =
+			entry.file_type().map_err(|source| io_failure("inspect scalar index entry", source))?;
+		if kind.is_file()
+			&& !kind.is_symlink()
+			&& entry.file_name().to_str().is_some_and(&owned_name)
+			&& !reachable.contains(&entry.path())
+		{
+			remove_retired_file(&entry.path())?;
+		}
+	}
+	Ok(())
+}
+
+/// Unlinks a trusted retired regular file; absence makes cleanup idempotent.
+fn remove_retired_file(path: &Path) -> FerrosGrynnResult<()> {
+	#[cfg(test)]
+	if take_injected_cleanup_failure() {
+		return Err(io_failure(
+			"remove retired file",
+			std::io::Error::other("injected retired-file cleanup failure"),
+		));
+	}
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(io_failure("inspect retired file", error)),
+	};
+	if !metadata.is_file() || metadata.file_type().is_symlink() {
+		return Err(invalid("retired path is not a physical file"));
+	}
+	fs::remove_file(path).map_err(|error| io_failure("remove retired file", error))
 }
 
 /// Removes immutable quarantine files that are not reachable from the
@@ -604,6 +817,528 @@ mod tests {
 			types::{DataFileId, DataFileKind},
 		},
 	};
+
+	/// Only the exact engine-owned endpoint basename belongs to graph cleanup.
+	#[test]
+	fn selected_endpoint_cleanup_name_is_exact_and_graph_only() {
+		assert!(is_selected_index_name("ee_endpoint.fgidx", true));
+		assert!(!is_selected_index_name("ee_endpoint.fgidx", false));
+		for name in
+			["ee_endpoint.fgidx.bak", "ee_endpoint_1.fgidx", "EE_endpoint.fgidx", "ee_endpoint.fgb"]
+		{
+			assert!(!is_selected_index_name(name, true));
+		}
+	}
+
+	/// Only canonical bounded decimal label identities belong to cleanup.
+	#[test]
+	fn selected_label_cleanup_names_are_exact() {
+		for name in ["lbl_node_0.fgidx", "lbl_edge_42.fgidx", "lbl_node_4294967295.fgidx"] {
+			assert!(is_selected_index_name(name, true));
+			assert!(!is_selected_index_name(name, false));
+		}
+		for name in [
+			"lbl_node_.fgidx",
+			"lbl_node_00.fgidx",
+			"lbl_node_-1.fgidx",
+			"lbl_edge_4294967296.fgidx",
+			"lbl_node_1.fgidx.bak",
+			"lbl_other_1.fgidx",
+		] {
+			assert!(!is_selected_index_name(name, true));
+		}
+	}
+
+	/// Class arrays use positive canonical ClassId values, only in graph
+	/// spaces.
+	#[test]
+	fn selected_class_cleanup_names_are_exact() {
+		for name in ["cls_1.fgidx", "cls_4294967295.fgidx"] {
+			assert!(is_selected_index_name(name, true));
+			assert!(!is_selected_index_name(name, false));
+		}
+		for name in [
+			"cls_0.fgidx",
+			"cls_01.fgidx",
+			"cls_+1.fgidx",
+			"cls_4294967296.fgidx",
+			"cls_.fgidx",
+			"cls_1.fgidx.bak",
+		] {
+			assert!(!is_selected_index_name(name, true));
+		}
+	}
+
+	/// Runtime and recovery share exact scoped membership/class ownership.
+	#[test]
+	fn selected_membership_cleanup_checks_scope_kind_and_reachability() {
+		use crate::{storage::direct::DirectFileOpenMode, test_assertions::AssertResult as _};
+		let root =
+			std::env::temp_dir().join(format!("fg-membership-retirement-{}", Uuid::now_v7()));
+		let registry = FileRegistry::open(
+			Vec::new(),
+			DirectFileOpenMode::Synchronous,
+			&rapidhash::RapidHashSet::default(),
+		)
+		.assert_ok();
+		for graph in [false, true] {
+			let (space, prefix) = if graph {
+				(
+					DataSpaceId::Graph(crate::graph::GraphId::new(1).assert_some()),
+					format!("graphs/0000000000000001/{}", Uuid::now_v7()),
+				)
+			} else {
+				(DataSpaceId::Database, format!("atoms/{}", Uuid::now_v7()))
+			};
+			let directory = root.join(&prefix);
+			fs::create_dir_all(directory.join("idx")).assert_ok();
+			for name in [
+				"membership.fgidx",
+				"memberships.fgidx",
+				"membership.fgidx.bak",
+				"idx/cls_1.fgidx",
+				"idx/cls_01.fgidx",
+				"idx/ee_endpoint.fgidx",
+				"idx/ee_endpoint.fgidx.bak",
+			] {
+				fs::write(directory.join(name), b"fixture").assert_ok();
+			}
+			let mut retained = FileCatalog::bootstrap().assert_ok();
+			retained.next_file_instance_id = 3;
+			retained.files.push(FileCatalogEntry {
+				space_id: space,
+				file_id: DataFileId::new(1, DataFileKind::Index).assert_some(),
+				companion_of: None,
+				role: DataFileRole::WalBackfilled,
+				path: CatalogPath::parse(&format!("{prefix}/idx/std_0000.fgidx")).assert_ok(),
+			});
+			for kind in [DataFileKind::Index, DataFileKind::AtomsHot] {
+				for name in [
+					"membership.fgidx",
+					"memberships.fgidx",
+					"idx/cls_1.fgidx",
+					"idx/cls_01.fgidx",
+					"idx/ee_endpoint.fgidx",
+					"idx/ee_endpoint.fgidx.bak",
+				] {
+					let mut previous = retained.clone();
+					previous.files.push(FileCatalogEntry {
+						space_id: space,
+						file_id: DataFileId::new(2, kind).assert_some(),
+						companion_of: None,
+						role: DataFileRole::WalBackfilled,
+						path: CatalogPath::parse(&format!("{prefix}/{name}")).assert_ok(),
+					});
+					let result = RetiredGeneration::between(&root, &previous, &retained, &registry)
+						.assert_ok();
+					let owned = kind == DataFileKind::Index
+						&& if graph {
+							matches!(
+								name,
+								"membership.fgidx" | "idx/cls_1.fgidx" | "idx/ee_endpoint.fgidx"
+							)
+						} else {
+							name == "memberships.fgidx"
+						};
+					if owned {
+						assert_eq!(result.assert_some().files, [directory.join(name)]);
+					} else {
+						assert!(result.is_none(), "{graph} {kind:?} {name}");
+					}
+				}
+			}
+			for _ in 0..2 {
+				cleanup_orphan_generations(&root, &retained).assert_ok();
+			}
+			assert_eq!(directory.join("membership.fgidx").exists(), !graph);
+			assert_eq!(directory.join("memberships.fgidx").exists(), graph);
+			assert_eq!(directory.join("idx/cls_1.fgidx").exists(), !graph);
+			assert_eq!(directory.join("idx/ee_endpoint.fgidx").exists(), !graph);
+			assert!(directory.join("idx/ee_endpoint.fgidx.bak").is_file());
+			assert!(directory.join("membership.fgidx.bak").is_file());
+			assert!(directory.join("idx/cls_01.fgidx").is_file());
+		}
+		drop(fs::remove_dir_all(root));
+	}
+
+	/// A later directory retirement honors an earlier markers-only batch.
+	#[test]
+	fn later_retirement_honors_earlier_file_pins() {
+		use crate::{
+			storage::{
+				direct::{DirectFile, DirectFileOpenMode},
+				file_registry::DataFileRegistration,
+			},
+			test_assertions::AssertResult as _,
+		};
+		let root = std::env::temp_dir().join(format!("fg-retirement-pins-{}", Uuid::now_v7()));
+		let directory = root.join("atoms").join(Uuid::now_v7().to_string());
+		fs::create_dir_all(&directory).assert_ok();
+		let path = directory.join("atoms_hot.fgb");
+		let native = DirectFile::create_new(&path).assert_ok();
+		native.resize_pages(1).assert_ok();
+		drop(native);
+		let id = DataFileId::new(1, DataFileKind::AtomsHot).assert_some();
+		let registry = FileRegistry::open(
+			vec![DataFileRegistration {
+				space_id: DataSpaceId::Database,
+				file_id: id,
+				role: DataFileRole::WalBackfilled,
+				path,
+			}],
+			DirectFileOpenMode::Synchronous,
+			&rapidhash::RapidHashSet::default(),
+		)
+		.assert_ok();
+		let file = registry.resolve_file(DataSpaceId::Database, id).assert_ok();
+		let early = RetiredGeneration {
+			directories: Vec::new(),
+			files: Vec::new(),
+			markers: vec![((DataSpaceId::Database, id), Arc::downgrade(&file))],
+		};
+		let mut later = RetiredGeneration {
+			directories: vec![directory.clone()],
+			files: vec![file.path().to_path_buf()],
+			markers: Vec::new(),
+		};
+		drop(registry);
+		let pinned = pin_retired_files(&[early]).assert_ok();
+		assert_eq!(later.sweep(&pinned), 0);
+		assert!(directory.is_dir());
+		drop(pinned);
+		drop(file);
+		assert_eq!(later.sweep(&[]), 0);
+		assert!(later.is_empty());
+		assert!(!directory.exists());
+		drop(fs::remove_dir_all(root));
+	}
+
+	/// A failed individual unlink remains pending and retries without changing
+	/// the already published catalog or removing another file.
+	#[test]
+	fn individual_file_cleanup_retries_known_failure() {
+		use crate::test_assertions::AssertResult as _;
+		let root = std::env::temp_dir().join(format!("fg-file-retry-{}", Uuid::now_v7()));
+		fs::create_dir_all(&root).assert_ok();
+		let path = root.join("std_0000.fgidx");
+		fs::write(&path, b"retired").assert_ok();
+		let mut retired = RetiredGeneration {
+			directories: Vec::new(),
+			files: vec![path.clone()],
+			markers: Vec::new(),
+		};
+		inject_cleanup_failures(1);
+		assert_eq!(retired.sweep(&[]), 1);
+		assert!(path.is_file());
+		assert!(!retired.is_empty());
+		assert_eq!(retired.sweep(&[]), 0);
+		assert!(!path.exists());
+		assert!(retired.is_empty());
+		drop(fs::remove_dir_all(root));
+	}
+
+	/// Only canonical unreferenced scalar files in reachable directories are
+	/// owned by startup cleanup; unknown names and nested directories survive.
+	#[test]
+	fn startup_scalar_cleanup_preserves_referenced_and_unknown_files() {
+		use crate::test_assertions::AssertResult as _;
+		let root = std::env::temp_dir().join(format!("fg-scalar-orphans-{}", Uuid::now_v7()));
+		let generation = Uuid::now_v7().to_string();
+		let relative = format!("atoms/{generation}/idx");
+		let directory = root.join(&relative);
+		fs::create_dir_all(&directory).assert_ok();
+		for name in [
+			"std_0000.fgidx",
+			"uniq_0001.fgidx",
+			"point_0000000000000001.fgidx",
+			"std_0002.fgidx",
+			"std_00002.fgidx",
+			"user.fgidx",
+			"lbl_node_0.fgidx",
+			"lbl_edge_1.fgidx",
+		] {
+			fs::write(directory.join(name), b"fixture").assert_ok();
+		}
+		fs::create_dir(directory.join("uniq_0003.fgidx")).assert_ok();
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
+		catalog.next_file_instance_id = 2;
+		catalog.files.push(FileCatalogEntry {
+			space_id: DataSpaceId::Database,
+			file_id: DataFileId::new(1, DataFileKind::Index).assert_some(),
+			companion_of: None,
+			role: DataFileRole::WalBackfilled,
+			path: CatalogPath::parse(&format!("{relative}/std_0002.fgidx")).assert_ok(),
+		});
+		for _ in 0..2 {
+			cleanup_orphan_generations(&root, &catalog).assert_ok();
+		}
+		for name in ["std_0000.fgidx", "uniq_0001.fgidx"] {
+			assert!(!directory.join(name).exists());
+		}
+		for name in [
+			"std_0002.fgidx",
+			"std_00002.fgidx",
+			"user.fgidx",
+			"uniq_0003.fgidx",
+			"point_0000000000000001.fgidx",
+			"lbl_node_0.fgidx",
+			"lbl_edge_1.fgidx",
+		] {
+			assert!(directory.join(name).exists());
+		}
+		drop(fs::remove_dir_all(root));
+	}
+
+	/// Graph cleanup removes only unreferenced canonical label arrays.
+	#[test]
+	fn startup_graph_label_cleanup_preserves_referenced_and_unknown_files() {
+		use crate::test_assertions::AssertResult as _;
+		let root = std::env::temp_dir().join(format!("fg-label-orphans-{}", Uuid::now_v7()));
+		let relative = format!("graphs/0000000000000001/{}/idx", Uuid::now_v7());
+		let directory = root.join(&relative);
+		fs::create_dir_all(&directory).assert_ok();
+		for name in [
+			"lbl_node_0.fgidx",
+			"lbl_edge_1.fgidx",
+			"lbl_node_1.fgidx",
+			"lbl_edge_01.fgidx",
+			"lbl_node_4294967296.fgidx",
+			"user.fgidx",
+		] {
+			fs::write(directory.join(name), b"fixture").assert_ok();
+		}
+		fs::create_dir(directory.join("lbl_node_2.fgidx")).assert_ok();
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
+		catalog.next_file_instance_id = 2;
+		catalog.files.push(FileCatalogEntry {
+			space_id: DataSpaceId::Graph(crate::graph::GraphId::new(1).assert_some()),
+			file_id: DataFileId::new(1, DataFileKind::Index).assert_some(),
+			companion_of: None,
+			role: DataFileRole::WalBackfilled,
+			path: CatalogPath::parse(&format!("{relative}/lbl_node_1.fgidx")).assert_ok(),
+		});
+		for _ in 0..2 {
+			cleanup_orphan_generations(&root, &catalog).assert_ok();
+		}
+		for name in ["lbl_node_0.fgidx", "lbl_edge_1.fgidx"] {
+			assert!(!directory.join(name).exists());
+		}
+		for name in [
+			"lbl_node_1.fgidx",
+			"lbl_edge_01.fgidx",
+			"lbl_node_4294967296.fgidx",
+			"lbl_node_2.fgidx",
+			"user.fgidx",
+		] {
+			assert!(directory.join(name).exists());
+		}
+		drop(fs::remove_dir_all(root));
+	}
+
+	/// Startup removes only canonical unreferenced graph metadata, preserving
+	/// lookalikes.
+	#[test]
+	fn startup_namespace_metadata_cleanup_preserves_referenced_unknown_and_atom_files() {
+		use crate::test_assertions::AssertResult as _;
+		let root = std::env::temp_dir().join(format!("fg-namespace-orphans-{}", Uuid::now_v7()));
+		let graph = format!("graphs/0000000000000001/{}", Uuid::now_v7());
+		let atoms = format!("atoms/{}", Uuid::now_v7());
+		for relative in [&graph, &atoms] {
+			fs::create_dir_all(root.join(relative).join("stats")).assert_ok();
+			for name in [
+				"labels.fgb",
+				"labels.fgb.bak",
+				"stats/graph_stats.fgb",
+				"stats/label_stats.fgb",
+				"stats/prop_stats.fgb",
+				"stats/user.fgb",
+			] {
+				fs::write(root.join(relative).join(name), b"fixture").assert_ok();
+			}
+		}
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
+		catalog.next_file_instance_id = 3;
+		for (instance, space, kind, path) in [
+			(
+				1,
+				DataSpaceId::Graph(crate::graph::GraphId::new(1).assert_some()),
+				DataFileKind::Labels,
+				format!("{graph}/labels.fgb"),
+			),
+			(2, DataSpaceId::Database, DataFileKind::AtomsHot, format!("{atoms}/atoms_hot.fgb")),
+		] {
+			catalog.files.push(FileCatalogEntry {
+				space_id: space,
+				file_id: DataFileId::new(instance, kind).assert_some(),
+				companion_of: None,
+				role: DataFileRole::WalBackfilled,
+				path: CatalogPath::parse(&path).assert_ok(),
+			});
+		}
+		for _ in 0..2 {
+			cleanup_orphan_generations(&root, &catalog).assert_ok();
+		}
+		for name in ["stats/graph_stats.fgb", "stats/label_stats.fgb"] {
+			assert!(!root.join(&graph).join(name).exists());
+		}
+		for name in ["labels.fgb", "labels.fgb.bak", "stats/prop_stats.fgb", "stats/user.fgb"] {
+			assert!(root.join(&graph).join(name).exists());
+		}
+		for name in [
+			"labels.fgb",
+			"labels.fgb.bak",
+			"stats/graph_stats.fgb",
+			"stats/label_stats.fgb",
+			"stats/prop_stats.fgb",
+			"stats/user.fgb",
+		] {
+			assert!(root.join(&atoms).join(name).exists());
+		}
+		drop(fs::remove_dir_all(root));
+	}
+
+	/// Selected metadata retirement requires exact kind, basename and graph
+	/// ownership.
+	#[test]
+	fn selected_namespace_metadata_retirement_checks_kind_name_and_owner() {
+		use crate::{storage::direct::DirectFileOpenMode, test_assertions::AssertResult as _};
+		let root = std::env::temp_dir().join(format!("fg-namespace-retirement-{}", Uuid::now_v7()));
+		let registry = FileRegistry::open(
+			Vec::new(),
+			DirectFileOpenMode::Synchronous,
+			&rapidhash::RapidHashSet::default(),
+		)
+		.assert_ok();
+		for graph in [false, true] {
+			for (kind, name, owned) in [
+				(DataFileKind::Labels, "labels.fgb", true),
+				(DataFileKind::Statistics, "stats/graph_stats.fgb", true),
+				(DataFileKind::LabelStatistics, "stats/label_stats.fgb", true),
+				(DataFileKind::Statistics, "stats/label_stats.fgb", false),
+				(DataFileKind::LabelStatistics, "stats/graph_stats.fgb", false),
+				(DataFileKind::PropertyStatistics, "stats/prop_stats.fgb", false),
+				(DataFileKind::Labels, "labels.fgb.bak", false),
+			] {
+				let (space, prefix) = if graph {
+					(
+						DataSpaceId::Graph(crate::graph::GraphId::new(1).assert_some()),
+						format!("graphs/0000000000000001/{}", Uuid::now_v7()),
+					)
+				} else {
+					(DataSpaceId::Database, format!("atoms/{}", Uuid::now_v7()))
+				};
+				let mut previous = FileCatalog::bootstrap().assert_ok();
+				previous.next_file_instance_id = 3;
+				for (instance, kind, name) in
+					[(1, DataFileKind::Index, "idx/std_0000.fgidx"), (2, kind, name)]
+				{
+					previous.files.push(FileCatalogEntry {
+						space_id: space,
+						file_id: DataFileId::new(instance, kind).assert_some(),
+						companion_of: None,
+						role: DataFileRole::WalBackfilled,
+						path: CatalogPath::parse(&format!("{prefix}/{name}")).assert_ok(),
+					});
+				}
+				let mut current = previous.clone();
+				current.files.retain(|entry| entry.file_id.instance_id() != 2);
+				let retired =
+					RetiredGeneration::between(&root, &previous, &current, &registry).assert_ok();
+				if graph && owned {
+					let retired = retired.assert_some();
+					assert_eq!(retired.files, [root.join(&prefix).join(name)]);
+					assert!(retired.directories.is_empty());
+				} else {
+					assert!(retired.is_none());
+				}
+			}
+		}
+	}
+
+	/// Individual retirement uses the same graph-only ownership as recovery.
+	#[test]
+	fn selected_label_retirement_requires_graph_ownership() {
+		use crate::{
+			storage::{direct::DirectFileOpenMode, file_registry::FileRegistry},
+			test_assertions::AssertResult as _,
+		};
+		let root = std::env::temp_dir().join(format!("fg-label-retirement-{}", Uuid::now_v7()));
+		let registry = FileRegistry::open(
+			Vec::new(),
+			DirectFileOpenMode::Synchronous,
+			&rapidhash::RapidHashSet::default(),
+		)
+		.assert_ok();
+		for graph in [false, true] {
+			let (space, relative) = if graph {
+				(
+					DataSpaceId::Graph(crate::graph::GraphId::new(1).assert_some()),
+					format!("graphs/0000000000000001/{}/idx", Uuid::now_v7()),
+				)
+			} else {
+				(DataSpaceId::Database, format!("atoms/{}/idx", Uuid::now_v7()))
+			};
+			let mut previous = FileCatalog::bootstrap().assert_ok();
+			previous.next_file_instance_id = 3;
+			for (instance, name) in [(1, "std_0000.fgidx"), (2, "lbl_node_0.fgidx")] {
+				previous.files.push(FileCatalogEntry {
+					space_id: space,
+					file_id: DataFileId::new(instance, DataFileKind::Index).assert_some(),
+					companion_of: None,
+					role: DataFileRole::WalBackfilled,
+					path: CatalogPath::parse(&format!("{relative}/{name}")).assert_ok(),
+				});
+			}
+			let mut current = previous.clone();
+			current.files.retain(|entry| entry.file_id.instance_id() != 2);
+			let retired =
+				RetiredGeneration::between(&root, &previous, &current, &registry).assert_ok();
+			if graph {
+				let retired = retired.assert_some();
+				assert_eq!(retired.files, [root.join(relative).join("lbl_node_0.fgidx")]);
+				assert!(retired.directories.is_empty());
+			} else {
+				assert!(retired.is_none());
+			}
+		}
+	}
+
+	/// Primary retirement preserves referenced files and unknown neighbours.
+	#[test]
+	fn startup_primary_cleanup_preserves_referenced_and_unknown_files() {
+		use crate::test_assertions::AssertResult as _;
+		let root = std::env::temp_dir().join(format!("fg-primary-orphans-{}", Uuid::now_v7()));
+		let relative = format!("atoms/{}", Uuid::now_v7());
+		let directory = root.join(&relative);
+		fs::create_dir_all(&directory).assert_ok();
+		for name in ["primary.fgidx", "primary-backup.fgidx", "user.fgidx"] {
+			fs::write(directory.join(name), b"fixture").assert_ok();
+		}
+		let mut catalog = FileCatalog::bootstrap().assert_ok();
+		catalog.next_file_instance_id = 3;
+		for (instance, kind, name) in [
+			(1, DataFileKind::AtomsHot, "atoms_hot.fgb"),
+			(2, DataFileKind::Index, "primary.fgidx"),
+		] {
+			catalog.files.push(FileCatalogEntry {
+				space_id: DataSpaceId::Database,
+				file_id: DataFileId::new(instance, kind).assert_some(),
+				companion_of: None,
+				role: DataFileRole::WalBackfilled,
+				path: CatalogPath::parse(&format!("{relative}/{name}")).assert_ok(),
+			});
+		}
+		cleanup_orphan_generations(&root, &catalog).assert_ok();
+		assert!(directory.join("primary.fgidx").is_file());
+		catalog.files.retain(|entry| entry.file_id.kind() != Some(DataFileKind::Index));
+		for _ in 0..2 {
+			cleanup_orphan_generations(&root, &catalog).assert_ok();
+		}
+		assert!(!directory.join("primary.fgidx").exists());
+		assert!(directory.join("primary-backup.fgidx").is_file());
+		assert!(directory.join("user.fgidx").is_file());
+		drop(fs::remove_dir_all(root));
+	}
 
 	/// Verifies startup cleanup removes only unreachable uuid generations.
 	#[test]
