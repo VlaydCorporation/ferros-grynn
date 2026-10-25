@@ -8,37 +8,27 @@ Ferros-Grynn is a **metagraph** engine with embedded data storage its own GQL qu
 The graph model is universal: it aims to represent metagraphs, hypergraphs, multigraphs, trees, DAGs and plain graphs uniformly (including their oriented, undirected, weighted, probabilistic, and attributed versions), supporting every kind of incidence (vertex–vertex, vertex–edge, edge–edge), graphs nested inside atoms (nodes/edges), and cross-level incidence between nested graphs. 
 It ships its own storage layer (Direct I/O with an optional Async I/O wrapper) and a query language (GQL) that blends Cypher, Gremlin and SurrealQL — SQL-like queries, graphs-as-tables, path matching, and imperative traverser-based pipelines.
 
-Most design docs, code comments, and `docs/implementation_notes.md` are written in **Russian** — preserve that language when editing them.
+Most design docs, code comments, and `docs/disk_storage_spec.md` are written in **Russian** — preserve that language when editing them.
 
 
 ## Project Structure
 
 ```text
-src/
-  changefeed/    # Public owned changefeed configuration, images and cursors
-  asynchronous/  # Reusable async/concurrency components; disconnected until audited
-  collections/   # Reusable collections and data structures
-  datastore/     # Datastore composition, catalogs, MVCC and transactions
-  ecs/           # AtomId-keyed runtime sidecar components and property columns
-  gql/           # Semantic analysis, logical IR and query execution
-  gql_status/    # Project-wide statuses, diagnostics, outcomes and errors
-  graph/         # Public runtime graph families, views, paths and algorithms
-  live/          # Public owned LIVE recipes, identities, options and metadata
-  math/          # Project-wide reusable mathematical operations
-  memory/        # Allocator/tracking, heap accounting and resource policy
-  storage/       # Local pages, indexes, WAL, recovery and Direct I/O
-  stats/         # Transactional planner counts and bulk-built histograms
-  syn/           # GrynnQL lexer, tokens, syntax tree and parser
-  unsafed/       # Reusable unsafe primitives; disconnected until audited
-  utils/         # Small project-wide utilities, grouped by subject as they grow
-  values/        # Runtime values, storage representation and columnar adapters
-  sys.rs         # System environment: process, CPU, memory and host observations
-docs/                         # Specifications, plans and reports
-ferros-grynn-bench/           # Ferros-Grynn benchmarks
+src/                         # Public SDK facade and disconnected legacy sources
+crates/fg-memory/src/         # Allocator, heap estimates and allocation accounting
+crates/fg-syntax/src/syn/     # Lexer, tokens, AST, parser and parser configuration
+crates/fg-runtime/src/        # Runtime values, graph families, ECS, math and CowVec
+crates/fg-value-codec/src/values/storage/  # Internal DTOs and canonical codecs
+crates/fg-columnar/src/values/columnar/   # PropertyBatch, Arrow and optional DataFusion
+crates/fg-engine/src/         # Datastore, storage, GQL, stats, LIVE, changefeed, bridges
+crates/fg-gql-status/src/     # Project-wide statuses and diagnostics
+crates/fg-test-support/       # Existing assertions for tests and benchmark setup
 crates/ferros-grynn-macros/   # Production procedural macros
 crates/fg-storage-engine-prototypes/  # Test-only storage experiments and probes
 crates/{ferntree,storekey,surrealmx,surrealdb}/  # Read-only reference trees
-tests/                        # Integration tests
+ferros-grynn-bench/          # Benchmarks consuming the public facade
+docs/                        # Specifications, plans and reports
+tests/                       # Facade integration tests
 ```
 
 New project-wide modules are allowed when a reusable responsibility has more
@@ -50,29 +40,29 @@ belong in `src/macros`; do not create an empty module tree in advance.
 Read the nearest module-specific instructions before editing a large production
 area:
 
-- [`src/storage/AGENTS.md`](src/storage/AGENTS.md) — local pages, indexes, WAL,
+- [`crates/fg-engine/src/storage/AGENTS.md`](crates/fg-engine/src/storage/AGENTS.md) — local pages, indexes, WAL,
   checkpoint/recovery and Direct I/O;
-- [`src/stats/AGENTS.md`](src/stats/AGENTS.md) — transactional counters and
+- [`crates/fg-engine/src/stats/AGENTS.md`](crates/fg-engine/src/stats/AGENTS.md) — transactional counters and
   bulk-built planner histograms;
-- [`src/datastore/AGENTS.md`](src/datastore/AGENTS.md) — catalogs, MVCC,
+- [`crates/fg-engine/src/datastore/AGENTS.md`](crates/fg-engine/src/datastore/AGENTS.md) — catalogs, MVCC,
   transactions and backend composition;
-- [`src/graph/AGENTS.md`](src/graph/AGENTS.md) — runtime graph families,
+- [`crates/fg-runtime/src/graph/AGENTS.md`](crates/fg-runtime/src/graph/AGENTS.md) — runtime graph families,
   views, paths and algorithms;
 - [`src/values/AGENTS.md`](src/values/AGENTS.md) — runtime values, storage DTOs
   and columnar conversion;
-- [`src/syn/AGENTS.md`](src/syn/AGENTS.md) — lexer, tokens, AST and parser;
-- [`src/gql/AGENTS.md`](src/gql/AGENTS.md) — analysis, logical IR and execution;
-- [`src/gql_status/AGENTS.md`](src/gql_status/AGENTS.md) — statuses,
+- [`crates/fg-syntax/src/syn/AGENTS.md`](crates/fg-syntax/src/syn/AGENTS.md) — lexer, tokens, AST and parser;
+- [`crates/fg-engine/src/gql/AGENTS.md`](crates/fg-engine/src/gql/AGENTS.md) — analysis, logical IR and execution;
+- [`crates/fg-gql-status/src/AGENTS.md`](crates/fg-gql-status/src/AGENTS.md) — statuses,
   diagnostics, errors and wire DTOs;
 - [`src/collections/AGENTS.md`](src/collections/AGENTS.md) — internal and
   reusable collections;
 - [`src/asynchronous/AGENTS.md`](src/asynchronous/AGENTS.md) — reusable async
   and concurrency components;
-- [`src/ecs/AGENTS.md`](src/ecs/AGENTS.md) — AtomId-keyed component and
+- [`crates/fg-runtime/src/ecs/AGENTS.md`](crates/fg-runtime/src/ecs/AGENTS.md) — AtomId-keyed component and
   materialized-property sidecars;
-- [`src/math/AGENTS.md`](src/math/AGENTS.md) — reusable mathematical
+- [`crates/fg-runtime/src/math/AGENTS.md`](crates/fg-runtime/src/math/AGENTS.md) — reusable mathematical
   operations;
-- [`src/memory/AGENTS.md`](src/memory/AGENTS.md) — allocators, allocation
+- [`crates/fg-memory/src/AGENTS.md`](crates/fg-memory/src/AGENTS.md) — allocators, allocation
   tracking and memory accounting;
 - [`src/unsafed/AGENTS.md`](src/unsafed/AGENTS.md) — reusable unsafe
   primitives and their proof obligations;
@@ -81,7 +71,7 @@ area:
 `src/sys.rs` is a file module, so its responsibility is recorded here rather
 than in a synthetic directory: it observes the process and host environment
 (system/cgroup memory, CPU, load and available parallelism). Memory policy and
-allocator accounting remain in `src/memory`.
+allocator accounting remain in `crates/fg-memory/src`.
 
 
 ## Repository state — read this first
@@ -89,12 +79,14 @@ allocator accounting remain in `src/memory`.
 The repo is mid-migration (branch `mvp`). Verify the exact feature/target slice
 you touch rather than assuming every configuration is complete.
 
-- The **root crate `ferros-grynn`** is the production target. Its active topology
-  is defined by `src/lib.rs`: collections, values, graph, datastore, storage,
-  GQL, statuses, ECS, math, memory, system information and utilities are
-  connected. `asynchronous`, `unsafed` and `collections/roaring_graphs` remain
-  disconnected; code in those paths is not production evidence until it is
-  reviewed, prepared for production and wired into normal checks.
+- The **root crate `ferros-grynn`** is the public SDK facade. `src/lib.rs`
+  re-exports the original concrete types from their production owners above.
+  Engine internals and storage DTOs remain outside the SDK. Internal owners
+  never depend on the facade, including in tests; benchmarks and prototypes
+  continue to consume it. Technical `__internal` namespaces are not SDK exports.
+  `src/asynchronous`, `src/unsafed`, `src/sys.rs`, `src/utils` and the remaining
+  legacy collections stay disconnected; production `CowVec` belongs to runtime.
+  Disconnected code needs review and normal gates before it can be wired in.
 - `crates/fg-meta` is a raw, unverified implementation example. It is not a
   specification or behavioral source of truth and needs the same review as any
   other reference before ideas or code are reused.
@@ -104,12 +96,12 @@ you touch rather than assuming every configuration is complete.
   `crates/surrealdb` are local study/reference trees, not root dependencies or
   workspace members. Their useful areas are summarized in
   `docs/reports/future_capability_analysis_stage_1_6.md` §§7.3–7.6.
-  `crates/ferros-grynn-macros`, `crates/fg-storage-engine-prototypes` and
-  `ferros-grynn-bench` are the actual additional workspace members. The
+  The workspace members are the facade, the production owners listed above,
+  `fg-test-support`, macros, storage prototypes and benchmarks. The
   removed `crates/configuration` must not be treated as an available
   implementation source.
 
-Current `src/`, current tests and the normative specifications control
+Current facade and production-owner sources, current tests and the normative specifications control
 production behavior. Reference trees may supply hypotheses, algorithms or
 test ideas only after their assumptions have been verified against those
 contracts.
@@ -120,14 +112,14 @@ contracts.
 ### Allocator & platform I/O (compile-time selected)
 - **Global allocator**: `mimalloc-pprof` on MSVC-compatible targets and
   `tikv-jemallocator` on supported non-MSVC Unix targets, selected in
-  `src/memory`.
-- **Direct I/O** lives in `src/storage`: platform file access, page I/O, the
+  `crates/fg-memory/src`.
+- **Direct I/O** lives in `crates/fg-engine/src/storage`: platform file access, page I/O, the
   production `HybridReadEngine`, WAL and checkpoint/recovery use one on-disk
   contract. The engine combines an atomic resident arena with validated sync
   Direct reads, sequential scatter/prefetch bypass and optional frame-IoRing
   for known sparse windows; mmap remains a benchmark control.
 
-### Graph core (`src/graph`)
+### Graph core (`crates/fg-runtime/src/graph`)
 - Nodes and edges are atoms stored in family-specific **struct-of-arrays (SoA)**
   layouts. `Graph`, `Forest`/`Tree`, `Dag`, `Hypergraph`, `Metagraph` and
   `Subgraph` retain separate structural invariants.
@@ -142,23 +134,23 @@ contracts.
 
 ### Values (`src/values`)
 The property/value type system. Read `src/values/AGENTS.md` before changing it.
-- `runtime` — the public Rust SDK types, collections, identifiers and
-  runtime-only values; graph types are owned by `src/graph` and compatibly
+- `runtime` in `fg-runtime` — the public Rust SDK types, collections, identifiers and
+  runtime-only values; graph types are owned by `crates/fg-runtime/src/graph` and compatibly
   re-exported through the values surface where required.
-- `storage` — internal on-disk DTOs, tags, conversion contexts, and codecs.
-- `columnar` — future Arrow/DataFusion batch materialization; runtime remains independent of it.
+- `storage` in `fg-value-codec` — internal DTOs, tags, conversion contexts and canonical codecs.
+- `columnar` in `fg-columnar` — PropertyBatch and Arrow/DataFusion materialization; runtime remains independent of it.
 
-### MVCC & persistence (`src/datastore`, `src/storage`)
+### MVCC & persistence (`crates/fg-engine/src/datastore`, `crates/fg-engine/src/storage`)
 
 The production datastore owns immutable MVCC roots, FCW/SSI validation,
 predicate tracking and RAM/local backend composition. Storage owns the
 database-level frame WAL, segment rotation, checkpoint/recovery and physical
 pages. Production behavior is governed by current specifications and root
 tests. Read
-`docs/implementation_notes.md` and the two module `AGENTS.md` files before
+`docs/disk_storage_spec.md` and the two module `AGENTS.md` files before
 touching MVCC, WAL or checkpoint code.
 
-### Status & error system (`src/gql_status`)
+### Status & error system (`crates/fg-gql-status/src`)
 This is the project-wide diagnostics/error mechanism — **not** just query errors. The core unit is a `Status` (GQLSTATUS-style: `Condition` + classification). Statuses are **code-generated** by the `define_status_codes!` proc macro (in `crates/ferros-grynn-macros/src/status_codes.rs`) from declarative descriptions with `template`/`params`/`subcondition`/`descriptor`/`hint`. Wrapping chain: `Status` → `DiagnosticRecord` → `ErrorState` → `FerrosGrynnError`. Both error *and* notification statuses exist, and statuses can be chained. When adding a new status, add it to the macro invocation rather than hand-writing a variant.
 
 ### Proc macros (`crates/ferros-grynn-macros`)
@@ -166,9 +158,9 @@ This is the project-wide diagnostics/error mechanism — **not** just query erro
 - `#[derive(StructureAccumulator)]` — builds an accumulator for JSON-like `Map<String, AnyValue>`; requires implementing `AccumulatorBuilder`.
 - `define_status_codes!` — see the status system above.
 
-### Query language (`src/gql`, `src/syn`)
-`src/syn` is the syntax front end (`lexer`, `token`, `parser`, AST and statement
-nodes). `src/gql` preserves the `parse -> analyze -> logical IR -> execute`
+### Query language (`crates/fg-engine/src/gql`, `crates/fg-syntax/src/syn`)
+`crates/fg-syntax/src/syn` is the syntax front end (`lexer`, `token`, `parser`, AST and statement
+nodes). `crates/fg-engine/src/gql` preserves the `parse -> analyze -> logical IR -> execute`
 pipeline and uses a transaction adapter for storage access. Extend it through
 vertical slices after reconciling the specifications below.
 
@@ -213,22 +205,26 @@ just build
 # Full code verification (REQUIRED before commits)
 just all-check
 
-# Run all tests
-cargo test
+# Run the complete workspace suite, including owner unit tests and doctests
+just test
 
-# Run a single test by substring
-cargo test <name>
+# Run a focused engine test
+cargo test --locked -p fg-engine --no-default-features <name> -- --test-threads=1
 
 # Workspace benchmarks (criterion + divan)
 cargo bench -p ferros-grynn-bench
 
 ```
 
+`cargo test` and `cargo test -p ferros-grynn` select only the facade and its
+integration tests. The default workspace package remains `ferros-grynn`.
+Core Clippy and coverage explicitly select the moved production owners.
+
 The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optimized builds are slow; prefer `cargo check`/debug builds while iterating.
 
 ## Code Quality Rules
 
-- Use types errors from `src/gql_status` for fallible APIs, don't use `anyhow` - it erases errors; NEWER use `.expect()` or another panics.
+- Use types errors from `crates/fg-gql-status/src` for fallible APIs, don't use `anyhow` - it erases errors; NEWER use `.expect()` or another panics.
 - Never use `.unwrap_or_default()` when debugging - it masks errors.
 - Follow the Clippy coding rules noted in `Cargo.toml` and their configurations in the `clippy.toml` file.
 - Completely cover code (includes private modules) with comments, including Panics, Errors and Safety sections, as required by Clippy.

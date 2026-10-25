@@ -5,6 +5,8 @@ rustflags = ["--cfg", "tokio_unstable"]
 #rustflags = ["--cfg", "tokio_unstable", "-Z", "threads=8"] # for nightly toolchain
 
 [target.x86_64-pc-windows-msvc]
+# Use the bundled COFF linker for locale-independent Windows diagnostics.
+linker = "rust-lld"
 rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=/NODEFAULTLIB:libvcruntimed.lib",

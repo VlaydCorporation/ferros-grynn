@@ -1,0 +1,35 @@
+[package]
+name = "fg-value-codec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Canonical value DTOs, budgets and codecs for Ferros-Grynn"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+fg-runtime.workspace = true
+fg-memory.workspace = true
+fg-gql-status.workspace = true
+jiff.workspace = true
+rust_decimal.workspace = true
+half.workspace = true
+rkyv.workspace = true
+uuid.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+fg-test-support.workspace = true
+proptest.workspace = true
+fg-memory = { workspace = true, features = ["test-support"] }
+compact_str.workspace = true

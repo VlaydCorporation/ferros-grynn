@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Report,
     [Parameter(Mandatory)][string]$Output,
     [string]$Commit = $env:GITHUB_SHA,
-    [string]$Scope = 'Windows; ferros-grynn; no-default-features; lib and integration tests'
+    [string]$Scope = 'Windows; facade and core owners; no-default-features; lib and integration tests'
 )
 
 # Reject empty or inconsistent reports rather than presenting fabricated coverage.

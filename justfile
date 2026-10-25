@@ -31,7 +31,7 @@ clippy *args:
 # Check core targets without workspace feature unification
 [group('dev')]
 clippy-core:
-    cargo +{{toolchain}} clippy --locked -p ferros-grynn --no-default-features --all-targets -- -D warnings
+    cargo +{{toolchain}} clippy --locked -p ferros-grynn -p fg-memory -p fg-syntax -p fg-runtime -p fg-value-codec -p fg-engine -p fg-gql-status --no-default-features --all-targets -- -D warnings
 
 # Check compilation, formatting and Clippy without rewriting source
 [group('dev')]

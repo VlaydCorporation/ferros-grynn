@@ -315,6 +315,8 @@ async fn wait_native_close(directory: &std::path::Path) -> FerrosGrynnResult<()>
 #[cfg(feature = "bridge-surreal-rocksdb")]
 #[test]
 fn bridge_surreal_rocksdb_both_directions_and_reopen() -> FerrosGrynnResult<()> {
+	use crate::test_assertions::AssertComparison as _;
+
 	let directory =
 		std::env::temp_dir().join(format!("sdb30-{:016x}", uuid::Uuid::now_v7().as_u128() as u64));
 	runtime()?.block_on(async {
@@ -336,7 +338,7 @@ fn bridge_surreal_rocksdb_both_directions_and_reopen() -> FerrosGrynnResult<()> 
 			.map_err(external)?;
 		client.use_ns("bridge").use_db("test").await.map_err(external)?;
 		let value = single(client.query("RETURN retained:a.value").await.map_err(external)?)?;
-		assert_eq!(value, sdk::Value::Number(sdk::Number::Int(7)));
+		(&value, &sdk::Value::Number(sdk::Number::Int(7))).assert_equal();
 		drop(client);
 		wait_native_close(&directory).await?;
 		Ok::<_, FerrosGrynnError>(())

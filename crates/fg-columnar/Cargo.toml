@@ -1,0 +1,32 @@
+[package]
+name = "fg-columnar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Arrow and optional DataFusion property batches for Ferros-Grynn"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+datafusion = ["dep:datafusion"]
+
+[dependencies]
+fg-runtime.workspace = true
+fg-gql-status.workspace = true
+arrow.workspace = true
+rust_decimal.workspace = true
+uuid.workspace = true
+ulid.workspace = true
+datafusion = { workspace = true, optional = true }
+
+[dev-dependencies]
+fg-test-support.workspace = true
+tokio.workspace = true

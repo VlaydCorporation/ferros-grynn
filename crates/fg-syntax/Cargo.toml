@@ -1,0 +1,27 @@
+[package]
+name = "fg-syntax"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Owned GrynnQL lexer, parser and syntax trees"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+fg-gql-status.workspace = true
+reblessive.workspace = true
+
+[dev-dependencies]
+fg-memory.workspace = true
+fg-test-support.workspace = true
+proptest.workspace = true

@@ -1,7 +1,10 @@
 /.idea
 /target
 /output
+/graphify-out
 
-/crates/configuration
-/crates/storage_engine
+/crates/ferntree
+/crates/storekey
+/crates/surrealmx
+/crates/surrealdb
 /.codex/hooks.json

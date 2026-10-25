@@ -1,7 +1,5 @@
+//! Owned runtime SDK values and optional columnar materialization.
+/// Arrow property batches and optional DataFusion adapters.
 #[cfg(feature = "columnar")]
-pub mod columnar;
-/// Owned Rust SDK values and their type, comparison and conversion contracts.
-pub mod runtime;
-pub(crate) mod storage;
-
-pub use runtime::*;
+pub use fg_columnar as columnar;
+pub use fg_runtime::values::*;

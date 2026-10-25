@@ -15,13 +15,13 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo-llvm-cov is required.' }
 if ($Scope -eq 'Workspace') {
     $reportRoot = 'target/coverage-workspace'
     $testArguments = @('--workspace', '--lib', '--bins', '--tests')
-    $exclude = '(^|[/\\])tests[/\\]|(^|[/\\])([^/\\]*_)?tests\.rs$'
+    $exclude = '(^|[/\\])tests[/\\]|(^|[/\\])([^/\\]*_)?tests\.rs$|(^|[/\\])crates[/\\]fg-test-support[/\\]'
     $description = 'Windows; workspace; default features; library, binary and integration tests'
 } else {
     $reportRoot = 'target/coverage'
-    $testArguments = @('-p', 'ferros-grynn', '--no-default-features', '--lib', '--tests')
-    $exclude = '(^|[/\\])(tests|crates|ferros-grynn-bench)[/\\]|(^|[/\\])([^/\\]*_)?tests\.rs$'
-    $description = 'Windows; ferros-grynn; no-default-features; lib and integration tests'
+    $testArguments = @('-p', 'ferros-grynn', '-p', 'fg-memory', '-p', 'fg-syntax', '-p', 'fg-runtime', '-p', 'fg-value-codec', '-p', 'fg-engine', '--no-default-features', '--lib', '--tests')
+    $exclude = '(^|[/\\])(tests|ferros-grynn-bench)[/\\]|(^|[/\\])([^/\\]*_)?tests\.rs$|(^|[/\\])crates[/\\](?!(?:fg-memory|fg-syntax|fg-runtime|fg-value-codec|fg-engine)[/\\])'
+    $description = 'Windows; facade and core owners; no-default-features; lib and integration tests'
 }
 New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
 # --no-report retains profiles, so clear the coverage workspace before this run.

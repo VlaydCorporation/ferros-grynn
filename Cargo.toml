@@ -1,16 +1,43 @@
 [workspace]
 resolver = "3"
+default-members = ["."]
 members = [
-    "crates/ferros-grynn-macros", "crates/fg-gql-status",
+    "crates/fg-engine",
+    "crates/fg-value-codec",
+    "crates/fg-columnar",
+    "crates/fg-runtime",
+    "crates/fg-syntax",
+    "crates/fg-test-support",
+    "crates/fg-memory",
+    "crates/ferros-grynn-macros",
+    "crates/fg-gql-status",
     "crates/fg-storage-engine-prototypes",
     "ferros-grynn-bench"
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Vlayd Detect"]
+license = "Apache-2.0"
+repository = "https://github.com/VlaydCorporation/ferros-grynn"
+homepage = "https://github.com/VlaydCorporation/ferros-grynn"
+keywords = ["database", "embedded-database", "graph", "graph-store"]
+categories = ["database-implementations", "data-structures", "embedded"]
+
 [workspace.dependencies]
+fg-engine = { path = "crates/fg-engine", version = "=0.1.0", default-features = false }
+flate2 = "=1.1.10"
+fg-value-codec = { path = "crates/fg-value-codec", version = "=0.1.0", default-features = false }
+fg-columnar = { path = "crates/fg-columnar", version = "=0.1.0", default-features = false }
+fg-runtime = { path = "crates/fg-runtime", version = "=0.1.0", default-features = false }
+fg-syntax = { path = "crates/fg-syntax", version = "=0.1.0", default-features = false }
 # Ferros-Grynn
-ferros-grynn = { path = ".", default-features = false }
-ferros-grynn-macros = { path = "crates/ferros-grynn-macros" }
-fg-gql-status = { path = "crates/fg-gql-status" }
+fg-test-support = { path = "crates/fg-test-support", version = "=0.1.0", default-features = false }
+fg-memory = { path = "crates/fg-memory", version = "=0.1.0", default-features = false }
+ferros-grynn = { path = ".", version = "=0.1.0", default-features = false }
+ferros-grynn-macros = { path = "crates/ferros-grynn-macros", version = "=0.1.0" }
+fg-gql-status = { path = "crates/fg-gql-status", version = "=0.1.0", default-features = false }
 
 # --------- Platform ---------
 sysinfo = "0.39.6"
@@ -219,14 +246,14 @@ categories = ["database-implementations", "data-structures", "embedded"]
 
 [features]
 default = ["columnar", "datafusion"]
-columnar = ["dep:arrow"]
-datafusion = ["columnar", "dep:datafusion"]
-native-async-io = []
-bridge-surreal = ["dep:surrealdb"]
-bridge-surreal-mem = ["bridge-surreal", "surrealdb/kv-mem"]
-bridge-surreal-rocksdb = ["bridge-surreal", "surrealdb/kv-rocksdb"]
-allocation-tracking = []
-storage-engine-prototype-api = []
+columnar = ["dep:arrow", "dep:fg-columnar"]
+datafusion = ["columnar", "dep:datafusion", "fg-columnar/datafusion"]
+native-async-io = ["fg-engine/native-async-io"]
+bridge-surreal = ["dep:surrealdb", "fg-engine/bridge-surreal"]
+bridge-surreal-mem = ["bridge-surreal", "surrealdb/kv-mem", "fg-engine/bridge-surreal-mem"]
+bridge-surreal-rocksdb = ["bridge-surreal", "surrealdb/kv-rocksdb", "fg-engine/bridge-surreal-rocksdb"]
+allocation-tracking = ["fg-memory/allocation-tracking", "fg-engine/allocation-tracking"]
+storage-engine-prototype-api = ["fg-engine/storage-engine-prototype-api"]
 
 # -------------------- System API --------------------
 [target.'cfg(windows)'.dependencies]
@@ -236,14 +263,13 @@ windows = { workspace = true }
 nix = { workspace = true }
 # ----------------------------------------------------
 
-# -------------------- Custom Allocator --------------------
-[target.'cfg(target_env="msvc")'.dependencies]
-mimalloc-pprof = { workspace = true }
-[target.'cfg(not(target_env="msvc"))'.dependencies]
-tikv-jemallocator = { workspace = true }
-# ----------------------------------------------------------
-
 [dependencies]
+fg-engine.workspace = true
+fg-value-codec.workspace = true
+fg-columnar = { workspace = true, optional = true }
+fg-runtime.workspace = true
+fg-syntax.workspace = true
+fg-memory = { workspace = true }
 fg-gql-status = { workspace = true }
 
 # --------- Platform ---------
@@ -292,7 +318,10 @@ icu_normalizer = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-flate2 = "=1.1.10"
+fg-runtime = { workspace = true, features = ["test-support"] }
+fg-test-support = { workspace = true }
+fg-memory = { workspace = true, features = ["test-support"] }
+flate2.workspace = true
 proptest = { workspace = true }
 memmap2 = { workspace = true }
 dashmap = { workspace = true }
@@ -304,7 +333,10 @@ mimalloc-pprof = { workspace = true }
 pprof = { workspace = true }
 
 # See: https://rust-lang.github.io/rust-clippy/master/index.html
-[lints.clippy]
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
 # TODO: missing_enforced_import_renames
 # TODO: missing_inline_in_public_items
 absurd_extreme_comparisons = "deny"

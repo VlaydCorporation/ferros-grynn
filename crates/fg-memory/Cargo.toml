@@ -1,0 +1,39 @@
+[package]
+name = "fg-memory"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Ferros-Grynn allocator and heap accounting"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+allocation-tracking = []
+test-support = ["dep:parking_lot", "dep:rapidhash"]
+
+[dependencies]
+fg-gql-status.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true
+rapidhash.workspace = true
+# -------------------- Custom Allocator --------------------
+[target.'cfg(target_env="msvc")'.dependencies]
+mimalloc-pprof = { workspace = true }
+[target.'cfg(not(target_env="msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+# ----------------------------------------------------------
+
+
+# Test instrumentation retains the original weak reporter registry.
+[target.'cfg(any(unix, windows))'.dependencies]
+parking_lot = { workspace = true, optional = true }
+rapidhash = { workspace = true, optional = true }

@@ -2386,7 +2386,14 @@ dependencies = [
  "deunicode",
  "diskann 0.59.0",
  "diskann-vector 0.59.0",
+ "fg-columnar",
+ "fg-engine",
  "fg-gql-status",
+ "fg-memory",
+ "fg-runtime",
+ "fg-syntax",
+ "fg-test-support",
+ "fg-value-codec",
  "flate2",
  "geo",
  "geojson",
@@ -2414,7 +2421,6 @@ dependencies = [
  "surrealdb",
  "sysinfo 0.39.6",
  "thin-vec",
- "tikv-jemallocator",
  "tokio",
  "ulid 3.0.0",
  "uuid",
@@ -2457,6 +2463,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "fg-columnar"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "fg-gql-status",
+ "fg-runtime",
+ "fg-test-support",
+ "rust_decimal",
+ "tokio",
+ "ulid 3.0.0",
+ "uuid",
+]
+
+[[package]]
+name = "fg-engine"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "compact_str",
+ "dashmap 7.0.0-rc2",
+ "deunicode",
+ "diskann 0.59.0",
+ "diskann-vector 0.59.0",
+ "fg-gql-status",
+ "fg-memory",
+ "fg-runtime",
+ "fg-syntax",
+ "fg-test-support",
+ "fg-value-codec",
+ "flate2",
+ "geo",
+ "geojson",
+ "half",
+ "icu_collator",
+ "icu_normalizer",
+ "jiff",
+ "memmap2 0.9.11",
+ "mimalloc-pprof",
+ "nix 0.31.3",
+ "num",
+ "num-traits",
+ "parking_lot",
+ "pprof",
+ "proptest",
+ "rapidhash",
+ "rayon",
+ "reblessive",
+ "regex",
+ "rkyv",
+ "rust-stemmers",
+ "rust_decimal",
+ "serde_json",
+ "smallvec 2.0.0-alpha.12",
+ "surrealdb",
+ "sysinfo 0.39.6",
+ "thin-vec",
+ "tokio",
+ "ulid 3.0.0",
+ "uuid",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "fg-gql-status"
 version = "0.1.0"
 dependencies = [
@@ -2467,10 +2537,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "fg-memory"
+version = "0.1.0"
+dependencies = [
+ "fg-gql-status",
+ "mimalloc-pprof",
+ "parking_lot",
+ "rapidhash",
+ "tikv-jemallocator",
+]
+
+[[package]]
+name = "fg-runtime"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "compact_str",
+ "fg-gql-status",
+ "fg-memory",
+ "fg-test-support",
+ "geo",
+ "geojson",
+ "half",
+ "jiff",
+ "num",
+ "num-traits",
+ "parking_lot",
+ "proptest",
+ "rapidhash",
+ "regex",
+ "rust_decimal",
+ "serde_json",
+ "smallvec 2.0.0-alpha.12",
+ "thin-vec",
+ "ulid 3.0.0",
+ "uuid",
+]
+
+[[package]]
 name = "fg-storage-engine-prototypes"
 version = "0.1.0"
 dependencies = [
  "ferros-grynn",
+ "fg-test-support",
  "memmap2 0.9.11",
  "parking_lot",
  "rapidhash",
@@ -2478,6 +2587,39 @@ dependencies = [
  "sysinfo 0.39.6",
  "uuid",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "fg-syntax"
+version = "0.1.0"
+dependencies = [
+ "fg-gql-status",
+ "fg-memory",
+ "fg-test-support",
+ "proptest",
+ "reblessive",
+]
+
+[[package]]
+name = "fg-test-support"
+version = "0.1.0"
+
+[[package]]
+name = "fg-value-codec"
+version = "0.1.0"
+dependencies = [
+ "compact_str",
+ "fg-gql-status",
+ "fg-memory",
+ "fg-runtime",
+ "fg-test-support",
+ "half",
+ "jiff",
+ "proptest",
+ "rkyv",
+ "rust_decimal",
+ "ulid 3.0.0",
+ "uuid",
 ]
 
 [[package]]

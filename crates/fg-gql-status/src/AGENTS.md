@@ -228,10 +228,10 @@ parameters, classification/category/domain/severity, diagnostic record и
 Запускайте:
 
 ```text
-cargo +nightly fmt
+cargo +nightly fmt --all
 cargo test -p ferros-grynn-macros
-cargo test gql_status
-cargo check
+cargo test -p fg-gql-status
+cargo check -p fg-gql-status
 ```
 
 Корневая crate находится в миграции и может не собираться по причинам вне

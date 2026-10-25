@@ -13,25 +13,25 @@
 
 ## Карта подмодулей
 
-- `runtime/value.rs`, `kind.rs`, `types.rs` — основной `Value`, стабильный
+- `crates/fg-runtime/src/values/runtime/value.rs`, `kind.rs`, `types.rs` — основной `Value`, стабильный
   порядок видов и type descriptions;
-- `runtime/number.rs`, `temporal.rs`, `geometry/mod.rs`, `vector.rs`, `regex.rs` —
+- `crates/fg-runtime/src/values/runtime/number.rs`, `temporal.rs`, `geometry/mod.rs`, `vector.rs`, `regex.rs` —
   предметные scalar/runtime values;
-- `runtime/array.rs`, `object.rs`, `set.rs`, `range.rs`, `bytes.rs`, `text.rs` —
+- `crates/fg-runtime/src/values/runtime/array.rs`, `object.rs`, `set.rs`, `range.rs`, `bytes.rs`, `text.rs` —
   runtime collections и owning wrappers;
-- `runtime/id.rs`, `record_id.rs`, `property_dictionary.rs`,
+- `crates/fg-runtime/src/values/runtime/id.rs`, `record_id.rs`, `property_dictionary.rs`,
   `property_map.rs` — идентификаторы и компактные property structures;
-- `runtime/conversions.rs`, `formatting.rs`, `laws.rs`, `closure.rs` —
+- `crates/fg-runtime/src/values/runtime/conversions.rs`, `formatting.rs`, `laws.rs`, `closure.rs` —
   conversions, presentation, law tests и runtime-only callable values;
-- `storage/tags_refs.rs` — stable tags и storage references;
+- `crates/fg-value-codec/src/values/storage/tags_refs.rs` — stable tags и storage references;
   `dto/mod.rs` — внутренние storage DTO; `dto/bounded/` — borrowed conversion
   с admission до DTO allocations; `context/mod.rs` — conversion contexts;
   `encode_budget.rs` — operation envelope для DTO, нового context и scratch;
   `order_key.rs` — order-preserving index keys;
-- `storage/codec/encode.rs`, `decode.rs`, `envelope.rs` — canonical payload,
+- `crates/fg-value-codec/src/values/storage/codec/encode.rs`, `decode.rs`, `envelope.rs` — canonical payload,
   bounded decoding и versioned archive envelope;
-- `columnar/arrow.rs` — Arrow materialization;
-  `columnar/datafusion.rs` — feature-gated DataFusion adapter.
+- `crates/fg-columnar/src/values/columnar/arrow.rs` — Arrow materialization;
+  `crates/fg-columnar/src/values/columnar/datafusion.rs` — feature-gated DataFusion adapter.
 
 ## Инварианты runtime
 
@@ -82,8 +82,8 @@
 
 ## Graph surface
 
-- Корневой `ferros_grynn::graph` владеет graph SDK; `values::runtime::graph`
-  остаётся совместимым реэкспортом.
+- `fg_runtime::graph` владеет concrete graph types; `ferros_grynn::graph` и
+  `values::runtime::graph` сохраняют совместимые SDK-реэкспорты.
 - `Graph<Mutable>` не помещается в `Value`; `Value::Graph` принимает только `Graph<Frozen>`.
 - Графовые значения сравниваются по `(identity, revision)`, не по содержимому или изоморфизму.
 - General graph поддерживает node/edge, edge/edge, hyper-, meta- и cross-level incidence.
@@ -106,13 +106,16 @@
 
 ## Проверка
 
+Команды ниже показывают runtime-срез. Для DTO/codec выбирать `-p fg-value-codec`,
+для columnar — `-p fg-columnar` и отдельно его feature `datafusion`.
+
 После изменений:
 
 ```text
-cargo +nightly fmt --check
-cargo check
-cargo clippy --all-targets
-cargo test
+cargo +nightly fmt --all -- --check
+cargo check -p fg-runtime
+cargo clippy -p fg-runtime --all-targets
+cargo test -p fg-runtime
 ```
 
 Новые ветви логики покрывать unit-тестами. Законы `Eq`/`Ord`/`Hash`, канонический порядок

@@ -20,13 +20,28 @@ $coverageScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'coverage.ps
 $exclusions = @([regex]::Matches($coverageScript, '(?m)^\s*\$exclude = ''([^'']+)''') | ForEach-Object { $_.Groups[1].Value })
 Assert-True ($exclusions.Count -eq 2) 'Expected separate workspace and core coverage scopes.'
 foreach ($pattern in $exclusions) {
-    foreach ($testFile in @('src/gql/analysis/layout_tests.rs', 'src/storage/changefeed/tests.rs', 'tests/system.rs', 'src\gql\analysis\layout_tests.rs')) {
+    foreach ($testFile in @('crates/fg-engine/src/gql/analysis/layout_tests.rs', 'crates/fg-engine/src/storage/changefeed/tests.rs', 'crates/fg-runtime/src/values/runtime/tests.rs', 'tests/system.rs', 'crates\fg-engine\src\gql\analysis\layout_tests.rs')) {
         Assert-True ($testFile -match $pattern) "Test code enters production coverage: $testFile"
     }
-    Assert-True ('src/gql/analysis/mod.rs' -notmatch $pattern) 'Production code was excluded from coverage.'
+    foreach ($productionFile in @('src/lib.rs', 'crates/fg-memory/src/lib.rs', 'crates/fg-syntax/src/syn/mod.rs', 'crates/fg-runtime/src/graph/mod.rs', 'crates/fg-value-codec/src/values/storage/codec/mod.rs', 'crates/fg-engine/src/gql/analysis/mod.rs')) {
+        Assert-True (Test-Path -LiteralPath $productionFile) "Missing core owner fixture: $productionFile"
+        Assert-True ($productionFile -notmatch $pattern) "Production code was excluded from coverage: $productionFile"
+        Assert-True ($productionFile.Replace('/', '\') -notmatch $pattern) "Windows production path was excluded: $productionFile"
+    }
+    Assert-True ('crates/fg-test-support/src/lib.rs' -match $pattern) 'Test helpers enter production coverage.'
 }
 Assert-True ('crates/ferros-grynn-macros/src/lib.rs' -notmatch $exclusions[0]) 'Workspace coverage excludes a workspace package.'
 Assert-True ('crates/ferros-grynn-macros/src/lib.rs' -match $exclusions[1]) 'Core coverage includes a separate workspace package.'
+foreach ($package in @('fg-columnar', 'fg-gql-status', 'fg-storage-engine-prototypes')) {
+    $source = "crates/$package/src/lib.rs"
+    Assert-True ($source -notmatch $exclusions[0]) "Workspace coverage excludes $package."
+    Assert-True ($source -match $exclusions[1]) "Core coverage includes $package."
+}
+$argumentArrays = @([regex]::Matches($coverageScript, '\$testArguments = @\(([^)]*)\)'))
+Assert-True ($argumentArrays.Count -eq 2) 'Expected separate workspace and core test selections.'
+$corePackages = @([regex]::Matches($argumentArrays[1].Groups[1].Value, '''-p'',\s*''([^'']+)''') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
+$expectedCorePackages = @('ferros-grynn', 'fg-memory', 'fg-syntax', 'fg-runtime', 'fg-value-codec', 'fg-engine') | Sort-Object
+Assert-True (($corePackages -join ',') -eq ($expectedCorePackages -join ',')) 'Core coverage must test every moved production owner.'
 
 $report = Join-Path $fixtureRoot 'summary.json'
 $badgePath = Join-Path $fixtureRoot 'coverage.json'
@@ -71,7 +86,7 @@ foreach ($readme in @('README.md', 'README.ru.md')) {
     Assert-True ($sql -eq $query) "SQL example drift in $readme."
     Assert-True ($content.Contains('version-' + $versionMatch.Groups[1].Value + '-')) "Version badge drift in $readme."
 }
-foreach ($document in @('README.md', 'README.ru.md', 'CONTRIBUTING.md', 'CONTRIBUTING.ru.md', 'CLA.md')) {
+foreach ($document in @('README.md', 'README.ru.md', 'CONTRIBUTING.md', 'CONTRIBUTING.ru.md', 'CLA.md', 'AGENTS.md')) {
     $content = Get-Content -LiteralPath $document -Raw
     $links = @([regex]::Matches($content, '(?:href|src|srcset)="([^"#]+)"')) + @([regex]::Matches($content, '\]\(([^)#]+)(?:#[^)]*)?\)'))
     foreach ($match in $links) {

@@ -1,0 +1,18 @@
+[package]
+name = "fg-test-support"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Shared Ferros-Grynn test assertions"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []

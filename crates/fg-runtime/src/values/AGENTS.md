@@ -1,0 +1,122 @@
+# Values module guidance
+
+Этот файл дополняет корневой `AGENTS.md` для `crates/fg-runtime/src/values`.
+
+## Границы
+
+- `runtime` — публичный Rust SDK и не зависит от storage engine, Arrow или DataFusion.
+- `storage` — внутренние DTO, `TypeTag`, encode/decode contexts и canonical codec.
+- `columnar` — пакетная материализация Arrow/DataFusion; она не заменяет runtime-типы и
+  feature-gated отдельно от них.
+- `ValueKind`, `Type` и `TypeTag` решают разные задачи. Не переносить `TypeTag` в `runtime`.
+- `option<T>` существует только как `Type`; runtime-отсутствие представлено `Value::None`.
+
+## Карта подмодулей
+
+- `crates/fg-runtime/src/values/runtime/value.rs`, `kind.rs`, `types.rs` — основной `Value`, стабильный
+  порядок видов и type descriptions;
+- `crates/fg-runtime/src/values/runtime/number.rs`, `temporal.rs`, `geometry/mod.rs`, `vector.rs`, `regex.rs` —
+  предметные scalar/runtime values;
+- `crates/fg-runtime/src/values/runtime/array.rs`, `object.rs`, `set.rs`, `range.rs`, `bytes.rs`, `text.rs` —
+  runtime collections и owning wrappers;
+- `crates/fg-runtime/src/values/runtime/id.rs`, `record_id.rs`, `property_dictionary.rs`,
+  `property_map.rs` — идентификаторы и компактные property structures;
+- `crates/fg-runtime/src/values/runtime/conversions.rs`, `formatting.rs`, `laws.rs`, `closure.rs` —
+  conversions, presentation, law tests и runtime-only callable values;
+- `crates/fg-value-codec/src/values/storage/tags_refs.rs` — stable tags и storage references;
+  `dto/mod.rs` — внутренние storage DTO; `dto/bounded/` — borrowed conversion
+  с admission до DTO allocations; `context/mod.rs` — conversion contexts;
+  `encode_budget.rs` — operation envelope для DTO, нового context и scratch;
+  `order_key.rs` — order-preserving index keys;
+- `crates/fg-value-codec/src/values/storage/codec/encode.rs`, `decode.rs`, `envelope.rs` — canonical payload,
+  bounded decoding и versioned archive envelope;
+- `crates/fg-columnar/src/values/columnar/arrow.rs` — Arrow materialization;
+  `crates/fg-columnar/src/values/columnar/datafusion.rs` — feature-gated DataFusion adapter.
+
+## Инварианты runtime
+
+- Расширять `#[non_exhaustive] Value` только одновременно с реализацией типа, `ValueKind`,
+  `Type::of`, `Eq`/`Ord`/`Hash`, `Display`, conversions и тестов.
+- Порядок `Value` задаётся только `ValueKind::stable_rank`; порядок вариантов enum не является
+  контрактом.
+- `none` и `null` — разные обычные sentinel. Трёхзначную логику и `OrdValue` не возвращать.
+- `Number` сравнивается точно между `Int`, `Float` и `Decimal`; `-0.0 == 0.0`, все NaN
+  канонически равны. Любое изменение `Eq` обязано одновременно сохранять `Ord` и `Hash`.
+- Сужающие и потенциально неточные преобразования реализуются только через `TryFrom`.
+  Silent-default conversions запрещены.
+- Публичный fallible runtime API возвращает `FerrosGrynnResult`. Не вводить локальные
+  `thiserror`-enum; value-статусы принадлежат `Domain::Value`, а ошибки внешних crates
+  сохраняются только как redacted `technical_source`.
+- `Text` — единственная публичная runtime-обёртка строк; `CompactString` используется только
+  как её внутреннее представление. Прямые зависимости остальных values-типов от `compact_str`
+  запрещены.
+- `Object` остаётся публичным `BTreeMap<Text, Value>`. `PropertyMap` — отдельный
+  однословный sorted `ThinVec<(PropertyKeyId, Value)>`: empty не аллоцирует, non-empty имеет
+  один contiguous buffer. Не возвращать tagged-pointer/ложный inline hybrid без benchmark evidence.
+- `PropertyDictionary` выдаёт плотные `PropertyKeyId` в порядке интернирования и разрешает ключи
+  в обе стороны; on-disk `LabelDictionary` остаётся ответственностью storage layer.
+- Не выдавать `DerefMut` или внешнее внутреннее представление, если оно позволяет обойти
+  инварианты.
+- `RecordIdPart` допускает только int/string/uuid/ulid/array/object; вложенные array/object
+  проверяются рекурсивно с лимитом глубины.
+- Runtime-only значения сравниваются по `RuntimeId`, а storage-конвертер обязан отклонять их
+  структурированной ошибкой.
+- `Value::Path` heap estimate включает steps/public identifiers через владельца `graph::Path`.
+  Размер boxed структуры недостаточен для query memory admission; Eq/Ord/Hash и codecs не меняются.
+- `Matcher` — runtime-only identity value: mutable cursor скрыт под синхронизацией, но
+  `Eq`/`Ord`/`Hash` не зависят от позиции. Matcher, Closure, Cursor и ErrorValue не получают
+  durable или query-spill encoding.
+
+## Columnar и ECS
+
+- `PropertyBatch` всегда хранит Arrow validity и отдельный presence bitmap: `presence=0` —
+  `none`, `presence=1 && valid=0` — `null`.
+- DataFusion видит скрытые `__fg_presence_<key_id>` поля; не передавать ему голый `RecordBatch`,
+  если оператор должен различать `none` и `null`.
+- До реализации `StorageValue` native Arrow conversion поддерживает scalar-набор; nested и
+  runtime-only значения отклоняются доменным статусом. Не кодировать их через `Display`.
+- ECS использует только полный graph `AtomId`, отдельные node/edge sparse pages и проверку
+  generation после sparse lookup. Собственный `Entity` allocator запрещён.
+- Materialized property pool ключуется `(PropertyKeyId, TypeId)` и не смешивается с обычным
+  component pool по `TypeId`.
+
+## Graph surface
+
+- `fg_runtime::graph` владеет concrete graph types; `ferros_grynn::graph` и
+  `values::runtime::graph` сохраняют совместимые SDK-реэкспорты.
+- `Graph<Mutable>` не помещается в `Value`; `Value::Graph` принимает только `Graph<Frozen>`.
+- Графовые значения сравниваются по `(identity, revision)`, не по содержимому или изоморфизму.
+- General graph поддерживает node/edge, edge/edge, hyper-, meta- и cross-level incidence.
+  `Tree`/`RootedTree`/`Forest`, `Dag` и `Hypergraph` используют отдельные storage families;
+  не заменять их номинальными обёртками над `Graph`. `Metagraph` разделяет general layout как
+  явно зафиксированное исключение.
+- Общий алгоритмический API принимает `GraphRead` и обязан давать одинаковую семантику для
+  full in-memory, transaction-bound disk view и hybrid materialization. `query_to_memory`
+  освобождает исходный guard после копирования; mutable hybrid сохраняет origin mapping и
+  dirty-set для явного write-back.
+- `GraphWorkspace` остаётся ECS-sidecar и не входит в `Value`, equality, codec или durability.
+  Derived pools привязаны к `(identity, revision)` и инвалидируются после graph mutation.
+- Публичный `Path` содержит стабильные `AtomRef`, а не `AtomId`; разрешение свойств всегда
+  проверяет origin identity и snapshot. `LiveGraph` не подменяет статический `Graph<Frozen>` и
+  требует явного conflict resolution для пересечения remote/local dirty-set.
+- Внутренний `AtomId` не является публичным GQL ID. На границе query/storage используется
+  `RecordId`/`GraphRef`.
+- Production-раскладка `AtomId` — `gen(23) | kind(1) | slot(40)`; старую u31-раскладку
+  прототипа `fg-meta` не переносить.
+
+## Проверка
+
+Команды ниже показывают runtime-срез. Для DTO/codec выбирать `-p fg-value-codec`,
+для columnar — `-p fg-columnar` и отдельно его feature `datafusion`.
+
+После изменений:
+
+```text
+cargo +nightly fmt --all -- --check
+cargo check -p fg-runtime
+cargo clippy -p fg-runtime --all-targets
+cargo test -p fg-runtime
+```
+
+Новые ветви логики покрывать unit-тестами. Законы `Eq`/`Ord`/`Hash`, канонический порядок
+коллекций и cross-number comparison дополнительно покрывать property-based тестами.
