@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "label": "coverage",
+  "message": "87.5%",
+  "color": "brightgreen",
+  "lines": 283833,
+  "covered": 248232,
+  "commit": "dcb1dd0d27625de621a36466f2bce2874a08a54a",
+  "scope": "Windows; facade and core owners; no-default-features; lib and integration tests"
+}
